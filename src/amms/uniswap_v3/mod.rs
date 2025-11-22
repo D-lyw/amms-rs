@@ -771,7 +771,7 @@ impl UniswapV3Factory {
         let sync_provider = provider.clone();
         let mut futures = FuturesUnordered::new();
 
-        let sync_step = 10_000;
+        let sync_step = 2_000;
         let mut latest_block = self.creation_block;
         let tip = block_number.as_u64().unwrap_or_default();
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(5));
