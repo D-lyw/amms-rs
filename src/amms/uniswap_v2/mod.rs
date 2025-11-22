@@ -398,33 +398,46 @@ impl UniswapV2Factory {
             .await?
             .to::<usize>();
 
-        let step = 766;
+        let step = 200;
         let mut futures_unordered = FuturesUnordered::new();
-        for i in (0..pairs_length).step_by(step) {
-            // Note that the batch contract handles if the step is greater than the pairs length
-            // So we can pass the step in as is without checking for this condition
-            let deployer = IGetUniswapV2PairsBatchRequest::deploy_builder(
-                provider.clone(),
-                U256::from(i),
-                U256::from(step),
-                factory_address,
-            );
-
-            futures_unordered.push(async move {
-                let res = deployer.call_raw().block(block_number).await?;
-                let return_data = <Vec<Address> as SolValue>::abi_decode(&res)?;
-
-                Ok::<Vec<Address>, AMMError>(return_data)
-            });
-        }
+        let mut i = 0usize;
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(20));
 
         let mut pairs = Vec::new();
-        while let Some(res) = futures_unordered.next().await {
-            let tokens = res?;
-            for token in tokens {
-                if !token.is_zero() {
-                    pairs.push(token);
+        loop {
+            tokio::select! {
+                _ = interval.tick(), if i < pairs_length => {
+                    let provider = provider.clone();
+                    let deployer = IGetUniswapV2PairsBatchRequest::deploy_builder(
+                        provider,
+                        U256::from(i),
+                        U256::from(step),
+                        factory_address,
+                    );
+
+                    futures_unordered.push(async move {
+                        let res = deployer.call_raw().block(block_number).await?;
+                        let return_data = <Vec<Address> as SolValue>::abi_decode(&res)?;
+
+                        Ok::<Vec<Address>, AMMError>(return_data)
+                    });
+
+                    i = i.saturating_add(step);
+                },
+                res = futures_unordered.next(), if !futures_unordered.is_empty() => {
+                    if let Some(res) = res {
+                        let tokens = res?;
+                        for token in tokens {
+                            if !token.is_zero() {
+                                pairs.push(token);
+                            }
+                        }
+                    }
                 }
+            }
+
+            if i >= pairs_length && futures_unordered.is_empty() {
+                break;
             }
         }
 
