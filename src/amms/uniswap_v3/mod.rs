@@ -774,7 +774,7 @@ impl UniswapV3Factory {
         let sync_step = 2_000;
         let mut latest_block = self.creation_block;
         let tip = block_number.as_u64().unwrap_or_default();
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(30));
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(15));
 
         let mut pools = vec![];
         loop {
@@ -819,7 +819,7 @@ impl UniswapV3Factory {
         N: Network,
         P: Provider<N> + Clone,
     {
-        let batch_size = 300;
+        let batch_size = 100;
         let mut result = Vec::new();
 
         while !pools.is_empty() {
