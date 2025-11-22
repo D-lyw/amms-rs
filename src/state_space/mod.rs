@@ -4,7 +4,10 @@ pub mod error;
 pub mod filters;
 
 use crate::amms::amm::AutomatedMarketMaker;
-use crate::amms::amm::AMM;
+use crate::amms::amm::{AMM, Variant};
+use crate::amms::balancer::BalancerFactory;
+use crate::amms::uniswap_v2::UniswapV2Factory;
+use crate::amms::uniswap_v3::UniswapV3Factory;
 use crate::amms::error::AMMError;
 use crate::amms::factory::Factory;
 
@@ -223,12 +226,33 @@ where
             }
         }
 
-        // Sync remaining AMM variants
-        for (_, remaining_amms) in amm_variants.drain() {
-            for mut amm in remaining_amms {
-                let address = amm.address();
-                amm = amm.init(chain_tip, self.provider.clone()).await?;
-                state_space.state.insert(address, amm);
+        // Sync remaining AMM variants in batches by variant
+        for (variant, remaining_amms) in amm_variants.drain() {
+            let provider = self.provider.clone();
+
+            let synced = match variant {
+                Variant::UniswapV3Pool => {
+                    UniswapV3Factory::sync_all_pools::<N, _>(remaining_amms, chain_tip, provider.clone()).await?
+                }
+                Variant::UniswapV2Pool => {
+                    UniswapV2Factory::sync_all_pools::<N, _>(remaining_amms, chain_tip, provider.clone()).await?
+                }
+                Variant::BalancerPool => {
+                    BalancerFactory::sync_all_pools::<N, _>(remaining_amms, chain_tip, provider.clone()).await?
+                }
+                Variant::ERC4626Vault => {
+                    // Fallback: sequential init for ERC4626Vault variants (no factory batching)
+                    let mut out = Vec::with_capacity(remaining_amms.len());
+                    for amm in remaining_amms {
+                        let amm = amm.init(chain_tip, provider.clone()).await?;
+                        out.push(amm);
+                    }
+                    out
+                }
+            };
+
+            for amm in synced {
+                state_space.state.insert(amm.address(), amm);
             }
         }
 
