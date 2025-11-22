@@ -774,7 +774,7 @@ impl UniswapV3Factory {
         let sync_step = 2_000;
         let mut latest_block = self.creation_block;
         let tip = block_number.as_u64().unwrap_or_default();
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(5));
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(30));
 
         let mut pools = vec![];
         loop {
