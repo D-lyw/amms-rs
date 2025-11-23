@@ -18,7 +18,7 @@ use alloy::{
     transports::BoxFuture,
 };
 use futures::{stream::FuturesUnordered, StreamExt};
-use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
+use rayon::iter::{IntoParallelRefIterator, ParallelDrainRange, ParallelIterator};
 use serde::{Deserialize, Serialize};
 use std::{
     cmp::Ordering,
@@ -819,36 +819,26 @@ impl UniswapV3Factory {
         N: Network,
         P: Provider<N> + Clone,
     {
-        info!("Syncing {} V3 pools", pools.len());
-        let batch_size = 100;
-        let mut result = Vec::new();
+        // info!("Syncing {} V3 pools", pools.len());
+        UniswapV3Factory::sync_slot_0(&mut pools, block_number, provider.clone()).await?;
+        UniswapV3Factory::sync_token_decimals(&mut pools, provider.clone()).await?;
 
-        while !pools.is_empty() {
-            let size = batch_size.min(pools.len());
-            let mut group: Vec<AMM> = pools.drain(0..size).collect();
+        pools = pools
+            .par_drain(..)
+            .filter(|pool| match pool {
+                AMM::UniswapV3Pool(uv3_pool) => {
+                    uv3_pool.liquidity > 0
+                        && uv3_pool.token_a.decimals > 0
+                        && uv3_pool.token_b.decimals > 0
+                }
+                _ => true,
+            })
+            .collect();
 
-            UniswapV3Factory::sync_slot_0(&mut group, block_number, provider.clone()).await?;
-            UniswapV3Factory::sync_token_decimals(&mut group, provider.clone()).await?;
+        UniswapV3Factory::sync_tick_bitmaps(&mut pools, block_number, provider.clone()).await?;
+        UniswapV3Factory::sync_tick_data(&mut pools, block_number, provider.clone()).await?;
 
-            group = group
-                .into_par_iter()
-                .filter(|pool| match pool {
-                    AMM::UniswapV3Pool(uv3_pool) => {
-                        uv3_pool.liquidity > 0
-                            && uv3_pool.token_a.decimals > 0
-                            && uv3_pool.token_b.decimals > 0
-                    }
-                    _ => true,
-                })
-                .collect();
-
-            UniswapV3Factory::sync_tick_bitmaps(&mut group, block_number, provider.clone()).await?;
-            UniswapV3Factory::sync_tick_data(&mut group, block_number, provider.clone()).await?;
-
-            result.extend(group);
-        }
-
-        Ok(result)
+        Ok(pools)
     }
 
     async fn sync_token_decimals<N, P>(
