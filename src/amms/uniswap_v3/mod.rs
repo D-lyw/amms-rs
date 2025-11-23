@@ -819,6 +819,7 @@ impl UniswapV3Factory {
         N: Network,
         P: Provider<N> + Clone,
     {
+        info!("Syncing {} V3 pools", pools.len());
         let batch_size = 100;
         let mut result = Vec::new();
 
