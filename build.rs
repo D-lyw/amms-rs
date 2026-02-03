@@ -37,6 +37,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let status = Command::new("forge")
         .arg("build")
+        .args(&["--skip", "test", "--skip", "script"])
         .current_dir("contracts")
         .status()?;
 
