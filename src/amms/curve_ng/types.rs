@@ -1,0 +1,124 @@
+//! Curve NG 池类型定义
+
+use alloy::primitives::{Address, U256};
+use serde::{Deserialize, Serialize};
+
+/// Curve NG 池类型枚举
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CurveNGPoolType {
+    /// StableSwap-NG: 2-8 个锚定资产 (如稳定币、LSD)
+    StableSwap,
+    /// TwoCrypto-NG: 2 个波动资产
+    TwoCrypto,
+    /// TriCrypto-NG: 3 个波动资产
+    TriCrypto,
+}
+
+impl CurveNGPoolType {
+    /// 是否为 CryptoSwap 类型 (TwoCrypto 或 TriCrypto)
+    pub fn is_crypto(&self) -> bool {
+        matches!(self, Self::TwoCrypto | Self::TriCrypto)
+    }
+
+    /// 是否为 StableSwap 类型
+    pub fn is_stable(&self) -> bool {
+        matches!(self, Self::StableSwap)
+    }
+}
+
+/// Curve NG 池状态
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CurveNGPool {
+    /// 池子地址
+    pub address: Address,
+    /// 最后同步区块
+    pub last_synced_block: u64,
+    /// 池子类型
+    pub pool_type: CurveNGPoolType,
+    /// 代币数量
+    pub n_coins: u8,
+    /// 代币地址列表
+    pub coins: Vec<Address>,
+    /// 各代币余额
+    pub balances: Vec<U256>,
+    /// 各代币精度
+    pub decimals: Vec<u8>,
+    /// 费率/汇率 (用于 rate provider, 如 wstETH)
+    pub rates: Vec<U256>,
+
+    // === StableSwap 参数 ===
+    /// 放大系数 A (StableSwap)
+    pub amp: Option<U256>,
+    /// 手续费 (1e10 = 100%)
+    pub fee: U256,
+    /// 管理费分成
+    /// 管理费分成
+    pub admin_fee: U256,
+    /// 动态费率乘数 (Off-peg fee multiplier)
+    pub offpeg_fee_multiplier: U256,
+
+    // === CryptoSwap 额外参数 ===
+    /// 价格缩放因子 (CryptoSwap)
+    pub price_scale: Option<Vec<U256>>,
+    /// 内部预言机价格 (CryptoSwap)
+    pub price_oracle: Option<Vec<U256>>,
+    /// 最后交易价格 (CryptoSwap)
+    pub last_prices: Option<Vec<U256>>,
+    /// D 不变量缓存 (CryptoSwap)
+    pub d: Option<U256>,
+    /// gamma 参数 (CryptoSwap)
+    pub gamma: Option<U256>,
+    /// 虚拟价格
+    pub virtual_price: Option<U256>,
+
+    // === CryptoSwap 动态费率参数 ===
+    /// 中间费率
+    pub mid_fee: Option<U256>,
+    /// 外部费率
+    pub out_fee: Option<U256>,
+    /// 费用 Gamma
+    pub fee_gamma: Option<U256>,
+    /// 允许的额外利润
+    pub allowed_extra_profit: Option<U256>,
+    /// 调整步长
+    pub adjustment_step: Option<U256>,
+    /// 移动平均半衰期
+    pub ma_half_time: Option<U256>,
+
+    /// 缓存的现货价格 (base_token, quote_token) -> price
+    #[serde(skip)]
+    pub spot_prices: std::collections::HashMap<(Address, Address), f64>,
+}
+
+impl CurveNGPool {
+    /// 创建新的空池子实例
+    pub fn new(address: Address, pool_type: CurveNGPoolType) -> Self {
+        Self {
+            address,
+            last_synced_block: 0,
+            pool_type,
+            n_coins: 0,
+            coins: Vec::new(),
+            balances: Vec::new(),
+            decimals: Vec::new(),
+            rates: Vec::new(),
+            amp: None,
+            fee: U256::ZERO,
+            admin_fee: U256::ZERO,
+            offpeg_fee_multiplier: U256::ZERO,
+            price_scale: None,
+            price_oracle: None,
+            last_prices: None,
+            d: None,
+            gamma: None,
+            virtual_price: None,
+            mid_fee: None,
+            out_fee: None,
+            fee_gamma: None,
+            allowed_extra_profit: None,
+            adjustment_step: None,
+            ma_half_time: None,
+            spot_prices: std::collections::HashMap::new(),
+        }
+    }
+}
