@@ -195,6 +195,16 @@ impl AutomatedMarketMaker for EkuboPool {
         self.liquidity >= l_thresh
     }
 
+    fn decimals(&self, token: Address) -> u8 {
+        if token == self.token_a.address {
+            self.token_a.decimals
+        } else if token == self.token_b.address {
+            self.token_b.decimals
+        } else {
+            0
+        }
+    }
+
     fn set_last_synced_block(&mut self, block_number: u64) {
         self.last_synced_block = self.last_synced_block.max(block_number);
     }

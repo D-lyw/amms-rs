@@ -360,4 +360,8 @@ impl AutomatedMarketMaker for NoopAMM {
     {
         unreachable!()
     }
+
+    fn decimals(&self, _token: Address) -> u8 {
+        unreachable!()
+    }
 }

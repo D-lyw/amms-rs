@@ -262,6 +262,16 @@ impl AutomatedMarketMaker for SushiV2Pool {
             && self.token_b.has_sufficient_liquidity(self.reserve_1)
     }
 
+    fn decimals(&self, token: Address) -> u8 {
+        if token == self.token_a.address {
+            self.token_a.decimals
+        } else if token == self.token_b.address {
+            self.token_b.decimals
+        } else {
+            0
+        }
+    }
+
     async fn init<N, P>(mut self, block_number: BlockId, provider: P) -> Result<Self, AMMError>
     where
         N: Network,

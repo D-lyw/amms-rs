@@ -559,6 +559,10 @@ impl AutomatedMarketMaker for BalancerV3Pool {
         meaningful_tokens >= 2
     }
 
+    fn decimals(&self, token: Address) -> u8 {
+        self.tokens.get(&token).map(|t| t.decimals).unwrap_or(0)
+    }
+
     fn spot_price(&self, base_token: Address, quote_token: Address) -> Result<f64, AMMError> {
         // Try cache first
         if let Some(&price) = self.spot_prices.get(&(base_token, quote_token)) {

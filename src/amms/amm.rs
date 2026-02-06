@@ -76,6 +76,9 @@ pub trait AutomatedMarketMaker: Send + Sync + 'static {
         true
     }
 
+    /// Returns the decimals of the token in the pool
+    fn decimals(&self, token: Address) -> u8;
+
     /// Simulate a swap
     /// Returns the amount_out in `quote token` for a given `amount_in` of `base_token`
     fn simulate_swap(
@@ -195,6 +198,12 @@ macro_rules! amm {
             fn has_sufficient_liquidity(&self) -> bool {
                 match self {
                     $(AMM::$pool_type(pool) => pool.has_sufficient_liquidity(),)+
+                }
+            }
+
+            fn decimals(&self, token: Address) -> u8 {
+                match self {
+                    $(AMM::$pool_type(pool) => pool.decimals(token),)+
                 }
             }
 

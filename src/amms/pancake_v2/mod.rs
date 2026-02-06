@@ -154,6 +154,16 @@ impl AutomatedMarketMaker for PancakeV2Pool {
             && self.token_b.has_sufficient_liquidity(self.reserve_1)
     }
 
+    fn decimals(&self, token: Address) -> u8 {
+        if token == self.token_a.address {
+            self.token_a.decimals
+        } else if token == self.token_b.address {
+            self.token_b.decimals
+        } else {
+            0
+        }
+    }
+
     fn calculate_price(&self, base_token: Address, _quote_token: Address) -> Result<f64, AMMError> {
         if self.reserve_0 < MIN_POOL_RESERVE || self.reserve_1 < MIN_POOL_RESERVE {
             return Ok(0.0);

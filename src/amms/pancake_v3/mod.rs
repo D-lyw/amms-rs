@@ -281,6 +281,16 @@ impl AutomatedMarketMaker for PancakeV3Pool {
         self.liquidity >= l_thresh
     }
 
+    fn decimals(&self, token: Address) -> u8 {
+        if token == self.token_a.address {
+            self.token_a.decimals
+        } else if token == self.token_b.address {
+            self.token_b.decimals
+        } else {
+            0
+        }
+    }
+
     fn calculate_price(&self, base_token: Address, _quote_token: Address) -> Result<f64, AMMError> {
         if self.sqrt_price.is_zero() {
             return Err(AMMError::Msg("sqrt_price is zero".into()));

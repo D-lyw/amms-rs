@@ -143,15 +143,26 @@ impl AutomatedMarketMaker for ERC4626Vault {
                 reserve >= U256::from(10).pow(U256::from(decimals.saturating_sub(4)))
             } else if decimals >= 6 {
                 // 100 units
-                let threshold = U256::from(100).saturating_mul(U256::from(10).pow(U256::from(decimals)));
+                let threshold =
+                    U256::from(100).saturating_mul(U256::from(10).pow(U256::from(decimals)));
                 reserve >= threshold
             } else {
                 reserve >= U256::from(100_000)
             }
         };
 
-        check_reserve(self.asset_reserve, self.asset_token_decimals) && 
-        check_reserve(self.vault_reserve, self.vault_token_decimals)
+        check_reserve(self.asset_reserve, self.asset_token_decimals)
+            && check_reserve(self.vault_reserve, self.vault_token_decimals)
+    }
+
+    fn decimals(&self, token: Address) -> u8 {
+        if token == self.vault_token {
+            self.vault_token_decimals
+        } else if token == self.asset_token {
+            self.asset_token_decimals
+        } else {
+            0
+        }
     }
 
     fn calculate_price(&self, base_token: Address, _quote_token: Address) -> Result<f64, AMMError> {

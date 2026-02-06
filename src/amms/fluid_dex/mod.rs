@@ -471,6 +471,16 @@ impl AutomatedMarketMaker for FluidDexPool {
             && self.token1_real_reserves_1e12 > U256::from(1_000_000_000)
     }
 
+    fn decimals(&self, token: Address) -> u8 {
+        if token == self.token_a.address {
+            self.token_a.decimals
+        } else if token == self.token_b.address {
+            self.token_b.decimals
+        } else {
+            0
+        }
+    }
+
     fn last_synced_block(&self) -> u64 {
         self.last_synced_block
     }
@@ -1367,7 +1377,7 @@ mod tests {
             .init::<alloy::network::Ethereum, _>(BlockId::latest(), provider.clone())
             .await?;
 
-        let native_eth = Address::from_str(FLUID_NATIVE_ETH)?;
+        let native_eth = FLUID_NATIVE_ETH;
 
         // Check that one token is Native ETH
         let has_native_eth =

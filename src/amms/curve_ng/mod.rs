@@ -371,6 +371,14 @@ impl AutomatedMarketMaker for CurveNGPool {
         true
     }
 
+    fn decimals(&self, token: Address) -> u8 {
+        self.coins
+            .iter()
+            .position(|&t| t == token)
+            .and_then(|i| self.decimals.get(i).copied())
+            .unwrap_or(0)
+    }
+
     fn sync_events(&self) -> Vec<B256> {
         match self.pool_type {
             CurveNGPoolType::StableSwap => vec![

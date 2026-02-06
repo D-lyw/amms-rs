@@ -362,6 +362,10 @@ impl AutomatedMarketMaker for BalancerV2Pool {
         true
     }
 
+    fn decimals(&self, token: Address) -> u8 {
+        self.tokens.get(&token).map(|t| t.decimals).unwrap_or(0)
+    }
+
     fn spot_price(&self, base_token: Address, quote_token: Address) -> Result<f64, AMMError> {
         if let Some(&price) = self.spot_prices.get(&(base_token, quote_token)) {
             // 价格有效性校验

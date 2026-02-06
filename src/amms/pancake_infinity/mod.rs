@@ -154,27 +154,53 @@ impl AutomatedMarketMaker for PancakeInfinityPool {
         // L ~ sqrt(x * y)
         // We estimate required L based on required token amounts (x_thresh, y_thresh)
         // L_thresh = sqrt(x_thresh * y_thresh)
-        
+
         let d_a = self.token_a.decimals;
         let d_b = self.token_b.decimals;
-        
-        let t_a_u128 = if d_a >= 18 { 10u128.pow(d_a as u32 - 4) } // 0.0001
-                       else if d_a >= 6 { 100u128.saturating_mul(10u128.pow(d_a as u32)) } // 100
-                       else { 100_000 };
-                       
-        let t_b_u128 = if d_b >= 18 { 10u128.pow(d_b as u32 - 4) } // 0.0001
-                       else if d_b >= 6 { 100u128.saturating_mul(10u128.pow(d_b as u32)) } // 100
-                       else { 100_000 };
-        
+
+        let t_a_u128 = if d_a >= 18 {
+            10u128.pow(d_a as u32 - 4)
+        }
+        // 0.0001
+        else if d_a >= 6 {
+            100u128.saturating_mul(10u128.pow(d_a as u32))
+        }
+        // 100
+        else {
+            100_000
+        };
+
+        let t_b_u128 = if d_b >= 18 {
+            10u128.pow(d_b as u32 - 4)
+        }
+        // 0.0001
+        else if d_b >= 6 {
+            100u128.saturating_mul(10u128.pow(d_b as u32))
+        }
+        // 100
+        else {
+            100_000
+        };
+
         // Calculate geometric mean of thresholds
         let l_thresh = if let Some(prod) = t_a_u128.checked_mul(t_b_u128) {
-             prod.isqrt()
+            prod.isqrt()
         } else {
-             // Fallback if product overflows u128 (rare, requires decimals > 30)
-             u128::MAX.isqrt()
+            // Fallback if product overflows u128 (rare, requires decimals > 30)
+            u128::MAX.isqrt()
         };
 
         self.liquidity >= l_thresh
+    }
+
+    fn decimals(&self, token: Address) -> u8 {
+        if token == self.token_a.address {
+            self.token_a.decimals
+        } else if token == self.token_b.address {
+            self.token_b.decimals
+        } else {
+            0
+        }
     }
 
     fn calculate_price(&self, base_token: Address, _quote_token: Address) -> Result<f64, AMMError> {
