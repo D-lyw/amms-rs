@@ -75,7 +75,7 @@ fn get_eth_usdt_pool_key() -> EkuboPoolKey {
 
 async fn setup_provider() -> Result<impl Provider<Ethereum> + Clone> {
     let rpc_url = env::var("ETHEREUM_RPC_URL").unwrap_or("https://eth.merkle.io".to_string());
-    Ok(ProviderBuilder::new().on_http(rpc_url.parse()?))
+    Ok(ProviderBuilder::new().connect_http(rpc_url.parse()?))
 }
 
 /// Helper to verify simulation against on-chain Router quote

@@ -28,7 +28,7 @@ sol! {
 
 async fn setup_provider() -> Result<impl alloy::providers::Provider<Ethereum> + Clone> {
     let rpc_url = env::var("ETHEREUM_RPC_URL").unwrap_or("https://eth.merkle.io".to_string());
-    Ok(ProviderBuilder::new().on_http(rpc_url.parse()?))
+    Ok(ProviderBuilder::new().connect_http(rpc_url.parse()?))
 }
 
 /// 验证本地模拟与链上结果的偏差

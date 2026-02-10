@@ -33,7 +33,7 @@ fn find_index(coins: &[Address], target: Address) -> usize {
 #[tokio::test]
 async fn test_ng_stableswap_simulation() -> Result<()> {
     let rpc_url = env::var("ETHEREUM_RPC_URL").unwrap_or("https://eth.merkle.io".to_string());
-    let provider = ProviderBuilder::new().on_http(rpc_url.parse()?);
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
 
     // StableSwap NG: crvUSD/USDC
     let pool_addr = address!("4DEcE678ceceb27446b35C672dC7d61F30bAD69E");

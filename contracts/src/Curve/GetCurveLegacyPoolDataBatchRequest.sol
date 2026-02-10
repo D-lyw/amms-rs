@@ -29,7 +29,8 @@ interface ICurveLegacyPool {
     function allowed_extra_profit() external view returns (uint256);
     function adjustment_step() external view returns (uint256);
     function ma_half_time() external view returns (uint256);
-    function price_scale(uint256 i) external view returns (uint256);
+    // price_scale is handled via manual selector encoding to support both array and scalar
+    // function price_scale(uint256 i) external view returns (uint256);
     function stored_rates(uint256 i) external view returns (uint256); // For Lending/Metapools
 }
 
@@ -175,7 +176,14 @@ contract GetCurveLegacyPoolDataBatchRequest {
                 uint256 numPriceScales = nCoins > 1 ? nCoins - 1 : 0;
                 data.priceScale = new uint256[](numPriceScales);
                 for (uint256 k = 0; k < numPriceScales; k++) {
-                    data.priceScale[k] = safeGetUint256(input.pool, abi.encodeWithSelector(ICurveLegacyPool.price_scale.selector, k));
+                    // Try array access first: price_scale(k)
+                    uint256 val = safeGetUint256(input.pool, abi.encodeWithSignature("price_scale(uint256)", k));
+                    
+                    // If failed (0) and we only expect 1 value (2-coin pool), try scalar: price_scale()
+                    if (val == 0 && numPriceScales == 1) {
+                         val = safeGetUint256(input.pool, abi.encodeWithSignature("price_scale()"));
+                    }
+                    data.priceScale[k] = val;
                 }
             } else {
                 // StableSwap: empty price scale

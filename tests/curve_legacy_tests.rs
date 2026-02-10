@@ -25,7 +25,7 @@ sol! {
 #[tokio::test]
 async fn test_curve_legacy_3pool_simulation() -> Result<()> {
     let rpc_url = env::var("ETHEREUM_RPC_URL").unwrap_or("https://eth.merkle.io".to_string());
-    let provider = ProviderBuilder::new().on_http(rpc_url.parse()?);
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
 
     // 3pool Address (DAI/USDC/USDT)
     let pool_addr = address!("bEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7");
@@ -84,7 +84,7 @@ async fn test_curve_legacy_3pool_simulation() -> Result<()> {
 #[tokio::test]
 async fn test_curve_legacy_tricrypto2_simulation() -> Result<()> {
     let rpc_url = env::var("ETHEREUM_RPC_URL").unwrap_or("https://rpc.flashbots.net".to_string());
-    let provider = ProviderBuilder::new().on_http(rpc_url.parse()?);
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
 
     // Tricrypto2 Address (USDT/WBTC/WETH)
     let pool_addr = address!("D51a44d3FaE010294C616388b506AcdA1bfAAE46");

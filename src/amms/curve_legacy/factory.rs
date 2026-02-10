@@ -224,9 +224,10 @@ impl CurveLegacyFactory {
         }
 
         // 减小批次大小以避免 Contract Size 限制和 RPC 执行超时
-        // Curve Legacy 池子初始化计算量大，特别是 CryptoSwap，将批次大小从 10 降低到 2
-        // CryptoSwap 的初始化非常消耗 Gas，即使是 4 个池子也可能导致 Revert
-        let step = 2;
+        // Curve Legacy 池子初始化计算量大，特别是 CryptoSwap，将批次大小从 10 降低到 1
+        // CryptoSwap 的初始化非常消耗 Gas，即使是 2 个池子也可能导致 Revert，因此保守设置为 1
+        // 注意：即使批次大小为 1，使用 Batch Contract 仍然比 Individual Init (多次 RPC 调用) 高效
+        let step = 1;
         // 使用 pool_chunks 保存 (address, pool_type) 元组
         let pool_chunks = amms
             .iter()
