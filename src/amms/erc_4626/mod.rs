@@ -1,5 +1,5 @@
 use super::{
-    amm::{AutomatedMarketMaker, SyncAction},
+    amm::{AutomatedMarketMaker, SyncAction, AMM},
     consts::{U128_0X10000000000000000, U256_10000, U256_2},
     error::AMMError,
     float::q64_to_float,
@@ -14,8 +14,10 @@ use alloy::{
     sol,
     sol_types::{SolEvent, SolValue},
 };
+use futures::{stream::FuturesUnordered, StreamExt};
+use itertools::Itertools;
 use serde::{Deserialize, Serialize};
-use std::cmp::Ordering;
+use std::{cmp::Ordering, collections::HashMap};
 use thiserror::Error;
 use tracing::info;
 
@@ -310,6 +312,155 @@ impl AutomatedMarketMaker for ERC4626Vault {
 
 // TODO: swap calldata
 impl ERC4626Vault {
+    pub async fn init_batch<N, P>(
+        amms: Vec<AMM>,
+        block_number: BlockId,
+        provider: P,
+    ) -> Result<Vec<AMM>, AMMError>
+    where
+        N: Network,
+        P: Provider<N> + Clone,
+    {
+        let step = 100;
+        let vaults = amms
+            .iter()
+            .chunks(step)
+            .into_iter()
+            .map(|chunk| chunk.map(|amm| amm.address()).collect())
+            .collect::<Vec<Vec<Address>>>();
+
+        let mut futures_unordered = FuturesUnordered::new();
+        for group in vaults {
+            let deployer =
+                IGetERC4626VaultDataBatchRequest::deploy_builder(provider.clone(), group.clone());
+
+            futures_unordered.push(async move {
+                let res = deployer.call_raw().block(block_number).await?;
+
+                let return_data = <Vec<(
+                    Address,
+                    u16,
+                    Address,
+                    u16,
+                    U256,
+                    U256,
+                    U256,
+                    U256,
+                    U256,
+                    U256,
+                    U256,
+                    U256,
+                )> as SolValue>::abi_decode(&res)?;
+
+                Ok::<(
+                    Vec<Address>,
+                    Vec<(
+                        Address,
+                        u16,
+                        Address,
+                        u16,
+                        U256,
+                        U256,
+                        U256,
+                        U256,
+                        U256,
+                        U256,
+                        U256,
+                        U256,
+                    )>,
+                ), AMMError>((group, return_data))
+            });
+        }
+
+        let mut amms = amms
+            .into_iter()
+            .map(|amm| (amm.address(), amm))
+            .collect::<HashMap<_, _>>();
+
+        while let Some(res) = futures_unordered.next().await {
+            let (group, return_data) = res?;
+            for (data, vault_address) in return_data.iter().zip(group.iter()) {
+                let (
+                    vault_token,
+                    vault_token_dec,
+                    asset_token,
+                    asset_token_dec,
+                    vault_reserve,
+                    asset_reserve,
+                    deposit_fee_delta_1,
+                    deposit_fee_delta_2,
+                    deposit_no_fee,
+                    withdraw_fee_delta_1,
+                    withdraw_fee_delta_2,
+                    withdraw_no_fee,
+                ) = data;
+
+                if vault_token.is_zero() {
+                    continue;
+                }
+
+                let deposit_fee;
+                if deposit_fee_delta_1.is_zero() && deposit_fee_delta_2.is_zero() {
+                    deposit_fee = 0;
+                } else if deposit_fee_delta_1 * U256_2 == *deposit_fee_delta_2 {
+                    deposit_fee =
+                        (deposit_fee_delta_1 / (deposit_no_fee / U256::from(10_000))).to();
+                } else {
+                    tracing::warn!(?vault_address, "Invalid deposit fee delta");
+                    continue;
+                }
+
+                let withdraw_fee;
+                if withdraw_fee_delta_1.is_zero() && withdraw_fee_delta_2.is_zero() {
+                    withdraw_fee = 0;
+                } else if withdraw_fee_delta_1 * U256_2 == *withdraw_fee_delta_2 {
+                    withdraw_fee =
+                        (withdraw_fee_delta_1 / (withdraw_no_fee / U256::from(10_000))).to();
+                } else {
+                    tracing::warn!(?vault_address, "Invalid withdraw fee delta");
+                    continue;
+                }
+
+                let amm = amms.get_mut(vault_address).unwrap();
+                let AMM::ERC4626Vault(vault) = amm else {
+                    panic!("Unexpected vault type")
+                };
+
+                vault.deposit_fee = deposit_fee;
+                vault.withdraw_fee = withdraw_fee;
+                vault.vault_token = *vault_token;
+                vault.vault_token_decimals = *vault_token_dec as u8;
+                vault.asset_token = *asset_token;
+                vault.asset_token_decimals = *asset_token_dec as u8;
+                vault.vault_reserve = *vault_reserve;
+                vault.asset_reserve = *asset_reserve;
+
+                if let Ok(p) = vault.calculate_price(vault.vault_token, vault.asset_token) {
+                    vault.vault_token_price = p;
+                }
+                if let Ok(p) = vault.calculate_price(vault.asset_token, vault.vault_token) {
+                    vault.asset_token_price = p;
+                }
+            }
+        }
+
+        let (valid_amms, invalid_amms): (Vec<_>, Vec<_>) = amms
+            .into_iter()
+            .partition(|(_, amm)| !amm.tokens().iter().any(|t| t.is_zero()));
+
+        if !invalid_amms.is_empty() {
+            for (_, amm) in &invalid_amms {
+                info!(
+                    target: "amms::erc_4626::init_batch",
+                    address = ?amm.address(),
+                    "Filtering out uninitialized vault"
+                );
+            }
+        }
+
+        Ok(valid_amms.into_iter().map(|(_, amm)| amm).collect())
+    }
+
     // Returns a new, unsynced ERC4626 vault
     pub fn new(address: Address) -> Self {
         Self {
@@ -398,3 +549,5 @@ impl ERC4626Vault {
 
 #[cfg(test)]
 mod test_price;
+#[cfg(test)]
+mod test_batch;

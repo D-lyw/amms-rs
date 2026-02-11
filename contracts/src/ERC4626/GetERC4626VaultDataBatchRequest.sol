@@ -63,7 +63,7 @@ contract GetERC4626VaultDataBatchRequest {
 
             if (
                 !assetTokenDecimalsSuccess ||
-                assetTokenDecimalsData.length == 32
+                assetTokenDecimalsData.length != 32
             ) {
                 continue;
             }

@@ -1,6 +1,7 @@
 use crate::amms::curve_legacy::factory::CurveLegacyFactory;
 use crate::amms::curve_ng::factory::CurveNGFactory;
 use crate::amms::ekubo::EkuboFactory;
+use crate::amms::erc_4626::ERC4626Vault;
 use crate::amms::fluid_dex::FluidDexFactory;
 use crate::amms::pancake_infinity::factory::PancakeInfinityFactory;
 use crate::amms::pancake_v2::PancakeV2Factory;
@@ -106,11 +107,7 @@ impl Variant {
                 BalancerV3Factory::init_batch::<N, _>(amms, to_block, provider).await
             }
             Variant::ERC4626Vault => {
-                let mut out = Vec::with_capacity(amms.len());
-                for amm in amms {
-                    out.push(amm.init(to_block, provider.clone()).await?);
-                }
-                Ok(out)
+                ERC4626Vault::init_batch::<N, _>(amms, to_block, provider).await
             }
             Variant::SushiV2Pool => {
                 SushiV2Factory::init_batch::<N, _>(amms, to_block, provider).await
