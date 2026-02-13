@@ -1070,6 +1070,12 @@ impl CurveNGPool {
             return;
         }
 
+        // ANTIGRAVITY VERIFICATION
+        eprintln!(
+            "ANTIGRAVITY: Updating spot prices for pool {:?}",
+            self.address
+        );
+
         for i in 0..self.coins.len() {
             for j in 0..self.coins.len() {
                 if i == j {

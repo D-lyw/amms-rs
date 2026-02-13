@@ -4,6 +4,12 @@ pub const N_COINS: usize = 3;
 pub const A_MULTIPLIER: u64 = 10000;
 pub const PRECISION: u64 = 1_000_000_000_000_000_000; // 10^18
 
+// Antigravity Debug Helper
+fn debug_log(msg: &str) {
+    // Write directly to stderr to ensure visibility
+    eprintln!("[ANTIGRAVITY] {}", msg);
+}
+
 pub fn sort(upsorted_x: &[U256]) -> Vec<U256> {
     let mut x = upsorted_x.to_vec();
     x.sort_by(|a, b| b.cmp(a));
@@ -34,6 +40,10 @@ pub fn geometric_mean(x: &[U256], sort_input: bool) -> Result<U256, &'static str
 
         // tmp = 10**18 * x[0] / D * x[1] / D * ...
         // In Vyper: tmp = unsafe_div(unsafe_mul(10**18, x[0]), D)
+        if d.is_zero() {
+            debug_log(&format!("geometric_mean: d became zero at iter {}", _));
+            return Err("geometric_mean: d became zero");
+        }
         let mut tmp = precision * x[0] / d;
         for i in 1..n_coins {
             tmp = tmp * x[i] / d;
@@ -97,6 +107,7 @@ pub fn newton_d(ann: U256, gamma: U256, x_unsorted: &[U256]) -> Result<U256, &'s
                 return Err("newton_d: zero balance detected");
             }
             if d.is_zero() {
+                debug_log("newton_d: d is zero during loop before k0 update");
                 return Err("newton_d: d is zero during loop");
             }
             k0 = k0 * *_x * U256::from(n_coins) / d;
@@ -116,6 +127,12 @@ pub fn newton_d(ann: U256, gamma: U256, x_unsorted: &[U256]) -> Result<U256, &'s
 
         // mul1 = 10**18 * D / gamma * _g1k0 / gamma * _g1k0 * A_MULTIPLIER / ANN
         // Note: Vyper operator precedence / is same as *, evaluated left-to-right.
+        if gamma.is_zero() {
+            return Err("gamma zero in loop");
+        }
+        if ann.is_zero() {
+            return Err("ann zero in loop");
+        }
         let mul1 = precision * d / gamma * _g1k0 / gamma * _g1k0 * a_multiplier / ann;
 
         // mul2 = (2 * 10**18) * N * K0 / _g1k0
@@ -140,6 +157,9 @@ pub fn newton_d(ann: U256, gamma: U256, x_unsorted: &[U256]) -> Result<U256, &'s
         }
 
         // D_plus = D * (neg_fprime + S) / neg_fprime
+        if neg_fprime.is_zero() {
+            return Err("neg_fprime zero for d_plus");
+        }
         let d_plus = d * (neg_fprime + s) / neg_fprime;
 
         // D_minus = D^2 / neg_fprime
@@ -150,7 +170,12 @@ pub fn newton_d(ann: U256, gamma: U256, x_unsorted: &[U256]) -> Result<U256, &'s
             if k0 == U256::ZERO {
                 return Err("newton_d: k0 is zero in d_minus calculation");
             }
-            d_minus += d * (mul1 / neg_fprime) / precision * (precision - k0) / k0;
+            if neg_fprime.is_zero() {
+                return Err("neg_fprime zero in d_minus");
+            }
+            // Check intermediate division
+            let term = mul1 / neg_fprime;
+            d_minus += d * term / precision * (precision - k0) / k0;
         } else {
             // Guard against k0 being zero
             if k0 == U256::ZERO {
@@ -207,6 +232,9 @@ pub fn newton_y(
     let precision = U256::from(PRECISION);
     let a_multiplier = U256::from(A_MULTIPLIER);
     let n_coins_u256 = U256::from(n_coins);
+    if n_coins_u256.is_zero() {
+        return Err("n_coins is zero");
+    }
 
     let mut y = d / n_coins_u256;
     let mut k0_i = precision;
