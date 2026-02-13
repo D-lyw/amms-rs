@@ -64,6 +64,9 @@ fn get_d(xp: &[U256], amp: U256, uses_a_precision: bool) -> Result<U256, AMMErro
             let term2 = (ann - A_PRECISION) * d / A_PRECISION;
             let term3 = (n_u256 + U256::from(1)) * d_p;
             let denom = term2 + term3;
+            if denom == U256::ZERO {
+                return Err(AMMError::Msg("get_d: denom is zero".into()));
+            }
 
             d = numer / denom;
         } else {
@@ -75,6 +78,9 @@ fn get_d(xp: &[U256], amp: U256, uses_a_precision: bool) -> Result<U256, AMMErro
             let term2 = (ann - U256::from(1)) * d;
             let term3 = (n_u256 + U256::from(1)) * d_p;
             let denom = term2 + term3;
+            if denom == U256::ZERO {
+                return Err(AMMError::Msg("get_d: denom is zero".into()));
+            }
 
             d = numer / denom;
         }
@@ -171,6 +177,9 @@ fn get_y(
         // y = (y*y + c) / (2*y + b - D)
         let numer = y * y + c_final;
         let denom = U256::from(2) * y + b - d;
+        if denom == U256::ZERO {
+            return Err(AMMError::Msg("get_y: denom is zero".into()));
+        }
 
         y = numer / denom;
 

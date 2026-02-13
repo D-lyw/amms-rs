@@ -44,6 +44,11 @@ pub fn calculate_invariant(amp: U256, balances: &[U256]) -> Result<Float, Balanc
         let mut d_p = d.clone();
         for b in &balances_f {
             // D_P = (D_P * D) / (balances[j] * numTokens)
+            // If balance is zero, denom is zero -> division by zero
+            // We should catch this early or check b
+            if b.is_zero() {
+                return Err(BalancerV2Error::DivZero);
+            }
             let denom = Float::with_val(MPFR_T_PRECISION, &n_coins * b);
             let num = Float::with_val(MPFR_T_PRECISION, &d_p * &d);
             d_p = Float::with_val(MPFR_T_PRECISION, num / denom);

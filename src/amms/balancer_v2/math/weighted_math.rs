@@ -47,6 +47,9 @@ pub fn calculate_out_given_in(
     let base = Float::with_val(MPFR_T_PRECISION, &balance_in_f / &denominator);
 
     // Exponent = WeightIn / WeightOut
+    if weight_out_f.is_zero() {
+        return Err(BalancerV2Error::DivZero);
+    }
     let exponent = Float::with_val(MPFR_T_PRECISION, &weight_in_f / &weight_out_f);
 
     // Power = Base ^ Exponent

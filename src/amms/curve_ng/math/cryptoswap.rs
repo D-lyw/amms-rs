@@ -42,6 +42,9 @@ pub fn geometric_mean(x: &[U256], sort_input: bool) -> Result<U256, &'static str
         // D = D * ((N-1)*10**18 + tmp) / (N * 10**18)
         let numerator = d * ((n_coins_u256 - U256::from(1)) * precision + tmp);
         let denominator = n_coins_u256 * precision;
+        if denominator.is_zero() {
+            return Err("Division by zero in geometric_mean");
+        }
         d = numerator / denominator;
 
         let diff = if d > d_prev { d - d_prev } else { d_prev - d };
@@ -92,6 +95,9 @@ pub fn newton_d(ann: U256, gamma: U256, x_unsorted: &[U256]) -> Result<U256, &'s
             // Guard against zero balance which would make k0 zero
             if *_x == U256::ZERO {
                 return Err("newton_d: zero balance detected");
+            }
+            if d.is_zero() {
+                return Err("newton_d: d is zero during loop");
             }
             k0 = k0 * *_x * U256::from(n_coins) / d;
         }
@@ -212,12 +218,19 @@ pub fn newton_y(
         if _x == U256::ZERO {
             return Err("newton_y: zero balance detected");
         }
-        y = y * d / (_x * n_coins_u256);
+        let divisor = _x * n_coins_u256;
+        if divisor.is_zero() {
+            return Err("newton_y: zero divisor");
+        }
+        y = y * d / divisor;
         s_i += _x;
     }
 
     for j in 0..n_coins - 1 {
         let x_j = x_sorted[j]; // 正确：使用 x_sorted[j] 而不是残留的 _x
+        if d.is_zero() {
+            return Err("newton_y: d is zero in loop");
+        }
         k0_i = k0_i * x_j * n_coins_u256 / d;
     }
 
@@ -232,6 +245,9 @@ pub fn newton_y(
     for _ in 0..255 {
         let y_prev = y;
 
+        if d.is_zero() {
+            return Err("newton_y: d is zero in loop 2");
+        }
         let k0 = k0_i * y * n_coins_u256 / d;
         let s = s_i + y;
 
@@ -326,6 +342,9 @@ pub fn reduction_coefficient(x: &[U256], fee_gamma: U256) -> U256 {
 
     for val in x {
         // K = K * N * x[i] / S
+        if s.is_zero() {
+            return U256::ZERO;
+        }
         k = k * n_u256 * *val / s;
     }
 

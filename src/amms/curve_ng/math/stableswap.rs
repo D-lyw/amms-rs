@@ -63,7 +63,12 @@ pub fn get_d(balances: &[U256], amp: U256) -> Result<U256, AMMError> {
             if balance.is_zero() {
                 return Err(AMMError::Msg("Zero balance".into()));
             }
-            d_p = d_p * d / (*balance * n_coins);
+            let divisor = *balance * n_coins;
+            if divisor.is_zero() {
+                // This shouldn't happen if balance != 0 unless overflow wraps to 0
+                return Err(AMMError::Msg("Zero divisor in get_d (overflow?)".into()));
+            }
+            d_p = d_p * d / divisor;
         }
 
         let d_prev = d;
@@ -119,7 +124,11 @@ pub fn get_y(balances: &[U256], amp: U256, i: usize, j: usize, x: U256) -> Resul
             if x_k.is_zero() {
                 return Err(AMMError::Msg("Zero balance in get_y".into()));
             }
-            c = c * d / (x_k * n_coins);
+            let divisor = x_k * n_coins;
+            if divisor.is_zero() {
+                return Err(AMMError::Msg("Zero divisor in get_y".into()));
+            }
+            c = c * d / divisor;
         }
     }
 
