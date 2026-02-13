@@ -35,13 +35,13 @@ pub fn geometric_mean(x: &[U256], sort_input: bool) -> Result<U256, &'static str
     let n_coins_u256 = U256::from(n_coins);
 
     // Vyper implementation loops 255 times for convergence
-    for _ in 0..255 {
+    for i in 0..255 {
         d_prev = d;
 
         // tmp = 10**18 * x[0] / D * x[1] / D * ...
         // In Vyper: tmp = unsafe_div(unsafe_mul(10**18, x[0]), D)
         if d.is_zero() {
-            debug_log(&format!("geometric_mean: d became zero at iter {}", _));
+            debug_log(&format!("geometric_mean: d became zero at iter {}", i));
             return Err("geometric_mean: d became zero");
         }
         let mut tmp = precision * x[0] / d;
