@@ -131,6 +131,10 @@ fn widening_mul_256(x: U256, y: U256) -> (U256, U256) {
 /// Divide a 512-bit number (low, high) by a 256-bit divisor
 /// Returns the 256-bit quotient, errors if it would overflow
 fn div_512_by_256(low: U256, high: U256, d: U256, round_up: bool) -> Result<U256, MathError> {
+    if d.is_zero() {
+        return Err(MathError::DivisionByZero);
+    }
+
     // Use ruint's Uint type for 512-bit arithmetic
     type U512 = ruint::Uint<512, 8>;
 
