@@ -45,8 +45,6 @@ pub mod math;
 pub mod types;
 
 #[cfg(test)]
-mod test_panic;
-#[cfg(test)]
 mod test_price;
 
 pub use factory::CurveNGFactory;
@@ -1072,12 +1070,6 @@ impl CurveNGPool {
             return;
         }
 
-        // ANTIGRAVITY VERIFICATION
-        eprintln!(
-            "ANTIGRAVITY: Updating spot prices for pool {:?}",
-            self.address
-        );
-
         for i in 0..self.coins.len() {
             for j in 0..self.coins.len() {
                 if i == j {
@@ -1220,7 +1212,7 @@ impl CurveNGPool {
             .as_ref()
             .ok_or(AMMError::Msg("Price scale not found".into()))?;
 
-        // Antigravity Guard: Check for zero price scale elements used in division
+        // Check for zero price scale elements used in division
         for ps in price_scale {
             if ps.is_zero() {
                 return Err(AMMError::Msg("Zero price scale detected".into()));

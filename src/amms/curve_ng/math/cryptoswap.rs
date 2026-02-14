@@ -4,12 +4,6 @@ pub const N_COINS: usize = 3;
 pub const A_MULTIPLIER: u64 = 10000;
 pub const PRECISION: u64 = 1_000_000_000_000_000_000; // 10^18
 
-// Antigravity Debug Helper
-fn debug_log(msg: &str) {
-    // Write directly to stderr to ensure visibility
-    eprintln!("[ANTIGRAVITY] {}", msg);
-}
-
 pub fn sort(upsorted_x: &[U256]) -> Vec<U256> {
     let mut x = upsorted_x.to_vec();
     x.sort_by(|a, b| b.cmp(a));
@@ -41,7 +35,6 @@ pub fn geometric_mean(x: &[U256], sort_input: bool) -> Result<U256, &'static str
         // tmp = 10**18 * x[0] / D * x[1] / D * ...
         // In Vyper: tmp = unsafe_div(unsafe_mul(10**18, x[0]), D)
         if d.is_zero() {
-            debug_log(&format!("geometric_mean: d became zero at iter {}", i));
             return Err("geometric_mean: d became zero");
         }
         let mut tmp = precision * x[0] / d;
@@ -107,7 +100,6 @@ pub fn newton_d(ann: U256, gamma: U256, x_unsorted: &[U256]) -> Result<U256, &'s
                 return Err("newton_d: zero balance detected");
             }
             if d.is_zero() {
-                debug_log("newton_d: d is zero during loop before k0 update");
                 return Err("newton_d: d is zero during loop");
             }
             k0 = k0 * *_x * U256::from(n_coins) / d;
@@ -630,20 +622,6 @@ pub fn get_y_optimized(
     d: U256,
     i: usize,
 ) -> Result<(U256, U256), &'static str> {
-    // Detailed input logging for debugging
-    if std::env::var("RUST_LOG")
-        .unwrap_or_default()
-        .contains("debug")
-    {
-        debug_log(&format!(
-            "get_y_optimized inputs: ann={}, i={}, d={}",
-            ann, i, d
-        ));
-        // Sort of assumes x len is N_COINS, checking
-        for (idx, bal) in x.iter().enumerate() {
-            debug_log(&format!("  x[{}]: {}", idx, bal));
-        }
-    }
     // 参数验证
     let min_a =
         U256::from(N_COINS.pow(N_COINS as u32)) * U256::from(A_MULTIPLIER) / U256::from(100);
@@ -866,7 +844,6 @@ pub fn get_y_optimized(
     };
 
     if b_scaled == I256::ZERO {
-        debug_log("get_y_optimized: b_scaled is zero, cannot divide");
         // Fallback to newton_y
         return newton_y(ann, gamma, x, d, i).map(|y| (y, U256::ZERO));
     }
@@ -980,7 +957,6 @@ pub fn get_y_optimized(
 
     // Ensure root is non-negative before conversion
     if root < I256::ZERO {
-        debug_log(&format!("get_y_optimized: root is negative: {}", root));
         return Err("Root negative");
     }
 

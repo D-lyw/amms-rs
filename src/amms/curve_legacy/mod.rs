@@ -1662,7 +1662,7 @@ impl CurveLegacyPool {
 
         // 1. 获取 Rates
         let rates = self.get_rates()?;
-        // Antigravity Guard: division by rate later
+        // Guard: division by rate later
         if rates[i].is_zero() || rates[j].is_zero() {
             return Err(AMMError::Msg(
                 "Zero rate detected in simulate_stableswap".into(),
@@ -1711,7 +1711,7 @@ impl CurveLegacyPool {
             .as_ref()
             .ok_or(AMMError::Msg("Price scale not set".into()))?;
 
-        // Antigravity Guard: Check for zero price scale elements used in division
+        // Check for zero price scale elements used in division
         for ps in price_scale {
             if ps.is_zero() {
                 return Err(AMMError::Msg("Zero price scale detected".into()));
