@@ -338,6 +338,9 @@ pub fn newton_y(
             // Safety check: frac = y * 1e18 / D
             // assert frac >= 10**16 - 1 and frac < 10**20 + 1
             // This matches the "Unsafe value for y" check in Curve CryptoSwap contracts
+            if d.is_zero() {
+                return Err("newton_y: d is zero before frac calculation");
+            }
             let frac = y * precision / d;
             let min_frac = U256::from(10).pow(U256::from(16)) - U256::from(1);
             let max_frac = U256::from(10).pow(U256::from(20)) + U256::from(1);
@@ -671,6 +674,9 @@ pub fn get_y_optimized(
     // 检查 x 值的安全性
     for k in 0..n_coins {
         if k != i {
+            if d.is_zero() {
+                return Err("get_y_optimized: d is zero before frac calculation");
+            }
             let frac = x[k] * precision / d;
             let min_frac = U256::from(10u64).pow(U256::from(16)) - U256::from(1);
             let max_frac = U256::from(10u64).pow(U256::from(20)) + U256::from(1);
@@ -987,6 +993,9 @@ pub fn get_y_optimized(
         .unwrap_or(U256::ZERO);
 
     // 安全检查
+    if d.is_zero() {
+        return Err("get_y_optimized (analytical): d is zero before frac calculation");
+    }
     let frac = y * precision / d;
     let min_frac = U256::from(10u64).pow(U256::from(16)) - U256::from(1);
     let max_frac = U256::from(10u64).pow(U256::from(20)) + U256::from(1);
