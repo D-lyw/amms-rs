@@ -19,6 +19,11 @@
 use crate::amms::error::AMMError;
 use alloy::primitives::U256;
 
+// Antigravity Debug Helper
+fn debug_log(msg: &str) {
+    eprintln!("[ANTIGRAVITY] {}", msg);
+}
+
 /// 精度常量: 1e18
 pub const PRECISION: U256 = U256::from_limbs([1_000_000_000_000_000_000u64, 0, 0, 0]);
 
@@ -40,6 +45,10 @@ pub fn get_d(balances: &[U256], amp: U256) -> Result<U256, AMMError> {
     let n = balances.len();
     if n == 0 {
         return Err(AMMError::Msg("Empty balances".into()));
+    }
+    if amp.is_zero() {
+        debug_log("get_d: amp is zero");
+        return Err(AMMError::Msg("Zero amp in get_d".into()));
     }
 
     let n_coins = U256::from(n);
@@ -108,6 +117,10 @@ pub fn get_y(balances: &[U256], amp: U256, i: usize, j: usize, x: U256) -> Resul
     if i >= n || j >= n || i == j {
         return Err(AMMError::Msg("Invalid token indices".into()));
     }
+    if amp.is_zero() {
+        debug_log("get_y: amp is zero");
+        return Err(AMMError::Msg("Zero amp in get_y".into()));
+    }
 
     let n_coins = U256::from(n);
     let d = get_d(balances, amp)?;
@@ -132,6 +145,10 @@ pub fn get_y(balances: &[U256], amp: U256, i: usize, j: usize, x: U256) -> Resul
         }
     }
 
+    if ann.is_zero() {
+        debug_log("get_y: ann is zero (should be caught by amp check)");
+        return Err(AMMError::Msg("Zero ann in get_y".into()));
+    }
     c = c * d * A_PRECISION / (ann * n_coins);
     let b = s + d * A_PRECISION / ann;
 
