@@ -252,16 +252,28 @@ pub fn next_sqrt_ratio_from_amount0(
 
         let denominator = numerator1.checked_sub(product).ok_or(MathError::Overflow)?;
 
+        if denominator.is_zero() {
+            return Err(MathError::DivisionByZero);
+        }
+
         muldiv(numerator1, sqrt_ratio, denominator, true)
     } else {
         // Adding token0 (price decreases)
         let amount0_u256 = U256::from(amount0 as u128);
+
+        if sqrt_ratio.is_zero() {
+            return Err(MathError::ZeroRatio);
+        }
 
         let denom_p1 = numerator1 / sqrt_ratio;
 
         let denom = denom_p1
             .checked_add(amount0_u256)
             .ok_or(MathError::Overflow)?;
+
+        if denom.is_zero() {
+            return Err(MathError::DivisionByZero);
+        }
 
         muldiv(numerator1, U256::from(1u64), denom, true)
     }
