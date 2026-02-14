@@ -675,6 +675,9 @@ impl AutomatedMarketMaker for FluidDexPool {
         let fee_100_percent = U256::from(1_000_000u64);
         let amount_in_after_fee = amount_in * (fee_100_percent - fee) / fee_100_percent;
         let amount_to_swap = scale_to_1e12(amount_in_after_fee, in_decimals);
+        if amount_to_swap.is_zero() {
+            return Ok(U256::ZERO);
+        }
 
         // Check if pools are enabled
         let col_pool_enabled = !self.col_token0_imag_1e12.is_zero()
