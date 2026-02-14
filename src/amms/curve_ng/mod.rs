@@ -45,6 +45,8 @@ pub mod math;
 pub mod types;
 
 #[cfg(test)]
+mod test_panic;
+#[cfg(test)]
 mod test_price;
 
 pub use factory::CurveNGFactory;

@@ -507,11 +507,14 @@ pub fn isqrt(x: U256) -> U256 {
 
     // 初始猜测值: 2^((log2(x) + 1) / 2)
     let log2x = log2(x, false);
-    let mut z = U256::from(1) << ((log2x + U256::from(1)) >> 1);
+    let mut z: U256 = U256::from(1) << ((log2x + U256::from(1)) >> 1);
 
     // 牛顿迭代
     for _ in 0..255 {
         let z_prev = z;
+        if z.is_zero() {
+            return U256::ZERO;
+        }
         z = (z + x / z) >> 1;
         if z >= z_prev {
             return z_prev;
@@ -573,12 +576,33 @@ pub fn cbrt(x: U256) -> U256 {
 
     // 7 轮 Newton-Raphson 迭代 (与链上完全一致)
     // a = (2*a + xx/(a*a)) / 3
+    if a.is_zero() {
+        return U256::ZERO;
+    }
     a = (U256::from(2u64) * a + xx / (a * a)) / U256::from(3u64);
+    if a.is_zero() {
+        return U256::ZERO;
+    }
     a = (U256::from(2u64) * a + xx / (a * a)) / U256::from(3u64);
+    if a.is_zero() {
+        return U256::ZERO;
+    }
     a = (U256::from(2u64) * a + xx / (a * a)) / U256::from(3u64);
+    if a.is_zero() {
+        return U256::ZERO;
+    }
     a = (U256::from(2u64) * a + xx / (a * a)) / U256::from(3u64);
+    if a.is_zero() {
+        return U256::ZERO;
+    }
     a = (U256::from(2u64) * a + xx / (a * a)) / U256::from(3u64);
+    if a.is_zero() {
+        return U256::ZERO;
+    }
     a = (U256::from(2u64) * a + xx / (a * a)) / U256::from(3u64);
+    if a.is_zero() {
+        return U256::ZERO;
+    }
     a = (U256::from(2u64) * a + xx / (a * a)) / U256::from(3u64);
 
     // 恢复缩放
@@ -603,6 +627,20 @@ pub fn get_y_optimized(
     d: U256,
     i: usize,
 ) -> Result<(U256, U256), &'static str> {
+    // Detailed input logging for debugging
+    if std::env::var("RUST_LOG")
+        .unwrap_or_default()
+        .contains("debug")
+    {
+        debug_log(&format!(
+            "get_y_optimized inputs: ann={}, i={}, d={}",
+            ann, i, d
+        ));
+        // Sort of assumes x len is N_COINS, checking
+        for (idx, bal) in x.iter().enumerate() {
+            debug_log(&format!("  x[{}]: {}", idx, bal));
+        }
+    }
     // 参数验证
     let min_a =
         U256::from(N_COINS.pow(N_COINS as u32)) * U256::from(A_MULTIPLIER) / U256::from(100);
@@ -821,6 +859,12 @@ pub fn get_y_optimized(
         )
     };
 
+    if b_scaled == I256::ZERO {
+        debug_log("get_y_optimized: b_scaled is zero, cannot divide");
+        // Fallback to newton_y
+        return newton_y(ann, gamma, x, d, i).map(|y| (y, U256::ZERO));
+    }
+
     // delta0 = 3*a*c/b - b (缩放后)
     let three_ac_scaled = i3
         .checked_mul(a_scaled)
@@ -927,6 +971,12 @@ pub fn get_y_optimized(
         .and_then(|v| v.checked_mul(root_k0))
         .and_then(|v| v.checked_div(a_scaled))
         .ok_or("root overflow")?;
+
+    // Ensure root is non-negative before conversion
+    if root < I256::ZERO {
+        debug_log(&format!("get_y_optimized: root is negative: {}", root));
+        return Err("Root negative");
+    }
 
     // 转换结果
     let y = U256::try_from(root).map_err(|_| "result negative")?;
