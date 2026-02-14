@@ -1662,6 +1662,12 @@ impl CurveLegacyPool {
 
         // 1. 获取 Rates
         let rates = self.get_rates()?;
+        // Antigravity Guard: division by rate later
+        if rates[i].is_zero() || rates[j].is_zero() {
+            return Err(AMMError::Msg(
+                "Zero rate detected in simulate_stableswap".into(),
+            ));
+        }
 
         // 2. 计算 xp (缩放后的余额)
         let mut xp: Vec<U256> = Vec::with_capacity(n);
@@ -1704,6 +1710,13 @@ impl CurveLegacyPool {
             .price_scale
             .as_ref()
             .ok_or(AMMError::Msg("Price scale not set".into()))?;
+
+        // Antigravity Guard: Check for zero price scale elements used in division
+        for ps in price_scale {
+            if ps.is_zero() {
+                return Err(AMMError::Msg("Zero price scale detected".into()));
+            }
+        }
 
         // D 值范围检查 - 与 CurveNG 保持一致
         // 链上合约: assert _D > 10**17 - 1 and _D < 10**15 * 10**18 + 1

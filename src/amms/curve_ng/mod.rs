@@ -1218,6 +1218,13 @@ impl CurveNGPool {
             .as_ref()
             .ok_or(AMMError::Msg("Price scale not found".into()))?;
 
+        // Antigravity Guard: Check for zero price scale elements used in division
+        for ps in price_scale {
+            if ps.is_zero() {
+                return Err(AMMError::Msg("Zero price scale detected".into()));
+            }
+        }
+
         let n_coins = self.n_coins as usize;
         let precision = U256::from(10).pow(U256::from(18));
 
