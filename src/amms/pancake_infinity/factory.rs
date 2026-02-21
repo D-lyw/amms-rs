@@ -351,10 +351,22 @@ impl PancakeInfinityFactory {
             })
             .collect();
         Self::sync_slot_0(&mut pools, block_number, provider.clone()).await?;
-        let (valid_pools, _invalid_pools): (Vec<_>, Vec<_>) =
+        let (valid_pools, invalid_pools): (Vec<_>, Vec<_>) =
             pools.into_par_iter().partition(|pool| {
                 pool.liquidity > 0 && pool.token_a.decimals > 0 && pool.token_b.decimals > 0
             });
+
+        if !invalid_pools.is_empty() {
+            for pool in &invalid_pools {
+                tracing::info!(
+                    target: "amms::pancake_infinity::sync",
+                    pool_id = ?pool.pool_id,
+                    liquidity = ?pool.liquidity,
+                    "Filtering out PancakeInfinity pool"
+                );
+            }
+        }
+
         let mut pools = valid_pools;
         Self::sync_tick_bitmap(&mut pools, block_number, provider.clone()).await?;
         Self::sync_tick_data(&mut pools, block_number, provider.clone()).await?;
@@ -390,10 +402,26 @@ impl PancakeInfinityFactory {
         Self::sync_slot_0(&mut pools, block_number, provider.clone()).await?;
         Self::sync_token_decimals(&mut pools, provider.clone()).await?;
 
-        let (valid_pools, _invalid_pools): (Vec<_>, Vec<_>) =
+        let (valid_pools, invalid_pools): (Vec<_>, Vec<_>) =
             pools.into_par_iter().partition(|pool| {
                 pool.liquidity > 0 && pool.token_a.decimals > 0 && pool.token_b.decimals > 0
             });
+
+        if !invalid_pools.is_empty() {
+            for pool in &invalid_pools {
+                tracing::info!(
+                    target: "amms::pancake_infinity::init_batch",
+                    pool_id = ?pool.pool_id,
+                    liquidity = ?pool.liquidity,
+                    token_a = ?pool.token_a.address,
+                    token_b = ?pool.token_b.address,
+                    token_a_decimals = ?pool.token_a.decimals,
+                    token_b_decimals = ?pool.token_b.decimals,
+                    "Filtering out PancakeInfinity pool"
+                );
+            }
+        }
+
         let mut pools = valid_pools;
 
         Self::sync_tick_bitmap(&mut pools, block_number, provider.clone()).await?;

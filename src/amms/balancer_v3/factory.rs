@@ -350,7 +350,27 @@ impl BalancerV3Factory {
             }
         }
 
-        Ok(synced_amms.into_values().collect())
+        // Filter out invalid pools (no tokens populated or all-zero balances)
+        let (valid_amms, invalid_amms): (Vec<_>, Vec<_>) =
+            synced_amms.into_values().partition(|amm| match amm {
+                AMM::BalancerV3Pool(pool) => {
+                    !pool.tokens.is_empty()
+                        && pool.tokens.values().any(|t| !t.balance.is_zero())
+                }
+                _ => false,
+            });
+
+        if !invalid_amms.is_empty() {
+            for amm in &invalid_amms {
+                tracing::info!(
+                    target: "amms::balancer_v3::init_batch",
+                    address = ?amm.address(),
+                    "Filtering out Balancer V3 pool with no valid tokens"
+                );
+            }
+        }
+
+        Ok(valid_amms)
     }
 }
 

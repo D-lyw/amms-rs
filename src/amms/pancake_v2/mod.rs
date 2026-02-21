@@ -530,6 +530,14 @@ impl PancakeV2Factory {
                 if pool.fee == 0 {
                     pool.fee = 250;
                 }
+
+                // Init prices
+                if let Ok(pa) = pool.calculate_price(pool.token_a.address, pool.token_b.address) {
+                    pool.token_a_price = pa;
+                    if pa != 0.0 {
+                        pool.token_b_price = 1.0 / pa;
+                    }
+                }
             }
         }
 
