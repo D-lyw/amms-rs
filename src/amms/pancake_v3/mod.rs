@@ -1,30 +1,37 @@
 use super::{
-    amm::{AutomatedMarketMaker, SyncAction, AMM},
+    Token,
+    amm::{AMM, AutomatedMarketMaker, SyncAction},
     consts::{MIN_V3_LIQUIDITY, MPFR_T_PRECISION},
     error::AMMError,
     factory::{AutomatedMarketMakerFactory, DiscoverySync},
-    uniswap_v3::{GetUniswapV3PoolStaticMetaBatchRequest, UniswapV3Factory},
-    Token,
+    uniswap_v3::{
+        GetUniswapV3PoolStaticMetaBatchRequest, GetUniswapV3PoolTickBitmapBatchRequest,
+        GetUniswapV3PoolTickDataBatchRequest, UniswapV3Factory,
+    },
 };
 use crate::amms::consts::U256_1;
-use crate::amms::uniswap_v3::UniswapV3Error;
+use crate::amms::uniswap_v3::{
+    GetUniswapV3PoolTickBitmapBatchRequest::TickBitmapInfo,
+    GetUniswapV3PoolTickDataBatchRequest::TickDataInfo, UniswapV3Error,
+};
 use alloy::{
     eips::BlockId,
     network::Network,
-    primitives::{Address, Signed, B256, I256, U256},
+    primitives::{Address, B256, Bytes, I256, Signed, U256},
     providers::Provider,
     rpc::types::Log,
     sol,
     sol_types::{SolEvent, SolValue},
+    transports::BoxFuture,
 };
-use futures::{stream::FuturesUnordered, StreamExt};
-use rayon::iter::{ParallelDrainRange, ParallelIterator};
-use rug::ops::Pow;
+use futures::{StreamExt, stream::FuturesUnordered};
+use rayon::iter::{IntoParallelRefIterator, ParallelDrainRange, ParallelIterator};
 use rug::Float;
+use rug::ops::Pow;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::hash::Hash;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 use tracing::info;
 use uniswap_v3_math::tick_math::{MAX_SQRT_RATIO, MAX_TICK, MIN_SQRT_RATIO, MIN_TICK};
 
@@ -1202,7 +1209,8 @@ impl PancakeV3Factory {
         Ok(())
     }
 
-
+    /// Batch sync tick bitmaps using the same batch contract as UniswapV3.
+    /// PancakeV3 tickBitmap interface is ABI-compatible with UniswapV3.
     pub async fn sync_tick_bitmaps<N, P>(
         pools: &mut [AMM],
         block_number: BlockId,
@@ -1212,54 +1220,102 @@ impl PancakeV3Factory {
         N: Network,
         P: Provider<N> + Clone,
     {
-        let mut futures = FuturesUnordered::new();
+        let mut futures: FuturesUnordered<BoxFuture<'_, _>> = FuturesUnordered::new();
+
+        let max_range = 6900;
+        let mut group_range = 0;
+        let mut group = vec![];
 
         for pool in pools.iter() {
             let AMM::PancakeV3Pool(pv3_pool) = pool else {
                 continue;
             };
-            let address = pv3_pool.address;
-            let tick_spacing = pv3_pool.tick_spacing;
-            let min_word = tick_to_word(MIN_TICK, tick_spacing);
-            let max_word = tick_to_word(MAX_TICK, tick_spacing);
 
-            for word_pos in min_word..=max_word {
-                let provider = provider.clone();
-                futures.push(async move {
-                    let pool_contract = IPancakeV3PoolState::new(address, provider);
-                    let bitmap = pool_contract
-                        .tickBitmap(word_pos as i16)
-                        .block(block_number)
-                        .call()
-                        .await?;
-                    Ok::<(Address, i16, U256), AMMError>((address, word_pos as i16, bitmap))
+            let mut min_word = tick_to_word(MIN_TICK, pv3_pool.tick_spacing);
+            let max_word = tick_to_word(MAX_TICK, pv3_pool.tick_spacing);
+
+            while min_word <= max_word {
+                let remaining_range = max_range - group_range;
+                let word_range = max_word - min_word + 1;
+                let range = word_range.min(remaining_range);
+
+                let start = min_word;
+                let end = start + range - 1;
+
+                group.push(TickBitmapInfo {
+                    pool: pv3_pool.address,
+                    minWord: start as i16,
+                    maxWord: end as i16,
                 });
+
+                min_word = end + 1;
+                group_range += range;
+
+                if group_range >= max_range {
+                    let provider = provider.clone();
+                    let pool_info = group.iter().map(|info| info.pool).collect::<Vec<_>>();
+                    let calldata = std::mem::take(&mut group);
+                    group_range = 0;
+
+                    futures.push(Box::pin(async move {
+                        Ok::<(Vec<Address>, Bytes), AMMError>((
+                            pool_info,
+                            GetUniswapV3PoolTickBitmapBatchRequest::deploy_builder(
+                                provider, calldata,
+                            )
+                            .call_raw()
+                            .block(block_number)
+                            .await?,
+                        ))
+                    }));
+                }
             }
         }
 
-        let mut pool_map: std::collections::HashMap<Address, &mut AMM> =
-            pools.iter_mut().map(|p| (p.address(), p)).collect();
+        // Flush remaining group
+        if !group.is_empty() {
+            let provider = provider.clone();
+            let pool_info = group.iter().map(|info| info.pool).collect::<Vec<_>>();
+            let calldata = std::mem::take(&mut group);
+
+            futures.push(Box::pin(async move {
+                Ok::<(Vec<Address>, Bytes), AMMError>((
+                    pool_info,
+                    GetUniswapV3PoolTickBitmapBatchRequest::deploy_builder(provider, calldata)
+                        .call_raw()
+                        .block(block_number)
+                        .await?,
+                ))
+            }));
+        }
+
+        let mut pool_set = pools
+            .iter_mut()
+            .map(|pool| (pool.address(), pool))
+            .collect::<HashMap<Address, &mut AMM>>();
 
         while let Some(res) = futures.next().await {
-            match res {
-                Ok((addr, word_pos, bitmap)) => {
-                    if bitmap != U256::ZERO {
-                        if let Some(pool) = pool_map.get_mut(&addr) {
-                            if let AMM::PancakeV3Pool(pv3_pool) = pool {
-                                pv3_pool.tick_bitmap.insert(word_pos, bitmap);
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to sync tick bitmap word: {:?}", e);
+            let (pools_addrs, return_data) = res?;
+            let return_data = <Vec<Vec<U256>> as SolValue>::abi_decode(&return_data)?;
+
+            for (tick_bitmaps, pool_address) in return_data.iter().zip(pools_addrs.iter()) {
+                let pool = pool_set.get_mut(pool_address).unwrap();
+                let AMM::PancakeV3Pool(ref mut pv3_pool) = pool else {
+                    continue;
+                };
+
+                for chunk in tick_bitmaps.chunks_exact(2) {
+                    let word_pos = I256::from_raw(chunk[0]).as_i16();
+                    let tick_bitmap = chunk[1];
+                    pv3_pool.tick_bitmap.insert(word_pos, tick_bitmap);
                 }
             }
         }
-
         Ok(())
     }
 
+    /// Batch sync tick data using the same batch contract as UniswapV3.
+    /// PancakeV3 ticks() interface is ABI-compatible with UniswapV3.
     pub async fn sync_tick_data<N, P>(
         pools: &mut [AMM],
         block_number: BlockId,
@@ -1269,65 +1325,125 @@ impl PancakeV3Factory {
         N: Network,
         P: Provider<N> + Clone,
     {
-        let mut futures = FuturesUnordered::new();
+        // Step 1: Collect all initialized ticks from bitmaps (parallel)
+        let pool_ticks = pools
+            .par_iter()
+            .filter_map(|pool| {
+                if let AMM::PancakeV3Pool(pv3_pool) = pool {
+                    let min_word = tick_to_word(MIN_TICK, pv3_pool.tick_spacing);
+                    let max_word = tick_to_word(MAX_TICK, pv3_pool.tick_spacing);
 
-        for pool in pools.iter() {
-            let AMM::PancakeV3Pool(pv3_pool) = pool else {
-                continue;
-            };
-            let address = pv3_pool.address;
-            let tick_spacing = pv3_pool.tick_spacing;
+                    let initialized_ticks: Vec<Signed<24, 1>> = (min_word..=max_word)
+                        .filter_map(|word_pos| {
+                            pv3_pool
+                                .tick_bitmap
+                                .get(&(word_pos as i16))
+                                .filter(|&bitmap| *bitmap != U256::ZERO)
+                                .map(|&bitmap| (word_pos, bitmap))
+                        })
+                        .flat_map(|(word_pos, bitmap)| {
+                            (0..256)
+                                .filter(move |i| {
+                                    (bitmap & (U256::from(1) << U256::from(*i))) != U256::ZERO
+                                })
+                                .filter_map(move |i| {
+                                    let tick_index = (word_pos * 256 + i) * pv3_pool.tick_spacing;
+                                    Signed::<24, 1>::try_from(tick_index).ok()
+                                })
+                        })
+                        .collect();
 
-            let min_word = tick_to_word(MIN_TICK, tick_spacing);
-            let max_word = tick_to_word(MAX_TICK, tick_spacing);
-
-            for word_pos in min_word..=max_word {
-                if let Some(bitmap) = pv3_pool.tick_bitmap.get(&(word_pos as i16)) {
-                    if *bitmap == U256::ZERO {
-                        continue;
+                    if !initialized_ticks.is_empty() {
+                        Some((pv3_pool.address, initialized_ticks))
+                    } else {
+                        None
                     }
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<(Address, Vec<Signed<24, 1>>)>>();
 
-                    for i in 0..256 {
-                        if (bitmap & (U256::from(1) << U256::from(i))) != U256::ZERO {
-                            let tick_index = (word_pos * 256 + i) * tick_spacing;
-                            if tick_index >= MIN_TICK && tick_index <= MAX_TICK {
-                                let provider = provider.clone();
-                                futures.push(async move {
-                                     let pool_contract = IPancakeV3PoolState::new(address, provider);
-                                     let tick_signed = Signed::<24, 1>::try_from(tick_index).unwrap();
-                                     let tick_data = pool_contract.ticks(tick_signed).block(block_number).call().await?;
-                                     Ok::<(Address, i32, IPancakeV3PoolState::ticksReturn), AMMError>((address, tick_index, tick_data))
-                                 });
-                            }
-                        }
-                    }
+        // Step 2: Batch fetch tick data
+        let mut futures: FuturesUnordered<BoxFuture<'_, _>> = FuturesUnordered::new();
+        let max_ticks = 60;
+        let mut group_ticks = 0;
+        let mut group = vec![];
+
+        for (pool_address, mut ticks) in pool_ticks {
+            while !ticks.is_empty() {
+                let remaining_ticks = max_ticks - group_ticks;
+                let selected_ticks = ticks.drain(0..remaining_ticks.min(ticks.len()));
+                group_ticks += selected_ticks.len();
+
+                group.push(TickDataInfo {
+                    pool: pool_address,
+                    ticks: selected_ticks.collect(),
+                });
+
+                if group_ticks >= max_ticks {
+                    let provider = provider.clone();
+                    let calldata = std::mem::take(&mut group);
+                    group_ticks = 0;
+                    group.clear();
+
+                    futures.push(Box::pin(async move {
+                        Ok::<(Vec<TickDataInfo>, Bytes), AMMError>((
+                            calldata.clone(),
+                            GetUniswapV3PoolTickDataBatchRequest::deploy_builder(
+                                provider, calldata,
+                            )
+                            .call_raw()
+                            .block(block_number)
+                            .await?,
+                        ))
+                    }));
                 }
             }
         }
 
-        let mut pool_map: std::collections::HashMap<Address, &mut AMM> =
-            pools.iter_mut().map(|p| (p.address(), p)).collect();
+        // Flush remaining
+        if !group.is_empty() {
+            let provider = provider.clone();
+            let calldata = std::mem::take(&mut group);
+
+            futures.push(Box::pin(async move {
+                Ok::<(Vec<TickDataInfo>, Bytes), AMMError>((
+                    calldata.clone(),
+                    GetUniswapV3PoolTickDataBatchRequest::deploy_builder(provider, calldata)
+                        .call_raw()
+                        .block(block_number)
+                        .await?,
+                ))
+            }));
+        }
+
+        // Step 3: Apply results
+        let mut pool_set = pools
+            .iter_mut()
+            .map(|pool| (pool.address(), pool))
+            .collect::<HashMap<Address, &mut AMM>>();
 
         while let Some(res) = futures.next().await {
-            match res {
-                Ok((addr, tick_idx, data)) => {
-                    if let Some(pool) = pool_map.get_mut(&addr) {
-                        if let AMM::PancakeV3Pool(pv3_pool) = pool {
-                            let info = Info {
-                                liquidity_gross: data.liquidityGross,
-                                liquidity_net: data.liquidityNet,
-                                initialized: data.initialized,
-                            };
-                            pv3_pool.ticks.insert(tick_idx, info);
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to sync tick data: {:?}", e);
+            let (tick_info, return_data) = res?;
+            let return_data = <Vec<Vec<(bool, u128, i128)>> as SolValue>::abi_decode(&return_data)?;
+
+            for (tick_results, tick_info) in return_data.iter().zip(tick_info.iter()) {
+                let pool = pool_set.get_mut(&tick_info.pool).unwrap();
+                let AMM::PancakeV3Pool(ref mut pv3_pool) = pool else {
+                    continue;
+                };
+
+                for (tick, tick_idx) in tick_results.iter().zip(tick_info.ticks.iter()) {
+                    let info = Info {
+                        liquidity_gross: tick.1,
+                        liquidity_net: tick.2,
+                        initialized: tick.0,
+                    };
+                    pv3_pool.ticks.insert(tick_idx.as_i32(), info);
                 }
             }
         }
-
         Ok(())
     }
 }
@@ -1418,7 +1534,7 @@ mod tests {
 
     use alloy::{
         eips::BlockId,
-        primitives::{address, aliases::U24, Address, U160, U256},
+        primitives::{Address, U160, U256, address, aliases::U24},
         providers::{Provider, ProviderBuilder},
     };
 
