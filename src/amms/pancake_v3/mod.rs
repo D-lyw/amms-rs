@@ -893,6 +893,8 @@ impl PancakeV3Factory {
             .filter(|amm| matches!(amm, AMM::PancakeV3Pool(_)))
             .collect();
 
+        // Sync immutables (tickSpacing, fee, token0, token1) for pools that need it
+        PancakeV3Factory::sync_immutables(&mut pancake_pools, provider.clone()).await?;
         PancakeV3Factory::sync_slot_0(&mut pancake_pools, block_number, provider.clone()).await?;
         PancakeV3Factory::sync_token_decimals_safe(&mut pancake_pools, provider.clone()).await?;
 
@@ -1120,6 +1122,77 @@ impl PancakeV3Factory {
                 }
                 Err(e) => {
                     tracing::warn!("Failed to sync slot0 for pool: {:?}", e);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Sync immutable parameters (tickSpacing, fee, token0, token1) for pools
+    /// that were created with only an address (e.g. via PancakeV3Pool::new(addr)).
+    /// These pools have tick_spacing == 0 because the immutables were never fetched.
+    async fn sync_immutables<N, P>(pools: &mut [AMM], provider: P) -> Result<(), AMMError>
+    where
+        N: Network,
+        P: Provider<N> + Clone,
+    {
+        let mut futures = FuturesUnordered::new();
+
+        for pool in pools.iter() {
+            let AMM::PancakeV3Pool(pv3_pool) = pool else {
+                continue;
+            };
+            // Only sync if immutables haven't been set yet
+            if pv3_pool.tick_spacing != 0 {
+                continue;
+            }
+            let address = pv3_pool.address;
+            let provider = provider.clone();
+
+            futures.push(async move {
+                let immutables = IPancakeV3PoolImmutables::new(address, provider.clone());
+
+                let ts_builder = immutables.tickSpacing();
+                let tick_spacing_task = ts_builder.call();
+                let fee_builder = immutables.fee();
+                let fee_task = fee_builder.call();
+                let t0_builder = immutables.token0();
+                let token0_task = t0_builder.call();
+                let t1_builder = immutables.token1();
+                let token1_task = t1_builder.call();
+
+                let (ts_res, fee_res, t0_res, t1_res) =
+                    tokio::join!(tick_spacing_task, fee_task, token0_task, token1_task);
+
+                Ok::<(Address, i32, u32, Address, Address), AMMError>((
+                    address,
+                    ts_res?.as_i32(),
+                    fee_res?.to::<u32>(),
+                    t0_res?,
+                    t1_res?,
+                ))
+            });
+        }
+
+        while let Some(res) = futures.next().await {
+            match res {
+                Ok((addr, tick_spacing, fee, token0, token1)) => {
+                    if let Some(pool) = pools.iter_mut().find(|p| p.address() == addr) {
+                        if let AMM::PancakeV3Pool(pv3_pool) = pool {
+                            pv3_pool.tick_spacing = tick_spacing;
+                            pv3_pool.fee = fee;
+                            if pv3_pool.token_a.address.is_zero() {
+                                pv3_pool.token_a.address = token0;
+                            }
+                            if pv3_pool.token_b.address.is_zero() {
+                                pv3_pool.token_b.address = token1;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to sync immutables for pool: {:?}", e);
                 }
             }
         }
