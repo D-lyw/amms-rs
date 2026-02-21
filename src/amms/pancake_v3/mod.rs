@@ -3,7 +3,7 @@ use super::{
     consts::{MIN_V3_LIQUIDITY, MPFR_T_PRECISION},
     error::AMMError,
     factory::{AutomatedMarketMakerFactory, DiscoverySync},
-    uniswap_v3::UniswapV3Factory,
+    uniswap_v3::{GetUniswapV3PoolStaticMetaBatchRequest, UniswapV3Factory},
     Token,
 };
 use crate::amms::consts::U256_1;
@@ -15,7 +15,7 @@ use alloy::{
     providers::Provider,
     rpc::types::Log,
     sol,
-    sol_types::SolEvent,
+    sol_types::{SolEvent, SolValue},
 };
 use futures::{stream::FuturesUnordered, StreamExt};
 use rayon::iter::{ParallelDrainRange, ParallelIterator};
@@ -24,6 +24,8 @@ use rug::Float;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::hash::Hash;
+use tokio::time::{sleep, Duration};
+use tracing::info;
 use uniswap_v3_math::tick_math::{MAX_SQRT_RATIO, MAX_TICK, MIN_SQRT_RATIO, MIN_TICK};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -879,6 +881,14 @@ impl PancakeV3Factory {
         }
     }
 
+    /// Batch initialize PancakeV3 pools, mirroring UniswapV3's init_batch pattern.
+    ///
+    /// 1. Fetch static metadata (token0, token1, tickSpacing, fee) via batch contract
+    /// 2. Sync dynamic state: slot0 (tick, liquidity, sqrtPrice)
+    /// 3. Sync token decimals
+    /// 4. Filter invalid pools
+    /// 5. Init spot prices
+    /// 6. Sync tick bitmaps and tick data
     pub async fn init_batch<N, P>(
         amms: Vec<AMM>,
         block_number: BlockId,
@@ -893,25 +903,85 @@ impl PancakeV3Factory {
             .filter(|amm| matches!(amm, AMM::PancakeV3Pool(_)))
             .collect();
 
-        // Sync immutables (tickSpacing, fee, token0, token1) for pools that need it
-        PancakeV3Factory::sync_immutables(&mut pancake_pools, provider.clone()).await?;
-        PancakeV3Factory::sync_slot_0(&mut pancake_pools, block_number, provider.clone()).await?;
-        PancakeV3Factory::sync_token_decimals_safe(&mut pancake_pools, provider.clone()).await?;
+        // 1) Identify pools that need static metadata
+        let addresses: Vec<Address> = pancake_pools
+            .iter()
+            .filter_map(|amm| match amm {
+                AMM::PancakeV3Pool(p) => {
+                    if p.token_a.address.is_zero()
+                        || p.token_b.address.is_zero()
+                        || p.tick_spacing == 0
+                        || p.fee == 0
+                    {
+                        Some(p.address)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            })
+            .collect();
 
+        // 2) Batch fetch static metadata using the same contract as UniswapV3
+        //    (PancakeV3 has identical ABI: token0, token1, tickSpacing, fee)
+        if !addresses.is_empty() {
+            let mut meta_map: HashMap<Address, (Address, Address, i32, u32)> = HashMap::new();
+            let step = 150;
+            for chunk in addresses.chunks(step) {
+                let chunk_addrs = chunk.to_vec();
+                let return_data = GetUniswapV3PoolStaticMetaBatchRequest::deploy_builder(
+                    provider.clone(),
+                    chunk_addrs.clone(),
+                )
+                .call_raw()
+                .block(block_number)
+                .await?;
+                let return_data =
+                    <Vec<(Address, Address, i32, u32)> as SolValue>::abi_decode(&return_data)?;
+
+                for (meta, pool_addr) in return_data.iter().zip(chunk_addrs.iter()) {
+                    let (t0, t1, ts, fee) = *meta;
+                    meta_map.insert(*pool_addr, (t0, t1, ts, fee));
+                }
+                sleep(Duration::from_millis(500)).await;
+            }
+
+            for amm in pancake_pools.iter_mut() {
+                if let AMM::PancakeV3Pool(ref mut pv3_pool) = amm {
+                    if let Some((t0, t1, ts, fee)) = meta_map.get(&pv3_pool.address).copied() {
+                        pv3_pool.token_a.address = t0;
+                        pv3_pool.token_b.address = t1;
+                        pv3_pool.tick_spacing = ts;
+                        pv3_pool.fee = fee;
+                    }
+                }
+            }
+        }
+
+        // 3) Sync dynamic state: slot0 (tick, liquidity, sqrtPrice)
+        PancakeV3Factory::sync_slot_0(&mut pancake_pools, block_number, provider.clone()).await?;
+        sleep(Duration::from_millis(500)).await;
+
+        // 4) Sync token decimals
+        PancakeV3Factory::sync_token_decimals_safe(&mut pancake_pools, provider.clone()).await?;
+        sleep(Duration::from_millis(500)).await;
+
+        // 5) Filter invalid pools
         let (valid_pools, invalid_pools): (Vec<_>, Vec<_>) =
             pancake_pools.par_drain(..).partition(|pool| match pool {
                 AMM::PancakeV3Pool(pv3_pool) => {
                     pv3_pool.liquidity > 0
+                        && pv3_pool.tick_spacing != 0
+                        && !pv3_pool.token_a.address.is_zero()
+                        && !pv3_pool.token_b.address.is_zero()
                         && pv3_pool.token_a.decimals > 0
                         && pv3_pool.token_b.decimals > 0
-                        && pv3_pool.tick_spacing > 0
                 }
                 _ => false,
             });
 
+        // Init spot prices for valid pools
         let mut pools = valid_pools;
-
-        // Init prices for valid pools
         for amm in pools.iter_mut() {
             if let AMM::PancakeV3Pool(p) = amm {
                 if let Ok(price) = p.calculate_price(p.token_a.address, p.token_b.address) {
@@ -928,19 +998,22 @@ impl PancakeV3Factory {
         if !invalid_pools.is_empty() {
             for pool in &invalid_pools {
                 if let AMM::PancakeV3Pool(pv3_pool) = pool {
-                    tracing::debug!(
+                    info!(
                         target: "amms::pancake_v3::init_batch",
                         address = ?pv3_pool.address,
                         liquidity = ?pv3_pool.liquidity,
+                        tick_spacing = ?pv3_pool.tick_spacing,
+                        token_a = ?pv3_pool.token_a.address,
+                        token_b = ?pv3_pool.token_b.address,
                         token_a_decimals = ?pv3_pool.token_a.decimals,
                         token_b_decimals = ?pv3_pool.token_b.decimals,
-                        tick_spacing = ?pv3_pool.tick_spacing,
                         "Filtering out Pancake V3 pool"
                     );
                 }
             }
         }
 
+        // 6) Sync tick bitmaps and tick data
         let pools_step = 50;
         for group in pools.chunks_mut(pools_step) {
             PancakeV3Factory::sync_tick_bitmaps(group, block_number, provider.clone()).await?;
@@ -1129,76 +1202,6 @@ impl PancakeV3Factory {
         Ok(())
     }
 
-    /// Sync immutable parameters (tickSpacing, fee, token0, token1) for pools
-    /// that were created with only an address (e.g. via PancakeV3Pool::new(addr)).
-    /// These pools have tick_spacing == 0 because the immutables were never fetched.
-    async fn sync_immutables<N, P>(pools: &mut [AMM], provider: P) -> Result<(), AMMError>
-    where
-        N: Network,
-        P: Provider<N> + Clone,
-    {
-        let mut futures = FuturesUnordered::new();
-
-        for pool in pools.iter() {
-            let AMM::PancakeV3Pool(pv3_pool) = pool else {
-                continue;
-            };
-            // Only sync if immutables haven't been set yet
-            if pv3_pool.tick_spacing != 0 {
-                continue;
-            }
-            let address = pv3_pool.address;
-            let provider = provider.clone();
-
-            futures.push(async move {
-                let immutables = IPancakeV3PoolImmutables::new(address, provider.clone());
-
-                let ts_builder = immutables.tickSpacing();
-                let tick_spacing_task = ts_builder.call();
-                let fee_builder = immutables.fee();
-                let fee_task = fee_builder.call();
-                let t0_builder = immutables.token0();
-                let token0_task = t0_builder.call();
-                let t1_builder = immutables.token1();
-                let token1_task = t1_builder.call();
-
-                let (ts_res, fee_res, t0_res, t1_res) =
-                    tokio::join!(tick_spacing_task, fee_task, token0_task, token1_task);
-
-                Ok::<(Address, i32, u32, Address, Address), AMMError>((
-                    address,
-                    ts_res?.as_i32(),
-                    fee_res?.to::<u32>(),
-                    t0_res?,
-                    t1_res?,
-                ))
-            });
-        }
-
-        while let Some(res) = futures.next().await {
-            match res {
-                Ok((addr, tick_spacing, fee, token0, token1)) => {
-                    if let Some(pool) = pools.iter_mut().find(|p| p.address() == addr) {
-                        if let AMM::PancakeV3Pool(pv3_pool) = pool {
-                            pv3_pool.tick_spacing = tick_spacing;
-                            pv3_pool.fee = fee;
-                            if pv3_pool.token_a.address.is_zero() {
-                                pv3_pool.token_a.address = token0;
-                            }
-                            if pv3_pool.token_b.address.is_zero() {
-                                pv3_pool.token_b.address = token1;
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to sync immutables for pool: {:?}", e);
-                }
-            }
-        }
-
-        Ok(())
-    }
 
     pub async fn sync_tick_bitmaps<N, P>(
         pools: &mut [AMM],
