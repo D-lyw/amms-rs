@@ -20,7 +20,9 @@ use crate::amms::amm::{AutomatedMarketMaker, SyncAction};
 use crate::amms::consts::{MPFR_T_PRECISION, U256_1};
 use crate::amms::error::AMMError;
 use crate::amms::uniswap_v3::{compress_tick, Info, UniswapV3Error};
+use crate::amms::uniswap_v4::lense::{get_liquidity_slot, get_pool_state_slot};
 use crate::amms::Token;
+use ICLPoolManager::ICLPoolManagerInstance;
 
 use rug::ops::Pow;
 use rug::Float;
@@ -376,12 +378,67 @@ impl AutomatedMarketMaker for PancakeInfinityPool {
         Ok((-current_state.amount_calculated).into_raw())
     }
 
-    async fn init<N, P>(self, _block_number: BlockId, _provider: P) -> Result<Self, AMMError>
+    async fn init<N, P>(mut self, block_number: BlockId, provider: P) -> Result<Self, AMMError>
     where
         Self: Sized,
         N: Network,
         P: Provider<N> + Clone,
     {
+        self.token_a = Token::new(self.token_a.address, provider.clone()).await?;
+        self.token_b = Token::new(self.token_b.address, provider.clone()).await?;
+
+        // Initialize state via extsload
+        let ipool_manager = ICLPoolManagerInstance::new(self.manager_address, provider.clone());
+        let slots = vec![
+            B256::from(get_pool_state_slot(self.pool_id)),
+            B256::from(get_liquidity_slot(self.pool_id)),
+        ];
+
+        let results = ipool_manager
+            .extsload_2(slots)
+            .block(block_number)
+            .call()
+            .await?;
+
+        if results.len() != 2 {
+            return Err(AMMError::SyncError(self.manager_address));
+        }
+
+        let slot0_data = results[0];
+        let liquidity_data = results[1];
+
+        // Parse slot0
+        let sqrt_price_x96 = U160::from_be_slice(&slot0_data[12..32]);
+        let tick_bytes = unsafe { (slot0_data.as_ptr().add(9) as *const [u8; 3]).read_unaligned() };
+        let tick = I24::from_be_bytes::<3>(tick_bytes);
+        let protocol_fee_bytes =
+            unsafe { (slot0_data.as_ptr().add(6) as *const [u8; 3]).read_unaligned() };
+        let protocol_fee = alloy::primitives::aliases::U24::from_be_bytes(protocol_fee_bytes);
+        let lp_fee_bytes =
+            unsafe { (slot0_data.as_ptr().add(3) as *const [u8; 3]).read_unaligned() };
+        let lp_fee = alloy::primitives::aliases::U24::from_be_bytes(lp_fee_bytes);
+
+        // Parse liquidity
+        let liquidity = u128::from_be_bytes(liquidity_data[16..32].try_into().unwrap());
+
+        // Update state
+        self.sqrt_price = U256::from(sqrt_price_x96);
+        self.tick = tick.as_i32();
+        self.protocol_fee = protocol_fee.to::<u32>();
+        self.lp_fee = lp_fee.to::<u32>();
+        self.liquidity = liquidity;
+
+        if self.sqrt_price > U256::ZERO {
+            if let Ok(price) = self.calculate_price(self.token_a.address, self.token_b.address) {
+                self.token_a_price = price;
+                if price != 0.0 {
+                    self.token_b_price = 1.0 / price;
+                } else {
+                    self.token_b_price = 0.0;
+                }
+            }
+        }
+
         Ok(self)
     }
 }
