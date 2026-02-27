@@ -1,7 +1,7 @@
 //! Curve Legacy Factory
 //!
 //! 通过 Curve AddressProvider 和 Registry 发现 Legacy 池子。
-//! 使用批量获取合约高效初始化池子数据。
+//! 使用并发 init() 调用初始化池子数据 (不使用 Solidity 批量合约，原因见 init_batch 文档注释)。
 
 use super::types::{CurveLegacyPool, CurveLegacyPoolType};
 use crate::amms::amm::{AutomatedMarketMaker, AMM};
@@ -10,16 +10,13 @@ use crate::amms::factory::{AutomatedMarketMakerFactory, DiscoverySync};
 use alloy::{
     eips::BlockId,
     network::Network,
-    primitives::{address, Address, B256, U256},
+    primitives::{Address, B256, U256},
     providers::Provider,
     rpc::types::eth::Log,
     sol,
-    sol_types::SolValue,
 };
 use futures::{stream::FuturesUnordered, StreamExt};
-use itertools::Itertools;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 sol! {
     #[sol(rpc)]
@@ -209,7 +206,27 @@ impl CurveLegacyFactory {
             .collect())
     }
 
-    /// 批量初始化池子 (使用批量获取合约)
+    /// 批量初始化池子
+    ///
+    /// # 设计说明：为什么不使用 Solidity 批量合约
+    ///
+    /// 与 UniswapV2/V3 等标准化协议不同，Curve Legacy 池存在大量非标行为，
+    /// 使得 Solidity 批量合约不可靠：
+    ///
+    /// 1. **调用隔离问题**：Solidity 构造函数中所有外部调用共享 gas 上下文，
+    ///    部分老 Vyper 池的 `coins()` 使用 `assert` 做边界检查，失败时消耗全部
+    ///    forwarded gas，导致 try/catch 无法捕获 out-of-gas 错误，整个构造函数 revert。
+    ///
+    /// 2. **Subtype 检测缺失**：Solidity 合约无法检测 Meta/Lending/Plain 子类型，
+    ///    无法获取 `base_pool`, `virtual_price`, `lp_token`, `underlying_coins` 等
+    ///    Metapool/Lending 池必需的字段，导致这些池无法正确模拟 swap。
+    ///
+    /// 3. **int128 接口 fallback 不完整**：Solidity 合约仅对 StableSwap 尝试 int128
+    ///    fallback，CryptoSwap 池缺失此路径。
+    ///
+    /// 因此，对于 CurveLegacy（通常只有 ~12 个池），直接并发调用 Rust `init()` 方法，
+    /// 每个池使用独立的 RPC `eth_call`（各自有完整的 30M gas 额度），
+    /// 既能处理所有非标边界情况，性能开销也完全可接受。
     pub async fn init_batch<N, P>(
         amms: Vec<AMM>,
         block: BlockId,
@@ -223,254 +240,47 @@ impl CurveLegacyFactory {
             return Ok(vec![]);
         }
 
-        // 减小批次大小以避免 Contract Size 限制和 RPC 执行超时
-        // Curve Legacy 池子初始化计算量大，特别是 CryptoSwap，将批次大小从 10 降低到 1
-        // CryptoSwap 的初始化非常消耗 Gas，即使是 2 个池子也可能导致 Revert，因此保守设置为 1
-        // 注意：即使批次大小为 1，使用 Batch Contract 仍然比 Individual Init (多次 RPC 调用) 高效
-        let step = 1;
-        // 使用 pool_chunks 保存 (address, pool_type) 元组
-        let pool_chunks = amms
-            .iter()
-            .map(|amm| {
-                if let AMM::CurveLegacyPool(pool) = amm {
-                    let pool_type_u8: u8 = match pool.pool_type {
-                        CurveLegacyPoolType::StableSwap => 0,
-                        CurveLegacyPoolType::CryptoSwap => 1,
-                    };
-                    (pool.address, pool_type_u8)
-                } else {
-                    (Address::ZERO, 0)
-                }
-            })
-            .chunks(step)
-            .into_iter()
-            .map(|chunk| chunk.collect::<Vec<_>>())
-            .collect::<Vec<_>>();
+        let total = amms.len();
+        tracing::info!(
+            "Initializing {} Curve Legacy pools via individual init...",
+            total
+        );
 
-        let mut amms_map = amms
-            .into_iter()
-            .map(|amm| (amm.address(), amm))
-            .collect::<HashMap<_, _>>();
-
-        for (_i, chunk) in pool_chunks.into_iter().enumerate() {
-            let mut inputs: Vec<PoolInput> = Vec::new();
-
-            for (addr, pool_type_u8) in &chunk {
-                if *addr != Address::ZERO {
-                    inputs.push(PoolInput {
-                        pool: *addr,
-                        poolType: *pool_type_u8,
-                    });
-                }
-            }
-
-            if inputs.is_empty() {
-                continue;
-            }
-
-            let deployer =
-                GetCurveLegacyPoolDataBatchRequest::deploy_builder(provider.clone(), inputs);
-
-            // 执行批量调用，设置高 gas limit (5M，RPC节点最大限制) 以避免默认1M限制
-            let _batch_success = match deployer.gas(5_000_000).call_raw().block(block).await {
-                Ok(res) => {
-                    match <Vec<PoolData> as SolValue>::abi_decode(&res) {
-                        Ok(pool_data_list) => {
-                            for data in pool_data_list {
-                                let pool_addr = data.poolAddress;
-
-                                if let Some(AMM::CurveLegacyPool(pool)) =
-                                    amms_map.get_mut(&pool_addr)
-                                {
-                                    pool.n_coins = data.nCoins;
-                                    pool.coins = data.coins.clone();
-                                    pool.balances = data.balances.clone();
-                                    pool.decimals = data.decimals.clone();
-
-                                    pool.amp = if data.amp > U256::ZERO {
-                                        Some(data.amp)
-                                    } else {
-                                        None
-                                    };
-                                    pool.fee = data.fee;
-                                    pool.admin_fee = data.adminFee;
-
-                                    // CryptoSwap 特定参数
-                                    if pool.pool_type == CurveLegacyPoolType::CryptoSwap {
-                                        pool.d = if data.d > U256::ZERO {
-                                            Some(data.d)
-                                        } else {
-                                            None
-                                        };
-                                        pool.gamma = if data.gamma > U256::ZERO {
-                                            Some(data.gamma)
-                                        } else {
-                                            None
-                                        };
-                                        pool.mid_fee = if data.midFee > U256::ZERO {
-                                            Some(data.midFee)
-                                        } else {
-                                            None
-                                        };
-                                        pool.out_fee = if data.outFee > U256::ZERO {
-                                            Some(data.outFee)
-                                        } else {
-                                            None
-                                        };
-                                        pool.fee_gamma = if data.feeGamma > U256::ZERO {
-                                            Some(data.feeGamma)
-                                        } else {
-                                            None
-                                        };
-                                        pool.allowed_extra_profit =
-                                            if data.allowedExtraProfit > U256::ZERO {
-                                                Some(data.allowedExtraProfit)
-                                            } else {
-                                                None
-                                            };
-                                        pool.adjustment_step = if data.adjustmentStep > U256::ZERO {
-                                            Some(data.adjustmentStep)
-                                        } else {
-                                            None
-                                        };
-                                        pool.ma_half_time = if data.maHalfTime > U256::ZERO {
-                                            Some(data.maHalfTime)
-                                        } else {
-                                            None
-                                        };
-
-                                        if !data.priceScale.is_empty() {
-                                            pool.price_scale = Some(data.priceScale.clone());
-                                        }
-                                    }
-
-                                    // Populate rates if available (Solidity returns empty if no stored_rates)
-                                    if !data.rates.is_empty() {
-                                        pool.rates = data.rates.clone();
-                                    }
-
-                                    // 批量初始化后更新价格缓存
-                                    // 使用catch_unwind防止单个池子的计算错误导致整个程序崩溃
-                                    let pool_addr_for_log = pool.address;
-                                    if let Err(_e) = std::panic::catch_unwind(
-                                        std::panic::AssertUnwindSafe(|| {
-                                            pool.update_spot_prices();
-                                        }),
-                                    ) {
-                                        tracing::warn!(
-                                            "Pool {:?} update_spot_prices panicked, skipping",
-                                            pool_addr_for_log
-                                        );
-                                    }
-                                } else {
-                                    tracing::warn!(
-                                        "Pool {:?} not found in amms_map or not CurveLegacyPool",
-                                        pool_addr
-                                    );
-                                }
-                            }
-                            true
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to decode legacy batch response: {}", e);
-                            false
-                        }
+        // 并发初始化所有池子，每个池使用独立的 RPC eth_call
+        // init() 内部会完整处理：
+        //   - uint256/int128 双 ABI 兼容
+        //   - Meta/Lending/Plain subtype 检测
+        //   - A_precision 版本检测
+        //   - stored_rates 获取
+        //   - CryptoSwap 参数 (D, gamma, price_scale 等)
+        let mut tasks = FuturesUnordered::new();
+        for amm in amms {
+            let provider = provider.clone();
+            tasks.push(async move {
+                let addr = amm.address();
+                match amm.init(block, provider).await {
+                    Ok(initialized) => {
+                        tracing::debug!(pool = ?addr, "Successfully initialized Curve Legacy pool");
+                        Some(initialized)
+                    }
+                    Err(e) => {
+                        tracing::warn!(pool = ?addr, error = %e, "Failed to initialize Curve Legacy pool, skipping");
+                        None
                     }
                 }
-                Err(e) => {
-                    tracing::warn!("Failed to execute legacy batch request: {}, falling back to individual init", e);
-
-                    // 降级: 逐个初始化该批次的池子
-                    for (addr, pool_type_u8) in &chunk {
-                        if *addr == Address::ZERO {
-                            continue;
-                        }
-
-                        let pool_type = if *pool_type_u8 == 0 {
-                            CurveLegacyPoolType::StableSwap
-                        } else {
-                            CurveLegacyPoolType::CryptoSwap
-                        };
-
-                        let pool = CurveLegacyPool::new(*addr, pool_type);
-                        match pool.init(block, provider.clone()).await {
-                            Ok(initialized_pool) => {
-                                amms_map.insert(*addr, AMM::CurveLegacyPool(initialized_pool));
-                                tracing::debug!("Individually initialized pool {:?}", addr);
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "Failed to individually init pool {:?}: {}",
-                                    addr,
-                                    e
-                                );
-                            }
-                        }
-
-                        // 逐个请求间添加延迟
-                        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-                    }
-
-                    false
-                }
-            };
-
-            // 批次间延迟，避免触发 429
-            tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+            });
         }
 
-        // 版本检测后处理：对 StableSwap 池检测是否是新版 (有 A_precise 方法)
-        // 新版池子 uses_a_precision = true，旧版池子 uses_a_precision = false
-        let stableswap_pools: Vec<Address> = amms_map
-            .iter()
-            .filter_map(|(addr, amm)| {
-                if let AMM::CurveLegacyPool(pool) = amm {
-                    if pool.pool_type == CurveLegacyPoolType::StableSwap {
-                        return Some(*addr);
-                    }
-                }
-                None
-            })
-            .collect();
+        let mut results: Vec<AMM> = Vec::with_capacity(total);
+        let mut success_count = 0u32;
+        let mut fail_count = 0u32;
 
-        if !stableswap_pools.is_empty() {
-            tracing::info!(
-                "Detecting version for {} StableSwap pools...",
-                stableswap_pools.len()
-            );
-
-            let mut version_tasks = FuturesUnordered::new();
-            for pool_addr in stableswap_pools {
-                let provider_clone = provider.clone();
-                version_tasks.push(async move {
-                    let detect = IVersionDetect::new(pool_addr, provider_clone);
-
-                    // 尝试获取 A 和 A_precise
-                    let a_result = detect.A().block(block).call().await;
-                    let a_precise_result = detect.A_precise().block(block).call().await;
-
-                    let uses_a_precision = match (a_result, a_precise_result) {
-                        (Ok(a), Ok(a_precise)) => {
-                            // 新版池子: A_precise() = A() * 100
-                            a_precise == a * U256::from(100)
-                        }
-                        _ => false, // A_precise 调用失败表示旧版池子
-                    };
-
-                    (pool_addr, uses_a_precision)
-                });
-            }
-
-            while let Some((pool_addr, uses_a_precision)) = version_tasks.next().await {
-                if let Some(AMM::CurveLegacyPool(pool)) = amms_map.get_mut(&pool_addr) {
-                    pool.uses_a_precision = uses_a_precision;
-                    if uses_a_precision {
-                        tracing::debug!(
-                            "Pool {:?} detected as new version (uses A_PRECISION=100)",
-                            pool_addr
-                        );
-                    }
-                }
+        while let Some(result) = tasks.next().await {
+            if let Some(amm) = result {
+                success_count += 1;
+                results.push(amm);
+            } else {
+                fail_count += 1;
             }
         }
 
@@ -478,58 +288,60 @@ impl CurveLegacyFactory {
         // 验证必要参数：CryptoSwap 池必须有 d 和 gamma，StableSwap 池必须有 amp
         // 无效池子将被移除，避免后续 simulate_swap 时 divide by zero
         // =========================================================================
-        let invalid_pools: Vec<Address> = amms_map
-            .iter()
-            .filter_map(|(addr, amm)| {
-                if let AMM::CurveLegacyPool(pool) = amm {
-                    let is_invalid = match pool.pool_type {
-                        CurveLegacyPoolType::CryptoSwap => {
-                            // CryptoSwap 必须有 d, gamma, mid_fee, out_fee, fee_gamma
-                            pool.d.is_none()
-                                || pool.gamma.is_none()
-                                || pool.mid_fee.is_none()
-                                || pool.out_fee.is_none()
-                                || pool.fee_gamma.is_none()
+        let pre_filter = results.len();
+        results.retain(|amm| {
+            if let AMM::CurveLegacyPool(pool) = amm {
+                let is_valid = match pool.pool_type {
+                    CurveLegacyPoolType::CryptoSwap => {
+                        // CryptoSwap 必须有 d, gamma, mid_fee, out_fee, fee_gamma
+                        let valid = pool.d.is_some()
+                            && pool.gamma.is_some()
+                            && pool.mid_fee.is_some()
+                            && pool.out_fee.is_some()
+                            && pool.fee_gamma.is_some();
+                        if !valid {
+                            tracing::warn!(
+                                pool = ?pool.address,
+                                pool_type = ?pool.pool_type,
+                                has_d = pool.d.is_some(),
+                                has_gamma = pool.gamma.is_some(),
+                                has_mid_fee = pool.mid_fee.is_some(),
+                                has_out_fee = pool.out_fee.is_some(),
+                                has_fee_gamma = pool.fee_gamma.is_some(),
+                                "Removing CryptoSwap pool: missing required parameters"
+                            );
                         }
-                        CurveLegacyPoolType::StableSwap => {
-                            // StableSwap 必须有 amp
-                            pool.amp.is_none()
-                        }
-                    };
-
-                    if is_invalid {
-                        return Some(*addr);
+                        valid
                     }
-                }
-                None
-            })
-            .collect();
-
-        if !invalid_pools.is_empty() {
-            tracing::warn!(
-                "Removing {} Curve Legacy pools with missing required parameters",
-                invalid_pools.len()
-            );
-
-            for addr in &invalid_pools {
-                if let Some(AMM::CurveLegacyPool(pool)) = amms_map.get(addr) {
-                    tracing::warn!(
-                        pool = ?addr,
-                        pool_type = ?pool.pool_type,
-                        has_amp = pool.amp.is_some(),
-                        has_d = pool.d.is_some(),
-                        has_gamma = pool.gamma.is_some(),
-                        has_mid_fee = pool.mid_fee.is_some(),
-                        has_out_fee = pool.out_fee.is_some(),
-                        has_fee_gamma = pool.fee_gamma.is_some(),
-                        "Skipping pool due to missing required parameters"
-                    );
-                }
-                amms_map.remove(addr);
+                    CurveLegacyPoolType::StableSwap => {
+                        // StableSwap 必须有 amp
+                        let valid = pool.amp.is_some();
+                        if !valid {
+                            tracing::warn!(
+                                pool = ?pool.address,
+                                "Removing StableSwap pool: missing amp parameter"
+                            );
+                        }
+                        valid
+                    }
+                };
+                is_valid
+            } else {
+                true
             }
-        }
+        });
 
-        Ok(amms_map.into_values().collect())
+        let filtered = pre_filter - results.len();
+
+        tracing::info!(
+            "Curve Legacy init complete: {}/{} succeeded, {} failed, {} filtered (invalid params)",
+            success_count,
+            total,
+            fail_count,
+            filtered
+        );
+
+        Ok(results)
     }
 
     pub async fn sync_all_pools<N, P>(
