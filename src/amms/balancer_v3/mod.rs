@@ -745,13 +745,19 @@ impl AutomatedMarketMaker for BalancerV3Pool {
             .tokens
             .get_mut(&base_token)
             .ok_or(BalancerV3Error::TokenInDoesNotExist)?;
-        token_in_state.balance += amount_in;
+        token_in_state.balance = token_in_state
+            .balance
+            .checked_add(amount_in)
+            .ok_or(AMMError::Msg("BalancerV3 balance overflow".into()))?;
 
         let token_out_state = self
             .tokens
             .get_mut(&quote_token)
             .ok_or(BalancerV3Error::TokenOutDoesNotExist)?;
-        token_out_state.balance -= amount_out;
+        token_out_state.balance = token_out_state
+            .balance
+            .checked_sub(amount_out)
+            .ok_or(AMMError::Msg("BalancerV3 balance underflow".into()))?;
 
         Ok(amount_out)
     }

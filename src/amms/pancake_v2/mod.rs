@@ -323,8 +323,21 @@ impl AutomatedMarketMaker for PancakeV2Pool {
                 U256::from(self.reserve_1),
             );
 
-            self.reserve_0 += amount_in.to::<u128>();
-            self.reserve_1 -= amount_out.to::<u128>();
+            let amount_in_u128: u128 = amount_in.try_into().map_err(|_| {
+                AMMError::Msg("amount_in exceeds u128 in simulate_swap_mut".to_string())
+            })?;
+            let amount_out_u128: u128 = amount_out.try_into().map_err(|_| {
+                AMMError::Msg("amount_out exceeds u128 in simulate_swap_mut".to_string())
+            })?;
+
+            self.reserve_0 = self
+                .reserve_0
+                .checked_add(amount_in_u128)
+                .ok_or(AMMError::Msg("reserve_0 overflow".to_string()))?;
+            self.reserve_1 = self
+                .reserve_1
+                .checked_sub(amount_out_u128)
+                .ok_or(AMMError::Msg("reserve_1 underflow".to_string()))?;
 
             Ok(amount_out)
         } else {
@@ -334,8 +347,21 @@ impl AutomatedMarketMaker for PancakeV2Pool {
                 U256::from(self.reserve_0),
             );
 
-            self.reserve_0 -= amount_out.to::<u128>();
-            self.reserve_1 += amount_in.to::<u128>();
+            let amount_in_u128: u128 = amount_in.try_into().map_err(|_| {
+                AMMError::Msg("amount_in exceeds u128 in simulate_swap_mut".to_string())
+            })?;
+            let amount_out_u128: u128 = amount_out.try_into().map_err(|_| {
+                AMMError::Msg("amount_out exceeds u128 in simulate_swap_mut".to_string())
+            })?;
+
+            self.reserve_0 = self
+                .reserve_0
+                .checked_sub(amount_out_u128)
+                .ok_or(AMMError::Msg("reserve_0 underflow".to_string()))?;
+            self.reserve_1 = self
+                .reserve_1
+                .checked_add(amount_in_u128)
+                .ok_or(AMMError::Msg("reserve_1 overflow".to_string()))?;
 
             Ok(amount_out)
         }

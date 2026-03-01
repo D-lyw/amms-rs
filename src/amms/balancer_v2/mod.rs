@@ -738,10 +738,16 @@ impl AutomatedMarketMaker for BalancerV2Pool {
         let amount_out = self.simulate_swap(base_token, quote_token, amount_in)?;
 
         if let Some(t) = self.tokens.get_mut(&base_token) {
-            t.balance += amount_in;
+            t.balance = t
+                .balance
+                .checked_add(amount_in)
+                .ok_or(AMMError::Msg("BalancerV2 balance add overflow".into()))?;
         }
         if let Some(t) = self.tokens.get_mut(&quote_token) {
-            t.balance -= amount_out;
+            t.balance = t
+                .balance
+                .checked_sub(amount_out)
+                .ok_or(AMMError::Msg("BalancerV2 balance sub underflow".into()))?;
         }
 
         Ok(amount_out)

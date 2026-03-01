@@ -375,6 +375,11 @@ impl AutomatedMarketMaker for PancakeInfinityPool {
                 .map_err(UniswapV3Error::from)?;
             }
         }
+
+        self.sqrt_price = current_state.sqrt_price_x_96;
+        self.tick = current_state.tick;
+        self.liquidity = current_state.liquidity;
+
         Ok((-current_state.amount_calculated).into_raw())
     }
 
