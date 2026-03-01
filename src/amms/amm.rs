@@ -1,3 +1,5 @@
+use crate::amms::aerodrome_slipstream::AerodromeSlipstreamPool;
+use crate::amms::aerodrome_v2::AerodromeV2Pool;
 use crate::amms::balancer_v2::BalancerV2Pool;
 use crate::amms::balancer_v3::BalancerV3Pool;
 use crate::amms::curve_legacy::CurveLegacyPool;
@@ -280,5 +282,7 @@ amm!(
     FluidDexPool,
     CurveNGPool,
     CurveLegacyPool,
-    EkuboPool
+    EkuboPool,
+    AerodromeV2Pool,
+    AerodromeSlipstreamPool,
 );

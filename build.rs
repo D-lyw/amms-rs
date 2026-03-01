@@ -30,6 +30,8 @@ const TARGET_CONTRACTS: &[&str] = &[
     "GetEkuboPoolStateBatchRequest",
     "GetEkuboTickBitmapBatchRequest",
     "GetEkuboTickDataBatchRequest",
+    // Aerodrome V2
+    "GetAerodromeV2PoolDataBatchRequest",
 ];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

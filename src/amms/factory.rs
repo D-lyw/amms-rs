@@ -128,6 +128,16 @@ impl Variant {
                 CurveLegacyFactory::init_batch::<N, _>(amms, to_block, provider).await
             }
             Variant::EkuboPool => EkuboFactory::init_batch::<N, _>(amms, to_block, provider).await,
+            Variant::AerodromeV2Pool => {
+                // TODO: Implement AerodromeV2Factory::init_batch
+                // For now, return unsynced pools
+                Ok(amms)
+            }
+            Variant::AerodromeSlipstreamPool => {
+                // TODO: Implement AerodromeSlipstreamFactory::init_batch
+                // For now, return unsynced pools
+                Ok(amms)
+            }
         }
     }
 
@@ -189,6 +199,16 @@ impl Variant {
             }
             Variant::EkuboPool => {
                 EkuboFactory::sync_all_pools::<N, _>(amms, to_block, provider).await
+            }
+            Variant::AerodromeV2Pool => {
+                // TODO: Implement AerodromeV2Factory::sync_all_pools
+                // For now, return unsynced pools
+                Ok(amms)
+            }
+            Variant::AerodromeSlipstreamPool => {
+                // TODO: Implement AerodromeSlipstreamFactory::sync_all_pools
+                // For now, return unsynced pools
+                Ok(amms)
             }
         }
     }
