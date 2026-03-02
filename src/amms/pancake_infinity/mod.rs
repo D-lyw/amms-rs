@@ -192,7 +192,8 @@ impl AutomatedMarketMaker for PancakeInfinityPool {
             u128::MAX.isqrt()
         };
 
-        self.liquidity >= l_thresh
+        // Efficient O(1) best-case check for any tick containing enough liquidity
+        self.ticks.values().any(|info| info.liquidity_gross >= l_thresh)
     }
 
     fn decimals(&self, token: Address) -> u8 {

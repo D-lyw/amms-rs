@@ -334,9 +334,6 @@ impl AutomatedMarketMaker for UniswapV3Pool {
         if self.sqrt_price.is_zero() {
             return Err(AMMError::Msg("sqrt_price is zero".into()));
         }
-        if self.liquidity == 0 {
-            return Err(AMMError::Msg("liquidity is zero".into()));
-        }
 
         let zero_for_one = base_token == self.token_a.address;
 
@@ -744,20 +741,28 @@ impl AutomatedMarketMaker for UniswapV3Pool {
         let d_b = self.token_b.decimals;
 
         let t_a_u128 = if d_a >= 18 {
-            10u128.pow(d_a as u32 - 1)
+            10u128.pow(d_a as u32 - 4)
         }
-        // 0.1 Unit (e.g. 0.1 ETH = $300)
+        // 0.0001
+        else if d_a >= 6 {
+            100u128.saturating_mul(10u128.pow(d_a as u32))
+        }
+        // 100
         else {
-            1_000_000
-        }; // Fixed 10^6 raw units for low decimals (e.g. 1 USDC, 0.01 WBTC)
+            100_000
+        };
 
         let t_b_u128 = if d_b >= 18 {
-            10u128.pow(d_b as u32 - 1)
+            10u128.pow(d_b as u32 - 4)
         }
-        // 0.1 Unit
+        // 0.0001
+        else if d_b >= 6 {
+            100u128.saturating_mul(10u128.pow(d_b as u32))
+        }
+        // 100
         else {
-            1_000_000
-        }; // Fixed 10^6 raw units
+            100_000
+        };
 
         // Calculate geometric mean of thresholds
         let l_thresh = if let Some(prod) = t_a_u128.checked_mul(t_b_u128) {
@@ -767,7 +772,8 @@ impl AutomatedMarketMaker for UniswapV3Pool {
             u128::MAX.isqrt()
         };
 
-        self.liquidity >= l_thresh
+        // Efficient O(1) best-case check for any tick containing enough liquidity
+        self.ticks.values().any(|info| info.liquidity_gross >= l_thresh)
     }
 
     fn decimals(&self, token: Address) -> u8 {

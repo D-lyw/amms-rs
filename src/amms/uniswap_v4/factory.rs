@@ -450,8 +450,7 @@ impl UniswapV4Factory {
 
         let (valid_pools, invalid_pools): (Vec<_>, Vec<_>) =
             pools.into_par_iter().partition(|pool| {
-                pool.liquidity > 0
-                    && pool.tick_spacing != 0
+                pool.tick_spacing != 0
                     && !(pool.token_a.address.is_zero() && pool.token_b.address.is_zero())
                     && pool.token_a.decimals > 0
                     && pool.token_b.decimals > 0
@@ -510,8 +509,7 @@ impl UniswapV4Factory {
         Self::sync_slot_0(&mut pools, block_number, provider.clone()).await?;
         let (valid_pools, invalid_pools): (Vec<_>, Vec<_>) =
             pools.into_par_iter().partition(|pool| {
-                pool.liquidity > 0
-                    && pool.tick_spacing != 0
+                pool.tick_spacing != 0
                     && !(pool.token_a.address.is_zero() && pool.token_b.address.is_zero())
             });
 

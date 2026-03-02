@@ -499,9 +499,6 @@ impl AutomatedMarketMaker for AerodromeSlipstreamPool {
         if self.sqrt_price.is_zero() {
             return Err(AMMError::Msg("sqrt_price is zero".into()));
         }
-        if self.liquidity == 0 {
-            return Err(AMMError::Msg("liquidity is zero".into()));
-        }
 
         let zero_for_one = base_token == self.token_a.address;
         let sqrt_price_limit_x_96 = if zero_for_one {
@@ -715,15 +712,19 @@ impl AutomatedMarketMaker for AerodromeSlipstreamPool {
         let d_b = self.token_b.decimals;
 
         let t_a_u128 = if d_a >= 18 {
-            10u128.pow(d_a as u32 - 1)
+            10u128.pow(d_a as u32 - 4)
+        } else if d_a >= 6 {
+            100u128.saturating_mul(10u128.pow(d_a as u32))
         } else {
-            1_000_000
+            100_000
         };
 
         let t_b_u128 = if d_b >= 18 {
-            10u128.pow(d_b as u32 - 1)
+            10u128.pow(d_b as u32 - 4)
+        } else if d_b >= 6 {
+            100u128.saturating_mul(10u128.pow(d_b as u32))
         } else {
-            1_000_000
+            100_000
         };
 
         let l_thresh = if let Some(prod) = t_a_u128.checked_mul(t_b_u128) {
@@ -732,7 +733,7 @@ impl AutomatedMarketMaker for AerodromeSlipstreamPool {
             u128::MAX.isqrt()
         };
 
-        self.liquidity >= l_thresh
+        self.ticks.values().any(|info| info.liquidity_gross >= l_thresh)
     }
 
     fn decimals(&self, token: Address) -> u8 {

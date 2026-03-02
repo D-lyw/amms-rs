@@ -192,7 +192,8 @@ impl AutomatedMarketMaker for EkuboPool {
             u128::MAX.isqrt()
         };
 
-        self.liquidity >= l_thresh
+        // Efficient O(1) best-case check for any tick containing enough liquidity
+        self.ticks.values().any(|info| info.liquidity_gross >= l_thresh)
     }
 
     fn decimals(&self, token: Address) -> u8 {
@@ -379,9 +380,6 @@ impl AutomatedMarketMaker for EkuboPool {
         // 防御性检查
         if self.sqrt_price.is_zero() {
             return Err(AMMError::Msg("sqrt_price is zero".into()));
-        }
-        if self.liquidity == 0 {
-            return Err(AMMError::Msg("liquidity is zero".into()));
         }
         // Validate tick is within valid range
         if self.tick < MIN_TICK || self.tick > MAX_TICK {
