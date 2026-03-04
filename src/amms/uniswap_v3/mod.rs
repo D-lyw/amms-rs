@@ -773,7 +773,9 @@ impl AutomatedMarketMaker for UniswapV3Pool {
         };
 
         // Efficient O(1) best-case check for any tick containing enough liquidity
-        self.ticks.values().any(|info| info.liquidity_gross >= l_thresh)
+        self.ticks
+            .values()
+            .any(|info| info.liquidity_gross >= l_thresh)
     }
 
     fn decimals(&self, token: Address) -> u8 {
@@ -1227,12 +1229,32 @@ impl UniswapV3Factory {
         }
         pools = valid_pools;
 
+        // Clear previous tick data to prevent stale data buildup
+        for pool in pools.iter_mut() {
+            if let AMM::UniswapV3Pool(uv3_pool) = pool {
+                uv3_pool.tick_bitmap.clear();
+                uv3_pool.ticks.clear();
+            }
+        }
+
         let pools_step = 50;
         for group in pools.chunks_mut(pools_step) {
             UniswapV3Factory::sync_tick_bitmaps(group, block_number, provider.clone()).await?;
             sleep(Duration::from_millis(500)).await;
             UniswapV3Factory::sync_tick_data(group, block_number, provider.clone()).await?;
             sleep(Duration::from_millis(500)).await;
+        }
+
+        // Recalculate cached spot prices
+        for pool in pools.iter_mut() {
+            if let AMM::UniswapV3Pool(uv3_pool) = pool {
+                if let Ok(price) =
+                    uv3_pool.calculate_price(uv3_pool.token_a.address, uv3_pool.token_b.address)
+                {
+                    uv3_pool.token_a_price = price;
+                    uv3_pool.token_b_price = if price != 0.0 { 1.0 / price } else { 0.0 };
+                }
+            }
         }
 
         Ok(pools)

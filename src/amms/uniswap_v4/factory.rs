@@ -528,6 +528,12 @@ impl UniswapV4Factory {
         }
         let mut pools = valid_pools;
 
+        // Clear previous tick data to prevent stale data buildup
+        for pool in pools.iter_mut() {
+            pool.tick_bitmap.clear();
+            pool.ticks.clear();
+        }
+
         Self::sync_tick_bitmap(&mut pools, block_number, provider.clone()).await?;
         Self::sync_tick_data(&mut pools, block_number, provider.clone()).await?;
 

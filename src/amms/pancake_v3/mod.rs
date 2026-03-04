@@ -1,6 +1,5 @@
 use super::{
-    Token,
-    amm::{AMM, AutomatedMarketMaker, SyncAction},
+    amm::{AutomatedMarketMaker, SyncAction, AMM},
     consts::{MIN_V3_LIQUIDITY, MPFR_T_PRECISION},
     error::AMMError,
     factory::{AutomatedMarketMakerFactory, DiscoverySync},
@@ -8,6 +7,7 @@ use super::{
         GetUniswapV3PoolStaticMetaBatchRequest, GetUniswapV3PoolTickBitmapBatchRequest,
         GetUniswapV3PoolTickDataBatchRequest, UniswapV3Factory,
     },
+    Token,
 };
 use crate::amms::consts::U256_1;
 use crate::amms::uniswap_v3::{
@@ -17,21 +17,21 @@ use crate::amms::uniswap_v3::{
 use alloy::{
     eips::BlockId,
     network::Network,
-    primitives::{Address, B256, Bytes, I256, Signed, U256},
+    primitives::{Address, Bytes, Signed, B256, I256, U256},
     providers::Provider,
     rpc::types::Log,
     sol,
     sol_types::{SolEvent, SolValue},
     transports::BoxFuture,
 };
-use futures::{StreamExt, stream::FuturesUnordered};
+use futures::{stream::FuturesUnordered, StreamExt};
 use rayon::iter::{IntoParallelRefIterator, ParallelDrainRange, ParallelIterator};
-use rug::Float;
 use rug::ops::Pow;
+use rug::Float;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::hash::Hash;
-use tokio::time::{Duration, sleep};
+use tokio::time::{sleep, Duration};
 use tracing::info;
 use uniswap_v3_math::tick_math::{MAX_SQRT_RATIO, MAX_TICK, MIN_SQRT_RATIO, MIN_TICK};
 
@@ -176,6 +176,20 @@ impl AutomatedMarketMaker for PancakeV3Pool {
                 let swap_event = IPancakeV3PoolEvents::Swap::decode_log(log.as_ref())?;
                 let tick_after: i32 = swap_event.tick.unchecked_into();
 
+                // Only warn if liquidity mismatch happens WITHOUT a tick crossing.
+                // If ticks are different, liquidity change is expected.
+                if swap_event.liquidity != self.liquidity && tick_after == self.tick {
+                    tracing::warn!(
+                        target: "amms::pancake_v3::sync",
+                        address = ?self.address,
+                        local_liquidity = ?self.liquidity,
+                        remote_liquidity = ?swap_event.liquidity,
+                        local_tick = ?self.tick,
+                        remote_tick = ?tick_after,
+                        "Liquidity mismatch detected within same tick. Local state may be missing Mint/Burn events."
+                    );
+                }
+
                 self.sqrt_price = swap_event.sqrtPriceX96.to();
                 self.liquidity = swap_event.liquidity;
                 self.tick = tick_after;
@@ -296,7 +310,9 @@ impl AutomatedMarketMaker for PancakeV3Pool {
         };
 
         // Efficient O(1) best-case check for any tick containing enough liquidity
-        self.ticks.values().any(|info| info.liquidity_gross >= l_thresh)
+        self.ticks
+            .values()
+            .any(|info| info.liquidity_gross >= l_thresh)
     }
 
     fn decimals(&self, token: Address) -> u8 {
@@ -872,7 +888,9 @@ sol! {
             int256 amount1,
             uint160 sqrtPriceX96,
             uint128 liquidity,
-            int24 tick
+            int24 tick,
+            uint128 protocolFeesToken0,
+            uint128 protocolFeesToken1
         );
     }
 
@@ -1088,11 +1106,33 @@ impl PancakeV3Factory {
             }
         }
 
-        // 4. Sync ticks (use PancakeV3 specific logic to avoid batch contract incompatibility)
+        // 4. Clear stale tick data before re-syncing to avoid residual entries
+        for amm in pools.iter_mut() {
+            if let AMM::PancakeV3Pool(p) = amm {
+                p.tick_bitmap.clear();
+                p.ticks.clear();
+            }
+        }
+
+        // 5. Sync ticks (use PancakeV3 specific logic to avoid batch contract incompatibility)
         let pools_step = 50;
         for group in pools.chunks_mut(pools_step) {
             PancakeV3Factory::sync_tick_bitmaps(group, block_number, provider.clone()).await?;
             PancakeV3Factory::sync_tick_data(group, block_number, provider.clone()).await?;
+        }
+
+        // 6. Recalculate spot prices after full re-sync
+        for amm in pools.iter_mut() {
+            if let AMM::PancakeV3Pool(p) = amm {
+                if let Ok(price) = p.calculate_price(p.token_a.address, p.token_b.address) {
+                    p.token_a_price = price;
+                    if price != 0.0 {
+                        p.token_b_price = 1.0 / price;
+                    } else {
+                        p.token_b_price = 0.0;
+                    }
+                }
+            }
         }
 
         Ok(pools)
@@ -1543,7 +1583,7 @@ mod tests {
 
     use alloy::{
         eips::BlockId,
-        primitives::{Address, U160, U256, address, aliases::U24},
+        primitives::{address, aliases::U24, Address, U160, U256},
         providers::{Provider, ProviderBuilder},
     };
 
@@ -1758,3 +1798,6 @@ mod tests {
 
 #[cfg(test)]
 mod test_price;
+
+#[cfg(test)]
+mod test_sync_drift;
