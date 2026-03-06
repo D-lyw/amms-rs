@@ -253,34 +253,57 @@ impl CurveLegacyFactory {
         //   - A_precision 版本检测
         //   - stored_rates 获取
         //   - CryptoSwap 参数 (D, gamma, price_scale 等)
-        let mut tasks = FuturesUnordered::new();
+
+        let mut chunks = Vec::new();
+        let chunk_size = 10;
+        let mut current_chunk = Vec::with_capacity(chunk_size);
         for amm in amms {
-            let provider = provider.clone();
-            tasks.push(async move {
-                let addr = amm.address();
-                match amm.init(block, provider).await {
-                    Ok(initialized) => {
-                        tracing::debug!(pool = ?addr, "Successfully initialized Curve Legacy pool");
-                        Some(initialized)
-                    }
-                    Err(e) => {
-                        tracing::warn!(pool = ?addr, error = %e, "Failed to initialize Curve Legacy pool, skipping");
-                        None
-                    }
-                }
-            });
+            current_chunk.push(amm);
+            if current_chunk.len() == chunk_size {
+                chunks.push(std::mem::take(&mut current_chunk));
+            }
+        }
+        if !current_chunk.is_empty() {
+            chunks.push(current_chunk);
         }
 
         let mut results: Vec<AMM> = Vec::with_capacity(total);
         let mut success_count = 0u32;
         let mut fail_count = 0u32;
 
-        while let Some(result) = tasks.next().await {
-            if let Some(amm) = result {
-                success_count += 1;
-                results.push(amm);
-            } else {
-                fail_count += 1;
+        let num_chunks = chunks.len();
+
+        for (i, chunk) in chunks.into_iter().enumerate() {
+            let mut tasks = FuturesUnordered::new();
+            for amm in chunk {
+                let provider = provider.clone();
+                tasks.push(async move {
+                    let addr = amm.address();
+                    match amm.init(block, provider).await {
+                        Ok(initialized) => {
+                            tracing::debug!(pool = ?addr, "Successfully initialized Curve Legacy pool");
+                            Some(initialized)
+                        }
+                        Err(e) => {
+                            tracing::warn!(pool = ?addr, error = %e, "Failed to initialize Curve Legacy pool, skipping");
+                            None
+                        }
+                    }
+                });
+            }
+
+            while let Some(result) = tasks.next().await {
+                if let Some(amm) = result {
+                    success_count += 1;
+                    results.push(amm);
+                } else {
+                    fail_count += 1;
+                }
+            }
+
+            // 批次间延迟，避免触发 RPC 限制
+            if i < num_chunks - 1 {
+                tokio::time::sleep(tokio::time::Duration::from_millis(400)).await;
             }
         }
 
