@@ -1104,6 +1104,21 @@ impl AutomatedMarketMaker for CurveLegacyPool {
             self.admin_fee = admin_fee;
         }
 
+        // === Auto-detect pool_type ===
+        // Curve Registry 可能同时包含 StableSwap 和 CryptoSwap 池子，
+        // 但 Factory 构造时只传入单一 pool_type，导致所有池子被赋予同一类型。
+        // 通过尝试调用 gamma() 来自动检测：CryptoSwap 池有 gamma()，StableSwap 没有。
+        if self.pool_type == CurveLegacyPoolType::StableSwap {
+            if let Ok(gamma_val) = pool.gamma().block(block_number).call().await {
+                tracing::info!(
+                    pool = ?self.address,
+                    gamma = ?gamma_val,
+                    "Auto-detected CryptoSwap pool (gamma() exists), overriding pool_type from StableSwap to CryptoSwap"
+                );
+                self.pool_type = CurveLegacyPoolType::CryptoSwap;
+            }
+        }
+
         // === Subtype Detection (StableSwap) ===
         if self.pool_type == CurveLegacyPoolType::StableSwap {
             let pool_meta = ICurveLegacyPoolMeta::new(self.address, provider.clone());
