@@ -748,13 +748,27 @@ impl AutomatedMarketMaker for CurveLegacyPool {
         } else if topic0 == ICurveCryptoSwap2Event::AddLiquidity::SIGNATURE_HASH
             || topic0 == ICurveCryptoSwap3Event::AddLiquidity::SIGNATURE_HASH
         {
-            // CryptoSwap AddLiquidity doesn't have fees array, just a single fee
-            // We trigger AsyncUpdate to resync balances from chain (or implement logic if needed)
-            // Currently using AsyncUpdate for safety on D/gamma sync
+            // Parse event and update local balances BEFORE triggering async update
+            let amounts: Vec<U256> =
+                if topic0 == ICurveCryptoSwap2Event::AddLiquidity::SIGNATURE_HASH {
+                    let e = ICurveCryptoSwap2Event::AddLiquidity::decode_log(&log.inner)?;
+                    e.token_amounts.to_vec()
+                } else {
+                    let e = ICurveCryptoSwap3Event::AddLiquidity::decode_log(&log.inner)?;
+                    e.token_amounts.to_vec()
+                };
+
+            for (i, &amount) in amounts.iter().enumerate() {
+                if i < self.balances.len() {
+                    self.balances[i] = self.balances[i].saturating_add(amount);
+                }
+            }
+
             tracing::info!(
                 target = "amms::curve_legacy::sync",
                 pool = ?self.address,
-                "AddLiquidity (CryptoSwap) - Triggering async update"
+                amounts = ?amounts,
+                "AddLiquidity (CryptoSwap) - Balances updated, triggering async update for D/price_scale"
             );
             return Ok(SyncAction::AsyncUpdate);
 
@@ -762,11 +776,27 @@ impl AutomatedMarketMaker for CurveLegacyPool {
         } else if topic0 == ICurveCryptoSwap2Event::RemoveLiquidity::SIGNATURE_HASH
             || topic0 == ICurveCryptoSwap3Event::RemoveLiquidity::SIGNATURE_HASH
         {
-            // CryptoSwap RemoveLiquidity doesn't have fees array
+            // Parse event and update local balances BEFORE triggering async update
+            let amounts: Vec<U256> =
+                if topic0 == ICurveCryptoSwap2Event::RemoveLiquidity::SIGNATURE_HASH {
+                    let e = ICurveCryptoSwap2Event::RemoveLiquidity::decode_log(&log.inner)?;
+                    e.token_amounts.to_vec()
+                } else {
+                    let e = ICurveCryptoSwap3Event::RemoveLiquidity::decode_log(&log.inner)?;
+                    e.token_amounts.to_vec()
+                };
+
+            for (i, &amount) in amounts.iter().enumerate() {
+                if i < self.balances.len() {
+                    self.balances[i] = self.balances[i].saturating_sub(amount);
+                }
+            }
+
             tracing::info!(
                 target = "amms::curve_legacy::sync",
                 pool = ?self.address,
-                "RemoveLiquidity (CryptoSwap) - Triggering async update"
+                amounts = ?amounts,
+                "RemoveLiquidity (CryptoSwap) - Balances updated, triggering async update for D/price_scale"
             );
             return Ok(SyncAction::AsyncUpdate);
 
@@ -1865,3 +1895,4 @@ impl CurveLegacyPool {
         Ok(())
     }
 }
+pub mod test_sync_drift;
