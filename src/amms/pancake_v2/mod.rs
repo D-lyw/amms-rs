@@ -164,6 +164,20 @@ impl AutomatedMarketMaker for PancakeV2Pool {
         }
     }
 
+    /// PancakeSwap V2 is deployed on multiple EVM-compatible chains
+    fn supported_chains(&self) -> Option<Vec<u64>> {
+        Some(vec![
+            56,     // BNB Chain (Main)
+            1,      // Ethereum
+            137,    // Polygon
+            42161,  // Arbitrum
+            8453,   // Base
+            10,     // Optimism
+            43114,  // Avalanche
+            100,    // Gnosis
+        ])
+    }
+
     fn calculate_price(&self, base_token: Address, _quote_token: Address) -> Result<f64, AMMError> {
         if self.reserve_0 < MIN_POOL_RESERVE || self.reserve_1 < MIN_POOL_RESERVE {
             return Ok(0.0);

@@ -206,6 +206,11 @@ impl AutomatedMarketMaker for PancakeInfinityPool {
         }
     }
 
+    /// PancakeSwap Infinity is currently only deployed on BNB Chain
+    fn supported_chains(&self) -> Option<Vec<u64>> {
+        Some(vec![56]) // BNB Chain
+    }
+
     fn calculate_price(&self, base_token: Address, _quote_token: Address) -> Result<f64, AMMError> {
         if self.sqrt_price.is_zero() {
             return Err(AMMError::Msg("sqrt_price is zero".into()));

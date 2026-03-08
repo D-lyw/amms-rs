@@ -325,6 +325,20 @@ impl AutomatedMarketMaker for PancakeV3Pool {
         }
     }
 
+    /// PancakeSwap V3 is deployed on multiple EVM-compatible chains
+    fn supported_chains(&self) -> Option<Vec<u64>> {
+        Some(vec![
+            56,     // BNB Chain (Main)
+            1,      // Ethereum
+            137,    // Polygon
+            8453,   // Base
+            42161,  // Arbitrum
+            10,     // Optimism
+            43114,  // Avalanche
+            1101,   // Polygon zkEVM
+        ])
+    }
+
     fn calculate_price(&self, base_token: Address, _quote_token: Address) -> Result<f64, AMMError> {
         if self.sqrt_price.is_zero() {
             return Err(AMMError::Msg("sqrt_price is zero".into()));

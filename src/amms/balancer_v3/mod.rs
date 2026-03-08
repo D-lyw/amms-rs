@@ -26,6 +26,19 @@ pub fn get_vault_address(_chain_id: u64) -> Option<Address> {
     // Ref: https://docs.balancer.fi/developer-reference/contracts/deployment-addresses/
     Some(address!("ba1333333333a1BA1108E8412f11850A5C319bA9"))
 }
+
+/// Returns the list of chain IDs where Balancer V3 is deployed
+pub fn get_supported_chains() -> Vec<u64> {
+    vec![
+        1,      // Ethereum
+        42161,  // Arbitrum
+        8453,   // Base
+        100,    // Gnosis
+        43114,  // Avalanche
+        137,    // Polygon
+        10,     // Optimism
+    ]
+}
 use thiserror::Error;
 
 pub mod factory;
@@ -561,6 +574,11 @@ impl AutomatedMarketMaker for BalancerV3Pool {
 
     fn decimals(&self, token: Address) -> u8 {
         self.tokens.get(&token).map(|t| t.decimals).unwrap_or(0)
+    }
+
+    /// Balancer V3 is deployed on multiple EVM-compatible chains
+    fn supported_chains(&self) -> Option<Vec<u64>> {
+        Some(get_supported_chains())
     }
 
     fn spot_price(&self, base_token: Address, quote_token: Address) -> Result<f64, AMMError> {

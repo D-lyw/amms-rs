@@ -22,6 +22,21 @@ pub fn get_vault_address(_chain_id: u64) -> Option<Address> {
     Some(address!("BA12222222228d8Ba445958a75a0704d566BF2C8"))
 }
 
+/// Returns the list of chain IDs where Balancer V2 is deployed
+pub fn get_supported_chains() -> Vec<u64> {
+    vec![
+        1,      // Ethereum
+        137,    // Polygon
+        42161,  // Arbitrum
+        10,     // Optimism
+        8453,   // Base
+        43114,  // Avalanche
+        100,    // Gnosis
+        56,     // BSC
+        250,    // Fantom (deprecated but historical data exists)
+    ]
+}
+
 pub mod abi;
 pub mod factory;
 pub mod math;
@@ -364,6 +379,11 @@ impl AutomatedMarketMaker for BalancerV2Pool {
 
     fn decimals(&self, token: Address) -> u8 {
         self.tokens.get(&token).map(|t| t.decimals).unwrap_or(0)
+    }
+
+    /// Balancer V2 is deployed on multiple EVM-compatible chains
+    fn supported_chains(&self) -> Option<Vec<u64>> {
+        Some(get_supported_chains())
     }
 
     fn spot_price(&self, base_token: Address, quote_token: Address) -> Result<f64, AMMError> {

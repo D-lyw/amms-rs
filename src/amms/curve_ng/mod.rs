@@ -379,6 +379,21 @@ impl AutomatedMarketMaker for CurveNGPool {
             .unwrap_or(0)
     }
 
+    /// Curve NG is deployed on multiple EVM-compatible chains
+    fn supported_chains(&self) -> Option<Vec<u64>> {
+        Some(vec![
+            1,      // Ethereum
+            42161,  // Arbitrum
+            137,    // Polygon
+            10,     // Optimism
+            8453,   // Base
+            56,     // BSC
+            43114,  // Avalanche
+            100,    // Gnosis
+            42220,  // Celo
+        ])
+    }
+
     fn sync_events(&self) -> Vec<B256> {
         match self.pool_type {
             CurveNGPoolType::StableSwap => vec![

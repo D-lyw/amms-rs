@@ -380,6 +380,22 @@ impl AutomatedMarketMaker for CurveLegacyPool {
             .unwrap_or(0)
     }
 
+    /// Curve Legacy pools are deployed on multiple EVM chains
+    fn supported_chains(&self) -> Option<Vec<u64>> {
+        Some(vec![
+            1,      // Ethereum
+            42161,  // Arbitrum
+            137,    // Polygon
+            10,     // Optimism
+            8453,   // Base
+            56,     // BSC
+            250,    // Fantom
+            43114,  // Avalanche
+            100,    // Gnosis
+            42220,  // Celo
+        ])
+    }
+
     fn sync_events(&self) -> Vec<B256> {
         vec![
             // Swaps
