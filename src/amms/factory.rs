@@ -1,3 +1,5 @@
+use crate::amms::aerodrome_slipstream::AerodromeSlipstreamFactory;
+use crate::amms::aerodrome_v2::AerodromeV2Factory;
 use crate::amms::curve_legacy::factory::CurveLegacyFactory;
 use crate::amms::curve_ng::factory::CurveNGFactory;
 use crate::amms::ekubo::EkuboFactory;
@@ -129,14 +131,10 @@ impl Variant {
             }
             Variant::EkuboPool => EkuboFactory::init_batch::<N, _>(amms, to_block, provider).await,
             Variant::AerodromeV2Pool => {
-                // TODO: Implement AerodromeV2Factory::init_batch
-                // For now, return unsynced pools
-                Ok(amms)
+                AerodromeV2Factory::init_batch::<N, _>(amms, to_block, provider).await
             }
             Variant::AerodromeSlipstreamPool => {
-                // TODO: Implement AerodromeSlipstreamFactory::init_batch
-                // For now, return unsynced pools
-                Ok(amms)
+                AerodromeSlipstreamFactory::init_batch::<N, _>(amms, to_block, provider).await
             }
         }
     }
@@ -201,14 +199,10 @@ impl Variant {
                 EkuboFactory::sync_all_pools::<N, _>(amms, to_block, provider).await
             }
             Variant::AerodromeV2Pool => {
-                // TODO: Implement AerodromeV2Factory::sync_all_pools
-                // For now, return unsynced pools
-                Ok(amms)
+                AerodromeV2Factory::sync_all_pools::<N, _>(amms, to_block, provider).await
             }
             Variant::AerodromeSlipstreamPool => {
-                // TODO: Implement AerodromeSlipstreamFactory::sync_all_pools
-                // For now, return unsynced pools
-                Ok(amms)
+                AerodromeSlipstreamFactory::init_batch::<N, _>(amms, to_block, provider).await
             }
         }
     }
@@ -315,7 +309,9 @@ factory!(
     PancakeInfinityFactory,
     SushiV2Factory,
     FluidDexFactory,
-    CurveLegacyFactory
+    CurveLegacyFactory,
+    AerodromeV2Factory,
+    AerodromeSlipstreamFactory
 );
 
 #[derive(Default)]

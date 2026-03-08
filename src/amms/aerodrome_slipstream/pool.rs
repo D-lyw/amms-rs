@@ -19,13 +19,16 @@
 use alloy::{
     eips::BlockId,
     network::Network,
-    primitives::{Address, I256, U256},
+    primitives::{Address, Bytes, Signed, I256, U256},
     providers::Provider,
     rpc::types::Log,
     sol,
-    sol_types::{SolCall, SolEvent},
+    sol_types::{SolCall, SolEvent, SolValue},
+    transports::BoxFuture,
 };
-use futures::StreamExt;
+use futures::{stream::FuturesUnordered, StreamExt};
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use std::collections::HashMap;
 use thiserror::Error;
 
 use crate::amms::{
@@ -33,16 +36,29 @@ use crate::amms::{
     consts::{MIN_V3_LIQUIDITY, MPFR_T_PRECISION, U256_1},
     error::AMMError,
     factory::{AutomatedMarketMakerFactory, DiscoverySync},
+    uniswap_v3::{
+        tick_to_word, GetUniswapV3PoolTickBitmapBatchRequest, GetUniswapV3PoolTickDataBatchRequest,
+        UniswapV3Factory,
+    },
     Token,
 };
-use uniswap_v3_math::tick_math::{MAX_SQRT_RATIO, MIN_SQRT_RATIO, MIN_TICK, MAX_TICK};
-use rug::Float;
 use rug::ops::Pow;
+use rug::Float;
+use uniswap_v3_math::tick_math::{MAX_SQRT_RATIO, MAX_TICK, MIN_SQRT_RATIO, MIN_TICK};
 
 sol! {
     #[derive(Debug, PartialEq, Eq)]
     #[sol(rpc)]
     contract ICLPool {
+        function slot0() external view returns (
+            uint160 sqrtPriceX96,
+            int24 tick,
+            uint16 observationIndex,
+            uint16 observationCardinality,
+            uint16 observationCardinalityNext,
+            bool unlocked
+        );
+        function liquidity() external view returns (uint128);
         function swap(address recipient, bool zeroForOne, int256 amountSpecified, uint160 sqrtPriceLimitX96, bytes calldata data) external returns (int256, int256);
         function tickSpacing() external view returns (int24);
         function fee() external view returns (uint24);
@@ -93,6 +109,21 @@ sol! {
             address pool
         );
     }
+
+    /// Fee change event emitted by the FeeModule contract
+    /// Note: This event is emitted from the FeeModule contract, not the pool contract
+    #[derive(Debug, PartialEq, Eq)]
+    contract ICustomFeeModule {
+        event CustomFeeSet(address indexed pool, uint24 indexed fee);
+    }
+}
+
+// Aerodrome Slipstream specific batch request contract
+// Slipstream slot0 returns 6 values (no feeProtocol) vs UniswapV3's 7
+sol! {
+    #[sol(rpc)]
+    GetAerodromeSlipstreamSlot0BatchRequest,
+    "src/amms/abi/GetAerodromeSlipstreamSlot0BatchRequest.json",
 }
 
 /// Aerodrome Slipstream specific errors
@@ -252,6 +283,10 @@ impl AutomatedMarketMaker for AerodromeSlipstreamPool {
             ICLPoolEvents::Mint::SIGNATURE_HASH,
             ICLPoolEvents::Burn::SIGNATURE_HASH,
             ICLPoolEvents::Swap::SIGNATURE_HASH,
+            // Fee change event from FeeModule contract
+            // Note: This event is emitted from FeeModule, not the pool
+            // The event has `pool` as indexed parameter, so we can filter by pool address
+            ICustomFeeModule::CustomFeeSet::SIGNATURE_HASH,
         ]
     }
 
@@ -331,6 +366,32 @@ impl AutomatedMarketMaker for AerodromeSlipstreamPool {
                     liquidity = ?self.liquidity,
                     tick = ?self.tick,
                     "Burn"
+                );
+            }
+            ICustomFeeModule::CustomFeeSet::SIGNATURE_HASH => {
+                // This event is emitted from FeeModule contract, not the pool
+                // The event has `pool` as indexed parameter (topic[1])
+                // Verify this event is for our pool
+                if log.topics().len() > 1 {
+                    let event_pool = Address::from_word(log.topics()[1]);
+                    if event_pool != self.address {
+                        // Not our pool's fee event, skip
+                        return Ok(SyncAction::None);
+                    }
+                }
+
+                let fee_event = ICustomFeeModule::CustomFeeSet::decode_log(log.as_ref())?;
+                let old_fee = self.fee;
+                self.fee = fee_event.fee.to::<u32>();
+
+                tracing::info!(
+                    target: "amms::aerodrome_slipstream::sync",
+                    block_number = ?log.block_number,
+                    address = ?self.address,
+                    old_fee = ?old_fee,
+                    new_fee = ?self.fee,
+                    fee_percent = ?(self.fee as f64 / 10000.0),
+                    "CustomFeeSet"
                 );
             }
             _ => {
@@ -475,9 +536,10 @@ impl AutomatedMarketMaker for AerodromeSlipstreamPool {
                     step.tick_next
                 }
             } else if current_state.sqrt_price_x_96 != step.sqrt_price_start_x_96 {
-                current_state.tick =
-                    uniswap_v3_math::tick_math::get_tick_at_sqrt_ratio(current_state.sqrt_price_x_96)
-                        .map_err(AerodromeSlipstreamError::from)?;
+                current_state.tick = uniswap_v3_math::tick_math::get_tick_at_sqrt_ratio(
+                    current_state.sqrt_price_x_96,
+                )
+                .map_err(AerodromeSlipstreamError::from)?;
             }
         }
 
@@ -611,9 +673,10 @@ impl AutomatedMarketMaker for AerodromeSlipstreamPool {
                     step.tick_next
                 }
             } else if current_state.sqrt_price_x_96 != step.sqrt_price_start_x_96 {
-                current_state.tick =
-                    uniswap_v3_math::tick_math::get_tick_at_sqrt_ratio(current_state.sqrt_price_x_96)
-                        .map_err(AerodromeSlipstreamError::from)?;
+                current_state.tick = uniswap_v3_math::tick_math::get_tick_at_sqrt_ratio(
+                    current_state.sqrt_price_x_96,
+                )
+                .map_err(AerodromeSlipstreamError::from)?;
             }
         }
 
@@ -733,7 +796,9 @@ impl AutomatedMarketMaker for AerodromeSlipstreamPool {
             u128::MAX.isqrt()
         };
 
-        self.ticks.values().any(|info| info.liquidity_gross >= l_thresh)
+        self.ticks
+            .values()
+            .any(|info| info.liquidity_gross >= l_thresh)
     }
 
     fn decimals(&self, token: Address) -> u8 {
@@ -746,30 +811,45 @@ impl AutomatedMarketMaker for AerodromeSlipstreamPool {
         }
     }
 
-    async fn init<N, P>(
-        mut self,
-        block_number: BlockId,
-        provider: P,
-    ) -> Result<Self, AMMError>
+    /// Aerodrome Slipstream is only deployed on Base chain (chain ID: 8453)
+    fn supported_chains(&self) -> Option<Vec<u64>> {
+        Some(vec![8453]) // Base mainnet
+    }
+
+    async fn init<N, P>(mut self, block_number: BlockId, provider: P) -> Result<Self, AMMError>
     where
         N: Network,
         P: Provider<N> + Clone,
     {
         let pool = ICLPool::new(self.address, provider.clone());
 
-        self.tick_spacing = pool.tickSpacing().call().await?.as_i32();
+        self.tick_spacing = pool
+            .tickSpacing()
+            .block(block_number)
+            .call()
+            .await?
+            .as_i32();
         if self.tick_spacing == 0 {
             return Err(AMMError::Msg("tick_spacing is zero".into()));
         }
 
-        self.fee = pool.fee().call().await?.to::<u32>();
+        // IMPORTANT: Use block_number to get historical fee value
+        // Slipstream has dynamic fee mechanism, fee can change over time
+        self.fee = pool.fee().block(block_number).call().await?.to::<u32>();
 
-        self.token_a = Token::new(pool.token0().call().await?, provider.clone()).await?;
-        self.token_b = Token::new(pool.token1().call().await?, provider.clone()).await?;
+        self.token_a = Token::new(
+            pool.token0().block(block_number).call().await?,
+            provider.clone(),
+        )
+        .await?;
+        self.token_b = Token::new(
+            pool.token1().block(block_number).call().await?,
+            provider.clone(),
+        )
+        .await?;
 
         let mut pool = vec![self.into()];
-        AerodromeSlipstreamFactory::sync_slot_0(&mut pool, block_number, provider.clone())
-            .await?;
+        AerodromeSlipstreamFactory::sync_slot_0(&mut pool, block_number, provider.clone()).await?;
         AerodromeSlipstreamFactory::sync_token_decimals(&mut pool, provider.clone()).await?;
 
         let AMM::AerodromeSlipstreamPool(mut pool_struct) = pool[0].to_owned() else {
@@ -808,10 +888,10 @@ impl AerodromeSlipstreamPool {
         if liquidity_delta != 0 {
             if self.tick >= tick_lower && self.tick < tick_upper {
                 self.liquidity = if liquidity_delta < 0 {
-                    self.liquidity - ((-liquidity_delta) as u128)
+                    self.liquidity.saturating_sub((-liquidity_delta) as u128)
                 } else {
-                    self.liquidity + (liquidity_delta as u128)
-                }
+                    self.liquidity.saturating_add(liquidity_delta as u128)
+                };
             }
         }
 
@@ -861,9 +941,9 @@ impl AerodromeSlipstreamPool {
         let liquidity_gross_before = info.liquidity_gross;
 
         let liquidity_gross_after = if liquidity_delta < 0 {
-            liquidity_gross_before - ((-liquidity_delta) as u128)
+            liquidity_gross_before.saturating_sub((-liquidity_delta) as u128)
         } else {
-            liquidity_gross_before + (liquidity_delta as u128)
+            liquidity_gross_before.saturating_add(liquidity_delta as u128)
         };
 
         let flipped = (liquidity_gross_after == 0) != (liquidity_gross_before == 0);
@@ -965,8 +1045,7 @@ impl AerodromeSlipstreamFactory {
         N: Network,
         P: Provider<N> + Clone,
     {
-        use crate::amms::uniswap_v3::GetUniswapV3PoolSlot0BatchRequest;
-
+        // Use Slipstream-specific batch request (different slot0 format than UniswapV3)
         let step = 255;
         let mut futures = futures::stream::FuturesUnordered::new();
 
@@ -980,10 +1059,13 @@ impl AerodromeSlipstreamFactory {
             futures.push(async move {
                 Ok::<(&mut [AMM], alloy::primitives::Bytes), AMMError>((
                     group,
-                    GetUniswapV3PoolSlot0BatchRequest::deploy_builder(provider, pool_addresses)
-                        .call_raw()
-                        .block(block_number)
-                        .await?,
+                    GetAerodromeSlipstreamSlot0BatchRequest::deploy_builder(
+                        provider,
+                        pool_addresses,
+                    )
+                    .call_raw()
+                    .block(block_number)
+                    .await?,
                 ))
             });
         });
@@ -992,8 +1074,7 @@ impl AerodromeSlipstreamFactory {
             let (group, return_data) = res?;
             use alloy::sol_types::SolValue;
 
-            let return_data =
-                <Vec<(u32, u128, U256)> as SolValue>::abi_decode(&return_data)?;
+            let return_data = <Vec<(u32, u128, U256)> as SolValue>::abi_decode(&return_data)?;
 
             for (pool, (tick, liquidity, sqrt_price)) in
                 group.iter_mut().zip(return_data.into_iter())
@@ -1038,7 +1119,8 @@ impl AerodromeSlipstreamFactory {
             }
         }
 
-        let token_decimals = crate::amms::get_token_decimals(tokens.into_iter().collect(), provider).await?;
+        let token_decimals =
+            crate::amms::get_token_decimals(tokens.into_iter().collect(), provider).await?;
 
         for pool in pools.iter_mut() {
             let AMM::AerodromeSlipstreamPool(aerodrome_pool) = pool else {
@@ -1056,6 +1138,342 @@ impl AerodromeSlipstreamFactory {
 
         Ok(())
     }
+
+    /// Batch sync tick bitmaps using the same batch contract as UniswapV3.
+    /// Aerodrome Slipstream tickBitmap interface is ABI-compatible with UniswapV3.
+    pub async fn sync_tick_bitmaps<N, P>(
+        pools: &mut [AMM],
+        block_number: BlockId,
+        provider: P,
+    ) -> Result<(), AMMError>
+    where
+        N: Network,
+        P: Provider<N> + Clone,
+    {
+        use crate::amms::uniswap_v3::GetUniswapV3PoolTickBitmapBatchRequest::TickBitmapInfo;
+
+        let mut futures: FuturesUnordered<BoxFuture<'_, _>> = FuturesUnordered::new();
+
+        let max_range = 6900;
+        let mut group_range = 0;
+        let mut group = vec![];
+
+        for pool in pools.iter() {
+            let AMM::AerodromeSlipstreamPool(slipstream_pool) = pool else {
+                continue;
+            };
+
+            let mut min_word = tick_to_word(MIN_TICK, slipstream_pool.tick_spacing);
+            let max_word = tick_to_word(MAX_TICK, slipstream_pool.tick_spacing);
+
+            while min_word <= max_word {
+                let remaining_range = max_range - group_range;
+                let word_range = max_word - min_word + 1;
+                let range = word_range.min(remaining_range);
+
+                let start = min_word;
+                let end = start + range - 1;
+
+                group.push(TickBitmapInfo {
+                    pool: slipstream_pool.address,
+                    minWord: start as i16,
+                    maxWord: end as i16,
+                });
+
+                min_word = end + 1;
+                group_range += range;
+
+                if group_range >= max_range {
+                    let provider = provider.clone();
+                    let pool_info = group.iter().map(|info| info.pool).collect::<Vec<_>>();
+                    let calldata = std::mem::take(&mut group);
+                    group_range = 0;
+
+                    futures.push(Box::pin(async move {
+                        Ok::<(Vec<Address>, Bytes), AMMError>((
+                            pool_info,
+                            GetUniswapV3PoolTickBitmapBatchRequest::deploy_builder(
+                                provider, calldata,
+                            )
+                            .call_raw()
+                            .block(block_number)
+                            .await?,
+                        ))
+                    }));
+                }
+            }
+        }
+
+        // Flush remaining group
+        if !group.is_empty() {
+            let provider = provider.clone();
+            let pool_info = group.iter().map(|info| info.pool).collect::<Vec<_>>();
+            let calldata = std::mem::take(&mut group);
+
+            futures.push(Box::pin(async move {
+                Ok::<(Vec<Address>, Bytes), AMMError>((
+                    pool_info,
+                    GetUniswapV3PoolTickBitmapBatchRequest::deploy_builder(provider, calldata)
+                        .call_raw()
+                        .block(block_number)
+                        .await?,
+                ))
+            }));
+        }
+
+        let mut pool_set = pools
+            .iter_mut()
+            .map(|pool| (pool.address(), pool))
+            .collect::<HashMap<Address, &mut AMM>>();
+
+        while let Some(res) = futures.next().await {
+            let (pools_addrs, return_data) = res?;
+            let return_data = <Vec<Vec<U256>> as SolValue>::abi_decode(&return_data)?;
+
+            for (tick_bitmaps, pool_address) in return_data.iter().zip(pools_addrs.iter()) {
+                let pool = pool_set.get_mut(pool_address).unwrap();
+                let AMM::AerodromeSlipstreamPool(ref mut slipstream_pool) = pool else {
+                    continue;
+                };
+
+                for chunk in tick_bitmaps.chunks_exact(2) {
+                    let word_pos = I256::from_raw(chunk[0]).as_i16();
+                    let tick_bitmap = chunk[1];
+                    slipstream_pool.tick_bitmap.insert(word_pos, tick_bitmap);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Batch sync tick data using the same batch contract as UniswapV3.
+    /// Aerodrome Slipstream ticks() interface is ABI-compatible with UniswapV3.
+    pub async fn sync_tick_data<N, P>(
+        pools: &mut [AMM],
+        block_number: BlockId,
+        provider: P,
+    ) -> Result<(), AMMError>
+    where
+        N: Network,
+        P: Provider<N> + Clone,
+    {
+        use crate::amms::uniswap_v3::GetUniswapV3PoolTickDataBatchRequest::TickDataInfo;
+
+        // Step 1: Collect all initialized ticks from bitmaps (parallel)
+        let pool_ticks = pools
+            .par_iter()
+            .filter_map(|pool| {
+                if let AMM::AerodromeSlipstreamPool(slipstream_pool) = pool {
+                    let min_word = tick_to_word(MIN_TICK, slipstream_pool.tick_spacing);
+                    let max_word = tick_to_word(MAX_TICK, slipstream_pool.tick_spacing);
+
+                    let initialized_ticks: Vec<Signed<24, 1>> = (min_word..=max_word)
+                        .filter_map(|word_pos| {
+                            slipstream_pool
+                                .tick_bitmap
+                                .get(&(word_pos as i16))
+                                .filter(|&bitmap| *bitmap != U256::ZERO)
+                                .map(|&bitmap| (word_pos, bitmap))
+                        })
+                        .flat_map(|(word_pos, bitmap)| {
+                            (0..256)
+                                .filter(move |i| {
+                                    (bitmap & (U256::from(1) << U256::from(*i))) != U256::ZERO
+                                })
+                                .filter_map(move |i| {
+                                    let tick_index =
+                                        (word_pos * 256 + i) * slipstream_pool.tick_spacing;
+                                    Signed::<24, 1>::try_from(tick_index).ok()
+                                })
+                        })
+                        .collect();
+
+                    if !initialized_ticks.is_empty() {
+                        Some((slipstream_pool.address, initialized_ticks))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<(Address, Vec<Signed<24, 1>>)>>();
+
+        // Step 2: Batch fetch tick data
+        let mut futures: FuturesUnordered<BoxFuture<'_, _>> = FuturesUnordered::new();
+        let max_ticks = 60;
+        let mut group_ticks = 0;
+        let mut group = vec![];
+
+        for (pool_address, mut ticks) in pool_ticks {
+            while !ticks.is_empty() {
+                let remaining_ticks = max_ticks - group_ticks;
+                let selected_ticks = ticks.drain(0..remaining_ticks.min(ticks.len()));
+                group_ticks += selected_ticks.len();
+
+                group.push(TickDataInfo {
+                    pool: pool_address,
+                    ticks: selected_ticks.collect(),
+                });
+
+                if group_ticks >= max_ticks {
+                    let provider = provider.clone();
+                    let calldata = std::mem::take(&mut group);
+                    group_ticks = 0;
+                    group.clear();
+
+                    futures.push(Box::pin(async move {
+                        Ok::<(Vec<TickDataInfo>, Bytes), AMMError>((
+                            calldata.clone(),
+                            GetUniswapV3PoolTickDataBatchRequest::deploy_builder(
+                                provider, calldata,
+                            )
+                            .call_raw()
+                            .block(block_number)
+                            .await?,
+                        ))
+                    }));
+                }
+            }
+        }
+
+        // Flush remaining
+        if !group.is_empty() {
+            let provider = provider.clone();
+            let calldata = std::mem::take(&mut group);
+
+            futures.push(Box::pin(async move {
+                Ok::<(Vec<TickDataInfo>, Bytes), AMMError>((
+                    calldata.clone(),
+                    GetUniswapV3PoolTickDataBatchRequest::deploy_builder(provider, calldata)
+                        .call_raw()
+                        .block(block_number)
+                        .await?,
+                ))
+            }));
+        }
+
+        // Step 3: Apply results
+        let mut pool_set = pools
+            .iter_mut()
+            .map(|pool| (pool.address(), pool))
+            .collect::<HashMap<Address, &mut AMM>>();
+
+        while let Some(res) = futures.next().await {
+            let (tick_info, return_data) = res?;
+            let return_data = <Vec<Vec<(bool, u128, i128)>> as SolValue>::abi_decode(&return_data)?;
+
+            for (tick_results, tick_info) in return_data.iter().zip(tick_info.iter()) {
+                let pool = pool_set.get_mut(&tick_info.pool).unwrap();
+                let AMM::AerodromeSlipstreamPool(ref mut slipstream_pool) = pool else {
+                    continue;
+                };
+
+                for (tick, tick_idx) in tick_results.iter().zip(tick_info.ticks.iter()) {
+                    let info = TickInfo {
+                        liquidity_gross: tick.1,
+                        liquidity_net: tick.2,
+                        initialized: tick.0,
+                    };
+                    slipstream_pool.ticks.insert(tick_idx.as_i32(), info);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Batch initialize pools with all necessary data (static metadata, slot0, tick bitmaps, tick data)
+    pub async fn init_batch<N, P>(
+        mut amms: Vec<AMM>,
+        block_number: BlockId,
+        provider: P,
+    ) -> Result<Vec<AMM>, AMMError>
+    where
+        N: Network,
+        P: Provider<N> + Clone,
+    {
+        use crate::amms::uniswap_v3::GetUniswapV3PoolStaticMetaBatchRequest;
+
+        let step = 255;
+        let mut futures: FuturesUnordered<BoxFuture<'_, _>> = FuturesUnordered::new();
+
+        // Collect addresses for batch fetching
+        let pool_addresses: Vec<Address> = amms.iter().map(|p| p.address()).collect();
+
+        // Batch fetch static metadata (token0, token1, tickSpacing, fee)
+        for chunk in pool_addresses.chunks(step) {
+            let provider = provider.clone();
+            let addresses = chunk.to_vec();
+            let addresses_clone = addresses.clone();
+            futures.push(Box::pin(async move {
+                Ok::<(Vec<Address>, Bytes), AMMError>((
+                    addresses,
+                    GetUniswapV3PoolStaticMetaBatchRequest::deploy_builder(
+                        provider,
+                        addresses_clone,
+                    )
+                    .call_raw()
+                    .block(block_number)
+                    .await?,
+                ))
+            }));
+        }
+
+        while let Some(res) = futures.next().await {
+            let (addresses, return_data) = res?;
+            let static_data =
+                <Vec<(Address, Address, i32, u32)> as SolValue>::abi_decode(&return_data)?;
+
+            // Create a lookup map for addresses
+            let addr_to_data: HashMap<Address, (Address, Address, i32, u32)> =
+                addresses.into_iter().zip(static_data.into_iter()).collect();
+
+            for pool in amms.iter_mut() {
+                if let Some((token0, token1, tick_spacing, fee)) = addr_to_data.get(&pool.address())
+                {
+                    let AMM::AerodromeSlipstreamPool(ref mut slipstream_pool) = pool else {
+                        continue;
+                    };
+                    slipstream_pool.token_a.address = *token0;
+                    slipstream_pool.token_b.address = *token1;
+                    slipstream_pool.tick_spacing = *tick_spacing;
+                    slipstream_pool.fee = *fee;
+                }
+            }
+        }
+
+        // Sync slot0
+        Self::sync_slot_0(&mut amms, block_number, provider.clone()).await?;
+
+        // Sync token decimals
+        Self::sync_token_decimals(&mut amms, provider.clone())
+            .await
+            .map_err(AMMError::from)?;
+
+        // Sync tick bitmaps
+        Self::sync_tick_bitmaps(&mut amms, block_number, provider.clone()).await?;
+
+        // Sync tick data
+        Self::sync_tick_data(&mut amms, block_number, provider.clone()).await?;
+
+        // Update prices
+        for pool in amms.iter_mut() {
+            let AMM::AerodromeSlipstreamPool(ref mut slipstream_pool) = pool else {
+                continue;
+            };
+            if let Ok(price) = slipstream_pool.calculate_price(
+                slipstream_pool.token_a.address,
+                slipstream_pool.token_b.address,
+            ) {
+                slipstream_pool.token_a_price = price;
+                if price != 0.0 {
+                    slipstream_pool.token_b_price = 1.0 / price;
+                }
+            }
+        }
+
+        Ok(amms)
+    }
 }
 
 impl DiscoverySync for AerodromeSlipstreamFactory {
@@ -1068,9 +1486,32 @@ impl DiscoverySync for AerodromeSlipstreamFactory {
         N: alloy::network::Network,
         P: Provider<N> + Clone,
     {
+        let address = self.address;
+        let creation_block = self.creation_block;
         async move {
-            // TODO: Implement pool discovery via PoolCreated events
-            Ok(vec![])
+            // Use UniswapV3 factory's get_all_pools method (compatible interface)
+            let pools = UniswapV3Factory::new(address, creation_block)
+                .get_all_pools::<N, _>(to_block, provider.clone())
+                .await?;
+
+            // Convert to AerodromeSlipstreamPool
+            Ok(pools
+                .into_iter()
+                .filter_map(|amm| {
+                    if let AMM::UniswapV3Pool(pool) = amm {
+                        Some(AMM::AerodromeSlipstreamPool(AerodromeSlipstreamPool {
+                            address: pool.address,
+                            token_a: pool.token_a,
+                            token_b: pool.token_b,
+                            fee: pool.fee,
+                            tick_spacing: pool.tick_spacing,
+                            ..Default::default()
+                        }))
+                    } else {
+                        None
+                    }
+                })
+                .collect())
         }
     }
 
@@ -1084,9 +1525,6 @@ impl DiscoverySync for AerodromeSlipstreamFactory {
         N: alloy::network::Network,
         P: Provider<N> + Clone,
     {
-        async move {
-            // TODO: Implement batch sync
-            Ok(amms)
-        }
+        async move { AerodromeSlipstreamFactory::init_batch::<N, _>(amms, to_block, provider).await }
     }
 }

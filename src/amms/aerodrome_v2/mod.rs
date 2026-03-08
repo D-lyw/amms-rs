@@ -14,6 +14,9 @@
 pub mod factory;
 pub mod pool;
 
+#[cfg(test)]
+mod test_sync_drift;
+
 // Re-export main types
 pub use factory::AerodromeV2FactoryConfig;
-pub use pool::{AerodromeV2Factory, AerodromeV2Pool};
+pub use pool::{AerodromeV2Factory, AerodromeV2Pool, IAerodromeV2Pool, IAerodromeV2Factory};

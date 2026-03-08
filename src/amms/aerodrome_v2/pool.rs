@@ -48,7 +48,7 @@ sol! {
     #[derive(Debug, PartialEq, Eq)]
     #[sol(rpc)]
     contract IAerodromeV2Pool {
-        event Sync(uint112 reserve0, uint112 reserve1);
+        event Sync(uint256 reserve0, uint256 reserve1);
         function token0() external view returns (address);
         function token1() external view returns (address);
         function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
@@ -141,187 +141,339 @@ impl AerodromeV2Pool {
     /// Calculates the amount received for a given `amount_in` `reserve_in` and `reserve_out`
     /// for volatile pools using the standard constant product formula.
     ///
-    /// Formula: `output = (input * reserveOut) / (reserveIn + input)`
+    /// Matches Aerodrome Pool.sol implementation:
+    /// ```solidity
+    /// amountIn -= (amountIn * fee) / 10000;
+    /// return (amountIn * reserveB) / (reserveA + amountIn);
+    /// ```
     pub fn get_amount_out_volatile(&self, amount_in: U256, reserve_in: U256, reserve_out: U256) -> U256 {
         if amount_in.is_zero() || reserve_in.is_zero() || reserve_out.is_zero() {
             return U256::ZERO;
         }
 
-        // Fee is in hundredths of a bip (1e10 as base)
-        let fee = U256::from(100000u64) - U256::from(self.fee);
-        let amount_in_with_fee = amount_in * fee;
-        let numerator = amount_in_with_fee * reserve_out;
-        let denominator = reserve_in * U256::from(100000u64) + amount_in_with_fee;
+        // Fee is in hundredths of a percent (base 10000)
+        // Stable: 5 (0.05%), Volatile: 30 (0.3%)
+        let fee_amount = (amount_in * U256::from(self.fee)) / U256::from(10000u64);
 
-        numerator / denominator
+        // Deduct fee BEFORE swap calculation (matching Solidity)
+        let amount_in_after_fee = amount_in - fee_amount;
+
+        // Standard constant product formula: output = (input * reserveOut) / (reserveIn + input)
+        (amount_in_after_fee * reserve_out) / (reserve_in + amount_in_after_fee)
     }
 
     /// Calculates the amount received for a given `amount_in` for stable pools
-    /// using Curve-style StableSwap formula.
+    /// using the Aerodrome/Solidly formula: `x³y + y³x = k`
     ///
-    /// Formula: A·n^n·Σx_i + D = A·D·n^n + D^(n+1) / (n^n·Πx_i)
+    /// This matches the implementation in Aerodrome's Pool.sol contract.
+    /// Uses f64 for calculations to avoid U256 overflow issues.
     ///
-    /// For 2-token pools, this simplifies to finding y such that:
-    /// Amp * (x + y) + D = Amp * D + D² / (x * y)
-    ///
-    /// Uses Newton-Raphson iteration to solve for the output amount.
+    /// Fee is deducted BEFORE calculation, matching Solidity:
+    /// ```solidity
+    /// amountIn -= (amountIn * fee) / 10000;
+    /// ```
     pub fn get_amount_out_stable(&self, amount_in: U256, reserve_in: U256, reserve_out: U256) -> U256 {
         if amount_in.is_zero() || reserve_in.is_zero() || reserve_out.is_zero() {
             return U256::ZERO;
         }
 
-        // For Aerodrome V2 stable pools, use A = 100 (typical for 2-coin pools)
-        let amp = U256::from(100u64);
+        // Deduct fee BEFORE swap calculation (matching Solidity)
+        // Fee is in hundredths of a percent (base 10000)
+        let fee_amount = (amount_in * U256::from(self.fee)) / U256::from(10000u64);
+        let amount_in_after_fee = amount_in - fee_amount;
+
+        // Get decimals for both tokens
+        let decimals0 = self.token_a.decimals as f64;
+        let decimals1 = self.token_b.decimals as f64;
+
+        // Convert to f64 for calculation
+        let reserve_in_f = reserve_in.to::<u128>() as f64;
+        let reserve_out_f = reserve_out.to::<u128>() as f64;
+        let amount_in_f = amount_in_after_fee.to::<u128>() as f64;
+
+        // Normalize to 18 decimals (same as Solidity)
+        let precision = 1e18;
+        let x = reserve_in_f * precision / decimals0;
+        let y = reserve_out_f * precision / decimals1;
+
+        // Calculate K = (x³y + y³x) / 10³⁶
+        let xy = self.k_stable_f64(x, y);
+
+        // Add amount_in and normalize
+        let dx = amount_in_f * precision / decimals0;
+        let x0 = x + dx;
+
+        // Use Newton-Raphson iteration to find y_new such that: f(x0, y_new) = xy
+        let y_new = self.get_y_stable_f64(x0, xy, y);
+
+        // Calculate output amount
+        let dy = y - y_new;
+        if dy <= 0.0 {
+            return U256::ZERO;
+        }
+
+        // Denormalize to output token decimals
+        let y_out = dy * decimals1 / precision;
+
+        // Convert back to U256
+        if y_out < 0.0 || y_out >= (u128::MAX as f64) {
+            return U256::ZERO;
+        }
+
+        U256::from(y_out as u128)
+    }
+
+    /// Calculate K = (x³y + y³x) / 10³⁶ for stable pools (f64 version)
+    fn k_stable_f64(&self, x: f64, y: f64) -> f64 {
+        let precision = 1e18;
+
+        // _a = (x * y) / 1e18
+        let a = (x * y) / precision;
+
+        // _b = (x² / 1e18) + (y² / 1e18)
+        let x_squared = (x * x) / precision;
+        let y_squared = (y * y) / precision;
+        let b = x_squared + y_squared;
+
+        // K = (_a * _b) / 1e18 = (x³y + y³x) / 10³⁶
+        (a * b) / precision
+    }
+
+    /// Calculate K = (x³y + y³x) / 10³⁶ for stable pools
+    ///
+    /// From Aerodrome Pool.sol _k function:
+    /// ```solidity
+    /// uint256 _x = (x * 1e18) / decimals0;
+    /// uint256 _y = (y * 1e18) / decimals1;
+    /// uint256 _a = (_x * _y) / 1e18;
+    /// uint256 _b = ((_x * _x) / 1e18 + (_y * _y) / 1e18);
+    /// return (_a * _b) / 1e18; // x3y+y3x >= k
+    /// ```
+    fn k_stable(&self, x: U256, y: U256, decimals0: U256, decimals1: U256) -> U256 {
         let precision = U256::from(1_000_000_000_000_000_000u64); // 1e18
-        let a_precision = U256::from(100u64);
 
-        let n_coins = U256::from(2u64);
-        let ann = amp * n_coins; // A * n^n
+        // Normalize to 18 decimals
+        let x_norm = x * precision / decimals0;
+        let y_norm = y * precision / decimals1;
 
-        // Normalize reserves to 18 decimals for calculation
-        // Reserve values may have different decimals, so we work with them directly
-        let balances = [reserve_in, reserve_out];
+        tracing::trace!("k_stable: x_norm={}, y_norm={}", x_norm, y_norm);
 
-        // Calculate D invariant
-        let d = match self.get_d_stable(&balances, ann, precision, a_precision, n_coins) {
-            Some(d) => d,
-            None => return U256::ZERO,
-        };
+        // _a = (x * y) / 1e18
+        let product = x_norm * y_norm;
+        let a = product / precision;
 
-        // Apply fee to input amount
-        let fee_multiplier = U256::from(100000u64) - U256::from(self.fee);
-        let dx = amount_in * fee_multiplier / U256::from(100000u64);
+        tracing::trace!("k_stable: product={}, a={}", product, a);
 
-        let x = reserve_in + dx;
+        // _b = (x² / 1e18) + (y² / 1e18)
+        let x_squared = x_norm * x_norm / precision;
+        let y_squared = y_norm * y_norm / precision;
+        let b = x_squared + y_squared;
 
-        // Calculate new y using get_y
-        let y = match self.get_y_stable(&balances, d, ann, x, precision, a_precision, n_coins) {
-            Some(y) => y,
-            None => return U256::ZERO,
-        };
+        tracing::trace!("k_stable: x_squared={}, y_squared={}, b={}", x_squared, y_squared, b);
 
-        // dy = old_y - new_y - 1 (rounding protection)
-        if reserve_out <= y {
-            return U256::ZERO;
-        }
-        let dy = reserve_out - y;
-        if dy.is_zero() {
-            return U256::ZERO;
-        }
-        let dy = dy - U256::from(1);
+        // K = (_a * _b) / 1e18 = (x³y + y³x) / 10³⁶
+        let ab = a * b;
+        let k = ab / precision;
 
-        dy
+        tracing::trace!("k_stable: ab={}, k={}", ab, k);
+
+        k
     }
 
-    /// Calculate D invariant for StableSwap (Newton-Raphson)
-    fn get_d_stable(
-        &self,
-        balances: &[U256; 2],
-        ann: U256,
-        precision: U256,
-        a_precision: U256,
-        n_coins: U256,
-    ) -> Option<U256> {
-        let s = balances[0] + balances[1];
-        if s.is_zero() {
-            return Some(U256::ZERO);
-        }
-
-        let mut d = s;
+    /// Calculate y using Newton-Raphson iteration for stable swap (f64 version)
+    fn get_y_stable_f64(&self, x0: f64, xy: f64, mut y: f64) -> f64 {
+        let precision = 1e18;
 
         for _ in 0..255 {
-            // D_P = D^(n+1) / (n^n * prod(x_i))
-            // For 2 coins: D_P = D³ / (4 * x0 * x1)
-            let d_p = if balances[0].is_zero() || balances[1].is_zero() {
-                return None;
-            } else {
-                let d_squared = d * d;
-                let divisor = balances[0] * balances[1] * n_coins;
-                if divisor.is_zero() {
-                    return None;
+            let k = self.f_stable_f64(x0, y);
+
+            if k < xy {
+                // Need to increase y
+                let d = self.d_stable_f64(x0, y);
+                if d == 0.0 {
+                    return y;
                 }
-                d_squared * d / divisor
-            };
-
-            let d_prev = d;
-
-            // d = (Ann * S / A_PRECISION + D_P * n) * D / ((Ann - A_PRECISION) * D / A_PRECISION + (n + 1) * D_P)
-            let numerator = (ann * s / a_precision + d_p * n_coins) * d;
-            let denominator = ((ann - a_precision) * d / a_precision) + (n_coins + U256::from(1)) * d_p;
-
-            if denominator.is_zero() {
-                return None;
-            }
-            d = numerator / denominator;
-
-            // Convergence check
-            let diff = if d > d_prev { d - d_prev } else { d_prev - d };
-            if diff <= U256::from(1) {
-                return Some(d);
+                let dy = ((xy - k) * precision) / d;
+                if dy == 0.0 {
+                    if (k - xy).abs() < 1.0 {
+                        return y;
+                    }
+                    if self.f_stable_f64(x0, y + 1.0) > xy {
+                        return y + 1.0;
+                    }
+                    y += 1.0;
+                } else {
+                    y += dy;
+                }
+            } else {
+                // Need to decrease y
+                let d = self.d_stable_f64(x0, y);
+                if d == 0.0 {
+                    return y;
+                }
+                let dy = ((k - xy) * precision) / d;
+                if dy == 0.0 {
+                    if (k - xy).abs() < 1.0 || self.f_stable_f64(x0, y - 1.0) < xy {
+                        return y;
+                    }
+                    if y > 1.0 {
+                        y -= 1.0;
+                    }
+                } else {
+                    if y > dy {
+                        y -= dy;
+                    } else {
+                        return y;
+                    }
+                }
             }
         }
 
-        None
+        y
     }
 
-    /// Calculate y (new balance of output token) for StableSwap
-    fn get_y_stable(
-        &self,
-        balances: &[U256; 2],
-        d: U256,
-        ann: U256,
-        x: U256,
-        precision: U256,
-        a_precision: U256,
-        n_coins: U256,
-    ) -> Option<U256> {
-        // For 2-token pool swapping token 0 -> token 1:
-        // c = D³ / (4 * x * n)
-        // s = x (sum of all balances except output token)
-        // y = (y² + c) / (2y + b - D) where b = s + D * A_PRECISION / Ann
+    /// f(x, y) = (x³y + y³x) / 10³⁶ for Newton-Raphson iteration (f64 version)
+    fn f_stable_f64(&self, x0: f64, y: f64) -> f64 {
+        let precision = 1e18;
 
-        if ann.is_zero() {
-            return None;
-        }
+        let a = (x0 * y) / precision;
+        let x0_squared = (x0 * x0) / precision;
+        let y_squared = (y * y) / precision;
+        let b = x0_squared + y_squared;
 
-        // c = D^(n+1) / (n^n * prod(x_k for k != j))
-        // For 2 coins: c = D³ / (4 * x * 2) = D³ / (8x)
-        // Actually: c = D * D / (n_coins * x) * D * A_PRECISION / (Ann * n_coins)
-        // Simplified: c = D³ * A_PRECISION / (4 * Ann * x)
-        let c = {
-            let d_squared = d * d;
-            let numerator = d_squared * d * a_precision;
-            let divisor = x * ann * n_coins;
-            if divisor.is_zero() {
-                return None;
-            }
-            numerator / divisor
-        };
+        (a * b) / precision
+    }
 
-        let s = x; // sum of balances except output token (which is just x for 2-token pool)
-        let b = s + d * a_precision / ann;
+    /// Derivative of f for Newton-Raphson: f'(x, y) = 3xy² + x³ (f64 version)
+    fn d_stable_f64(&self, x0: f64, y: f64) -> f64 {
+        let precision = 1e18;
 
-        let mut y = d;
+        let y_squared = (y * y) / precision;
+        let term1 = (3.0 * x0 * y_squared) / precision;
+
+        let x0_squared = (x0 * x0) / precision;
+        let term2 = (x0_squared * x0) / precision;
+
+        term1 + term2
+    }
+
+    /// Calculate y using Newton-Raphson iteration for stable swap
+    ///
+    /// From Aerodrome Pool.sol _get_y function
+    fn get_y_stable(&self, x0: U256, xy: U256, mut y: U256) -> U256 {
+        let precision = U256::from(1_000_000_000_000_000_000u64); // 1e18
 
         for _ in 0..255 {
-            let y_prev = y;
+            let k = self.f_stable(x0, y);
 
-            // y = (y² + c) / (2y + b - d)
-            let numerator = y * y + c;
-            let denominator = y * U256::from(2) + b - d;
-
-            if denominator.is_zero() {
-                return None;
+            // Safety check: if k overflowed (is very large), return early
+            if k > xy && k > U256::from(10).pow(U256::from(36).into()) {
+                // Something went wrong, return a reasonable approximation
+                return xy * y / (x0 + y);
             }
-            y = numerator / denominator;
 
-            let diff = if y > y_prev { y - y_prev } else { y_prev - y };
-            if diff <= U256::from(1) {
-                return Some(y);
+            if k < xy {
+                // Need to increase y
+                let d = self.d_stable(x0, y);
+                if d.is_zero() {
+                    return y;
+                }
+                let dy = ((xy - k) * precision) / d;
+                let dy = if dy.is_zero() {
+                    if k == xy {
+                        return y;
+                    }
+                    if self.f_stable(x0, y + U256::from(1)) > xy {
+                        return y + U256::from(1);
+                    }
+                    U256::from(1)
+                } else {
+                    dy
+                };
+                y = y.saturating_add(dy);
+            } else {
+                // Need to decrease y
+                let d = self.d_stable(x0, y);
+                if d.is_zero() {
+                    return y;
+                }
+                let dy = ((k - xy) * precision) / d;
+                let dy = if dy.is_zero() {
+                    if k == xy || self.f_stable(x0, y.saturating_sub(U256::from(1))) < xy {
+                        return y;
+                    }
+                    U256::from(1)
+                } else {
+                    dy
+                };
+                if y > dy {
+                    y = y - dy;
+                } else {
+                    return y;
+                }
             }
         }
 
-        None
+        y
+    }
+
+    /// f(x, y) = (x³y + y³x) / 10³⁶ for Newton-Raphson iteration
+    ///
+    /// From Aerodrome Pool.sol _f function:
+    /// ```solidity
+    /// uint256 _a = (x0 * y) / 1e18;
+    /// uint256 _b = ((x0 * x0) / 1e18 + (y * y) / 1e18);
+    /// return (_a * _b) / 1e18;
+    /// ```
+    fn f_stable(&self, x0: U256, y: U256) -> U256 {
+        let precision = U256::from(1_000_000_000_000_000_000u64); // 1e18
+
+        // Check for overflow before multiplication
+        // x0 * y can overflow if both are large
+        let product = match x0.checked_mul(y) {
+            Some(p) => p,
+            None => return U256::MAX, // Signal overflow
+        };
+        let a = product / precision;
+
+        // x0² can overflow
+        let x0_squared = match x0.checked_mul(x0) {
+            Some(s) => s / precision,
+            None => return U256::MAX,
+        };
+
+        // y² can overflow
+        let y_squared = match y.checked_mul(y) {
+            Some(s) => s / precision,
+            None => return U256::MAX,
+        };
+
+        let b = x0_squared + y_squared;
+
+        // a * b can overflow
+        match a.checked_mul(b) {
+            Some(p) => p / precision,
+            None => U256::MAX,
+        }
+    }
+
+    /// Derivative of f for Newton-Raphson: f'(x, y) = 3xy² + x³
+    ///
+    /// From Aerodrome Pool.sol _d function:
+    /// ```solidity
+    /// return (3 * x0 * ((y * y) / 1e18)) / 1e18 + ((((x0 * x0) / 1e18) * x0) / 1e18);
+    /// ```
+    fn d_stable(&self, x0: U256, y: U256) -> U256 {
+        let precision = U256::from(1_000_000_000_000_000_000u64); // 1e18
+
+        let y_squared = y.checked_mul(y).map_or(U256::MAX, |s| s / precision);
+        let term1 = U256::from(3u64) * x0;
+        let term1 = term1.checked_mul(y_squared).map_or(U256::MAX, |t| t / precision);
+
+        let x0_squared = x0.checked_mul(x0).map_or(U256::MAX, |s| s / precision);
+        let term2 = x0_squared.checked_mul(x0).map_or(U256::MAX, |t| t / precision);
+
+        term1.saturating_add(term2)
     }
 
     /// Get amount out based on pool type (volatile or stable)
@@ -454,8 +606,25 @@ impl AutomatedMarketMaker for AerodromeV2Pool {
                 U256::from(self.reserve_1),
             );
 
-            self.reserve_0 += amount_in.to::<u128>();
-            self.reserve_1 -= amount_out.to::<u128>();
+            let amount_in_u128 = amount_in.try_into().map_err(|_| {
+                AMMError::Msg("simulate_swap_mut: amount_in overflow to u128".to_string())
+            })?;
+            let amount_out_u128 = amount_out.try_into().map_err(|_| {
+                AMMError::Msg("simulate_swap_mut: amount_out overflow to u128".to_string())
+            })?;
+
+            self.reserve_0 = self
+                .reserve_0
+                .checked_add(amount_in_u128)
+                .ok_or(AMMError::Msg(
+                    "simulate_swap_mut: reserve_0 overflow".to_string(),
+                ))?;
+            self.reserve_1 = self
+                .reserve_1
+                .checked_sub(amount_out_u128)
+                .ok_or(AMMError::Msg(
+                    "simulate_swap_mut: reserve_1 underflow".to_string(),
+                ))?;
 
             Ok(amount_out)
         } else {
@@ -465,8 +634,25 @@ impl AutomatedMarketMaker for AerodromeV2Pool {
                 U256::from(self.reserve_0),
             );
 
-            self.reserve_0 -= amount_out.to::<u128>();
-            self.reserve_1 += amount_in.to::<u128>();
+            let amount_in_u128 = amount_in.try_into().map_err(|_| {
+                AMMError::Msg("simulate_swap_mut: amount_in overflow to u128".to_string())
+            })?;
+            let amount_out_u128 = amount_out.try_into().map_err(|_| {
+                AMMError::Msg("simulate_swap_mut: amount_out overflow to u128".to_string())
+            })?;
+
+            self.reserve_0 = self
+                .reserve_0
+                .checked_sub(amount_out_u128)
+                .ok_or(AMMError::Msg(
+                    "simulate_swap_mut: reserve_0 underflow".to_string(),
+                ))?;
+            self.reserve_1 = self
+                .reserve_1
+                .checked_add(amount_in_u128)
+                .ok_or(AMMError::Msg(
+                    "simulate_swap_mut: reserve_1 overflow".to_string(),
+                ))?;
 
             Ok(amount_out)
         }
@@ -553,6 +739,11 @@ impl AutomatedMarketMaker for AerodromeV2Pool {
         }
     }
 
+    /// Aerodrome V2 is only deployed on Base chain (chain ID: 8453)
+    fn supported_chains(&self) -> Option<Vec<u64>> {
+        Some(vec![8453]) // Base mainnet
+    }
+
     async fn init<N, P>(mut self, block_number: BlockId, provider: P) -> Result<Self, AMMError>
     where
         N: Network,
@@ -564,20 +755,20 @@ impl AutomatedMarketMaker for AerodromeV2Pool {
         let metadata = pool.metadata().call().block(block_number).await?;
         self.stable = metadata.st;
 
-        // Fetch tokens
-        self.token_a = Token::new(pool.token0().call().await?, provider.clone()).await?;
-        self.token_b = Token::new(pool.token1().call().await?, provider.clone()).await?;
+        // Fetch tokens (use block_number for token queries too)
+        self.token_a = Token::new(pool.token0().call().block(block_number).await?, provider.clone()).await?;
+        self.token_b = Token::new(pool.token1().call().block(block_number).await?, provider.clone()).await?;
 
-        // Fetch reserves
-        let reserves = pool.getReserves().call().await?;
+        // Fetch reserves at the specified block
+        let reserves = pool.getReserves().call().block(block_number).await?;
         self.reserve_0 = reserves.reserve0.to::<u128>();
         self.reserve_1 = reserves.reserve1.to::<u128>();
 
-        // Set default fee for Aerodrome V2
-        // Volatile pools: 0.05% (500 in hundredths of a bip)
-        // Stable pools: 0.01% (100 in hundredths of a bip)
-        // Note: These can be overridden by governance, but these are the standard defaults
-        self.fee = if self.stable { 100 } else { 500 };
+        // Set default fee for Aerodrome V2 (from PoolFactory.sol)
+        // Fee is in hundredths of a percent (base 10000)
+        // Volatile pools: 30 (0.3%)
+        // Stable pools: 5 (0.05%)
+        self.fee = if self.stable { 5 } else { 30 };
 
         tracing::trace!(
             target = "amms::aerodrome_v2::init",

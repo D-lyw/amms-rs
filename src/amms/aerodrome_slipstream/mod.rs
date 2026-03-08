@@ -16,6 +16,9 @@
 pub mod factory;
 pub mod pool;
 
+#[cfg(test)]
+mod test_sync_drift;
+
 // Re-export main types
 pub use factory::{AerodromeSlipstreamFactoryConfig, get_tick_spacing};
-pub use pool::{AerodromeSlipstreamFactory, AerodromeSlipstreamPool, TickInfo, CurrentState, StepComputations};
+pub use pool::{AerodromeSlipstreamFactory, AerodromeSlipstreamPool, TickInfo, CurrentState, StepComputations, ICLPool, ICLPoolEvents, ICLPoolFactory, ICustomFeeModule};
