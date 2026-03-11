@@ -1437,3 +1437,6 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod test_sync_drift;
