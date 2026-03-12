@@ -1,6 +1,6 @@
 use alloy::eips::BlockId;
 use alloy::network::Network;
-use alloy::primitives::Address;
+use alloy::primitives::{Address, B256, U256};
 use alloy::providers::Provider;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -15,10 +15,32 @@ use crate::amms::balancer_v2::BalancerV2Pool;
 use crate::amms::balancer_v3::BalancerV3Pool;
 use crate::amms::curve_ng::{ICurveNGPool, ICurveNGStableSwap, ICurveTriCrypto, ICurveTwoCrypto};
 use crate::amms::factory::Factory;
-use crate::amms::fluid_dex::{DexReservesResolver, TokenLimitData};
+use crate::amms::fluid_dex::{DexReservesResolver, FluidDexT1, FluidLiquidity, TokenLimitData, FLUID_DEX_RESOLVER};
 use crate::state_space::StateSpace;
 
-const FLUID_DEX_RESOLVER: &str = "0xC93876C0EEd99645DD53937b25433e311881A27C";
+fn mask(bits: u32) -> U256 {
+    if bits == 256 {
+        return U256::MAX;
+    }
+    (U256::ONE << bits) - U256::ONE
+}
+
+fn from_big_number(value: U256) -> U256 {
+    let exponent_mask = U256::from(0xFFu64);
+    let exponent = (value & exponent_mask).to::<u64>();
+    let coefficient = value >> 8;
+    coefficient << exponent
+}
+
+fn decode_price_from_dex_variables(dex_variables: U256, shift: u32) -> U256 {
+    let x40 = U256::MAX >> 216;
+    let raw = (dex_variables >> shift) & x40;
+    from_big_number(raw)
+}
+
+fn decode_liquidity_utilization(exchange_price_word: U256) -> U256 {
+    (exchange_price_word >> 30u32) & mask(14)
+}
 
 /// Periodically syncs a subset of AMMs (round-robin) to ensure they are up-to-date with the latest block.
 pub async fn start_state_maintenance_task<N, P>(
@@ -662,7 +684,7 @@ pub async fn start_fluid_dex_limits_sync_task<N, P>(
     N: Network,
     P: Provider<N> + Clone + 'static,
 {
-    let resolver_address: Address = FLUID_DEX_RESOLVER.parse().unwrap_or(Address::ZERO);
+    let resolver_address = FLUID_DEX_RESOLVER;
     let resolver = DexReservesResolver::new(resolver_address, provider.clone());
 
     loop {
@@ -710,6 +732,7 @@ pub async fn start_fluid_dex_limits_sync_task<N, P>(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        let block_timestamp = current_time;
 
         // 3. Update state
         let mut updated_count = 0;
@@ -763,6 +786,79 @@ pub async fn start_fluid_dex_limits_sync_task<N, P>(
                         expands_to: pr.limits.borrowableToken1.expandsTo,
                         expand_duration: pr.limits.borrowableToken1.expandDuration.to::<u64>(),
                     };
+
+                    let dex = FluidDexT1::new(pool.address, provider.clone());
+                    let dex_variables = dex
+                        .readFromStorage(B256::from(U256::from(0u64)))
+                        .call()
+                        .await
+                        .unwrap_or(U256::ZERO);
+                    let dex_variables2 = dex
+                        .readFromStorage(B256::from(U256::from(1u64)))
+                        .call()
+                        .await
+                        .unwrap_or(U256::ZERO);
+                    pool.range_shift = dex
+                        .readFromStorage(B256::from(U256::from(7u64)))
+                        .call()
+                        .await
+                        .unwrap_or(U256::ZERO);
+                    pool.threshold_shift = dex
+                        .readFromStorage(B256::from(U256::from(8u64)))
+                        .call()
+                        .await
+                        .unwrap_or(U256::ZERO);
+                    pool.center_price_shift = dex
+                        .readFromStorage(B256::from(U256::from(9u64)))
+                        .call()
+                        .await
+                        .unwrap_or(U256::ZERO);
+                    let fee_1e4 = u32::try_from((dex_variables2 >> 2u32) & mask(17)).unwrap_or(0);
+                    let revenue_cut_percent: U256 = (dex_variables2 >> 19u32) & mask(7);
+                    let revenue_cut = U256::from(100_000_000u64)
+                        .saturating_sub(revenue_cut_percent.saturating_mul(U256::from(fee_1e4)));
+                    pool.fee_1e6 = fee_1e4;
+                    pool.revenue_cut_1e8 = if revenue_cut.is_zero() {
+                        U256::from(100_000_000u64)
+                    } else {
+                        revenue_cut
+                    };
+                    pool.is_swap_paused = ((dex_variables2 >> 255) & U256::ONE) == U256::ONE;
+                    pool.is_smart_collateral_enabled = (dex_variables2 & U256::ONE) == U256::ONE;
+                    pool.is_smart_debt_enabled = ((dex_variables2 >> 1) & U256::ONE) == U256::ONE;
+                    pool.utilization_limit_token0 = (dex_variables2 >> 228u32) & mask(10);
+                    pool.utilization_limit_token1 = (dex_variables2 >> 238u32) & mask(10);
+                    pool.older_price_1e27 = decode_price_from_dex_variables(dex_variables, 1);
+                    pool.last_stored_price_1e27 = decode_price_from_dex_variables(dex_variables, 41);
+                    pool.last_center_price_1e27 = decode_price_from_dex_variables(dex_variables, 81);
+                    pool.last_swap_timestamp = ((dex_variables >> 121u32) & mask(33)).to::<u64>();
+                    pool.last_synced_block_timestamp = block_timestamp;
+                    let _ = pool
+                        .update_center_price_from_chain::<N, _>(
+                            dex_variables,
+                            dex_variables2,
+                            provider.clone(),
+                            alloy::eips::BlockId::latest(),
+                            block_timestamp,
+                        )
+                        .await;
+                    pool.compute_ranges_from_dex(dex_variables, dex_variables2, block_timestamp);
+
+                    if !pool.liquidity_address.is_zero() {
+                        let liquidity = FluidLiquidity::new(pool.liquidity_address, provider.clone());
+                        let exchange_price_token0 = liquidity
+                            .readFromStorage(pool.exchange_price_token0_slot)
+                            .call()
+                            .await
+                            .unwrap_or(U256::ZERO);
+                        let exchange_price_token1 = liquidity
+                            .readFromStorage(pool.exchange_price_token1_slot)
+                            .call()
+                            .await
+                            .unwrap_or(U256::ZERO);
+                        pool.token0_utilization = decode_liquidity_utilization(exchange_price_token0);
+                        pool.token1_utilization = decode_liquidity_utilization(exchange_price_token1);
+                    }
 
                     pool.limits_sync_time = current_time;
                     updated_count += 1;

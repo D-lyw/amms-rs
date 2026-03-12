@@ -7,8 +7,9 @@ use super::{
     get_token_decimals, Token, IERC20,
 };
 use alloy::{
+    consensus::BlockHeader,
     eips::BlockId,
-    network::Network,
+    network::{BlockResponse, Network},
     primitives::{address, Address, B256, I256, U256},
     providers::Provider,
     rpc::types::Log,
@@ -20,11 +21,12 @@ use futures::{stream::FuturesUnordered, StreamExt};
 use rug::ops::Pow;
 use rug::Float;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, future::Future, hash::Hash, str::FromStr};
+use std::{collections::HashMap, future::Future, hash::Hash};
 
-// Address is consistent across Mainnet, Arbitrum, Base, Polygon, Plasma, etc. (Instadapp Fluid uses CREATE2)
+// Addresses are consistent across Mainnet, Arbitrum, Base, Polygon, Plasma, etc. (Instadapp Fluid uses CREATE2)
 // https://github.com/Instadapp/fluid-contracts-public/blob/main/deployments/deployments.md
 pub const FLUID_LIQUIDITY_LAYER: Address = address!("52Aa899454998Be5b000Ad077a46Bbe360F4e497");
+pub const FLUID_DEX_RESOLVER: Address = address!("05Bd8269A20C472b148246De20E6852091BF16Ff");
 
 pub const FLUID_NATIVE_ETH: Address = address!("EeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE");
 
@@ -78,6 +80,38 @@ sol! {
         DexLimits limits;
     }
 
+    struct Implementations {
+        address shift;
+        address admin;
+        address colOperations;
+        address debtOperations;
+        address perfectOperationsAndSwapOut;
+    }
+
+    struct ConstantViews {
+        uint256 dexId;
+        address liquidity;
+        address factory;
+        Implementations implementations;
+        address deployerContract;
+        address token0;
+        address token1;
+        bytes32 supplyToken0Slot;
+        bytes32 borrowToken0Slot;
+        bytes32 supplyToken1Slot;
+        bytes32 borrowToken1Slot;
+        bytes32 exchangePriceToken0Slot;
+        bytes32 exchangePriceToken1Slot;
+        uint256 oracleMapping;
+    }
+
+    struct ConstantViews2 {
+        uint256 token0NumeratorPrecision;
+        uint256 token0DenominatorPrecision;
+        uint256 token1NumeratorPrecision;
+        uint256 token1DenominatorPrecision;
+    }
+
     #[sol(rpc)]
     contract DexReservesResolver {
         function getPoolAddress(uint256 poolId_) external view returns (address pool_);
@@ -93,6 +127,19 @@ sol! {
     contract FluidDexT1 {
         event Swap(bool swap0to1, uint256 amountIn, uint256 amountOut, address to);
         function swap(bool swap0to1, uint256 amountIn, uint256 amountOutMin, address to, uint256 deadline) external returns (uint256 amountOut);
+        function readFromStorage(bytes32 slot_) external view returns (uint256 result_);
+        function constantsView() external view returns (ConstantViews memory constantsView_);
+        function constantsView2() external view returns (ConstantViews2 memory constantsView2_);
+    }
+
+    #[sol(rpc)]
+    contract ICenterPrice {
+        function centerPrice() external returns (uint256 price);
+    }
+
+    #[sol(rpc)]
+    contract FluidLiquidity {
+        function readFromStorage(bytes32 slot_) external view returns (uint256 result_);
     }
 }
 
@@ -120,6 +167,58 @@ fn unscale_from_1e12(amount_1e12: U256, decimals: u8) -> U256 {
     amount_1e12.saturating_mul(mul)
 }
 
+fn address_calc(deployed_from: Address, nonce: U256) -> Address {
+    if nonce.is_zero() {
+        return Address::ZERO;
+    }
+    let nonce_u64 = nonce.to::<u64>();
+    let mut data: Vec<u8> = Vec::with_capacity(30);
+    let from_bytes = deployed_from.as_slice();
+    if nonce_u64 <= 0x7f {
+        data.extend_from_slice(&[0xd6, 0x94]);
+        data.extend_from_slice(from_bytes);
+        data.push(nonce_u64 as u8);
+    } else if nonce_u64 <= 0xff {
+        data.extend_from_slice(&[0xd7, 0x94]);
+        data.extend_from_slice(from_bytes);
+        data.extend_from_slice(&[0x81, nonce_u64 as u8]);
+    } else if nonce_u64 <= 0xffff {
+        data.extend_from_slice(&[0xd8, 0x94]);
+        data.extend_from_slice(from_bytes);
+        data.push(0x82);
+        data.extend_from_slice(&(nonce_u64 as u16).to_be_bytes());
+    } else if nonce_u64 <= 0xffffff {
+        data.extend_from_slice(&[0xd9, 0x94]);
+        data.extend_from_slice(from_bytes);
+        data.push(0x83);
+        let n = nonce_u64 as u32;
+        data.extend_from_slice(&[(n >> 16) as u8, (n >> 8) as u8, n as u8]);
+    } else {
+        data.extend_from_slice(&[0xda, 0x94]);
+        data.extend_from_slice(from_bytes);
+        data.push(0x84);
+        data.extend_from_slice(&(nonce_u64 as u32).to_be_bytes());
+    }
+    let hash = alloy::primitives::keccak256(data);
+    Address::from_slice(&hash.as_slice()[12..])
+}
+
+async fn fetch_block_timestamp<N, P>(provider: P, block_id: BlockId) -> u64
+where
+    N: Network,
+    N::BlockResponse: BlockResponse,
+    <N::BlockResponse as BlockResponse>::Header: BlockHeader,
+    P: Provider<N> + Clone,
+{
+    if let Ok(Some(block)) = provider.get_block(block_id).await {
+        return block.header().timestamp();
+    }
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 fn calc_amount_out(amount_in: U256, reserve_in: U256, reserve_out: U256, fee_1e6: U256) -> U256 {
     if amount_in.is_zero() || reserve_in.is_zero() || reserve_out.is_zero() {
         return U256::ZERO;
@@ -129,6 +228,43 @@ fn calc_amount_out(amount_in: U256, reserve_in: U256, reserve_out: U256, fee_1e6
     let amount_in_with_fee = amount_in.saturating_mul(fee_multiplier) / one;
     (amount_in_with_fee.saturating_mul(reserve_out))
         / (reserve_in.saturating_add(amount_in_with_fee))
+}
+
+fn mask(bits: u32) -> U256 {
+    if bits == 256 {
+        return U256::MAX;
+    }
+    (U256::ONE << bits) - U256::ONE
+}
+
+fn from_big_number(value: U256) -> U256 {
+    let exponent_mask = U256::from(0xFFu64);
+    let exponent = (value & exponent_mask).to::<u64>();
+    let coefficient = value >> 8;
+    coefficient << exponent
+}
+
+fn decode_price_from_dex_variables(dex_variables: U256, shift: u32) -> U256 {
+    let x40 = U256::MAX >> 216;
+    let raw = (dex_variables >> shift) & x40;
+    from_big_number(raw)
+}
+
+fn decode_liquidity_utilization(exchange_price_word: U256) -> U256 {
+    (exchange_price_word >> 30u32) & mask(14)
+}
+
+fn price_diff_check(old_price: U256, new_price: U256) -> bool {
+    if old_price.is_zero() || new_price.is_zero() {
+        return false;
+    }
+    let oracle_precision = U256::from(10u64).pow(U256::from(18u64));
+    let oracle_limit = U256::from(5u64) * U256::from(10u64).pow(U256::from(16u64));
+    let ratio = old_price.saturating_mul(oracle_precision) / new_price;
+    let diff = I256::try_from(oracle_precision).unwrap_or(I256::MAX)
+        - I256::try_from(ratio).unwrap_or(I256::MAX);
+    let limit = I256::try_from(oracle_limit).unwrap_or(I256::MAX);
+    diff <= limit && diff >= -limit
 }
 
 /// Integer square root using Newton's method
@@ -189,6 +325,17 @@ impl TokenLimitData {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SwapCalc {
+    amount_out: U256,
+    amount_out_1e12: U256,
+    amount_in_col_net: U256,
+    amount_out_col: U256,
+    amount_in_debt_net: U256,
+    amount_out_debt: U256,
+    swap0to1: bool,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FluidDexPool {
     pub address: Address,
@@ -200,6 +347,20 @@ pub struct FluidDexPool {
     pub fee_1e6: u32,
     #[serde(default)]
     pub center_price_1e27: U256,
+    #[serde(default)]
+    pub last_stored_price_1e27: U256,
+    #[serde(default)]
+    pub upper_range_1e27: U256,
+    #[serde(default)]
+    pub lower_range_1e27: U256,
+    #[serde(default)]
+    pub upper_range_pct_1e6: U256,
+    #[serde(default)]
+    pub lower_range_pct_1e6: U256,
+    #[serde(default)]
+    pub upper_threshold_pct_1e3: U256,
+    #[serde(default)]
+    pub lower_threshold_pct_1e3: U256,
     #[serde(default)]
     pub token0_real_reserves_1e12: U256,
     #[serde(default)]
@@ -243,6 +404,44 @@ pub struct FluidDexPool {
     pub token_a_price: f64,
     #[serde(default)]
     pub token_b_price: f64,
+    #[serde(default)]
+    pub revenue_cut_1e8: U256,
+    #[serde(default)]
+    pub is_swap_paused: bool,
+    #[serde(default)]
+    pub is_smart_collateral_enabled: bool,
+    #[serde(default)]
+    pub is_smart_debt_enabled: bool,
+    #[serde(default)]
+    pub liquidity_address: Address,
+    #[serde(default)]
+    pub deployer_contract: Address,
+    #[serde(default)]
+    pub exchange_price_token0_slot: B256,
+    #[serde(default)]
+    pub exchange_price_token1_slot: B256,
+    #[serde(default)]
+    pub token0_utilization: U256,
+    #[serde(default)]
+    pub token1_utilization: U256,
+    #[serde(default)]
+    pub utilization_limit_token0: U256,
+    #[serde(default)]
+    pub utilization_limit_token1: U256,
+    #[serde(default)]
+    pub last_swap_timestamp: u64,
+    #[serde(default)]
+    pub last_synced_block_timestamp: u64,
+    #[serde(default)]
+    pub older_price_1e27: U256,
+    #[serde(default)]
+    pub last_center_price_1e27: U256,
+    #[serde(default)]
+    pub range_shift: U256,
+    #[serde(default)]
+    pub threshold_shift: U256,
+    #[serde(default)]
+    pub center_price_shift: U256,
     #[serde(skip)]
     pub reserves_resolver: Address,
 }
@@ -289,6 +488,272 @@ impl FluidDexPool {
         }
     }
 
+    fn calc_shifting_done(current: U256, old: U256, time_passed: u64, shift_duration: u64) -> U256 {
+        if shift_duration == 0 {
+            return current;
+        }
+        if time_passed >= shift_duration {
+            return current;
+        }
+        if current >= old {
+            let diff = current - old;
+            old + (diff * U256::from(time_passed) / U256::from(shift_duration))
+        } else {
+            let diff = old - current;
+            old - (diff * U256::from(time_passed) / U256::from(shift_duration))
+        }
+    }
+
+    fn apply_range_shift(&self, upper_pct: U256, lower_pct: U256, now_ts: u64) -> (U256, U256) {
+        let active = ((self.range_shift >> 60u32) & mask(33)).to::<u64>() != 0;
+        if !active {
+            return (upper_pct, lower_pct);
+        }
+        let old_upper = self.range_shift & mask(20);
+        let old_lower = (self.range_shift >> 20u32) & mask(20);
+        let duration = ((self.range_shift >> 40u32) & mask(20)).to::<u64>();
+        let start = ((self.range_shift >> 60u32) & mask(33)).to::<u64>();
+        if start.saturating_add(duration) < now_ts {
+            return (upper_pct, lower_pct);
+        }
+        let time_passed = now_ts.saturating_sub(start);
+        (
+            Self::calc_shifting_done(upper_pct, old_upper, time_passed, duration),
+            Self::calc_shifting_done(lower_pct, old_lower, time_passed, duration),
+        )
+    }
+
+    fn apply_threshold_shift(
+        &self,
+        upper_threshold: U256,
+        lower_threshold: U256,
+        threshold_time: U256,
+        now_ts: u64,
+    ) -> (U256, U256, U256) {
+        let active = ((self.threshold_shift >> 60u32) & mask(33)).to::<u64>() != 0;
+        if !active {
+            return (upper_threshold, lower_threshold, threshold_time);
+        }
+        let old_upper = self.threshold_shift & mask(10);
+        let old_lower = (self.threshold_shift >> 20u32) & mask(10);
+        let duration = ((self.threshold_shift >> 40u32) & mask(20)).to::<u64>();
+        let start = ((self.threshold_shift >> 60u32) & mask(33)).to::<u64>();
+        let old_threshold_time = (self.threshold_shift >> 93u32) & mask(24);
+        if start.saturating_add(duration) < now_ts {
+            return (upper_threshold, lower_threshold, threshold_time);
+        }
+        let time_passed = now_ts.saturating_sub(start);
+        (
+            Self::calc_shifting_done(upper_threshold, old_upper, time_passed, duration),
+            Self::calc_shifting_done(lower_threshold, old_lower, time_passed, duration),
+            Self::calc_shifting_done(threshold_time, old_threshold_time, time_passed, duration),
+        )
+    }
+
+    pub(crate) async fn update_center_price_from_chain<N, P>(
+        &mut self,
+        dex_variables: U256,
+        dex_variables2: U256,
+        provider: P,
+        block_number: BlockId,
+        now_ts: u64,
+    ) -> Result<(), AMMError>
+    where
+        N: Network,
+        P: Provider<N> + Clone,
+    {
+        let center_price_nonce = (dex_variables2 >> 112u32) & mask(30);
+        let shift_active = ((dex_variables2 >> 248u32) & U256::ONE) == U256::ONE;
+        let old_center = decode_price_from_dex_variables(dex_variables, 81);
+
+        if center_price_nonce.is_zero() {
+            if !shift_active && !old_center.is_zero() {
+                self.center_price_1e27 = old_center;
+            }
+            return Ok(());
+        }
+        if self.deployer_contract.is_zero() {
+            return Ok(());
+        }
+
+        let hook_address = address_calc(self.deployer_contract, center_price_nonce);
+        if hook_address.is_zero() {
+            return Ok(());
+        }
+
+        let hook = ICenterPrice::new(hook_address, provider.clone());
+        let external_price = hook
+            .centerPrice()
+            .block(block_number)
+            .call()
+            .await
+            .unwrap_or(U256::ZERO);
+        if external_price.is_zero() {
+            return Ok(());
+        }
+
+        if !shift_active {
+            self.center_price_1e27 = external_price;
+            return Ok(());
+        }
+
+        let start = (self.center_price_shift & mask(33)).to::<u64>();
+        let percent = (self.center_price_shift >> 33u32) & mask(20);
+        let shift_time = (self.center_price_shift >> 53u32) & mask(20);
+        if shift_time.is_zero() {
+            self.center_price_1e27 = external_price;
+            return Ok(());
+        }
+        let from_ts = std::cmp::max(self.last_swap_timestamp, start);
+        let elapsed = now_ts.saturating_sub(from_ts);
+        let price_shift = old_center
+            .saturating_mul(percent)
+            .saturating_mul(U256::from(elapsed))
+            / (shift_time.saturating_mul(U256::from(1_000_000u64)));
+
+        let mut new_center = external_price;
+        let mut shift_done = false;
+        if external_price > old_center {
+            let shifted = old_center.saturating_add(price_shift);
+            if external_price > shifted {
+                new_center = shifted;
+            } else {
+                shift_done = true;
+            }
+        } else {
+            let shifted = old_center.saturating_sub(price_shift);
+            if external_price < shifted {
+                new_center = shifted;
+            } else {
+                shift_done = true;
+            }
+        }
+
+        self.center_price_1e27 = new_center;
+        if shift_done {
+            self.center_price_shift = U256::ZERO;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn compute_ranges_from_dex(
+        &mut self,
+        dex_variables: U256,
+        dex_variables2: U256,
+        now_ts: u64,
+    ) {
+        let six_decimals = U256::from(1_000_000u64);
+        let three_decimals = U256::from(1_000u64);
+
+        let mut center_price = self.center_price_1e27;
+        let last_stored_price = self.last_stored_price_1e27;
+
+        let upper_pct_raw = (dex_variables2 >> 27u32) & mask(20);
+        let lower_pct_raw = (dex_variables2 >> 47u32) & mask(20);
+        let mut upper_pct = upper_pct_raw;
+        let mut lower_pct = lower_pct_raw;
+
+        if ((dex_variables2 >> 26u32) & U256::ONE) == U256::ONE {
+            let shifted = self.apply_range_shift(upper_pct, lower_pct, now_ts);
+            upper_pct = shifted.0;
+            lower_pct = shifted.1;
+        }
+
+        let mut upper_range = if upper_pct >= six_decimals {
+            U256::ZERO
+        } else {
+            (center_price * six_decimals) / (six_decimals - upper_pct)
+        };
+        let mut lower_range = (center_price * (six_decimals - lower_pct)) / six_decimals;
+
+        if ((dex_variables2 >> 68u32) & mask(20)) > U256::ZERO {
+            let mut upper_threshold = (dex_variables2 >> 68u32) & mask(10);
+            let mut lower_threshold = (dex_variables2 >> 78u32) & mask(10);
+            let mut threshold_time = (dex_variables2 >> 88u32) & mask(24);
+
+            if ((dex_variables2 >> 67u32) & U256::ONE) == U256::ONE {
+                let shifted =
+                    self.apply_threshold_shift(upper_threshold, lower_threshold, threshold_time, now_ts);
+                upper_threshold = shifted.0;
+                lower_threshold = shifted.1;
+                threshold_time = shifted.2;
+            }
+
+            let time_elapsed = now_ts.saturating_sub(self.last_swap_timestamp);
+            if last_stored_price
+                > center_price
+                    + ((upper_range - center_price)
+                        * (three_decimals - upper_threshold)
+                        / three_decimals)
+            {
+                if threshold_time > U256::ZERO {
+                    let shift_time = threshold_time.to::<u64>();
+                    if time_elapsed < shift_time {
+                        center_price = center_price
+                            + ((upper_range - center_price) * U256::from(time_elapsed)
+                                / U256::from(shift_time));
+                    } else {
+                        center_price = upper_range;
+                    }
+                }
+            } else if last_stored_price
+                < center_price
+                    - ((center_price - lower_range)
+                        * (three_decimals - lower_threshold)
+                        / three_decimals)
+            {
+                if threshold_time > U256::ZERO {
+                    let shift_time = threshold_time.to::<u64>();
+                    if time_elapsed < shift_time {
+                        center_price = center_price
+                            - ((center_price - lower_range) * U256::from(time_elapsed)
+                                / U256::from(shift_time));
+                    } else {
+                        center_price = lower_range;
+                    }
+                }
+            }
+
+            let max_center_raw = (dex_variables2 >> 172u32) & mask(28);
+            let max_center = from_big_number(max_center_raw);
+            let mut changed = false;
+            if !max_center.is_zero() && center_price > max_center {
+                center_price = max_center;
+                changed = true;
+            } else {
+                let min_center_raw = (dex_variables2 >> 200u32) & mask(28);
+                let min_center = from_big_number(min_center_raw);
+                if !min_center.is_zero() && center_price < min_center {
+                    center_price = min_center;
+                    changed = true;
+                }
+            }
+
+            if changed {
+                if ((dex_variables2 >> 26u32) & U256::ONE) == U256::ONE {
+                    let shifted = self.apply_range_shift(upper_pct_raw, lower_pct_raw, now_ts);
+                    upper_pct = shifted.0;
+                    lower_pct = shifted.1;
+                }
+                upper_range = if upper_pct >= six_decimals {
+                    U256::ZERO
+                } else {
+                    (center_price * six_decimals) / (six_decimals - upper_pct)
+                };
+                lower_range = (center_price * (six_decimals - lower_pct)) / six_decimals;
+            }
+
+            self.upper_threshold_pct_1e3 = upper_threshold;
+            self.lower_threshold_pct_1e3 = lower_threshold;
+        }
+
+        self.center_price_1e27 = center_price;
+        self.upper_range_pct_1e6 = upper_pct;
+        self.lower_range_pct_1e6 = lower_pct;
+        self.upper_range_1e27 = upper_range;
+        self.lower_range_1e27 = lower_range;
+    }
+
     fn apply_swap_1e12(&mut self, swap0to1: bool, amount_in_1e12: U256, amount_out_1e12: U256) {
         if swap0to1 {
             self.token0_real_reserves_1e12 = self
@@ -331,17 +796,14 @@ impl FluidDexPool {
         x2: U256, // Imaginary reserves of token out of debt
         y2: U256, // Imaginary reserves of token in of debt
     ) -> I256 {
-        // Handle edge cases
         if x.is_zero() || y.is_zero() || x2.is_zero() || y2.is_zero() {
             return I256::ZERO;
         }
 
-        // Calculate sqrt(x * y) and sqrt(x2 * y2) with 1e18 precision
-        // We use integer approximation since exact float sqrt is not available
-        let xy = x.saturating_mul(y);
-        let x2y2 = x2.saturating_mul(y2);
+        let scale_1e18 = U256::from(10u64).pow(U256::from(18u64));
+        let xy = x.saturating_mul(y).saturating_mul(scale_1e18);
+        let x2y2 = x2.saturating_mul(y2).saturating_mul(scale_1e18);
 
-        // Integer square root approximation
         let xy_root = integer_sqrt(xy);
         let x2y2_root = integer_sqrt(x2y2);
 
@@ -349,7 +811,6 @@ impl FluidDexPool {
             return I256::ZERO;
         }
 
-        // a = (y2 * xy_root + t * xy_root - y * x2y2_root) / (xy_root + x2y2_root)
         let numerator_pos = y2
             .saturating_mul(xy_root)
             .saturating_add(t.saturating_mul(xy_root));
@@ -396,8 +857,6 @@ impl FluidDexPool {
         let scale_1e27 = U256::from(10u64).pow(U256::from(27));
 
         if swap0to1 {
-            // verify token1 (output) reserves
-            // reserve_out >= (reserve_in * center_price) / (1e27 * min_swap_liquidity)
             let numerator = reserve_in.saturating_mul(center_price);
             let denominator = scale_1e27.saturating_mul(min_swap_liquidity);
             if denominator.is_zero() {
@@ -406,8 +865,6 @@ impl FluidDexPool {
             let min_required = numerator / denominator;
             reserve_out >= min_required
         } else {
-            // verify token0 (output) reserves
-            // reserve_out >= (reserve_in * 1e27) / (center_price * min_swap_liquidity)
             let numerator = reserve_in.saturating_mul(scale_1e27);
             let denominator = center_price.saturating_mul(min_swap_liquidity);
             if denominator.is_zero() {
@@ -416,6 +873,317 @@ impl FluidDexPool {
             let min_required = numerator / denominator;
             reserve_out >= min_required
         }
+    }
+
+    fn simulate_swap_internal(
+        &self,
+        base_token: Address,
+        quote_token: Address,
+        amount_in: U256,
+    ) -> Result<SwapCalc, AMMError> {
+        let swap0to1 = base_token == self.token_a.address && quote_token == self.token_b.address;
+        let swap1to0 = base_token == self.token_b.address && quote_token == self.token_a.address;
+
+        if !swap0to1 && !swap1to0 {
+            return Err(AMMError::Msg("Token pair not in pool".to_string()));
+        }
+
+        let in_decimals = if swap0to1 {
+            self.token_a.decimals
+        } else {
+            self.token_b.decimals
+        };
+        let out_decimals = if swap0to1 {
+            self.token_b.decimals
+        } else {
+            self.token_a.decimals
+        };
+
+        let zero = || SwapCalc {
+            amount_out: U256::ZERO,
+            amount_out_1e12: U256::ZERO,
+            amount_in_col_net: U256::ZERO,
+            amount_out_col: U256::ZERO,
+            amount_in_debt_net: U256::ZERO,
+            amount_out_debt: U256::ZERO,
+            swap0to1,
+        };
+
+        if self.is_swap_paused {
+            return Ok(zero());
+        }
+
+        let amount_to_swap = scale_to_1e12(amount_in, in_decimals);
+        if amount_to_swap.is_zero() {
+            return Ok(zero());
+        }
+
+        let six_decimals = U256::from(1_000_000u64);
+        let two_decimals = U256::from(100u64);
+        let x96 = U256::MAX >> 160;
+        let x128 = U256::MAX >> 128;
+        if amount_to_swap < six_decimals
+            || amount_to_swap > x96
+            || amount_in < two_decimals
+            || amount_in > x128
+        {
+            return Ok(zero());
+        }
+
+        let utilization_limit = if swap0to1 {
+            self.utilization_limit_token1
+        } else {
+            self.utilization_limit_token0
+        };
+        if utilization_limit < U256::from(1_000u64) {
+            let utilization = if swap0to1 {
+                self.token1_utilization
+            } else {
+                self.token0_utilization
+            };
+            if utilization > utilization_limit.saturating_mul(U256::from(10u64)) {
+                return Ok(zero());
+            }
+        }
+
+        let col_pool_enabled = self.is_smart_collateral_enabled
+            && !self.col_token0_imag_1e12.is_zero()
+            && !self.col_token1_imag_1e12.is_zero()
+            && !self.col_token0_real_1e12.is_zero()
+            && !self.col_token1_real_1e12.is_zero();
+
+        let debt_pool_enabled = self.is_smart_debt_enabled
+            && !self.debt_token0_imag_1e12.is_zero()
+            && !self.debt_token1_imag_1e12.is_zero()
+            && !self.debt_token0_real_1e12.is_zero()
+            && !self.debt_token1_real_1e12.is_zero();
+
+        if !col_pool_enabled && !debt_pool_enabled {
+            let amount_out = self.simulate_swap_simple(base_token, quote_token, amount_in)?;
+            let amount_out_1e12 = scale_to_1e12(amount_out, out_decimals);
+            return Ok(SwapCalc {
+                amount_out,
+                amount_out_1e12,
+                amount_in_col_net: U256::ZERO,
+                amount_out_col: U256::ZERO,
+                amount_in_debt_net: U256::ZERO,
+                amount_out_debt: U256::ZERO,
+                swap0to1,
+            });
+        }
+
+        let (col_reserve_in, col_reserve_out, col_i_reserve_in, col_i_reserve_out) = if swap0to1 {
+            (
+                self.col_token0_real_1e12,
+                self.col_token1_real_1e12,
+                self.col_token0_imag_1e12,
+                self.col_token1_imag_1e12,
+            )
+        } else {
+            (
+                self.col_token1_real_1e12,
+                self.col_token0_real_1e12,
+                self.col_token1_imag_1e12,
+                self.col_token0_imag_1e12,
+            )
+        };
+
+        let (debt_reserve_in, debt_reserve_out, debt_i_reserve_in, debt_i_reserve_out) = if swap0to1
+        {
+            (
+                self.debt_token0_real_1e12,
+                self.debt_token1_real_1e12,
+                self.debt_token0_imag_1e12,
+                self.debt_token1_imag_1e12,
+            )
+        } else {
+            (
+                self.debt_token1_real_1e12,
+                self.debt_token0_real_1e12,
+                self.debt_token1_imag_1e12,
+                self.debt_token0_imag_1e12,
+            )
+        };
+
+        let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let (borrowable, withdrawable) = if swap0to1 {
+            (
+                self.borrowable_token1
+                    .get_expanded_limit(self.limits_sync_time, current_time),
+                self.withdrawable_token1
+                    .get_expanded_limit(self.limits_sync_time, current_time),
+            )
+        } else {
+            (
+                self.borrowable_token0
+                    .get_expanded_limit(self.limits_sync_time, current_time),
+                self.withdrawable_token0
+                    .get_expanded_limit(self.limits_sync_time, current_time),
+            )
+        };
+
+        let borrowable_1e12 = scale_to_1e12(borrowable, out_decimals);
+        let withdrawable_1e12 = scale_to_1e12(withdrawable, out_decimals);
+
+        let limit_amount = (col_i_reserve_in + debt_i_reserve_in) / U256::from(2u64);
+        if amount_to_swap > limit_amount {
+            return Ok(zero());
+        }
+
+        let a = if col_pool_enabled && debt_pool_enabled {
+            self.swap_routing_in(
+                amount_to_swap,
+                col_i_reserve_out,
+                col_i_reserve_in,
+                debt_i_reserve_out,
+                debt_i_reserve_in,
+            )
+        } else if debt_pool_enabled {
+            I256::MINUS_ONE
+        } else {
+            I256::try_from(amount_to_swap).unwrap_or(I256::MAX) + I256::ONE
+        };
+
+        let (amount_in_col, amount_out_col, amount_in_debt, amount_out_debt) = if a <= I256::ZERO {
+            let out = calc_amount_out(
+                amount_to_swap,
+                debt_i_reserve_in,
+                debt_i_reserve_out,
+                U256::from(self.fee_1e6),
+            );
+            (U256::ZERO, U256::ZERO, amount_to_swap, out)
+        } else if a >= I256::try_from(amount_to_swap).unwrap_or(I256::MAX) {
+            let out = calc_amount_out(
+                amount_to_swap,
+                col_i_reserve_in,
+                col_i_reserve_out,
+                U256::from(self.fee_1e6),
+            );
+            (amount_to_swap, out, U256::ZERO, U256::ZERO)
+        } else {
+            let a_u256 = a.into_raw();
+            let out_col =
+                calc_amount_out(a_u256, col_i_reserve_in, col_i_reserve_out, U256::from(self.fee_1e6));
+            let in_debt = amount_to_swap - a_u256;
+            let out_debt =
+                calc_amount_out(in_debt, debt_i_reserve_in, debt_i_reserve_out, U256::from(self.fee_1e6));
+            (a_u256, out_col, in_debt, out_debt)
+        };
+
+        if amount_out_debt > debt_reserve_out || amount_out_col > col_reserve_out {
+            return Ok(zero());
+        }
+        if amount_out_debt > borrowable_1e12 || amount_out_col > withdrawable_1e12 {
+            return Ok(zero());
+        }
+
+        let min_swap_liquidity = U256::from(10_000u64);
+        let center_price = self.center_price_1e27;
+
+        if !amount_in_col.is_zero() {
+            let new_reserve_in = col_reserve_in + amount_in_col;
+            let new_reserve_out = col_reserve_out.saturating_sub(amount_out_col);
+            if !self.verify_reserves_ratio(
+                swap0to1,
+                new_reserve_in,
+                new_reserve_out,
+                center_price,
+                min_swap_liquidity,
+            ) {
+                return Ok(zero());
+            }
+        }
+        if !amount_in_debt.is_zero() {
+            let new_reserve_in = debt_reserve_in + amount_in_debt;
+            let new_reserve_out = debt_reserve_out.saturating_sub(amount_out_debt);
+            if !self.verify_reserves_ratio(
+                swap0to1,
+                new_reserve_in,
+                new_reserve_out,
+                center_price,
+                min_swap_liquidity,
+            ) {
+                return Ok(zero());
+            }
+        }
+
+        let scale_1e27 = U256::from(10u64).pow(U256::from(27u64));
+        let amount_in_col_net =
+            amount_in_col.saturating_mul(self.revenue_cut_1e8) / U256::from(100_000_000u64);
+        let amount_in_debt_net =
+            amount_in_debt.saturating_mul(self.revenue_cut_1e8) / U256::from(100_000_000u64);
+
+        let new_price = if amount_in_col > amount_in_debt {
+            let new_i_in = col_i_reserve_in + amount_in_col_net;
+            let new_i_out = col_i_reserve_out.saturating_sub(amount_out_col);
+            if swap0to1 {
+                new_i_out * scale_1e27 / new_i_in
+            } else {
+                new_i_in * scale_1e27 / new_i_out
+            }
+        } else {
+            let new_i_in = debt_i_reserve_in + amount_in_debt_net;
+            let new_i_out = debt_i_reserve_out.saturating_sub(amount_out_debt);
+            if swap0to1 {
+                new_i_out * scale_1e27 / new_i_in
+            } else {
+                new_i_in * scale_1e27 / new_i_out
+            }
+        };
+        if !self.upper_range_1e27.is_zero() && !self.lower_range_1e27.is_zero() {
+            if new_price < self.lower_range_1e27 || new_price > self.upper_range_1e27 {
+                return Ok(zero());
+            }
+        }
+
+        let current_timestamp = self.last_synced_block_timestamp;
+        let time_diff = current_timestamp.saturating_sub(self.last_swap_timestamp);
+        if time_diff == 0 {
+            if !self.last_center_price_1e27.is_zero() {
+                let scale_1e8 = U256::from(100_000_000u64);
+                let lower = (self.last_center_price_1e27
+                    .saturating_mul(scale_1e8.saturating_sub(U256::ONE)))
+                    / scale_1e8;
+                let upper = (self.last_center_price_1e27
+                    .saturating_mul(scale_1e8.saturating_add(U256::ONE)))
+                    / scale_1e8;
+                if center_price < lower || center_price > upper {
+                    return Ok(zero());
+                }
+            }
+            let old_price = if self.older_price_1e27.is_zero() {
+                new_price
+            } else {
+                self.older_price_1e27
+            };
+            if !price_diff_check(old_price, new_price) {
+                return Ok(zero());
+            }
+        } else {
+            let old_price = if self.last_stored_price_1e27.is_zero() {
+                new_price
+            } else {
+                self.last_stored_price_1e27
+            };
+            if !price_diff_check(old_price, new_price) {
+                return Ok(zero());
+            }
+        }
+
+        let total_out_1e12 = amount_out_col + amount_out_debt;
+        Ok(SwapCalc {
+            amount_out: unscale_from_1e12(total_out_1e12, out_decimals),
+            amount_out_1e12: total_out_1e12,
+            amount_in_col_net,
+            amount_out_col,
+            amount_in_debt_net,
+            amount_out_debt,
+            swap0to1,
+        })
     }
 
     /// Simple swap simulation (backward compatibility fallback)
@@ -549,12 +1317,36 @@ impl AutomatedMarketMaker for FluidDexPool {
                 };
 
                 if is_token0 {
+                    self.col_token0_real_1e12 =
+                        apply_delta(self.col_token0_real_1e12, event.supplyAmount);
+                    self.col_token0_imag_1e12 =
+                        apply_delta(self.col_token0_imag_1e12, event.supplyAmount);
+                    self.debt_token0_real_1e12 =
+                        apply_delta(self.debt_token0_real_1e12, event.borrowAmount);
+                    self.debt_token0_imag_1e12 =
+                        apply_delta(self.debt_token0_imag_1e12, event.borrowAmount);
+                    let total_delta = event.supplyAmount + event.borrowAmount;
                     self.token0_real_reserves_1e12 =
-                        apply_delta(self.token0_real_reserves_1e12, event.supplyAmount);
+                        apply_delta(self.token0_real_reserves_1e12, total_delta);
+                    self.token0_imag_reserves_1e12 =
+                        apply_delta(self.token0_imag_reserves_1e12, total_delta);
                 } else {
+                    self.col_token1_real_1e12 =
+                        apply_delta(self.col_token1_real_1e12, event.supplyAmount);
+                    self.col_token1_imag_1e12 =
+                        apply_delta(self.col_token1_imag_1e12, event.supplyAmount);
+                    self.debt_token1_real_1e12 =
+                        apply_delta(self.debt_token1_real_1e12, event.borrowAmount);
+                    self.debt_token1_imag_1e12 =
+                        apply_delta(self.debt_token1_imag_1e12, event.borrowAmount);
+                    let total_delta = event.supplyAmount + event.borrowAmount;
                     self.token1_real_reserves_1e12 =
-                        apply_delta(self.token1_real_reserves_1e12, event.supplyAmount);
+                        apply_delta(self.token1_real_reserves_1e12, total_delta);
+                    self.token1_imag_reserves_1e12 =
+                        apply_delta(self.token1_imag_reserves_1e12, total_delta);
                 }
+
+                self.refresh_prices();
             }
 
             tracing::info!(
@@ -650,246 +1442,9 @@ impl AutomatedMarketMaker for FluidDexPool {
         quote_token: Address,
         amount_in: U256,
     ) -> Result<U256, AMMError> {
-        // Determine swap direction
-        let swap0to1 = base_token == self.token_a.address && quote_token == self.token_b.address;
-        let swap1to0 = base_token == self.token_b.address && quote_token == self.token_a.address;
-
-        if !swap0to1 && !swap1to0 {
-            return Err(AMMError::Msg("Token pair not in pool".to_string()));
-        }
-
-        // Scale input amount to 1e12
-        let in_decimals = if swap0to1 {
-            self.token_a.decimals
-        } else {
-            self.token_b.decimals
-        };
-        let out_decimals = if swap0to1 {
-            self.token_b.decimals
-        } else {
-            self.token_a.decimals
-        };
-
-        // Apply fee upfront (fee is in 1e6 scale)
-        let fee = U256::from(self.fee_1e6);
-        let fee_100_percent = U256::from(1_000_000u64);
-        let amount_in_after_fee = amount_in * (fee_100_percent - fee) / fee_100_percent;
-        let amount_to_swap = scale_to_1e12(amount_in_after_fee, in_decimals);
-        if amount_to_swap.is_zero() {
-            return Ok(U256::ZERO);
-        }
-
-        // Check if pools are enabled
-        let col_pool_enabled = !self.col_token0_imag_1e12.is_zero()
-            && !self.col_token1_imag_1e12.is_zero()
-            && !self.col_token0_real_1e12.is_zero()
-            && !self.col_token1_real_1e12.is_zero();
-
-        let debt_pool_enabled = !self.debt_token0_imag_1e12.is_zero()
-            && !self.debt_token1_imag_1e12.is_zero()
-            && !self.debt_token0_real_1e12.is_zero()
-            && !self.debt_token1_real_1e12.is_zero();
-
-        if !col_pool_enabled && !debt_pool_enabled {
-            // Fallback to combined reserves (backward compatibility)
-            return self.simulate_swap_simple(base_token, quote_token, amount_in);
-        }
-
-        // Get reserves based on swap direction
-        let (col_reserve_in, col_reserve_out, col_i_reserve_in, col_i_reserve_out) = if swap0to1 {
-            (
-                self.col_token0_real_1e12,
-                self.col_token1_real_1e12,
-                self.col_token0_imag_1e12,
-                self.col_token1_imag_1e12,
-            )
-        } else {
-            (
-                self.col_token1_real_1e12,
-                self.col_token0_real_1e12,
-                self.col_token1_imag_1e12,
-                self.col_token0_imag_1e12,
-            )
-        };
-
-        let (debt_reserve_in, debt_reserve_out, debt_i_reserve_in, debt_i_reserve_out) = if swap0to1
-        {
-            (
-                self.debt_token0_real_1e12,
-                self.debt_token1_real_1e12,
-                self.debt_token0_imag_1e12,
-                self.debt_token1_imag_1e12,
-            )
-        } else {
-            (
-                self.debt_token1_real_1e12,
-                self.debt_token0_real_1e12,
-                self.debt_token1_imag_1e12,
-                self.debt_token0_imag_1e12,
-            )
-        };
-
-        // Get current limits (with time expansion)
-        let current_time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-
-        let (borrowable, withdrawable) = if swap0to1 {
-            (
-                self.borrowable_token1
-                    .get_expanded_limit(self.limits_sync_time, current_time),
-                self.withdrawable_token1
-                    .get_expanded_limit(self.limits_sync_time, current_time),
-            )
-        } else {
-            (
-                self.borrowable_token0
-                    .get_expanded_limit(self.limits_sync_time, current_time),
-                self.withdrawable_token0
-                    .get_expanded_limit(self.limits_sync_time, current_time),
-            )
-        };
-
-        // Scale limits to 1e12
-        let borrowable_1e12 = scale_to_1e12(borrowable, out_decimals);
-        let withdrawable_1e12 = scale_to_1e12(withdrawable, out_decimals);
-
-        // Calculate routing between collateral and debt pools
-        let a = if col_pool_enabled && debt_pool_enabled {
-            self.swap_routing_in(
-                amount_to_swap,
-                col_i_reserve_out,
-                col_i_reserve_in,
-                debt_i_reserve_out,
-                debt_i_reserve_in,
-            )
-        } else if debt_pool_enabled {
-            I256::MINUS_ONE // Route entirely through debt pool
-        } else {
-            I256::try_from(amount_to_swap).unwrap_or(I256::MAX) + I256::ONE // Route entirely through col pool
-        };
-
-        let (amount_in_col, amount_out_col, amount_in_debt, amount_out_debt) = if a <= I256::ZERO {
-            // Entire trade routes through debt pool
-            let out = calc_amount_out(
-                amount_to_swap,
-                debt_i_reserve_in,
-                debt_i_reserve_out,
-                U256::ZERO,
-            );
-            (U256::ZERO, U256::ZERO, amount_to_swap, out)
-        } else if a >= I256::try_from(amount_to_swap).unwrap_or(I256::MAX) {
-            // Entire trade routes through collateral pool
-            let out = calc_amount_out(
-                amount_to_swap,
-                col_i_reserve_in,
-                col_i_reserve_out,
-                U256::ZERO,
-            );
-            (amount_to_swap, out, U256::ZERO, U256::ZERO)
-        } else {
-            // Trade routes through both pools
-            let a_u256 = a.into_raw();
-            let out_col = calc_amount_out(a_u256, col_i_reserve_in, col_i_reserve_out, U256::ZERO);
-            let in_debt = amount_to_swap - a_u256;
-            let out_debt =
-                calc_amount_out(in_debt, debt_i_reserve_in, debt_i_reserve_out, U256::ZERO);
-            (a_u256, out_col, in_debt, out_debt)
-        };
-
-        // Check 1: Output amount vs real reserves
-        if amount_out_debt > debt_reserve_out {
-            return Ok(U256::ZERO); // Not enough liquidity in debt pool
-        }
-        if amount_out_col > col_reserve_out {
-            return Ok(U256::ZERO); // Not enough liquidity in col pool
-        }
-
-        // Check 2: Output amount vs limits
-        if amount_out_debt > borrowable_1e12 {
-            return Ok(U256::ZERO); // Exceeds borrowable limit
-        }
-        if amount_out_col > withdrawable_1e12 {
-            return Ok(U256::ZERO); // Exceeds withdrawable limit
-        }
-
-        // Check 3: Reserves ratio verification (prevents extreme imbalance)
-        let min_swap_liquidity = U256::from(8500u64); // 0.85e4 with buffer
-        let center_price = self.center_price_1e27;
-
-        if !amount_in_col.is_zero() {
-            let new_reserve_in = col_reserve_in + amount_in_col;
-            let new_reserve_out = col_reserve_out.saturating_sub(amount_out_col);
-            if !self.verify_reserves_ratio(
-                swap0to1,
-                new_reserve_in,
-                new_reserve_out,
-                center_price,
-                min_swap_liquidity,
-            ) {
-                return Ok(U256::ZERO); // Reserves ratio invalid
-            }
-        }
-        if !amount_in_debt.is_zero() {
-            let new_reserve_in = debt_reserve_in + amount_in_debt;
-            let new_reserve_out = debt_reserve_out.saturating_sub(amount_out_debt);
-            if !self.verify_reserves_ratio(
-                swap0to1,
-                new_reserve_in,
-                new_reserve_out,
-                center_price,
-                min_swap_liquidity,
-            ) {
-                return Ok(U256::ZERO); // Reserves ratio invalid
-            }
-        }
-
-        // Check 4: Price movement limit (>5% revert)
-        let max_price_diff_percent = 5u64;
-        let (old_price, new_price) = if amount_in_col > amount_in_debt {
-            let old = if swap0to1 {
-                col_i_reserve_out * U256::from(10u64).pow(U256::from(27)) / col_i_reserve_in
-            } else {
-                col_i_reserve_in * U256::from(10u64).pow(U256::from(27)) / col_i_reserve_out
-            };
-            let new_i_in = col_i_reserve_in + amount_in_col;
-            let new_i_out = col_i_reserve_out.saturating_sub(amount_out_col);
-            let new = if swap0to1 {
-                new_i_out * U256::from(10u64).pow(U256::from(27)) / new_i_in
-            } else {
-                new_i_in * U256::from(10u64).pow(U256::from(27)) / new_i_out
-            };
-            (old, new)
-        } else {
-            let old = if swap0to1 {
-                debt_i_reserve_out * U256::from(10u64).pow(U256::from(27)) / debt_i_reserve_in
-            } else {
-                debt_i_reserve_in * U256::from(10u64).pow(U256::from(27)) / debt_i_reserve_out
-            };
-            let new_i_in = debt_i_reserve_in + amount_in_debt;
-            let new_i_out = debt_i_reserve_out.saturating_sub(amount_out_debt);
-            let new = if swap0to1 {
-                new_i_out * U256::from(10u64).pow(U256::from(27)) / new_i_in
-            } else {
-                new_i_in * U256::from(10u64).pow(U256::from(27)) / new_i_out
-            };
-            (old, new)
-        };
-
-        let price_diff = if old_price > new_price {
-            old_price - new_price
-        } else {
-            new_price - old_price
-        };
-        let max_allowed_diff = old_price * U256::from(max_price_diff_percent) / U256::from(100);
-        if price_diff > max_allowed_diff {
-            return Ok(U256::ZERO); // Price movement too large
-        }
-
-        // Total output
-        let total_out_1e12 = amount_out_col + amount_out_debt;
-        Ok(unscale_from_1e12(total_out_1e12, out_decimals))
+        Ok(self
+            .simulate_swap_internal(base_token, quote_token, amount_in)?
+            .amount_out)
     }
 
     fn simulate_swap_mut(
@@ -898,26 +1453,111 @@ impl AutomatedMarketMaker for FluidDexPool {
         quote_token: Address,
         amount_in: U256,
     ) -> Result<U256, AMMError> {
-        let out = self.simulate_swap(base_token, quote_token, amount_in)?;
-        let swap0to1 = base_token == self.token_a.address && quote_token == self.token_b.address;
-        let amount_in_1e12 = if base_token == self.token_a.address {
-            scale_to_1e12(amount_in, self.token_a.decimals)
+        let calc = self.simulate_swap_internal(base_token, quote_token, amount_in)?;
+        if calc.amount_out_1e12.is_zero() {
+            return Ok(U256::ZERO);
+        }
+
+        if calc.swap0to1 {
+            if calc.amount_in_col_net > U256::ZERO {
+                self.col_token0_real_1e12 = self
+                    .col_token0_real_1e12
+                    .saturating_add(calc.amount_in_col_net);
+                self.col_token1_real_1e12 = self
+                    .col_token1_real_1e12
+                    .saturating_sub(calc.amount_out_col);
+                self.col_token0_imag_1e12 = self
+                    .col_token0_imag_1e12
+                    .saturating_add(calc.amount_in_col_net);
+                self.col_token1_imag_1e12 = self
+                    .col_token1_imag_1e12
+                    .saturating_sub(calc.amount_out_col);
+            }
+            if calc.amount_in_debt_net > U256::ZERO {
+                self.debt_token0_real_1e12 = self
+                    .debt_token0_real_1e12
+                    .saturating_add(calc.amount_in_debt_net);
+                self.debt_token1_real_1e12 = self
+                    .debt_token1_real_1e12
+                    .saturating_sub(calc.amount_out_debt);
+                self.debt_token0_imag_1e12 = self
+                    .debt_token0_imag_1e12
+                    .saturating_add(calc.amount_in_debt_net);
+                self.debt_token1_imag_1e12 = self
+                    .debt_token1_imag_1e12
+                    .saturating_sub(calc.amount_out_debt);
+            }
         } else {
-            scale_to_1e12(amount_in, self.token_b.decimals)
-        };
-        let out_decimals = if quote_token == self.token_a.address {
-            self.token_a.decimals
+            if calc.amount_in_col_net > U256::ZERO {
+                self.col_token1_real_1e12 = self
+                    .col_token1_real_1e12
+                    .saturating_add(calc.amount_in_col_net);
+                self.col_token0_real_1e12 = self
+                    .col_token0_real_1e12
+                    .saturating_sub(calc.amount_out_col);
+                self.col_token1_imag_1e12 = self
+                    .col_token1_imag_1e12
+                    .saturating_add(calc.amount_in_col_net);
+                self.col_token0_imag_1e12 = self
+                    .col_token0_imag_1e12
+                    .saturating_sub(calc.amount_out_col);
+            }
+            if calc.amount_in_debt_net > U256::ZERO {
+                self.debt_token1_real_1e12 = self
+                    .debt_token1_real_1e12
+                    .saturating_add(calc.amount_in_debt_net);
+                self.debt_token0_real_1e12 = self
+                    .debt_token0_real_1e12
+                    .saturating_sub(calc.amount_out_debt);
+                self.debt_token1_imag_1e12 = self
+                    .debt_token1_imag_1e12
+                    .saturating_add(calc.amount_in_debt_net);
+                self.debt_token0_imag_1e12 = self
+                    .debt_token0_imag_1e12
+                    .saturating_sub(calc.amount_out_debt);
+            }
+        }
+
+        self.token0_real_reserves_1e12 =
+            self.col_token0_real_1e12 + self.debt_token0_real_1e12;
+        self.token1_real_reserves_1e12 =
+            self.col_token1_real_1e12 + self.debt_token1_real_1e12;
+        self.token0_imag_reserves_1e12 =
+            self.col_token0_imag_1e12 + self.debt_token0_imag_1e12;
+        self.token1_imag_reserves_1e12 =
+            self.col_token1_imag_1e12 + self.debt_token1_imag_1e12;
+
+        let scale_1e27 = U256::from(10u64).pow(U256::from(27u64));
+        let new_price_1e27 = if calc.swap0to1 {
+            (self.token1_imag_reserves_1e12 * scale_1e27) / self.token0_imag_reserves_1e12
         } else {
-            self.token_b.decimals
+            (self.token0_imag_reserves_1e12 * scale_1e27) / self.token1_imag_reserves_1e12
         };
-        let amount_out_1e12 = scale_to_1e12(out, out_decimals);
-        self.apply_swap_1e12(swap0to1, amount_in_1e12, amount_out_1e12);
-        Ok(out)
+
+        let current_timestamp = self.last_synced_block_timestamp;
+        let time_diff = current_timestamp.saturating_sub(self.last_swap_timestamp);
+        if time_diff == 0 {
+            self.last_stored_price_1e27 = new_price_1e27;
+        } else {
+            self.older_price_1e27 = if self.last_stored_price_1e27.is_zero() {
+                new_price_1e27
+            } else {
+                self.last_stored_price_1e27
+            };
+            self.last_stored_price_1e27 = new_price_1e27;
+            self.last_center_price_1e27 = self.center_price_1e27;
+            self.last_swap_timestamp = current_timestamp;
+        }
+
+        self.refresh_prices();
+        Ok(calc.amount_out)
     }
 
     async fn init<N, P>(mut self, block_number: BlockId, provider: P) -> Result<Self, AMMError>
     where
         N: Network,
+        N::BlockResponse: BlockResponse,
+        <N::BlockResponse as BlockResponse>::Header: BlockHeader,
         P: Provider<N> + Clone,
     {
         let resolver = DexReservesResolver::new(self.reserves_resolver, provider.clone());
@@ -926,6 +1566,65 @@ impl AutomatedMarketMaker for FluidDexPool {
             .block(block_number)
             .call()
             .await?;
+
+        let dex = FluidDexT1::new(self.address, provider.clone());
+        let dex_variables = dex
+            .readFromStorage(B256::from(U256::from(0u64)))
+            .block(block_number)
+            .call()
+            .await
+            .unwrap_or(U256::ZERO);
+        let dex_variables2 = dex
+            .readFromStorage(B256::from(U256::from(1u64)))
+            .block(block_number)
+            .call()
+            .await
+            .unwrap_or(U256::ZERO);
+        let range_shift = dex
+            .readFromStorage(B256::from(U256::from(7u64)))
+            .block(block_number)
+            .call()
+            .await
+            .unwrap_or(U256::ZERO);
+        let threshold_shift = dex
+            .readFromStorage(B256::from(U256::from(8u64)))
+            .block(block_number)
+            .call()
+            .await
+            .unwrap_or(U256::ZERO);
+        let center_price_shift = dex
+            .readFromStorage(B256::from(U256::from(9u64)))
+            .block(block_number)
+            .call()
+            .await
+            .unwrap_or(U256::ZERO);
+        let constants_view = dex.constantsView().block(block_number).call().await;
+        let constants_view2 = dex.constantsView2().block(block_number).call().await;
+        let _ = constants_view2;
+        if let Ok(cv) = constants_view {
+            self.liquidity_address = cv.liquidity;
+            self.exchange_price_token0_slot = cv.exchangePriceToken0Slot;
+            self.exchange_price_token1_slot = cv.exchangePriceToken1Slot;
+            self.deployer_contract = cv.deployerContract;
+        }
+
+        if !self.liquidity_address.is_zero() {
+            let liquidity = FluidLiquidity::new(self.liquidity_address, provider.clone());
+            let exchange_price_token0 = liquidity
+                .readFromStorage(self.exchange_price_token0_slot)
+                .block(block_number)
+                .call()
+                .await
+                .unwrap_or(U256::ZERO);
+            let exchange_price_token1 = liquidity
+                .readFromStorage(self.exchange_price_token1_slot)
+                .block(block_number)
+                .call()
+                .await
+                .unwrap_or(U256::ZERO);
+            self.token0_utilization = decode_liquidity_utilization(exchange_price_token0);
+            self.token1_utilization = decode_liquidity_utilization(exchange_price_token1);
+        }
 
         // Token mapping reverted: We store raw 0xEeeee... address.
         // Core engine handles the logical mapping to WETH.
@@ -967,8 +1666,32 @@ impl AutomatedMarketMaker for FluidDexPool {
         };
         self.token_a = Token::new_with_decimals(res.token0, d0);
         self.token_b = Token::new_with_decimals(res.token1, d1);
-        self.fee_1e6 = res.fee.to::<u32>();
+        let fee_1e4 = u32::try_from((dex_variables2 >> 2u32) & mask(17)).unwrap_or(0);
+        self.fee_1e6 = fee_1e4;
+        let revenue_cut_percent: U256 = (dex_variables2 >> 19u32) & mask(7);
+        let revenue_cut = U256::from(100_000_000u64)
+            .saturating_sub(revenue_cut_percent.saturating_mul(U256::from(fee_1e4)));
+        self.revenue_cut_1e8 = if revenue_cut.is_zero() {
+            U256::from(100_000_000u64)
+        } else {
+            revenue_cut
+        };
+        self.is_swap_paused = ((dex_variables2 >> 255) & U256::ONE) == U256::ONE;
+        self.is_smart_collateral_enabled = (dex_variables2 & U256::ONE) == U256::ONE;
+        self.is_smart_debt_enabled = ((dex_variables2 >> 1) & U256::ONE) == U256::ONE;
+        self.utilization_limit_token0 = (dex_variables2 >> 228u32) & mask(10);
+        self.utilization_limit_token1 = (dex_variables2 >> 238u32) & mask(10);
         self.center_price_1e27 = res.centerPrice;
+        self.older_price_1e27 = decode_price_from_dex_variables(dex_variables, 1);
+        self.last_stored_price_1e27 = decode_price_from_dex_variables(dex_variables, 41);
+        self.last_center_price_1e27 = decode_price_from_dex_variables(dex_variables, 81);
+        self.last_swap_timestamp = ((dex_variables >> 121u32) & mask(33)).to::<u64>();
+
+        self.last_synced_block_timestamp =
+            fetch_block_timestamp::<N, _>(provider.clone(), block_number).await;
+        self.range_shift = range_shift;
+        self.threshold_shift = threshold_shift;
+        self.center_price_shift = center_price_shift;
 
         // Combined reserves (for backward compatibility)
         self.token0_real_reserves_1e12 =
@@ -1015,11 +1738,22 @@ impl AutomatedMarketMaker for FluidDexPool {
         };
 
         // Record sync time for limit expansion calculation
-        self.limits_sync_time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        self.limits_sync_time = self.last_synced_block_timestamp;
 
+        let _ = self
+            .update_center_price_from_chain::<N, _>(
+                dex_variables,
+                dex_variables2,
+                provider.clone(),
+                block_number,
+                self.last_synced_block_timestamp,
+            )
+            .await;
+        self.compute_ranges_from_dex(
+            dex_variables,
+            dex_variables2,
+            self.last_synced_block_timestamp,
+        );
         self.refresh_prices();
         Ok(self)
     }
@@ -1055,6 +1789,8 @@ impl FluidDexFactory {
     ) -> Result<Vec<AMM>, AMMError>
     where
         N: Network,
+        N::BlockResponse: BlockResponse,
+        <N::BlockResponse as BlockResponse>::Header: BlockHeader,
         P: Provider<N> + Clone,
     {
         if amms.is_empty() {
@@ -1120,6 +1856,49 @@ impl FluidDexFactory {
                         pool.token_b = Token::new_with_decimals(pr.token1, d1);
                         pool.fee_1e6 = pr.fee.to::<u32>();
                         pool.center_price_1e27 = pr.centerPrice;
+                        let dex = FluidDexT1::new(pr.pool, provider.clone());
+                        let dex_variables = dex
+                            .readFromStorage(B256::from(U256::from(0u64)))
+                            .block(block_number)
+                            .call()
+                            .await
+                            .unwrap_or(U256::ZERO);
+                        let dex_variables2 = dex
+                            .readFromStorage(B256::from(U256::from(1u64)))
+                            .block(block_number)
+                            .call()
+                            .await
+                            .unwrap_or(U256::ZERO);
+                        if let Ok(cv) = dex.constantsView().block(block_number).call().await {
+                            pool.liquidity_address = cv.liquidity;
+                            pool.exchange_price_token0_slot = cv.exchangePriceToken0Slot;
+                            pool.exchange_price_token1_slot = cv.exchangePriceToken1Slot;
+                            pool.deployer_contract = cv.deployerContract;
+                        }
+                        pool.older_price_1e27 = decode_price_from_dex_variables(dex_variables, 1);
+                        pool.last_stored_price_1e27 =
+                            decode_price_from_dex_variables(dex_variables, 41);
+                        pool.last_center_price_1e27 =
+                            decode_price_from_dex_variables(dex_variables, 81);
+                        pool.last_swap_timestamp = ((dex_variables >> 121u32) & mask(33)).to::<u64>();
+                        pool.range_shift = dex
+                            .readFromStorage(B256::from(U256::from(7u64)))
+                            .block(block_number)
+                            .call()
+                            .await
+                            .unwrap_or(U256::ZERO);
+                        pool.threshold_shift = dex
+                            .readFromStorage(B256::from(U256::from(8u64)))
+                            .block(block_number)
+                            .call()
+                            .await
+                            .unwrap_or(U256::ZERO);
+                        pool.center_price_shift = dex
+                            .readFromStorage(B256::from(U256::from(9u64)))
+                            .block(block_number)
+                            .call()
+                            .await
+                            .unwrap_or(U256::ZERO);
 
                         // Combined reserves (for backward compatibility)
                         pool.token0_real_reserves_1e12 = pr.collateralReserves.token0RealReserves
@@ -1176,10 +1955,23 @@ impl FluidDexFactory {
                         };
 
                         // Record sync time for limit expansion calculation
-                        pool.limits_sync_time = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
+                        pool.limits_sync_time =
+                            fetch_block_timestamp::<N, _>(provider.clone(), block_number).await;
+                        pool.last_synced_block_timestamp = pool.limits_sync_time;
+                        let _ = pool
+                            .update_center_price_from_chain::<N, _>(
+                                dex_variables,
+                                dex_variables2,
+                                provider.clone(),
+                                block_number,
+                                pool.last_synced_block_timestamp,
+                            )
+                            .await;
+                        pool.compute_ranges_from_dex(
+                            dex_variables,
+                            dex_variables2,
+                            pool.last_synced_block_timestamp,
+                        );
 
                         pool.refresh_prices();
 
@@ -1295,14 +2087,12 @@ mod tests {
         amm::{AutomatedMarketMaker, AMM},
         factory::DiscoverySync,
         fluid_dex::{
-            DexReservesResolver, FluidDexFactory, FluidDexPool, FluidDexT1, FLUID_NATIVE_ETH,
+            DexReservesResolver, FluidDexFactory, FluidDexPool, FluidDexT1, FLUID_DEX_RESOLVER, FLUID_NATIVE_ETH,
         },
     };
 
-    // Known key pools for targeted testing
-    const FLUID_DEX_RESOLVER: &str = "0xC93876C0EEd99645DD53937b25433e311881A27C";
     const WSTETH_ETH_POOL: &str = "0x0B1a513ee24972DAEf112bC777a5610d4325C9e7";
-    const USDC_USDT_POOL: &str = "0x6166D17398D51cf38734A60E2135048dC50125F8";
+    const USDC_USDT_POOL: &str = "0x667701e51B4D1Ca244F17C78F7aB8744B4C99F9B";
 
     fn get_provider() -> Option<impl Provider<alloy::network::Ethereum> + Clone> {
         dotenv::dotenv().ok();
@@ -1323,7 +2113,7 @@ mod tests {
             Address::ZERO,
             0,
             vec![],
-            Some(Address::from_str(FLUID_DEX_RESOLVER).unwrap()),
+            Some(FLUID_DEX_RESOLVER),
         );
         let pools = factory
             .discover::<alloy::network::Ethereum, _>(BlockId::latest(), provider.clone())
@@ -1337,7 +2127,7 @@ mod tests {
             return Ok(());
         }
 
-        let mut pool = FluidDexPool::new(pool_addr, Address::from_str(FLUID_DEX_RESOLVER).unwrap());
+        let mut pool = FluidDexPool::new(pool_addr, FLUID_DEX_RESOLVER);
         pool = pool
             .init::<alloy::network::Ethereum, _>(BlockId::latest(), provider.clone())
             .await?;
@@ -1364,7 +2154,6 @@ mod tests {
         Ok(())
     }
 
-    /// Test Native ETH pool (0xEeeee...) specifically
     #[tokio::test]
     async fn test_fluid_dex_native_eth_pool() -> eyre::Result<()> {
         let Some(provider) = get_provider() else {
@@ -1372,17 +2161,15 @@ mod tests {
             return Ok(());
         };
 
-        // wstETH/ETH pool - known to have Native ETH
         let pool_addr = Address::from_str(WSTETH_ETH_POOL)?;
 
-        let mut pool = FluidDexPool::new(pool_addr, Address::from_str(FLUID_DEX_RESOLVER).unwrap());
+        let mut pool = FluidDexPool::new(pool_addr, FLUID_DEX_RESOLVER);
         pool = pool
             .init::<alloy::network::Ethereum, _>(BlockId::latest(), provider.clone())
             .await?;
 
         let native_eth = FLUID_NATIVE_ETH;
 
-        // Check that one token is Native ETH
         let has_native_eth =
             pool.token_a.address == native_eth || pool.token_b.address == native_eth;
         assert!(
@@ -1390,7 +2177,6 @@ mod tests {
             "wstETH/ETH pool should contain Native ETH token (0xEeeee...)"
         );
 
-        // Verify decimals for Native ETH is 18
         if pool.token_a.address == native_eth {
             assert_eq!(
                 pool.token_a.decimals, 18,
@@ -1404,7 +2190,6 @@ mod tests {
             );
         }
 
-        // Simulate swap involving Native ETH
         let amount_in = U256::from(10u64).pow(U256::from(18u64)); // 1 token
         let out = pool.simulate_swap(pool.token_a.address, pool.token_b.address, amount_in)?;
         assert!(out > U256::ZERO, "Native ETH swap output should be > 0");
@@ -1417,7 +2202,6 @@ mod tests {
         Ok(())
     }
 
-    /// Test swap simulation against on-chain results with stricter tolerance (0.5%)
     #[tokio::test]
     async fn test_fluid_dex_swap_simulation_accuracy() -> eyre::Result<()> {
         let Some(provider) = get_provider() else {
@@ -1425,7 +2209,6 @@ mod tests {
             return Ok(());
         };
 
-        // Test against known active pools
         let test_pools = vec![WSTETH_ETH_POOL, USDC_USDT_POOL];
 
         for pool_addr_str in test_pools {
@@ -1448,7 +2231,6 @@ mod tests {
                 continue;
             }
 
-            // Test multiple swap events (up to 5) for this pool
             let test_count = logs.len().min(5);
             let mut passed = 0;
             let mut total_deviation_bps = 0u64;
@@ -1458,8 +2240,7 @@ mod tests {
                 let block_number = log.block_number.unwrap();
                 let prev_block = block_number - 1;
 
-                let mut pool =
-                    FluidDexPool::new(pool_addr, Address::from_str(FLUID_DEX_RESOLVER).unwrap());
+                let mut pool = FluidDexPool::new(pool_addr, FLUID_DEX_RESOLVER);
                 pool = pool
                     .init::<alloy::network::Ethereum, _>(
                         BlockId::from(prev_block),
@@ -1483,7 +2264,6 @@ mod tests {
                     amount_out_actual - amount_out_sim
                 };
 
-                // Calculate deviation in basis points
                 let deviation_bps = if !amount_out_actual.is_zero() {
                     (diff * U256::from(10000) / amount_out_actual).to::<u64>()
                 } else {
@@ -1492,7 +2272,6 @@ mod tests {
 
                 total_deviation_bps += deviation_bps;
 
-                // Stricter tolerance: 0.5% (50 bps)
                 if deviation_bps <= 50 {
                     passed += 1;
                 } else {
@@ -1519,7 +2298,6 @@ mod tests {
         Ok(())
     }
 
-    /// Test that Resolver data matches our stored data
     #[tokio::test]
     async fn test_fluid_dex_resolver_consistency() -> eyre::Result<()> {
         let Some(provider) = get_provider() else {
@@ -1530,17 +2308,14 @@ mod tests {
         let pool_addr = Address::from_str(WSTETH_ETH_POOL)?;
         let resolver_addr: Address = "0xC93876C0EEd99645DD53937b25433e311881A27C".parse()?;
 
-        // Init pool
-        let mut pool = FluidDexPool::new(pool_addr, Address::from_str(FLUID_DEX_RESOLVER).unwrap());
+        let mut pool = FluidDexPool::new(pool_addr, FLUID_DEX_RESOLVER);
         pool = pool
             .init::<alloy::network::Ethereum, _>(BlockId::latest(), provider.clone())
             .await?;
 
-        // Fetch fresh from resolver
         let resolver = DexReservesResolver::new(resolver_addr, provider.clone());
         let res = resolver.getPoolReservesAdjusted(pool_addr).call().await?;
 
-        // Compare reserves
         let expected_real_0 =
             res.collateralReserves.token0RealReserves + res.debtReserves.token0RealReserves;
         let expected_real_1 =
@@ -1573,7 +2348,6 @@ mod tests {
         Ok(())
     }
 
-    /// Test sync_all_pools batch functionality
     #[tokio::test]
     async fn test_fluid_dex_factory_sync_all_pools() -> eyre::Result<()> {
         let Some(provider) = get_provider() else {
@@ -1585,7 +2359,7 @@ mod tests {
             Address::ZERO,
             0,
             vec![],
-            Some(Address::from_str(FLUID_DEX_RESOLVER).unwrap()),
+            Some(FLUID_DEX_RESOLVER),
         );
         let discovered = factory
             .discover::<alloy::network::Ethereum, _>(BlockId::latest(), provider.clone())
@@ -1607,14 +2381,12 @@ mod tests {
                     p.token_a.decimals > 0,
                     "Synced pool should have valid decimals"
                 );
-                // Some pools may have zero reserves (inactive), just check decimals are set
             }
         }
 
         Ok(())
     }
 
-    /// Test simulate_swap_mut correctly updates reserves
     #[tokio::test]
     async fn test_fluid_dex_simulate_swap_mut() -> eyre::Result<()> {
         let Some(provider) = get_provider() else {
@@ -1622,9 +2394,8 @@ mod tests {
             return Ok(());
         };
 
-        // Use wstETH/ETH pool which is known to be active
         let pool_addr = Address::from_str(WSTETH_ETH_POOL)?;
-        let mut pool = FluidDexPool::new(pool_addr, Address::from_str(FLUID_DEX_RESOLVER).unwrap());
+        let mut pool = FluidDexPool::new(pool_addr, FLUID_DEX_RESOLVER);
         pool = pool
             .init::<alloy::network::Ethereum, _>(BlockId::latest(), provider.clone())
             .await?;
@@ -1632,11 +2403,9 @@ mod tests {
         let initial_r0 = pool.token0_real_reserves_1e12;
         let initial_r1 = pool.token1_real_reserves_1e12;
 
-        // Perform swap
         let amount_in = U256::from(10u64).pow(U256::from(pool.token_a.decimals as u64)); // 1 token
         let out = pool.simulate_swap_mut(pool.token_a.address, pool.token_b.address, amount_in)?;
 
-        // Reserves should have changed
         assert!(
             pool.token0_real_reserves_1e12 != initial_r0,
             "Token0 reserves should change after swap"
@@ -1646,7 +2415,6 @@ mod tests {
             "Token1 reserves should change after swap"
         );
 
-        // For swap0to1: r0 should increase, r1 should decrease
         assert!(
             pool.token0_real_reserves_1e12 > initial_r0,
             "Token0 reserves should increase (input)"
@@ -1674,4 +2442,176 @@ mod tests {
         println!("Total Fluid DEX pools: {}", total);
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_fluid_dex_swap_accuracy_amm_approach() -> eyre::Result<()> {
+        let Some(provider) = get_provider() else {
+            println!("Skipping test: ETHEREUM_PROVIDER not set");
+            return Ok(());
+        };
+
+        let test_pools = vec![
+            (WSTETH_ETH_POOL, "wstETH/ETH"),
+            (USDC_USDT_POOL, "USDC/USDT"),
+        ];
+
+        for (pool_addr_str, label) in test_pools {
+            let pool_addr = Address::from_str(pool_addr_str)?;
+            println!("\n=== Testing {} pool ({}) ===", label, pool_addr);
+
+            let current_block = provider.get_block_number().await?;
+            let from_block = current_block.saturating_sub(10000);
+
+            let filter = Filter::new()
+                .address(pool_addr)
+                .event_signature(FluidDexT1::Swap::SIGNATURE_HASH)
+                .from_block(from_block);
+
+            let logs = provider.get_logs(&filter).await?;
+
+            if logs.is_empty() {
+                println!("No swap events for {} in last 10000 blocks, skipping", label);
+                continue;
+            }
+
+            let test_event = logs.iter().rev().find(|log| {
+                if let Ok(event) = FluidDexT1::Swap::decode_log(&log.inner) {
+                    event.amountIn > 0 && event.amountOut > 0
+                } else {
+                    false
+                }
+            });
+
+            let Some(test_log) = test_event else {
+                println!("No valid swap event with non-zero amounts for {}", label);
+                continue;
+            };
+
+            let event = FluidDexT1::Swap::decode_log(&test_log.inner)?;
+            let block_number = test_log.block_number.unwrap();
+            let prev_block = block_number - 1;
+
+            let mut pool = FluidDexPool::new(pool_addr, FLUID_DEX_RESOLVER);
+            pool = pool
+                .init::<alloy::network::Ethereum, _>(BlockId::from(prev_block), provider.clone())
+                .await?;
+
+            let (token_in, token_out) = if event.swap0to1 {
+                (pool.token_a.address, pool.token_b.address)
+            } else {
+                (pool.token_b.address, pool.token_a.address)
+            };
+
+            let base_amount = U256::from(event.amountIn);
+            let actual_amount_out = U256::from(event.amountOut);
+
+            println!("\n  Base swap from event at block {}:", block_number);
+            println!("    Amount In: {}", base_amount);
+            println!("    Actual Amount Out (on-chain): {}", actual_amount_out);
+
+            let test_amounts = vec![
+                base_amount,
+                base_amount / U256::from(10u64),
+                base_amount * U256::from(10u64),
+                base_amount / U256::from(100u64),
+                base_amount * U256::from(5u64),
+            ];
+
+            let mut all_passed = true;
+            let mut max_deviation_bps = 0u64;
+
+            for (idx, amount_in) in test_amounts.iter().enumerate() {
+                if amount_in.is_zero() {
+                    continue;
+                }
+
+                let mut test_pool = FluidDexPool::new(pool_addr, FLUID_DEX_RESOLVER);
+                test_pool = test_pool
+                    .init::<alloy::network::Ethereum, _>(
+                        BlockId::from(prev_block),
+                        provider.clone(),
+                    )
+                    .await?;
+
+                let amount_out_sim =
+                    match test_pool.simulate_swap(token_in, token_out, *amount_in) {
+                        Ok(out) => out,
+                        Err(e) => {
+                            println!(
+                                "    Test {}: Sim failed for amount {}: {:?}",
+                                idx + 1,
+                                amount_in,
+                                e
+                            );
+                            all_passed = false;
+                            continue;
+                        }
+                    };
+
+                let expected_out = if *amount_in == base_amount {
+                    actual_amount_out
+                } else {
+                    let ratio = if !base_amount.is_zero() {
+                        U256::from(1000000u64) * *amount_in / base_amount
+                    } else {
+                        U256::ZERO
+                    };
+                    actual_amount_out * ratio / U256::from(1000000u64)
+                };
+
+                let diff = if amount_out_sim > expected_out {
+                    amount_out_sim - expected_out
+                } else {
+                    expected_out - amount_out_sim
+                };
+
+                let deviation_bps = if !expected_out.is_zero() {
+                    (diff * U256::from(10000) / expected_out).to::<u64>()
+                } else {
+                    0
+                };
+
+                if deviation_bps > max_deviation_bps {
+                    max_deviation_bps = deviation_bps;
+                }
+
+                let status = if deviation_bps <= 100 {
+                    "✅"
+                } else {
+                    all_passed = false;
+                    "❌"
+                };
+
+                println!(
+                    "    Test {}: Amount In = {} -> Sim Out = {}, Expected Out = {}, Deviation = {} bps {}",
+                    idx + 1,
+                    amount_in,
+                    amount_out_sim,
+                    expected_out,
+                    deviation_bps,
+                    status
+                );
+            }
+
+            println!(
+                "\n  {} pool summary: Max deviation = {} bps, Overall = {}",
+                label,
+                max_deviation_bps,
+                if all_passed { "✅ PASSED" } else { "❌ FAILED" }
+            );
+
+            if label == "wstETH/ETH" {
+                assert!(
+                    max_deviation_bps <= 200,
+                    "wstETH/ETH pool max deviation should be <= 2% (200 bps)"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
 }
+
+#[cfg(test)]
+mod test_sync_drift;
