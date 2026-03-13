@@ -875,6 +875,22 @@ impl FluidDexPool {
         }
     }
 
+    fn check_price_boundary(&self, new_price: U256) -> bool {
+        if !self.lower_range_1e27.is_zero() && new_price < self.lower_range_1e27 {
+            return false;
+        }
+
+        // upper_range_1e27 being 0 usually means upper_pct >= 100%, which is an on-chain revert condition.
+        // However, we only enforce this if the pool is actually initialized (center_price > 0).
+        if !self.center_price_1e27.is_zero()
+            && (self.upper_range_1e27.is_zero() || new_price > self.upper_range_1e27)
+        {
+            return false;
+        }
+
+        true
+    }
+
     fn simulate_swap_internal(
         &self,
         base_token: Address,
@@ -961,6 +977,29 @@ impl FluidDexPool {
         if !col_pool_enabled && !debt_pool_enabled {
             let amount_out = self.simulate_swap_simple(base_token, quote_token, amount_in)?;
             let amount_out_1e12 = scale_to_1e12(amount_out, out_decimals);
+
+            // Even for simple swaps, we should check boundaries if possible
+            let scale_1e27 = U256::from(10u64).pow(U256::from(27u64));
+            let r_in = if swap0to1 { self.token0_imag_reserves_1e12 } else { self.token1_imag_reserves_1e12 };
+            let r_out = if swap0to1 { self.token1_imag_reserves_1e12 } else { self.token0_imag_reserves_1e12 };
+            
+            if !r_in.is_zero() && !r_out.is_zero() {
+                let revenue_cut = self.revenue_cut_1e8;
+                let amount_in_net = amount_to_swap.saturating_mul(revenue_cut) / U256::from(100_000_000u64);
+                let new_i_in = r_in.saturating_add(amount_in_net);
+                let new_i_out = r_out.saturating_sub(amount_out_1e12);
+                
+                let new_price = if swap0to1 {
+                    new_i_out.saturating_mul(scale_1e27) / new_i_in
+                } else {
+                    new_i_in.saturating_mul(scale_1e27) / new_i_out
+                };
+                
+                if !self.check_price_boundary(new_price) {
+                    return Ok(zero());
+                }
+            }
+
             return Ok(SwapCalc {
                 amount_out,
                 amount_out_1e12,
@@ -1085,8 +1124,8 @@ impl FluidDexPool {
         let center_price = self.center_price_1e27;
 
         if !amount_in_col.is_zero() {
-            let new_reserve_in = col_reserve_in + amount_in_col;
-            let new_reserve_out = col_reserve_out.saturating_sub(amount_out_col);
+            let new_reserve_in = col_reserve_in.checked_add(amount_in_col).ok_or(AMMError::ArithmeticError)?;
+            let new_reserve_out = col_reserve_out.checked_sub(amount_out_col).ok_or(AMMError::ArithmeticError)?;
             if !self.verify_reserves_ratio(
                 swap0to1,
                 new_reserve_in,
@@ -1098,8 +1137,8 @@ impl FluidDexPool {
             }
         }
         if !amount_in_debt.is_zero() {
-            let new_reserve_in = debt_reserve_in + amount_in_debt;
-            let new_reserve_out = debt_reserve_out.saturating_sub(amount_out_debt);
+            let new_reserve_in = debt_reserve_in.checked_add(amount_in_debt).ok_or(AMMError::ArithmeticError)?;
+            let new_reserve_out = debt_reserve_out.checked_sub(amount_out_debt).ok_or(AMMError::ArithmeticError)?;
             if !self.verify_reserves_ratio(
                 swap0to1,
                 new_reserve_in,
@@ -1118,26 +1157,24 @@ impl FluidDexPool {
             amount_in_debt.saturating_mul(self.revenue_cut_1e8) / U256::from(100_000_000u64);
 
         let new_price = if amount_in_col > amount_in_debt {
-            let new_i_in = col_i_reserve_in + amount_in_col_net;
-            let new_i_out = col_i_reserve_out.saturating_sub(amount_out_col);
+            let new_i_in = col_i_reserve_in.checked_add(amount_in_col_net).ok_or(AMMError::ArithmeticError)?;
+            let new_i_out = col_i_reserve_out.checked_sub(amount_out_col).ok_or(AMMError::ArithmeticError)?;
             if swap0to1 {
-                new_i_out * scale_1e27 / new_i_in
+                new_i_out.checked_mul(scale_1e27).ok_or(AMMError::ArithmeticError)? / new_i_in
             } else {
-                new_i_in * scale_1e27 / new_i_out
+                new_i_in.checked_mul(scale_1e27).ok_or(AMMError::ArithmeticError)? / new_i_out
             }
         } else {
-            let new_i_in = debt_i_reserve_in + amount_in_debt_net;
-            let new_i_out = debt_i_reserve_out.saturating_sub(amount_out_debt);
+            let new_i_in = debt_i_reserve_in.checked_add(amount_in_debt_net).ok_or(AMMError::ArithmeticError)?;
+            let new_i_out = debt_i_reserve_out.checked_sub(amount_out_debt).ok_or(AMMError::ArithmeticError)?;
             if swap0to1 {
-                new_i_out * scale_1e27 / new_i_in
+                new_i_out.checked_mul(scale_1e27).ok_or(AMMError::ArithmeticError)? / new_i_in
             } else {
-                new_i_in * scale_1e27 / new_i_out
+                new_i_in.checked_mul(scale_1e27).ok_or(AMMError::ArithmeticError)? / new_i_out
             }
         };
-        if !self.upper_range_1e27.is_zero() && !self.lower_range_1e27.is_zero() {
-            if new_price < self.lower_range_1e27 || new_price > self.upper_range_1e27 {
-                return Ok(zero());
-            }
+        if !self.check_price_boundary(new_price) {
+            return Ok(zero());
         }
 
         let current_timestamp = self.last_synced_block_timestamp;
@@ -1201,6 +1238,39 @@ impl FluidDexPool {
         } else {
             return Err(AMMError::Msg("Token not in pool".to_string()));
         };
+
+        // Dust protection and range checks
+        let six_decimals = U256::from(1_000_000u64);
+        let two_decimals = U256::from(100u64);
+        let x96 = mask(96);
+        let x128 = mask(128);
+
+        if amount_in_1e12 < six_decimals
+            || amount_in_1e12 > x96
+            || amount_in < two_decimals
+            || amount_in > x128
+        {
+            return Ok(U256::ZERO);
+        }
+
+        // Utilization limit check
+        let swap0to1 = base_token == self.token_a.address;
+        let utilization_limit = if swap0to1 {
+            self.utilization_limit_token1
+        } else {
+            self.utilization_limit_token0
+        };
+
+        if utilization_limit < U256::from(1_000u64) {
+            let utilization = if swap0to1 {
+                self.token1_utilization
+            } else {
+                self.token0_utilization
+            };
+            if utilization > utilization_limit.saturating_mul(U256::from(10u64)) {
+                return Ok(U256::ZERO);
+            }
+        }
 
         let (r0, r1) = self.total_imag_reserves();
         let amount_out_1e12 =
@@ -2615,3 +2685,6 @@ mod tests {
 
 #[cfg(test)]
 mod test_sync_drift;
+
+#[cfg(test)]
+mod test_swap_simulate;

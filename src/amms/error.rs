@@ -55,6 +55,8 @@ pub enum AMMError {
     DivisionByZero,
     #[error("Token not found: {0}")]
     TokenNotFound(alloy::primitives::Address),
+    #[error("Arithmetic error (overflow/underflow)")]
+    ArithmeticError,
     #[error("AMM Error: {0}")]
     Msg(String),
     #[error("Token Out Does Not Exist")]
