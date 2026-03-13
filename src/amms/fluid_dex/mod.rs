@@ -258,14 +258,17 @@ fn price_diff_check(old_price: U256, new_price: U256) -> bool {
     if old_price.is_zero() || new_price.is_zero() {
         return false;
     }
-    let oracle_precision = U256::from(10u64).pow(U256::from(18u64));
-    let oracle_limit = U256::from(5u64) * U256::from(10u64).pow(U256::from(16u64));
-    let ratio = old_price.saturating_mul(oracle_precision) / new_price;
-    let diff = I256::try_from(oracle_precision).unwrap_or(I256::MAX)
-        - I256::try_from(ratio).unwrap_or(I256::MAX);
-    let limit = I256::try_from(oracle_limit).unwrap_or(I256::MAX);
-    diff <= limit && diff >= -limit
+    
+    // Solidity: priceDiff_ = ((int(newPrice_) - int(oldPrice_)) * 1e4) / int(oldPrice_);
+    let np = I256::from_raw(new_price);
+    let op = I256::from_raw(old_price);
+    let diff = np.saturating_mul(I256::from_raw(U256::from(10000u64))) / op;
+    let price_diff = diff - I256::from_raw(U256::from(10000u64));
+
+    // Solidity check: if (priceDiff_ > 500 || priceDiff_ < -500)
+    price_diff <= I256::from_raw(U256::from(500u64)) && price_diff >= -I256::from_raw(U256::from(500u64))
 }
+
 
 /// Integer square root using Newton's method
 fn integer_sqrt(n: U256) -> U256 {
@@ -1070,8 +1073,9 @@ impl FluidDexPool {
 
         let limit_amount = (col_i_reserve_in + debt_i_reserve_in) / U256::from(2u64);
         if amount_to_swap > limit_amount {
-            return Ok(zero());
+            return Err(AMMError::ArithmeticError);
         }
+
 
         let a = if col_pool_enabled && debt_pool_enabled {
             self.swap_routing_in(
@@ -1114,8 +1118,9 @@ impl FluidDexPool {
         };
 
         if amount_out_debt > debt_reserve_out || amount_out_col > col_reserve_out {
-            return Ok(zero());
+            return Err(AMMError::ArithmeticError);
         }
+
         if amount_out_debt > borrowable_1e12 || amount_out_col > withdrawable_1e12 {
             return Ok(zero());
         }
@@ -1535,13 +1540,17 @@ impl AutomatedMarketMaker for FluidDexPool {
                     .saturating_add(calc.amount_in_col_net);
                 self.col_token1_real_1e12 = self
                     .col_token1_real_1e12
-                    .saturating_sub(calc.amount_out_col);
+                    .checked_sub(calc.amount_out_col)
+                    .ok_or(AMMError::ArithmeticError)?;
                 self.col_token0_imag_1e12 = self
                     .col_token0_imag_1e12
-                    .saturating_add(calc.amount_in_col_net);
+                    .checked_add(calc.amount_in_col_net)
+                    .ok_or(AMMError::ArithmeticError)?;
                 self.col_token1_imag_1e12 = self
                     .col_token1_imag_1e12
-                    .saturating_sub(calc.amount_out_col);
+                    .checked_sub(calc.amount_out_col)
+                    .ok_or(AMMError::ArithmeticError)?;
+
             }
             if calc.amount_in_debt_net > U256::ZERO {
                 self.debt_token0_real_1e12 = self
@@ -1549,13 +1558,17 @@ impl AutomatedMarketMaker for FluidDexPool {
                     .saturating_add(calc.amount_in_debt_net);
                 self.debt_token1_real_1e12 = self
                     .debt_token1_real_1e12
-                    .saturating_sub(calc.amount_out_debt);
+                    .checked_sub(calc.amount_out_debt)
+                    .ok_or(AMMError::ArithmeticError)?;
                 self.debt_token0_imag_1e12 = self
                     .debt_token0_imag_1e12
-                    .saturating_add(calc.amount_in_debt_net);
+                    .checked_add(calc.amount_in_debt_net)
+                    .ok_or(AMMError::ArithmeticError)?;
                 self.debt_token1_imag_1e12 = self
                     .debt_token1_imag_1e12
-                    .saturating_sub(calc.amount_out_debt);
+                    .checked_sub(calc.amount_out_debt)
+                    .ok_or(AMMError::ArithmeticError)?;
+
             }
         } else {
             if calc.amount_in_col_net > U256::ZERO {
@@ -1564,13 +1577,17 @@ impl AutomatedMarketMaker for FluidDexPool {
                     .saturating_add(calc.amount_in_col_net);
                 self.col_token0_real_1e12 = self
                     .col_token0_real_1e12
-                    .saturating_sub(calc.amount_out_col);
+                    .checked_sub(calc.amount_out_col)
+                    .ok_or(AMMError::ArithmeticError)?;
                 self.col_token1_imag_1e12 = self
                     .col_token1_imag_1e12
-                    .saturating_add(calc.amount_in_col_net);
+                    .checked_add(calc.amount_in_col_net)
+                    .ok_or(AMMError::ArithmeticError)?;
                 self.col_token0_imag_1e12 = self
                     .col_token0_imag_1e12
-                    .saturating_sub(calc.amount_out_col);
+                    .checked_sub(calc.amount_out_col)
+                    .ok_or(AMMError::ArithmeticError)?;
+
             }
             if calc.amount_in_debt_net > U256::ZERO {
                 self.debt_token1_real_1e12 = self
@@ -1578,13 +1595,17 @@ impl AutomatedMarketMaker for FluidDexPool {
                     .saturating_add(calc.amount_in_debt_net);
                 self.debt_token0_real_1e12 = self
                     .debt_token0_real_1e12
-                    .saturating_sub(calc.amount_out_debt);
+                    .checked_sub(calc.amount_out_debt)
+                    .ok_or(AMMError::ArithmeticError)?;
                 self.debt_token1_imag_1e12 = self
                     .debt_token1_imag_1e12
-                    .saturating_add(calc.amount_in_debt_net);
+                    .checked_add(calc.amount_in_debt_net)
+                    .ok_or(AMMError::ArithmeticError)?;
                 self.debt_token0_imag_1e12 = self
                     .debt_token0_imag_1e12
-                    .saturating_sub(calc.amount_out_debt);
+                    .checked_sub(calc.amount_out_debt)
+                    .ok_or(AMMError::ArithmeticError)?;
+
             }
         }
 

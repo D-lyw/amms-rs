@@ -300,3 +300,60 @@ async fn test_fluid_dex_utilization_limit() -> eyre::Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_fluid_dex_oseth_eth_panic_repro() -> Result<()> {
+    // reproduction of the case: 195 osETH -> ETH
+    // Pool only has ~103 ETH real reserves, but swap wants ~207 ETH.
+    // This should result in an error or 0 instead of success.
+    
+    let mut pool = FluidDexPool::default();
+    pool.token_a = crate::amms::Token {
+        address: ETH_ADDRESS,
+        decimals: 18,
+        symbol: "ETH".to_string(),
+        chain_id: 1,
+    };
+    pool.token_b = crate::amms::Token {
+        address: OSETH_TOKEN,
+        decimals: 18,
+        symbol: "osETH".to_string(),
+        chain_id: 1,
+    };
+    
+    // Set reserves from screenshot (1e12 scale)
+    pool.token0_real_reserves_1e12 = U256::from(103_760_000_000u64); // 103.76 ETH
+    pool.token1_real_reserves_1e12 = U256::from(5_641_400_000_000u128); // 5641.4 osETH
+    
+    // Set imaginary reserves large enough to allow calculation but real reserves will hit limit
+    pool.token0_imag_reserves_1e12 = U256::from(10_000_000_000_000u128); 
+    pool.token1_imag_reserves_1e12 = U256::from(10_000_000_000_000u128);
+    
+    pool.fee_1e6 = 100; // 0.01%
+    pool.center_price_1e27 = U256::from(936_839_000_000_000_000_000_000_000u128); // 0.936839
+    pool.upper_range_1e27 = U256::from(938_247_000_000_000_000_000_000_000u128);
+    pool.lower_range_1e27 = U256::from(936_838_000_000_000_000_000_000_000u128);
+
+    // Swap 195 osETH -> ETH
+    let amount_in = U256::from(195u64) * U256::from(10u64).pow(U256::from(18u64));
+    
+    println!("\n=== osETH/ETH Panic Repro ===");
+    println!("Amount In: 195 osETH");
+    println!("ETH Real Reserves: 103.76");
+    
+    // This should return Err(ArithmeticError) with our new fix
+    let result = pool.simulate_swap(OSETH_TOKEN, ETH_ADDRESS, amount_in);
+    
+    match result {
+        Ok(out) => {
+            println!("Simulated Amount Out: {} ETH", out);
+            assert!(out.is_zero(), "Should return 0 or Err if output > real reserves");
+        },
+        Err(e) => {
+            println!("Simulated Swap failed as expected: {:?}", e);
+            // This is the desired behavior for 100% parity with contract panic
+        }
+    }
+
+    Ok(())
+}
