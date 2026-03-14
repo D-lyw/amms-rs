@@ -1,5 +1,5 @@
 use crate::amms::amm::AutomatedMarketMaker;
-use super::{FluidDexPool, FLUID_DEX_RESOLVER};
+use super::{price_diff_check, FluidDexPool, FLUID_DEX_RESOLVER};
 use alloy::{
     eips::BlockId,
     primitives::{address, Address, U256},
@@ -225,6 +225,80 @@ async fn test_fluid_dex_boundary_revert() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn test_price_diff_check_matches_contract_formula() {
+    let old_price = U256::from(100u64);
+    let new_price_ok = U256::from(105u64); // ~4.76% change
+    let new_price_bad = U256::from(106u64); // ~5.66% change
+
+    assert!(price_diff_check(old_price, new_price_ok));
+    assert!(!price_diff_check(old_price, new_price_bad));
+}
+
+#[test]
+fn test_pool_not_initialized_returns_zero() {
+    let mut pool = FluidDexPool::default();
+    pool.token_a = crate::amms::Token {
+        address: address!("0000000000000000000000000000000000000001"),
+        decimals: 18,
+        symbol: "T0".to_string(),
+        chain_id: 1,
+    };
+    pool.token_b = crate::amms::Token {
+        address: address!("0000000000000000000000000000000000000002"),
+        decimals: 18,
+        symbol: "T1".to_string(),
+        chain_id: 1,
+    };
+    pool.is_swap_paused = false;
+    pool.is_smart_collateral_enabled = false;
+    pool.is_smart_debt_enabled = false;
+
+    let amount_in = U256::from(10u64).pow(U256::from(18u64)); // 1 T0
+    let result = pool
+        .simulate_swap(pool.token_a.address, pool.token_b.address, amount_in)
+        .expect("simulate_swap should not error");
+
+    assert_eq!(result, U256::ZERO, "Expected zero output for uninitialized pool");
+}
+
+#[test]
+fn test_amount_limits_return_zero() {
+    let mut pool = FluidDexPool::default();
+    pool.token_a = crate::amms::Token {
+        address: address!("0000000000000000000000000000000000000001"),
+        decimals: 18,
+        symbol: "T0".to_string(),
+        chain_id: 1,
+    };
+    pool.token_b = crate::amms::Token {
+        address: address!("0000000000000000000000000000000000000002"),
+        decimals: 18,
+        symbol: "T1".to_string(),
+        chain_id: 1,
+    };
+    pool.is_swap_paused = false;
+    pool.is_smart_collateral_enabled = true;
+    pool.is_smart_debt_enabled = false;
+    pool.fee_1e6 = 3000;
+    pool.center_price_1e27 = U256::from(10u64).pow(U256::from(27u64));
+    pool.upper_range_1e27 = pool.center_price_1e27 * U256::from(2u64);
+    pool.lower_range_1e27 = pool.center_price_1e27 / U256::from(2u64);
+
+    pool.col_token0_real_1e12 = U256::from(1_000_000_000u64);
+    pool.col_token1_real_1e12 = U256::from(1_000_000_000u64);
+    pool.col_token0_imag_1e12 = U256::from(1_000_000_000u64);
+    pool.col_token1_imag_1e12 = U256::from(1_000_000_000u64);
+
+    // amount_in_1e12 becomes 1 (< 1e6) => triggers limiting branch
+    let amount_in = U256::from(1_000_000u64); // 1e6 wei
+    let result = pool
+        .simulate_swap(pool.token_a.address, pool.token_b.address, amount_in)
+        .expect("simulate_swap should not error");
+
+    assert_eq!(result, U256::ZERO, "Expected zero output for limit-violating amount");
+}
+
 #[tokio::test]
 async fn test_fluid_dex_dust_protection() -> eyre::Result<()> {
     let mut pool = FluidDexPool::default();
@@ -352,6 +426,80 @@ async fn test_fluid_dex_oseth_eth_panic_repro() -> Result<()> {
         Err(e) => {
             println!("Simulated Swap failed as expected: {:?}", e);
             // This is the desired behavior for 100% parity with contract panic
+        }
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_reproduce_0xc065_panic() -> Result<()> {
+    use std::str::FromStr;
+    use crate::amms::fluid_dex::TokenLimitData;
+    let mut pool = FluidDexPool::default();
+    
+    let oseth = address!("f1C9acDc66974dFB6dEcB12aA385b9cD01190E38");
+    let eth = address!("EeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE");
+
+    pool.token_a = crate::amms::Token {
+        address: oseth,
+        decimals: 18,
+        symbol: "osETH".to_string(),
+        chain_id: 1,
+    };
+    pool.token_b = crate::amms::Token {
+        address: eth,
+        decimals: 18,
+        symbol: "ETH".to_string(),
+        chain_id: 1,
+    };
+
+    // Higher reserves to pass basic check
+    pool.col_token0_real_1e12 = U256::from(1000_000_000_000u128);
+    pool.col_token1_real_1e12 = U256::from(1000_000_000_000u128);
+    pool.debt_token0_real_1e12 = U256::from(1000_000_000_000u128);
+    pool.debt_token1_real_1e12 = U256::from(1000_000_000_000u128);
+    
+    // Imaginary reserves must be non-zero to enable pool
+    pool.col_token0_imag_1e12 = U256::from(10_000_000_000_000u128); 
+    pool.col_token1_imag_1e12 = U256::from(10_000_000_000_000u128);
+    pool.debt_token0_imag_1e12 = U256::from(10_000_000_000_000u128);
+    pool.debt_token1_imag_1e12 = U256::from(10_000_000_000_000u128);
+
+    // Set high limits
+    let high_limit = TokenLimitData {
+        available: U256::from(1_000_000_000u128) * U256::from(10u128.pow(18)),
+        expands_to: U256::from(1_000_000_000u128) * U256::from(10u128.pow(18)),
+        expand_duration: 0,
+    };
+    pool.borrowable_token0 = high_limit.clone();
+    pool.borrowable_token1 = high_limit.clone();
+    pool.withdrawable_token0 = high_limit.clone();
+    pool.withdrawable_token1 = high_limit.clone();
+    
+    // Unhealthy debt: 5000 osETH debt vs 1000 ETH real
+    // ry * 1e27 - dx * pb => 1000 * 1e27 - 5000 * 0.93 * 1e27 < 0
+    pool.is_smart_debt_enabled = true;
+    pool.debt0_1e12 = U256::from(0u64); 
+    pool.debt1_1e12 = U256::from(5000_000_000_000u128); // 5000 osETH debt
+    
+    pool.is_smart_collateral_enabled = true;
+    pool.fee_1e6 = 100;
+    pool.center_price_1e27 = U256::from_str("936839303419921804869391716").unwrap(); // ~0.93
+    pool.upper_range_1e27 = U256::from_str("1000000000000000000000000000").unwrap();
+    pool.lower_range_1e27 = U256::from_str("900000000000000000000000000").unwrap();
+
+    let amount_in = U256::from(1u64) * U256::from(10u64).pow(U256::from(18u64));
+    
+    println!("\n=== Reproduction: Debt Health Check (1000 ETH, 5000 osETH Debt) ===");
+    let result = pool.simulate_swap(oseth, eth, amount_in);
+    
+    match result {
+        Ok(out) => {
+            println!("SIMULATION BUG: Returned {} ETH (Should have failed/returned 0)", out);
+        },
+        Err(e) => {
+            println!("✅ Simulation correctly caught panic state: {:?}", e);
         }
     }
 

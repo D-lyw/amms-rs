@@ -258,15 +258,15 @@ fn price_diff_check(old_price: U256, new_price: U256) -> bool {
     if old_price.is_zero() || new_price.is_zero() {
         return false;
     }
-    
-    // Solidity: priceDiff_ = ((int(newPrice_) - int(oldPrice_)) * 1e4) / int(oldPrice_);
-    let np = I256::from_raw(new_price);
-    let op = I256::from_raw(old_price);
-    let diff = np.saturating_mul(I256::from_raw(U256::from(10000u64))) / op;
-    let price_diff = diff - I256::from_raw(U256::from(10000u64));
 
-    // Solidity check: if (priceDiff_ > 500 || priceDiff_ < -500)
-    price_diff <= I256::from_raw(U256::from(500u64)) && price_diff >= -I256::from_raw(U256::from(500u64))
+    // Solidity: priceDiff_ = int(1e18) - int((oldPrice_ * 1e18) / newPrice_)
+    let scale = U256::from(1_000_000_000_000_000_000u64);
+    let ratio = old_price.saturating_mul(scale) / new_price;
+    let price_diff = I256::from_raw(scale) - I256::from_raw(ratio);
+
+    // Solidity check: if (priceDiff_ > 5e16 || priceDiff_ < -5e16)
+    let limit = I256::from_raw(U256::from(50_000_000_000_000_000u64));
+    price_diff <= limit && price_diff >= -limit
 }
 
 
@@ -390,6 +390,11 @@ pub struct FluidDexPool {
     pub debt_token0_imag_1e12: U256,
     #[serde(default)]
     pub debt_token1_imag_1e12: U256,
+    /// Actual token debt (for debt pool health checks)
+    #[serde(default)]
+    pub debt0_1e12: U256,
+    #[serde(default)]
+    pub debt1_1e12: U256,
     /// Borrowable limits (for output token)
     #[serde(default)]
     pub borrowable_token0: TokenLimitData,
@@ -894,6 +899,82 @@ impl FluidDexPool {
         true
     }
 
+    fn validate_debt_pool_health(
+        &self,
+        geometric_mean: U256,
+        upper_range: U256,
+        lower_range: U256,
+    ) -> Result<(), AMMError> {
+        if !self.is_smart_debt_enabled {
+            return Ok(());
+        }
+
+        let dx = self.debt0_1e12;
+        let dy = self.debt1_1e12;
+
+        if dx.is_zero() && dy.is_zero() {
+            return Ok(());
+        }
+
+        let u27 = U256::from(10u64).pow(U256::from(27u64));
+        let u54 = U256::from(10u64).pow(U256::from(54u64));
+
+        let (gp_adj, pb_adj, dx_adj, dy_adj) = if geometric_mean < u27 {
+            (geometric_mean, lower_range, dx, dy)
+        } else {
+            (
+                u54 / geometric_mean,
+                u54 / upper_range,
+                dy,
+                dx,
+            )
+        };
+
+        // part1 = ((dx * gp) - (dy * 1e27)) / (2 * 1e27)
+        let term1 = dx_adj.checked_mul(gp_adj).ok_or(AMMError::ArithmeticError)?;
+        let term2 = dy_adj.checked_mul(u27).ok_or(AMMError::ArithmeticError)?;
+
+        let p1 = if term1 >= term2 {
+            I256::try_from((term1 - term2) / (U256::from(2u64) * u27)).unwrap_or(I256::MAX)
+        } else {
+            -I256::try_from((term2 - term1) / (U256::from(2u64) * u27)).unwrap_or(I256::MAX)
+        };
+
+        // p2 = (dx * dy * pb) / 1e27
+        let dx_dy = dx_adj.checked_mul(dy_adj).ok_or(AMMError::ArithmeticError)?;
+        let p2 = if dx_dy.is_zero() {
+            U256::ZERO
+        } else if pb_adj > u54 / dx_dy {
+            (dx_dy / u27).checked_mul(pb_adj).ok_or(AMMError::ArithmeticError)?
+        } else {
+            (dx_dy * pb_adj) / u27
+        };
+
+        // ry = p1 + sqrt(p2 + p1^2)
+        let p1_sq = p1.checked_mul(p1).ok_or(AMMError::ArithmeticError)?.into_raw();
+        let sqrt_val = integer_sqrt(p2.checked_add(p1_sq).ok_or(AMMError::ArithmeticError)?);
+        let ry = if p1 >= I256::ZERO {
+            p1.into_raw().checked_add(sqrt_val).ok_or(AMMError::ArithmeticError)?
+        } else {
+            sqrt_val.saturating_sub(p1.abs().into_raw())
+        };
+
+        // iry_ = ((ry * 1e27) - (dx * pb))
+        let ry_term = ry.checked_mul(u27).ok_or(AMMError::ArithmeticError)?;
+        let dx_pb_term = dx_adj.checked_mul(pb_adj).ok_or(AMMError::ArithmeticError)?;
+
+        if ry_term < dx_pb_term {
+            return Err(AMMError::ArithmeticError); // Panic point!
+        }
+
+        let iry_scaled = ry_term - dx_pb_term;
+        if iry_scaled < U256::from(1_000_000u64) {
+            return Err(AMMError::ArithmeticError); // DexT1__DebtReservesTooLow
+        }
+
+        Ok(())
+    }
+
     fn simulate_swap_internal(
         &self,
         base_token: Address,
@@ -931,6 +1012,10 @@ impl FluidDexPool {
         if self.is_swap_paused {
             return Ok(zero());
         }
+        if !self.is_smart_collateral_enabled && !self.is_smart_debt_enabled {
+            // Pool not initialized in-contract; return zero to signal non-executable swap
+            return Ok(zero());
+        }
 
         let amount_to_swap = scale_to_1e12(amount_in, in_decimals);
         if amount_to_swap.is_zero() {
@@ -946,6 +1031,7 @@ impl FluidDexPool {
             || amount_in < two_decimals
             || amount_in > x128
         {
+            // Signal non-executable swap (mirrors on-chain revert semantics)
             return Ok(zero());
         }
 
@@ -1127,6 +1213,39 @@ impl FluidDexPool {
 
         let min_swap_liquidity = U256::from(10_000u64);
         let center_price = self.center_price_1e27;
+
+        // Debt pool health check (The missing logic bias)
+        if self.is_smart_debt_enabled {
+            let (upper_pct, lower_pct) = if ((self.range_shift >> 26u32) & U256::ONE) == U256::ONE {
+                self.apply_range_shift(
+                    (self.range_shift >> 27u32) & mask(20),
+                    (self.range_shift >> 47u32) & mask(20),
+                    current_time,
+                )
+            } else {
+                (
+                    (self.range_shift >> 27u32) & mask(20),
+                    (self.range_shift >> 47u32) & mask(20),
+                )
+            };
+
+            let six_decimals = U256::from(1_000_000u64);
+            let upper_range = if upper_pct >= six_decimals {
+                U256::ZERO
+            } else {
+                (center_price * six_decimals) / (six_decimals - upper_pct)
+            };
+            let lower_range = (center_price * (six_decimals - lower_pct)) / six_decimals;
+
+            let u18 = U256::from(10u64).pow(U256::from(18u64));
+            let geometric_mean = if upper_range < U256::from(10u64).pow(U256::from(38u64)) {
+                integer_sqrt(upper_range * lower_range)
+            } else {
+                integer_sqrt((upper_range / u18) * (lower_range / u18)) * u18
+            };
+
+            self.validate_debt_pool_health(geometric_mean, upper_range, lower_range)?;
+        }
 
         if !amount_in_col.is_zero() {
             let new_reserve_in = col_reserve_in.checked_add(amount_in_col).ok_or(AMMError::ArithmeticError)?;
@@ -1805,6 +1924,8 @@ impl AutomatedMarketMaker for FluidDexPool {
         self.debt_token1_real_1e12 = res.debtReserves.token1RealReserves;
         self.debt_token0_imag_1e12 = res.debtReserves.token0ImaginaryReserves;
         self.debt_token1_imag_1e12 = res.debtReserves.token1ImaginaryReserves;
+        self.debt0_1e12 = res.debtReserves.token0Debt;
+        self.debt1_1e12 = res.debtReserves.token1Debt;
 
         // Limits for borrowable/withdrawable checks
         self.withdrawable_token0 = TokenLimitData {
@@ -2014,6 +2135,8 @@ impl FluidDexFactory {
                         pool.debt_token1_real_1e12 = pr.debtReserves.token1RealReserves;
                         pool.debt_token0_imag_1e12 = pr.debtReserves.token0ImaginaryReserves;
                         pool.debt_token1_imag_1e12 = pr.debtReserves.token1ImaginaryReserves;
+                        pool.debt0_1e12 = pr.debtReserves.token0Debt;
+                        pool.debt1_1e12 = pr.debtReserves.token1Debt;
 
                         // Limits for borrowable/withdrawable checks
                         pool.withdrawable_token0 = TokenLimitData {
