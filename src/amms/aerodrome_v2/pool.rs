@@ -183,25 +183,26 @@ impl AerodromeV2Pool {
         let fee_amount = (amount_in * U256::from(self.fee)) / U256::from(10000u64);
         let amount_in_after_fee = amount_in - fee_amount;
 
-        // Get decimals for both tokens
-        let decimals0 = self.token_a.decimals as f64;
-        let decimals1 = self.token_b.decimals as f64;
+        // Get decimals SCALE for both tokens (10^decimals, not decimals itself)
+        // Solidity: decimals0 = 10 ** ERC20(_token0).decimals()
+        let decimals0_scale = 10f64.powi(self.token_a.decimals as i32);
+        let decimals1_scale = 10f64.powi(self.token_b.decimals as i32);
 
         // Convert to f64 for calculation
         let reserve_in_f = reserve_in.to::<u128>() as f64;
         let reserve_out_f = reserve_out.to::<u128>() as f64;
         let amount_in_f = amount_in_after_fee.to::<u128>() as f64;
 
-        // Normalize to 18 decimals (same as Solidity)
+        // Normalize to 18 decimals (same as Solidity: (reserve * 1e18) / decimalsScale)
         let precision = 1e18;
-        let x = reserve_in_f * precision / decimals0;
-        let y = reserve_out_f * precision / decimals1;
+        let x = reserve_in_f * precision / decimals0_scale;
+        let y = reserve_out_f * precision / decimals1_scale;
 
         // Calculate K = (x³y + y³x) / 10³⁶
         let xy = self.k_stable_f64(x, y);
 
         // Add amount_in and normalize
-        let dx = amount_in_f * precision / decimals0;
+        let dx = amount_in_f * precision / decimals0_scale;
         let x0 = x + dx;
 
         // Use Newton-Raphson iteration to find y_new such that: f(x0, y_new) = xy
@@ -213,8 +214,8 @@ impl AerodromeV2Pool {
             return U256::ZERO;
         }
 
-        // Denormalize to output token decimals
-        let y_out = dy * decimals1 / precision;
+        // Denormalize to output token decimals: (y * decimalsScale) / 1e18
+        let y_out = dy * decimals1_scale / precision;
 
         // Convert back to U256
         if y_out < 0.0 || y_out >= (u128::MAX as f64) {
