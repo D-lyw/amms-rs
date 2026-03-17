@@ -121,14 +121,11 @@ impl BalancerV3Factory {
             return Ok(vec![]);
         }
 
-        let vault_address = if let AMM::BalancerV3Pool(pool) = &amms[0] {
-            pool.vault_address
-        } else {
-            return Err(AMMError::IncompatibleAMMVariant);
-        };
+        let chain_id = provider.get_chain_id().await?;
+        let vault_explorer_address = super::get_vault_explorer_address(chain_id)
+            .ok_or_else(|| AMMError::Msg(format!("Unsupported chain id: {}", chain_id)))?;
 
-        // Batch processing
-        let batch_size = 20; // Conservative batch size
+        let batch_size = 20;
         let mut futures = FuturesUnordered::new();
 
         for chunk in amms.chunks(batch_size) {
@@ -149,7 +146,7 @@ impl BalancerV3Factory {
 
             let deployer = IGetBalancerV3PoolDataBatchRequest::deploy_builder(
                 provider.clone(),
-                vault_address,
+                vault_explorer_address,
                 chunk_pools,
             );
 
@@ -233,11 +230,9 @@ impl BalancerV3Factory {
             return Ok(vec![]);
         }
 
-        let vault_address = if let AMM::BalancerV3Pool(pool) = &amms[0] {
-            pool.vault_address
-        } else {
-            return Err(AMMError::IncompatibleAMMVariant);
-        };
+        let chain_id = provider.get_chain_id().await?;
+        let vault_explorer_address = super::get_vault_explorer_address(chain_id)
+            .ok_or_else(|| AMMError::Msg(format!("Unsupported chain id: {}", chain_id)))?;
 
         let batch_size = 20;
         let mut futures = FuturesUnordered::new();
@@ -260,7 +255,7 @@ impl BalancerV3Factory {
 
             let deployer = IGetBalancerV3PoolDataBatchRequest::deploy_builder(
                 provider.clone(),
-                vault_address,
+                vault_explorer_address,
                 chunk_pools,
             );
 
@@ -399,7 +394,7 @@ impl AutomatedMarketMakerFactory for BalancerV3Factory {
         Ok(AMM::BalancerV3Pool(BalancerV3Pool::new(
             pool_created.pool,
             self.vault_address,
-            BalancerV3PoolType::Weighted, // Default
+            BalancerV3PoolType::Weighted,
         )))
     }
 }

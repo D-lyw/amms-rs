@@ -53,7 +53,6 @@ async fn run_swap_test(
 
     // Balancer V3 Vault (Mainnet)
     let vault_address = Address::from_str("ba1333333333a1BA1108E8412f11850A5C319bA9")?;
-    // Balancer V3 Router (Mainnet)
     let router_address = Address::from_str("0xAE563E3f8219521950555F5962419C8919758Ea2")?;
 
     // Check if pool exists
@@ -63,7 +62,11 @@ async fn run_swap_test(
         return Ok(());
     }
 
-    let mut pool = BalancerV3Pool::new(pool_address, vault_address, pool_type);
+    let mut pool = BalancerV3Pool::new(
+        pool_address,
+        vault_address,
+        pool_type,
+    );
     pool = pool.init(block_id, provider.clone()).await?;
 
     assert_eq!(pool.pool_type, pool_type);
@@ -327,8 +330,11 @@ async fn test_calculate_price() -> eyre::Result<()> {
     let pool_address = Address::from_str("0xB1F62fc950E30A64a5032bBD8619A70B2c2B27C6")?;
     let vault_address = Address::from_str("0xbA1333333333a1BA1108E8412f11850A5C319bA9")?;
 
-    let mut pool =
-        BalancerV3Pool::new(pool_address, vault_address, BalancerV3PoolType::Weighted);
+    let mut pool = BalancerV3Pool::new(
+        pool_address,
+        vault_address,
+        BalancerV3PoolType::Weighted,
+    );
 
     pool = pool.init(BlockId::latest(), provider.clone()).await?;
 

@@ -19,7 +19,6 @@ use alloy::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::str::FromStr;
 
 pub fn get_vault_address(_chain_id: u64) -> Option<Address> {
     // Balancer V3 Vault is deployed using Create2 at the same address on all supported chains.
@@ -35,9 +34,24 @@ pub fn get_supported_chains() -> Vec<u64> {
         8453,   // Base
         100,    // Gnosis
         43114,  // Avalanche
-        137,    // Polygon
         10,     // Optimism
+        196,    // X Layer
     ]
+}
+
+/// Returns the VaultExplorer contract address for a given chain ID
+/// Ref: https://docs.balancer.fi/developer-reference/contracts/deployment-addresses/
+pub fn get_vault_explorer_address(chain_id: u64) -> Option<Address> {
+    match chain_id {
+        1 => Some(address!("Fc2986feAB34713E659da84F3B1FA32c1da95832")),      // Ethereum Mainnet
+        42161 => Some(address!("B9d01CA61b9C181dA1051bFDd28e1097e920AB14")), // Arbitrum
+        8453 => Some(address!("aD89051bEd8d96f045E8912aE1672c6C0bF8a85E")),  // Base
+        100 => Some(address!("7f4C133e44381D05129F9B81bAD8Fa9F3345D29B")),   // Gnosis
+        43114 => Some(address!("4Cb42fc3b5fb9392Ce0772C3A540E4AE4da4Ac4d")), // Avalanche
+        10 => Some(address!("EAedc32a51c510d35ebC11088fD5fF2b47aACF2E")),    // Optimism
+        196 => Some(address!("7Ba29fE8E83dd6097A7298075C4AFfdBda3121cC")),   // X Layer
+        _ => None,
+    }
 }
 use thiserror::Error;
 
@@ -209,7 +223,11 @@ sol!(
 );
 
 impl BalancerV3Pool {
-    pub fn new(address: Address, vault_address: Address, pool_type: BalancerV3PoolType) -> Self {
+    pub fn new(
+        address: Address,
+        vault_address: Address,
+        pool_type: BalancerV3PoolType,
+    ) -> Self {
         Self {
             address,
             last_synced_block: 0,
@@ -835,9 +853,9 @@ impl AutomatedMarketMaker for BalancerV3Pool {
 
         // 2. Get Tokens and Balances
         // Use VaultExplorer to fetch pool token info
-        let vault_explorer_address =
-            Address::from_str("0xFc2986feAB34713E659da84F3B1FA32c1da95832")
-                .unwrap_or(Address::ZERO);
+        let chain_id = provider.get_chain_id().await?;
+        let vault_explorer_address = get_vault_explorer_address(chain_id)
+            .ok_or_else(|| AMMError::Msg(format!("Unsupported chain id: {}", chain_id)))?;
         let vault_explorer = IVaultExplorer::new(vault_explorer_address, provider.clone());
 
         // Check if VaultExplorer exists

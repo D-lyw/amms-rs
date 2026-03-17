@@ -52,12 +52,10 @@ contract GetBalancerV3PoolDataBatchRequest {
         uint256[] rates;
     }
 
-    // Mainnet VaultExplorer address
-    address constant VAULT_EXPLORER = 0xFc2986feAB34713E659da84F3B1FA32c1da95832;
-
-    constructor(address vault, address[] memory pools) {
-        // Note: vault param is kept for backward compatibility but not used
-        // We use VaultExplorer instead
+    constructor(address vaultExplorer, address[] memory pools) {
+        // vaultExplorer: chain-specific VaultExplorer address
+        // - Ethereum Mainnet: 0xFc2986feAB34713E659da84F3B1FA32c1da95832
+        // - Base: 0xaD89051bEd8d96f045E8912aE1672c6C0bF8a85E
         
         PoolData[] memory data = new PoolData[](pools.length);
         
@@ -67,7 +65,7 @@ contract GetBalancerV3PoolDataBatchRequest {
             
             // 1. Try to get data from VaultExplorer first (most complete)
             bool explorerSuccess = false;
-            try IVaultExplorer(VAULT_EXPLORER).getPoolTokenInfo(pool) returns (
+            try IVaultExplorer(vaultExplorer).getPoolTokenInfo(pool) returns (
                 address[] memory tokens,
                 IVaultExplorer.TokenInfo[] memory tokenInfo,
                 uint256[] memory balancesRaw,
