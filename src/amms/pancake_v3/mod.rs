@@ -3,6 +3,7 @@ use super::{
     consts::{MIN_V3_LIQUIDITY, MPFR_T_PRECISION},
     error::AMMError,
     factory::{AutomatedMarketMakerFactory, DiscoverySync},
+    get_token_decimals,
     uniswap_v3::{
         GetUniswapV3PoolStaticMetaBatchRequest, GetUniswapV3PoolTickBitmapBatchRequest,
         GetUniswapV3PoolTickDataBatchRequest, UniswapV3Factory,
@@ -907,12 +908,6 @@ sol! {
             uint128 protocolFeesToken1
         );
     }
-
-    #[derive(Debug, PartialEq, Eq)]
-    #[sol(rpc)]
-    contract IERC20 {
-        function decimals() external view returns (uint8);
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Hash, PartialEq, Eq)]
@@ -1157,7 +1152,6 @@ impl PancakeV3Factory {
         N: Network,
         P: Provider<N> + Clone,
     {
-        let mut futures = FuturesUnordered::new();
         let mut tokens = std::collections::HashSet::new();
 
         for pool in pools.iter() {
@@ -1168,29 +1162,10 @@ impl PancakeV3Factory {
             tokens.insert(pv3_pool.token_b.address);
         }
 
-        for token_addr in tokens {
-            if token_addr.is_zero() {
-                continue;
-            }
-            let provider = provider.clone();
-            futures.push(async move {
-                let token_contract = IERC20::new(token_addr, provider);
-                let decimals = token_contract.decimals().call().await;
-                (token_addr, decimals)
-            });
-        }
-
-        let mut decimals_map = std::collections::HashMap::new();
-        while let Some((addr, res)) = futures.next().await {
-            match res {
-                Ok(dec) => {
-                    decimals_map.insert(addr, dec);
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to fetch decimals for token {:?}: {:?}", addr, e);
-                }
-            }
-        }
+        let tokens: Vec<Address> = tokens.into_iter().collect();
+        let decimals_map = get_token_decimals(tokens, provider.clone())
+            .await
+            .map_err(AMMError::BatchContractError)?;
 
         for pool in pools.iter_mut() {
             let AMM::PancakeV3Pool(pv3_pool) = pool else {
@@ -1237,7 +1212,7 @@ impl PancakeV3Factory {
 
             futures.push(async move {
                 Ok::<(Vec<Address>, Bytes), AMMError>((
-                    pool_addresses,
+                    pool_addresses.clone(),
                     GetUniswapV3PoolSlot0BatchRequest::deploy_builder(provider, pool_addresses)
                         .call_raw()
                         .block(block_number)
