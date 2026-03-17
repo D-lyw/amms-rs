@@ -11,7 +11,7 @@ use super::{
 };
 use crate::amms::consts::U256_1;
 use crate::amms::uniswap_v3::{
-    GetUniswapV3PoolTickBitmapBatchRequest::TickBitmapInfo,
+    GetUniswapV3PoolSlot0BatchRequest, GetUniswapV3PoolTickBitmapBatchRequest::TickBitmapInfo,
     GetUniswapV3PoolTickDataBatchRequest::TickDataInfo, UniswapV3Error,
 };
 use alloy::{
@@ -1222,49 +1222,41 @@ impl PancakeV3Factory {
         N: Network,
         P: Provider<N> + Clone,
     {
-        let mut futures = FuturesUnordered::new();
+        let step = 255;
 
-        // Parallelize fetching slot0 and liquidity
-        for pool in pools.iter_mut() {
-            let AMM::PancakeV3Pool(pv3_pool) = pool else {
-                continue;
-            };
-            let address = pv3_pool.address;
+        let mut futures = FuturesUnordered::new();
+        pools.chunks_mut(step).for_each(|group| {
             let provider = provider.clone();
+            let pool_addresses = group
+                .iter_mut()
+                .filter_map(|pool| match pool {
+                    AMM::PancakeV3Pool(p) => Some(p.address),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
 
             futures.push(async move {
-                let pool_contract = IPancakeV3PoolState::new(address, provider);
-
-                let slot0_builder = pool_contract.slot0().block(block_number);
-                let liquidity_builder = pool_contract.liquidity().block(block_number);
-
-                let slot0_task = slot0_builder.call();
-                let liquidity_task = liquidity_builder.call();
-
-                let (slot0_res, liquidity_res) = tokio::join!(slot0_task, liquidity_task);
-
-                let slot0 = slot0_res?;
-                let liquidity = liquidity_res?;
-
-                Ok::<(Address, IPancakeV3PoolState::slot0Return, u128), AMMError>((
-                    address, slot0, liquidity,
+                Ok::<(Vec<Address>, Bytes), AMMError>((
+                    pool_addresses,
+                    GetUniswapV3PoolSlot0BatchRequest::deploy_builder(provider, pool_addresses)
+                        .call_raw()
+                        .block(block_number)
+                        .await?,
                 ))
             });
-        }
+        });
 
         while let Some(res) = futures.next().await {
-            match res {
-                Ok((addr, slot0, liq)) => {
-                    if let Some(pool) = pools.iter_mut().find(|p| p.address() == addr) {
-                        if let AMM::PancakeV3Pool(pv3_pool) = pool {
-                            pv3_pool.sqrt_price = U256::from(slot0.sqrtPriceX96);
-                            pv3_pool.tick = slot0.tick.unchecked_into();
-                            pv3_pool.liquidity = liq;
-                        }
+            let (pool_addresses, return_data) = res?;
+            let return_data = <Vec<(i32, u128, U256)> as SolValue>::abi_decode(&return_data)?;
+
+            for (slot_0_data, pool_addr) in return_data.iter().zip(pool_addresses.iter()) {
+                if let Some(pool) = pools.iter_mut().find(|p| p.address() == *pool_addr) {
+                    if let AMM::PancakeV3Pool(ref mut pv3_pool) = pool {
+                        pv3_pool.tick = slot_0_data.0;
+                        pv3_pool.liquidity = slot_0_data.1;
+                        pv3_pool.sqrt_price = slot_0_data.2;
                     }
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to sync slot0 for pool: {:?}", e);
                 }
             }
         }
