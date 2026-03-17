@@ -18,25 +18,33 @@ contract GetAerodromeSlipstreamSlot0BatchRequest {
         Slot0Data[] memory allSlot0Data = new Slot0Data[](pools.length);
 
         for (uint256 i = 0; i < pools.length; ++i) {
-            Slot0Data memory slot0Data = allSlot0Data[i];
             address poolAddress = pools[i];
 
-            ICLPoolState pool = ICLPoolState(poolAddress);
-            slot0Data.liquidity = pool.liquidity();
-
-            // Slipstream slot0 returns 6 values (no feeProtocol)
-            (slot0Data.sqrtPrice, slot0Data.tick, , , , ) = pool.slot0();
-
-            allSlot0Data[i] = slot0Data;
+            try ICLPoolState(poolAddress).liquidity() returns (uint128 liquidity) {
+                try ICLPoolState(poolAddress).slot0() returns (
+                    uint160 sqrtPriceX96,
+                    int24 tick,
+                    uint16,
+                    uint16,
+                    uint16,
+                    bool
+                ) {
+                    allSlot0Data[i] = Slot0Data({
+                        tick: tick,
+                        liquidity: liquidity,
+                        sqrtPrice: uint256(sqrtPriceX96)
+                    });
+                } catch {
+                    continue;
+                }
+            } catch {
+                continue;
+            }
         }
 
-        // ensure abi encoding, not needed here but increase reusability for different return types
-        // note: abi.encode add a first 32 bytes word with the address of the original data
         bytes memory abiEncodedData = abi.encode(allSlot0Data);
 
         assembly {
-            // Return from the start of the data (discarding the original data address)
-            // up to the end of the memory used
             let dataStart := add(abiEncodedData, 0x20)
             return(dataStart, sub(msize(), dataStart))
         }

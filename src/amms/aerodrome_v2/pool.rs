@@ -22,6 +22,7 @@ use alloy::{
 use futures::{stream::FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use tokio::time::{sleep, Duration};
 
 use crate::amms::{
     amm::{AutomatedMarketMaker, SyncAction, AMM},
@@ -912,10 +913,6 @@ impl DiscoverySync for AerodromeV2Factory {
 }
 
 impl AerodromeV2Factory {
-    /// Batch initialize Aerodrome V2 pools using a batch contract call.
-    ///
-    /// This method fetches all necessary pool data (tokens, reserves, decimals, stable flag)
-    /// in a single batched contract call for improved efficiency.
     pub async fn init_batch<N, P>(
         amms: Vec<AMM>,
         block_number: BlockId,
@@ -929,7 +926,7 @@ impl AerodromeV2Factory {
             return Ok(amms);
         }
 
-        let step = 120; // Max pools per batch call
+        let step = 80;
 
         let mut futures = FuturesUnordered::new();
         let pool_addresses: Vec<Vec<Address>> = amms
@@ -948,6 +945,7 @@ impl AerodromeV2Factory {
 
                 Ok::<(Vec<Address>, alloy::primitives::Bytes), AMMError>((group, result))
             });
+            sleep(Duration::from_millis(500)).await;
         }
 
         let mut amms_map: HashMap<Address, AMM> = amms
@@ -956,15 +954,53 @@ impl AerodromeV2Factory {
             .collect();
 
         while let Some(res) = futures.next().await {
-            let (group, return_data) = res?;
+            let (group, return_data) = match res {
+                Ok(data) => data,
+                Err(e) => {
+                    tracing::warn!(
+                        target = "amms::aerodrome_v2::init_batch",
+                        error = ?e,
+                        "Batch contract call failed, skipping batch"
+                    );
+                    continue;
+                }
+            };
 
-            // Decode return data: (address tokenA, address tokenB, uint112 reserve0, uint112 reserve1, uint8 decimals0, uint8 decimals1, bool stable)[]
-            let return_data =
-                <Vec<(Address, Address, u128, u128, u32, u32, bool)> as SolValue>::abi_decode(&return_data)?;
+            tracing::debug!(
+                target = "amms::aerodrome_v2::init_batch",
+                return_data_len = return_data.len(),
+                return_data_hex = ?return_data,
+                "Raw batch return data"
+            );
 
-            for (pool_data, pool_address) in return_data.iter().zip(group.iter()) {
-                // If tokenA is zero, the pool data was not populated
+            let return_data = match <Vec<(Address, Address, u128, u128, u32, u32, bool)> as SolValue>::abi_decode(&return_data) {
+                Ok(data) => data,
+                Err(e) => {
+                    tracing::error!(
+                        target = "amms::aerodrome_v2::init_batch",
+                        error = ?e,
+                        return_data_len = return_data.len(),
+                        "Failed to decode batch return data"
+                    );
+                    return Err(AMMError::from(e));
+                }
+            };
+
+            tracing::debug!(
+                target = "amms::aerodrome_v2::init_batch",
+                group_len = group.len(),
+                return_data_len = return_data.len(),
+                "Batch data decoded"
+            );
+
+            for (idx, (pool_data, pool_address)) in return_data.iter().zip(group.iter()).enumerate() {
                 if pool_data.0.is_zero() {
+                    tracing::warn!(
+                        target = "amms::aerodrome_v2::init_batch",
+                        ?pool_address,
+                        idx,
+                        "Pool returned zero tokenA address"
+                    );
                     continue;
                 }
 
@@ -975,7 +1011,6 @@ impl AerodromeV2Factory {
 
                     let (token_a, token_b, reserve_0, reserve_1, decimals_a, decimals_b, stable) = pool_data;
 
-                    // Validate decimals (u32 from SolValue, convert to u8)
                     let decimals_a = *decimals_a as u8;
                     let decimals_b = *decimals_b as u8;
                     if decimals_a == 0 || decimals_b == 0 {
@@ -995,12 +1030,10 @@ impl AerodromeV2Factory {
                     pool.reserve_1 = *reserve_1;
                     pool.stable = *stable;
 
-                    // Set default fee if not set (0.3% = 3000 in hundredths of a bip)
                     if pool.fee == 0 {
                         pool.fee = 3000;
                     }
 
-                    // Update cached prices
                     if let Ok(p) = pool.calculate_price(pool.token_a.address, pool.token_b.address) {
                         pool.token_a_price = p;
                         pool.token_b_price = if p != 0.0 { 1.0 / p } else { 0.0 };
@@ -1020,7 +1053,6 @@ impl AerodromeV2Factory {
             }
         }
 
-        // Filter out pools with invalid data
         let (valid_amms, invalid_amms): (Vec<_>, Vec<_>) = amms_map
             .into_iter()
             .partition(|(_, amm)| !amm.tokens().iter().any(|t| t.is_zero()));
@@ -1062,7 +1094,7 @@ impl AerodromeV2Factory {
             return Ok(amms);
         }
 
-        let step = 120;
+        let step = 80;
 
         let mut futures = FuturesUnordered::new();
         let pool_addresses: Vec<Vec<Address>> = amms
@@ -1081,6 +1113,7 @@ impl AerodromeV2Factory {
 
                 Ok::<(Vec<Address>, alloy::primitives::Bytes), AMMError>((group, result))
             });
+            sleep(Duration::from_millis(500)).await;
         }
 
         let mut amms_map: HashMap<Address, AMM> = amms
@@ -1089,10 +1122,30 @@ impl AerodromeV2Factory {
             .collect();
 
         while let Some(res) = futures.next().await {
-            let (group, return_data) = res?;
+            let (group, return_data) = match res {
+                Ok(data) => data,
+                Err(e) => {
+                    tracing::error!(
+                        target = "amms::aerodrome_v2::sync_all_pools",
+                        error = ?e,
+                        "Batch contract call failed"
+                    );
+                    return Err(e);
+                }
+            };
 
-            let return_data =
-                <Vec<(Address, Address, u128, u128, u32, u32, bool)> as SolValue>::abi_decode(&return_data)?;
+            let return_data = match <Vec<(Address, Address, u128, u128, u32, u32, bool)> as SolValue>::abi_decode(&return_data) {
+                Ok(data) => data,
+                Err(e) => {
+                    tracing::error!(
+                        target = "amms::aerodrome_v2::sync_all_pools",
+                        error = ?e,
+                        return_data_len = return_data.len(),
+                        "Failed to decode batch return data"
+                    );
+                    return Err(AMMError::from(e));
+                }
+            };
 
             for (pool_data, pool_address) in return_data.iter().zip(group.iter()) {
                 if pool_data.0.is_zero() {
@@ -1110,7 +1163,6 @@ impl AerodromeV2Factory {
                     pool.reserve_1 = *reserve_1;
                     pool.stable = *stable;
 
-                    // Update cached prices
                     if let Ok(p) = pool.calculate_price(pool.token_a.address, pool.token_b.address) {
                         pool.token_a_price = p;
                         pool.token_b_price = if p != 0.0 { 1.0 / p } else { 0.0 };

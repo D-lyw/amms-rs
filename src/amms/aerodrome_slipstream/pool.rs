@@ -30,6 +30,7 @@ use futures::{stream::FuturesUnordered, StreamExt};
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use std::collections::HashMap;
 use thiserror::Error;
+use tokio::time::{sleep, Duration};
 
 use crate::amms::{
     amm::{AutomatedMarketMaker, SyncAction, AMM},
@@ -37,7 +38,7 @@ use crate::amms::{
     error::AMMError,
     factory::{AutomatedMarketMakerFactory, DiscoverySync},
     uniswap_v3::{
-        tick_to_word, GetUniswapV3PoolTickBitmapBatchRequest, GetUniswapV3PoolTickDataBatchRequest,
+        tick_to_word, GetUniswapV3PoolTickBitmapBatchRequest,
         UniswapV3Factory,
     },
     Token,
@@ -118,12 +119,19 @@ sol! {
     }
 }
 
-// Aerodrome Slipstream specific batch request contract
+// Aerodrome Slipstream specific batch request contracts
 // Slipstream slot0 returns 6 values (no feeProtocol) vs UniswapV3's 7
+// Slipstream ticks() returns only (liquidityGross, liquidityNet) vs UniswapV3's 8 fields
 sol! {
     #[sol(rpc)]
     GetAerodromeSlipstreamSlot0BatchRequest,
     "src/amms/abi/GetAerodromeSlipstreamSlot0BatchRequest.json",
+}
+
+sol! {
+    #[sol(rpc)]
+    GetAerodromeSlipstreamPoolTickDataBatchRequest,
+    "src/amms/abi/GetAerodromeSlipstreamPoolTickDataBatchRequest.json",
 }
 
 /// Aerodrome Slipstream specific errors
@@ -1045,11 +1053,10 @@ impl AerodromeSlipstreamFactory {
         N: Network,
         P: Provider<N> + Clone,
     {
-        // Use Slipstream-specific batch request (different slot0 format than UniswapV3)
-        let step = 255;
+        let step = 150;
         let mut futures = futures::stream::FuturesUnordered::new();
 
-        pools.chunks_mut(step).for_each(|group| {
+        for group in pools.chunks_mut(step) {
             let provider = provider.clone();
             let pool_addresses = group
                 .iter_mut()
@@ -1068,13 +1075,35 @@ impl AerodromeSlipstreamFactory {
                     .await?,
                 ))
             });
-        });
+            sleep(Duration::from_millis(500)).await;
+        }
 
         while let Some(res) = futures.next().await {
-            let (group, return_data) = res?;
+            let (group, return_data) = match res {
+                Ok(data) => data,
+                Err(e) => {
+                    tracing::warn!(
+                        target = "amms::aerodrome_slipstream::sync_slot_0",
+                        error = ?e,
+                        "Batch slot0 call failed, skipping batch"
+                    );
+                    continue;
+                }
+            };
             use alloy::sol_types::SolValue;
 
-            let return_data = <Vec<(u32, u128, U256)> as SolValue>::abi_decode(&return_data)?;
+            let return_data = match <Vec<(u32, u128, U256)> as SolValue>::abi_decode(&return_data) {
+                Ok(data) => data,
+                Err(e) => {
+                    tracing::warn!(
+                        target = "amms::aerodrome_slipstream::sync_slot_0",
+                        error = ?e,
+                        return_data_len = return_data.len(),
+                        "Failed to decode slot0 data, skipping batch"
+                    );
+                    continue;
+                }
+            };
 
             for (pool, (tick, liquidity, sqrt_price)) in
                 group.iter_mut().zip(return_data.into_iter())
@@ -1227,8 +1256,29 @@ impl AerodromeSlipstreamFactory {
             .collect::<HashMap<Address, &mut AMM>>();
 
         while let Some(res) = futures.next().await {
-            let (pools_addrs, return_data) = res?;
-            let return_data = <Vec<Vec<U256>> as SolValue>::abi_decode(&return_data)?;
+            let (pools_addrs, return_data) = match res {
+                Ok(data) => data,
+                Err(e) => {
+                    tracing::warn!(
+                        target = "amms::aerodrome_slipstream::sync_tick_bitmaps",
+                        error = ?e,
+                        "Batch tick bitmap call failed, skipping batch"
+                    );
+                    continue;
+                }
+            };
+            let return_data = match <Vec<Vec<U256>> as SolValue>::abi_decode(&return_data) {
+                Ok(data) => data,
+                Err(e) => {
+                    tracing::warn!(
+                        target = "amms::aerodrome_slipstream::sync_tick_bitmaps",
+                        error = ?e,
+                        return_data_len = return_data.len(),
+                        "Failed to decode tick bitmap data, skipping batch"
+                    );
+                    continue;
+                }
+            };
 
             for (tick_bitmaps, pool_address) in return_data.iter().zip(pools_addrs.iter()) {
                 let pool = pool_set.get_mut(pool_address).unwrap();
@@ -1257,9 +1307,8 @@ impl AerodromeSlipstreamFactory {
         N: Network,
         P: Provider<N> + Clone,
     {
-        use crate::amms::uniswap_v3::GetUniswapV3PoolTickDataBatchRequest::TickDataInfo;
+        use GetAerodromeSlipstreamPoolTickDataBatchRequest::TickDataInfo;
 
-        // Step 1: Collect all initialized ticks from bitmaps (parallel)
         let pool_ticks = pools
             .par_iter()
             .filter_map(|pool| {
@@ -1299,7 +1348,6 @@ impl AerodromeSlipstreamFactory {
             })
             .collect::<Vec<(Address, Vec<Signed<24, 1>>)>>();
 
-        // Step 2: Batch fetch tick data
         let mut futures: FuturesUnordered<BoxFuture<'_, _>> = FuturesUnordered::new();
         let max_ticks = 60;
         let mut group_ticks = 0;
@@ -1325,7 +1373,7 @@ impl AerodromeSlipstreamFactory {
                     futures.push(Box::pin(async move {
                         Ok::<(Vec<TickDataInfo>, Bytes), AMMError>((
                             calldata.clone(),
-                            GetUniswapV3PoolTickDataBatchRequest::deploy_builder(
+                            GetAerodromeSlipstreamPoolTickDataBatchRequest::deploy_builder(
                                 provider, calldata,
                             )
                             .call_raw()
@@ -1337,7 +1385,6 @@ impl AerodromeSlipstreamFactory {
             }
         }
 
-        // Flush remaining
         if !group.is_empty() {
             let provider = provider.clone();
             let calldata = std::mem::take(&mut group);
@@ -1345,7 +1392,7 @@ impl AerodromeSlipstreamFactory {
             futures.push(Box::pin(async move {
                 Ok::<(Vec<TickDataInfo>, Bytes), AMMError>((
                     calldata.clone(),
-                    GetUniswapV3PoolTickDataBatchRequest::deploy_builder(provider, calldata)
+                    GetAerodromeSlipstreamPoolTickDataBatchRequest::deploy_builder(provider, calldata)
                         .call_raw()
                         .block(block_number)
                         .await?,
@@ -1353,15 +1400,35 @@ impl AerodromeSlipstreamFactory {
             }));
         }
 
-        // Step 3: Apply results
         let mut pool_set = pools
             .iter_mut()
             .map(|pool| (pool.address(), pool))
             .collect::<HashMap<Address, &mut AMM>>();
 
         while let Some(res) = futures.next().await {
-            let (tick_info, return_data) = res?;
-            let return_data = <Vec<Vec<(bool, u128, i128)>> as SolValue>::abi_decode(&return_data)?;
+            let (tick_info, return_data) = match res {
+                Ok(data) => data,
+                Err(e) => {
+                    tracing::warn!(
+                        target = "amms::aerodrome_slipstream::sync_tick_data",
+                        error = ?e,
+                        "Batch tick data call failed, skipping batch"
+                    );
+                    continue;
+                }
+            };
+            let return_data = match <Vec<Vec<(u128, i128)>> as SolValue>::abi_decode(&return_data) {
+                Ok(data) => data,
+                Err(e) => {
+                    tracing::warn!(
+                        target = "amms::aerodrome_slipstream::sync_tick_data",
+                        error = ?e,
+                        return_data_len = return_data.len(),
+                        "Failed to decode tick data, skipping batch"
+                    );
+                    continue;
+                }
+            };
 
             for (tick_results, tick_info) in return_data.iter().zip(tick_info.iter()) {
                 let pool = pool_set.get_mut(&tick_info.pool).unwrap();
@@ -1371,9 +1438,9 @@ impl AerodromeSlipstreamFactory {
 
                 for (tick, tick_idx) in tick_results.iter().zip(tick_info.ticks.iter()) {
                     let info = TickInfo {
-                        liquidity_gross: tick.1,
-                        liquidity_net: tick.2,
-                        initialized: tick.0,
+                        liquidity_gross: tick.0,
+                        liquidity_net: tick.1,
+                        initialized: tick.0 > 0,
                     };
                     slipstream_pool.ticks.insert(tick_idx.as_i32(), info);
                 }
@@ -1394,13 +1461,11 @@ impl AerodromeSlipstreamFactory {
     {
         use crate::amms::uniswap_v3::GetUniswapV3PoolStaticMetaBatchRequest;
 
-        let step = 255;
+        let step = 150;
         let mut futures: FuturesUnordered<BoxFuture<'_, _>> = FuturesUnordered::new();
 
-        // Collect addresses for batch fetching
         let pool_addresses: Vec<Address> = amms.iter().map(|p| p.address()).collect();
 
-        // Batch fetch static metadata (token0, token1, tickSpacing, fee)
         for chunk in pool_addresses.chunks(step) {
             let provider = provider.clone();
             let addresses = chunk.to_vec();
@@ -1417,14 +1482,34 @@ impl AerodromeSlipstreamFactory {
                     .await?,
                 ))
             }));
+            sleep(Duration::from_millis(500)).await;
         }
 
         while let Some(res) = futures.next().await {
-            let (addresses, return_data) = res?;
-            let static_data =
-                <Vec<(Address, Address, i32, u32)> as SolValue>::abi_decode(&return_data)?;
+            let (addresses, return_data) = match res {
+                Ok(data) => data,
+                Err(e) => {
+                    tracing::warn!(
+                        target = "amms::aerodrome_slipstream::init_batch",
+                        error = ?e,
+                        "Batch static meta call failed, skipping batch"
+                    );
+                    continue;
+                }
+            };
+            let static_data = match <Vec<(Address, Address, i32, u32)> as SolValue>::abi_decode(&return_data) {
+                Ok(data) => data,
+                Err(e) => {
+                    tracing::warn!(
+                        target = "amms::aerodrome_slipstream::init_batch",
+                        error = ?e,
+                        return_data_len = return_data.len(),
+                        "Failed to decode static data, skipping batch"
+                    );
+                    continue;
+                }
+            };
 
-            // Create a lookup map for addresses
             let addr_to_data: HashMap<Address, (Address, Address, i32, u32)> =
                 addresses.into_iter().zip(static_data.into_iter()).collect();
 
@@ -1442,22 +1527,57 @@ impl AerodromeSlipstreamFactory {
             }
         }
 
-        // Sync slot0
         Self::sync_slot_0(&mut amms, block_number, provider.clone()).await?;
+        sleep(Duration::from_millis(500)).await;
 
-        // Sync token decimals
         Self::sync_token_decimals(&mut amms, provider.clone())
             .await
             .map_err(AMMError::from)?;
+        sleep(Duration::from_millis(500)).await;
 
-        // Sync tick bitmaps
-        Self::sync_tick_bitmaps(&mut amms, block_number, provider.clone()).await?;
+        let (valid_amms, invalid_amms): (Vec<_>, Vec<_>) = amms
+            .into_iter()
+            .partition(|amm| {
+                if let AMM::AerodromeSlipstreamPool(pool) = amm {
+                    pool.liquidity > 0
+                        && pool.tick_spacing != 0
+                        && !pool.token_a.address.is_zero()
+                        && !pool.token_b.address.is_zero()
+                        && pool.token_a.decimals > 0
+                        && pool.token_b.decimals > 0
+                } else {
+                    false
+                }
+            });
 
-        // Sync tick data
-        Self::sync_tick_data(&mut amms, block_number, provider.clone()).await?;
+        if !invalid_amms.is_empty() {
+            for amm in &invalid_amms {
+                tracing::warn!(
+                    target = "amms::aerodrome_slipstream::init_batch",
+                    addr = ?amm.address(),
+                    "Filtered out invalid pool"
+                );
+            }
+        }
 
-        // Update prices
-        for pool in amms.iter_mut() {
+        tracing::info!(
+            target = "amms::aerodrome_slipstream::init_batch",
+            total = valid_amms.len() + invalid_amms.len(),
+            valid = valid_amms.len(),
+            invalid = invalid_amms.len(),
+            "Batch initialization complete"
+        );
+
+        let mut valid_amms = valid_amms;
+        let pools_step = 50;
+        for group in valid_amms.chunks_mut(pools_step) {
+            Self::sync_tick_bitmaps(group, block_number, provider.clone()).await?;
+            sleep(Duration::from_millis(500)).await;
+            Self::sync_tick_data(group, block_number, provider.clone()).await?;
+            sleep(Duration::from_millis(500)).await;
+        }
+
+        for pool in valid_amms.iter_mut() {
             let AMM::AerodromeSlipstreamPool(ref mut slipstream_pool) = pool else {
                 continue;
             };
@@ -1472,7 +1592,7 @@ impl AerodromeSlipstreamFactory {
             }
         }
 
-        Ok(amms)
+        Ok(valid_amms)
     }
 }
 

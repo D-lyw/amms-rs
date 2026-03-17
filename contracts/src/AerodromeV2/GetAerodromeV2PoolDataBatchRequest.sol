@@ -41,39 +41,54 @@ contract GetAerodromeV2PoolDataBatchRequest {
 
             PoolData memory poolData;
 
-            // Get metadata which includes all pool data in one call
-            (
-                uint256 dec0,
-                uint256 dec1,
+            try IAerodromeV2Pool(poolAddress).metadata() returns (
+                uint256,  // dec0 - precision value (10^decimals), not used
+                uint256,  // dec1 - precision value (10^decimals), not used
                 uint256 r0,
                 uint256 r1,
                 bool st,
                 address t0,
                 address t1
-            ) = IAerodromeV2Pool(poolAddress).metadata();
+            ) {
+                if (t0 == address(0) || t1 == address(0)) {
+                    continue;
+                }
 
-            // Check that tokens exist
-            if (codeSizeIsZero(t0) || codeSizeIsZero(t1)) {
+                if (codeSizeIsZero(t0) || codeSizeIsZero(t1)) {
+                    continue;
+                }
+
+                uint8 dec0;
+                uint8 dec1;
+                try IERC20(t0).decimals() returns (uint8 d0) {
+                    dec0 = d0;
+                } catch {
+                    continue;
+                }
+                try IERC20(t1).decimals() returns (uint8 d1) {
+                    dec1 = d1;
+                } catch {
+                    continue;
+                }
+
+                if (dec0 == 0 || dec1 == 0) {
+                    continue;
+                }
+
+                poolData.tokenA = t0;
+                poolData.tokenB = t1;
+                poolData.reserve0 = uint112(r0);
+                poolData.reserve1 = uint112(r1);
+                poolData.tokenADecimals = dec0;
+                poolData.tokenBDecimals = dec1;
+                poolData.stable = st;
+
+                allPoolData[i] = poolData;
+            } catch {
                 continue;
             }
-
-            // Validate decimals
-            if (dec0 == 0 || dec0 > 255 || dec1 == 0 || dec1 > 255) {
-                continue;
-            }
-
-            poolData.tokenA = t0;
-            poolData.tokenB = t1;
-            poolData.reserve0 = uint112(r0);
-            poolData.reserve1 = uint112(r1);
-            poolData.tokenADecimals = uint8(dec0);
-            poolData.tokenBDecimals = uint8(dec1);
-            poolData.stable = st;
-
-            allPoolData[i] = poolData;
         }
 
-        // ensure abi encoding
         bytes memory _abiEncodedData = abi.encode(allPoolData);
 
         assembly {
