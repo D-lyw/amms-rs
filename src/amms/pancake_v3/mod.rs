@@ -12,7 +12,7 @@ use super::{
 };
 use crate::amms::consts::U256_1;
 use crate::amms::uniswap_v3::{
-    GetUniswapV3PoolSlot0BatchRequest, GetUniswapV3PoolTickBitmapBatchRequest::TickBitmapInfo,
+    GetUniswapV3PoolTickBitmapBatchRequest::TickBitmapInfo,
     GetUniswapV3PoolTickDataBatchRequest::TickDataInfo, UniswapV3Error,
 };
 use alloy::{
@@ -840,6 +840,12 @@ contract IQuoterV2 {
 }
 );
 
+sol!(
+    #[sol(rpc)]
+    GetPancakeV3PoolSlot0BatchRequest,
+    "src/amms/abi/GetPancakeV3PoolSlot0BatchRequest.json",
+);
+
 sol! {
     #[derive(Debug, PartialEq, Eq)]
     #[sol(rpc)]
@@ -1213,7 +1219,7 @@ impl PancakeV3Factory {
             futures.push(async move {
                 Ok::<(Vec<Address>, Bytes), AMMError>((
                     pool_addresses.clone(),
-                    GetUniswapV3PoolSlot0BatchRequest::deploy_builder(provider, pool_addresses)
+                    GetPancakeV3PoolSlot0BatchRequest::deploy_builder(provider, pool_addresses)
                         .call_raw()
                         .block(block_number)
                         .await?,

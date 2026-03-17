@@ -35,6 +35,8 @@ const TARGET_CONTRACTS: &[&str] = &[
     // Aerodrome Slipstream
     "GetAerodromeSlipstreamSlot0BatchRequest",
     "GetAerodromeSlipstreamPoolTickDataBatchRequest",
+    // PancakeV3
+    "GetPancakeV3PoolSlot0BatchRequest",
 ];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
