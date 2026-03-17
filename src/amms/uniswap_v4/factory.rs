@@ -12,7 +12,7 @@ use futures::StreamExt;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::amms::amm::{AutomatedMarketMaker, AMM};
 // use crate::amms::consts::U256_1; // keep consistency with crate imports
@@ -135,11 +135,9 @@ impl UniswapV4Factory {
                 })
                 .collect();
 
-            // 减小每个 chunk 的大小以降低单次请求负载
             let chunks: Vec<_> = slots.chunks(100).collect();
             let mut all_results = Vec::new();
 
-            // 分批执行，每批限制并发数，批次间添加延迟
             for batch in chunks.chunks(Self::MAX_CONCURRENT_RPC_REQUESTS) {
                 let mut futures = Vec::new();
                 for chunk in batch {
@@ -154,10 +152,13 @@ impl UniswapV4Factory {
                     });
                 }
 
-                let batch_results = futures::future::try_join_all(futures).await?;
+                let batch_results: Vec<_> = futures::future::join_all(futures)
+                    .await
+                    .into_iter()
+                    .filter_map(|r| r.ok())
+                    .collect();
                 all_results.extend(batch_results);
 
-                // 批次间延迟，避免 RPS 超限
                 if Self::BATCH_DELAY_MS > 0 {
                     sleep(Duration::from_millis(Self::BATCH_DELAY_MS)).await;
                 }
@@ -166,12 +167,45 @@ impl UniswapV4Factory {
             let mut flat_results = all_results.into_iter().flatten();
 
             for pool in manager_pools {
-                let slot0_data = flat_results
-                    .next()
-                    .ok_or(AMMError::SyncError(Address::ZERO))?;
-                let liquidity_data = flat_results
-                    .next()
-                    .ok_or(AMMError::SyncError(Address::ZERO))?;
+                let slot0_data = match flat_results.next() {
+                    Some(data) => data,
+                    None => {
+                        warn!(
+                            target: "amms::uniswap_v4::sync_slot_0",
+                            pool_id = ?pool.pool_id,
+                            manager = ?manager_address,
+                            "Missing slot0 data for pool"
+                        );
+                        pool.tick_spacing = 0;
+                        continue;
+                    }
+                };
+                let liquidity_data = match flat_results.next() {
+                    Some(data) => data,
+                    None => {
+                        warn!(
+                            target: "amms::uniswap_v4::sync_slot_0",
+                            pool_id = ?pool.pool_id,
+                            manager = ?manager_address,
+                            "Missing liquidity data for pool"
+                        );
+                        pool.tick_spacing = 0;
+                        continue;
+                    }
+                };
+
+                if slot0_data.is_zero() || liquidity_data.is_zero() {
+                    warn!(
+                        target: "amms::uniswap_v4::sync_slot_0",
+                        pool_id = ?pool.pool_id,
+                        manager = ?manager_address,
+                        slot0_zero = slot0_data.is_zero(),
+                        liquidity_zero = liquidity_data.is_zero(),
+                        "Pool has zero slot data"
+                    );
+                    pool.tick_spacing = 0;
+                    continue;
+                }
 
                 let sqrt_price_x96 = U160::from_be_slice(&slot0_data[12..32]);
                 let tick_bytes =
@@ -298,12 +332,10 @@ impl UniswapV4Factory {
                 }
             }
 
-            // 减小 chunk 大小以降低单次请求负载
             let chunks: Vec<_> = all_slots.chunks(50).collect();
             let ipool_manager = IPoolManagerInstance::new(manager_address, provider.clone());
             let mut all_results = Vec::new();
 
-            // 分批执行，控制并发
             for batch in chunks.chunks(Self::MAX_CONCURRENT_RPC_REQUESTS) {
                 let mut futures = Vec::new();
                 for chunk in batch {
@@ -318,10 +350,13 @@ impl UniswapV4Factory {
                     });
                 }
 
-                let batch_results = futures::future::try_join_all(futures).await?;
+                let batch_results: Vec<_> = futures::future::join_all(futures)
+                    .await
+                    .into_iter()
+                    .filter_map(|r| r.ok())
+                    .collect();
                 all_results.extend(batch_results);
 
-                // 批次间延迟
                 if Self::BATCH_DELAY_MS > 0 {
                     sleep(Duration::from_millis(Self::BATCH_DELAY_MS)).await;
                 }
@@ -330,18 +365,20 @@ impl UniswapV4Factory {
             let flat_results: Vec<B256> = all_results.into_iter().flatten().collect();
 
             for (pool_idx, tick, slot_idx) in pool_slot_indices {
-                let word = flat_results[slot_idx];
-                let (liquidity_gross, liquidity_net) =
-                    decode_liquidity_gross_and_net(B256::from(word));
+                if slot_idx < flat_results.len() {
+                    let word = flat_results[slot_idx];
+                    let (liquidity_gross, liquidity_net) =
+                        decode_liquidity_gross_and_net(B256::from(word));
 
-                manager_pools[pool_idx].ticks.insert(
-                    tick,
-                    Info {
-                        liquidity_gross,
-                        liquidity_net,
-                        initialized: true,
-                    },
-                );
+                    manager_pools[pool_idx].ticks.insert(
+                        tick,
+                        Info {
+                            liquidity_gross,
+                            liquidity_net,
+                            initialized: true,
+                        },
+                    );
+                }
             }
         }
 
@@ -382,31 +419,31 @@ impl UniswapV4Factory {
                 }
             }
 
-            // 减小 chunk 大小以降低单次请求负载
             let chunks: Vec<_> = all_slots.chunks(200).collect();
             let ipool_manager = IPoolManagerInstance::new(manager_address, provider.clone());
             let mut all_results = Vec::new();
 
-            // 分批执行，控制并发
             for batch in chunks.chunks(Self::MAX_CONCURRENT_RPC_REQUESTS) {
                 let mut futures = Vec::new();
                 for chunk in batch {
                     let chunk_vec = chunk.to_vec();
                     let ipool_manager = ipool_manager.clone();
                     futures.push(async move {
-                        let words = ipool_manager
+                        ipool_manager
                             .extsload_2(chunk_vec)
                             .block(block_id)
                             .call()
-                            .await?;
-                        Ok::<Vec<B256>, AMMError>(words)
+                            .await
                     });
                 }
 
-                let batch_results = futures::future::try_join_all(futures).await?;
+                let batch_results: Vec<_> = futures::future::join_all(futures)
+                    .await
+                    .into_iter()
+                    .filter_map(|r| r.ok())
+                    .collect();
                 all_results.extend(batch_results);
 
-                // 批次间延迟
                 if Self::BATCH_DELAY_MS > 0 {
                     sleep(Duration::from_millis(Self::BATCH_DELAY_MS)).await;
                 }
@@ -415,10 +452,12 @@ impl UniswapV4Factory {
             let flat_results: Vec<B256> = all_results.into_iter().flatten().collect();
 
             for (pool_idx, word, slot_idx) in pool_slot_indices {
-                let bitmap = U256::from_be_bytes(flat_results[slot_idx].0);
-                manager_pools[pool_idx]
-                    .tick_bitmap
-                    .insert(word as i16, bitmap);
+                if slot_idx < flat_results.len() {
+                    let bitmap = U256::from_be_bytes(flat_results[slot_idx].0);
+                    manager_pools[pool_idx]
+                        .tick_bitmap
+                        .insert(word as i16, bitmap);
+                }
             }
         }
 
@@ -434,6 +473,7 @@ impl UniswapV4Factory {
         N: Network,
         P: Provider<N> + Clone,
     {
+        let total = amms.len();
         let mut pools: Vec<UniswapV4Pool> = amms
             .into_iter()
             .filter_map(|amm| {
@@ -456,20 +496,18 @@ impl UniswapV4Factory {
                     && pool.token_b.decimals > 0
             });
 
-        if !invalid_pools.is_empty() {
-            for pool in &invalid_pools {
-                info!(
-                    target: "amms::uniswap_v4::init_batch",
-                    pool_id = ?pool.pool_id,
-                    liquidity = ?pool.liquidity,
-                    tick_spacing = ?pool.tick_spacing,
-                    token_a = ?pool.token_a.address,
-                    token_b = ?pool.token_b.address,
-                    token_a_decimals = ?pool.token_a.decimals,
-                    token_b_decimals = ?pool.token_b.decimals,
-                    "Filtering out V4 pool"
-                );
-            }
+        let invalid = invalid_pools.len();
+        for pool in &invalid_pools {
+            warn!(
+                target: "amms::uniswap_v4::init_batch",
+                pool_id = ?pool.pool_id,
+                tick_spacing = pool.tick_spacing,
+                token_a = ?pool.token_a.address,
+                token_b = ?pool.token_b.address,
+                token_a_decimals = pool.token_a.decimals,
+                token_b_decimals = pool.token_b.decimals,
+                "Filtering out invalid V4 pool"
+            );
         }
         let mut pools = valid_pools;
 
@@ -482,6 +520,15 @@ impl UniswapV4Factory {
             pool.token_b_price =
                 pool.calculate_price(pool.token_b.address, pool.token_a.address)?;
         }
+
+        let valid = pools.len();
+        info!(
+            target: "amms::uniswap_v4::init_batch",
+            total = total,
+            valid = valid,
+            invalid = invalid,
+            "Batch initialization complete"
+        );
 
         Ok(pools.into_iter().map(AMM::UniswapV4Pool).collect())
     }
