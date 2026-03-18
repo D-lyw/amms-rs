@@ -1321,7 +1321,7 @@ impl PancakeV3Factory {
             pool_index.insert(pool.address(), idx);
         }
 
-        let max_in_flight = 4;
+        let max_in_flight = 8;
         let mut futures: FuturesUnordered<BoxFuture<'_, _>> = FuturesUnordered::new();
 
         for (pool_info, calldata) in jobs {
@@ -1470,7 +1470,7 @@ impl PancakeV3Factory {
             pool_index.insert(pool.address(), idx);
         }
 
-        let max_in_flight = 4;
+        let max_in_flight = 8;
 
         for job in jobs {
             let provider = provider.clone();
