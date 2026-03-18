@@ -1210,41 +1210,39 @@ impl PancakeV3Factory {
     {
         let step = 255;
 
-        let mut futures = FuturesUnordered::new();
-        pools.chunks_mut(step).for_each(|group| {
-            let provider = provider.clone();
-            let pool_addresses = group
-                .iter_mut()
+        for group in pools.chunks_mut(step) {
+            let pool_addresses: Vec<Address> = group
+                .iter()
                 .filter_map(|pool| match pool {
                     AMM::PancakeV3Pool(p) => Some(p.address),
                     _ => None,
                 })
-                .collect::<Vec<_>>();
+                .collect();
 
-            futures.push(async move {
-                Ok::<(Vec<Address>, Bytes), AMMError>((
-                    pool_addresses.clone(),
-                    GetPancakeV3PoolSlot0BatchRequest::deploy_builder(provider, pool_addresses)
-                        .call_raw()
-                        .block(block_number)
-                        .await?,
-                ))
-            });
-        });
+            let return_data = GetPancakeV3PoolSlot0BatchRequest::deploy_builder(
+                provider.clone(),
+                pool_addresses.clone(),
+            )
+            .call_raw()
+            .block(block_number)
+            .await?;
 
-        while let Some(res) = futures.next().await {
-            let (pool_addresses, return_data) = res?;
             let return_data = <Vec<(i32, u128, U256)> as SolValue>::abi_decode(&return_data)?;
 
-            for (slot_0_data, pool_addr) in return_data.iter().zip(pool_addresses.iter()) {
-                if let Some(pool) = pools.iter_mut().find(|p| p.address() == *pool_addr) {
-                    if let AMM::PancakeV3Pool(ref mut pv3_pool) = pool {
+            let mut slot_idx = 0;
+            for pool in group.iter_mut() {
+                if let AMM::PancakeV3Pool(ref mut pv3_pool) = pool {
+                    if slot_idx < return_data.len() {
+                        let slot_0_data = &return_data[slot_idx];
                         pv3_pool.tick = slot_0_data.0;
                         pv3_pool.liquidity = slot_0_data.1;
                         pv3_pool.sqrt_price = slot_0_data.2;
+                        slot_idx += 1;
                     }
                 }
             }
+
+            sleep(Duration::from_millis(300)).await;
         }
 
         Ok(())
