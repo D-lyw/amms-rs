@@ -394,7 +394,7 @@ impl AutomatedMarketMakerFactory for BalancerV3Factory {
         Ok(AMM::BalancerV3Pool(BalancerV3Pool::new(
             pool_created.pool,
             self.vault_address,
-            BalancerV3PoolType::Weighted,
+            BalancerV3PoolType::Weighted, // Default
         )))
     }
 }
