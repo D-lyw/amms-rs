@@ -230,6 +230,8 @@ impl BalancerV3Factory {
             return Ok(vec![]);
         }
 
+        let total = amms.len();
+
         let chain_id = provider.get_chain_id().await?;
         let vault_explorer_address = super::get_vault_explorer_address(chain_id)
             .ok_or_else(|| AMMError::Msg(format!("Unsupported chain id: {}", chain_id)))?;
@@ -369,6 +371,16 @@ impl BalancerV3Factory {
                 pool.update_spot_prices();
             }
         }
+
+        let valid = valid_amms.len();
+        let invalid = total.saturating_sub(valid);
+        tracing::info!(
+            target: "amms::balancer_v3::init_batch",
+            total = total,
+            valid = valid,
+            invalid = invalid,
+            "Batch initialization complete"
+        );
 
         Ok(valid_amms)
     }

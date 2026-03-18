@@ -350,6 +350,8 @@ impl BalancerV2Factory {
             return Ok(vec![]);
         }
 
+        let total = amms.len();
+
         let vault_address = if let AMM::BalancerV2Pool(pool) = &amms[0] {
             pool.vault_address
         } else {
@@ -519,6 +521,17 @@ impl BalancerV2Factory {
             sleep(Duration::from_millis(100)).await;
         }
 
-        Ok(amms_map.into_values().collect())
+        let initialized_amms: Vec<AMM> = amms_map.into_values().collect();
+        let valid = initialized_amms.len();
+        let invalid = total.saturating_sub(valid);
+        tracing::info!(
+            target: "amms::balancer_v2::init_batch",
+            total = total,
+            valid = valid,
+            invalid = invalid,
+            "Batch initialization complete"
+        );
+
+        Ok(initialized_amms)
     }
 }

@@ -1063,6 +1063,7 @@ impl UniswapV3Factory {
         N: Network,
         P: Provider<N> + Clone,
     {
+        let total = pools.len();
         let addresses = pools
             .iter()
             .filter_map(|amm| match amm {
@@ -1186,6 +1187,16 @@ impl UniswapV3Factory {
             UniswapV3Factory::sync_tick_data(group, block_number, provider.clone()).await?;
             sleep(Duration::from_millis(500)).await;
         }
+
+        let valid = pools.len();
+        let invalid = invalid_pools.len();
+        info!(
+            target: "amms::uniswap_v3::init_batch",
+            total = total,
+            valid = valid,
+            invalid = invalid,
+            "Batch initialization complete"
+        );
 
         Ok(pools)
     }

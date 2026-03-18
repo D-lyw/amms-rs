@@ -390,6 +390,8 @@ impl PancakeInfinityFactory {
         N: Network,
         P: Provider<N> + Clone,
     {
+        let total = amms.len();
+
         let mut pools: Vec<PancakeInfinityPool> = amms
             .into_iter()
             .filter_map(|amm| {
@@ -442,7 +444,18 @@ impl PancakeInfinityFactory {
                 pool.calculate_price(pool.token_b.address, pool.token_a.address)?;
         }
 
-        Ok(pools.into_iter().map(AMM::PancakeInfinityPool).collect())
+        let result: Vec<AMM> = pools.into_iter().map(AMM::PancakeInfinityPool).collect();
+        let valid = result.len();
+        let invalid = total.saturating_sub(valid);
+        tracing::info!(
+            target: "amms::pancake_infinity::init_batch",
+            total = total,
+            valid = valid,
+            invalid = invalid,
+            "Batch initialization complete"
+        );
+
+        Ok(result)
     }
 }
 

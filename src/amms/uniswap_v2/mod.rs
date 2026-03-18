@@ -723,7 +723,7 @@ impl UniswapV2Factory {
             }
         }
 
-        let amms = valid_amms.into_iter().map(|(_, amm)| amm).collect();
+        let amms: Vec<AMM> = valid_amms.into_iter().map(|(_, amm)| amm).collect();
 
         Ok(amms)
     }
@@ -737,6 +737,7 @@ impl UniswapV2Factory {
         N: Network,
         P: Provider<N> + Clone,
     {
+        let total = amms.len();
         let step = 120;
         let pairs = amms
             .iter()
@@ -832,7 +833,17 @@ impl UniswapV2Factory {
             }
         }
 
-        let amms = valid_amms.into_iter().map(|(_, amm)| amm).collect();
+        let amms: Vec<AMM> = valid_amms.into_iter().map(|(_, amm)| amm).collect();
+
+        let valid = amms.len();
+        let invalid = invalid_amms.len();
+        info!(
+            target: "amms::uniswap_v2::init_batch",
+            total = total,
+            valid = valid,
+            invalid = invalid,
+            "Batch initialization complete"
+        );
 
         Ok(amms)
     }

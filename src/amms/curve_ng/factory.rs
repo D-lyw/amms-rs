@@ -199,6 +199,8 @@ impl CurveNGFactory {
             return Ok(vec![]);
         }
 
+        let total = amms.len();
+
         // 减小批次大小以避免 Gas Limit 或 Contract Size 限制
         // 调试模式：设置为 1 以验证逻辑正确性
         let step = 20;
@@ -555,6 +557,16 @@ impl CurveNGFactory {
                 "Some CurveNG pools were filtered due to initialization failure"
             );
         }
+
+        let valid = initialized_amms.len();
+        let invalid = total.saturating_sub(valid);
+        tracing::info!(
+            target: "curve_ng::init_batch",
+            total = total,
+            valid = valid,
+            invalid = invalid,
+            "Batch initialization complete"
+        );
 
         Ok(initialized_amms)
     }

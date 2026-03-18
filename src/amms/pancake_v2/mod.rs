@@ -496,7 +496,7 @@ impl PancakeV2Factory {
             }
         }
 
-        let amms = valid_amms.into_iter().map(|(_, amm)| amm).collect();
+        let amms: Vec<AMM> = valid_amms.into_iter().map(|(_, amm)| amm).collect();
 
         Ok(amms)
     }
@@ -514,6 +514,7 @@ impl PancakeV2Factory {
             return Ok(vec![]);
         }
 
+        let total = amms.len();
         let step = 120;
         let pairs = amms
             .iter()
@@ -596,7 +597,17 @@ impl PancakeV2Factory {
             }
         }
 
-        let amms = valid_amms.into_iter().map(|(_, amm)| amm).collect();
+        let amms: Vec<AMM> = valid_amms.into_iter().map(|(_, amm)| amm).collect();
+
+        let valid = amms.len();
+        let invalid = invalid_amms.len();
+        info!(
+            target: "amms::pancake_v2::init_batch",
+            total = total,
+            valid = valid,
+            invalid = invalid,
+            "Batch initialization complete"
+        );
 
         Ok(amms)
     }

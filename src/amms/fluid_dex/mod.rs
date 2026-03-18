@@ -2009,6 +2009,8 @@ impl FluidDexFactory {
             return Ok(vec![]);
         }
 
+        let total = amms.len();
+
         let resolver_address = match &amms[0] {
             AMM::FluidDexPool(pool) => pool.reserves_resolver,
             _ => return Err(AMMError::Msg("Expected FluidDexPool".to_string())),
@@ -2202,6 +2204,16 @@ impl FluidDexFactory {
                 }
             }
         }
+
+        let valid = out.len();
+        let invalid = total.saturating_sub(valid);
+        tracing::info!(
+            target: "amms::fluid_dex::init_batch",
+            total = total,
+            valid = valid,
+            invalid = invalid,
+            "Batch initialization complete"
+        );
 
         Ok(out)
     }

@@ -321,6 +321,7 @@ impl ERC4626Vault {
         N: Network,
         P: Provider<N> + Clone,
     {
+        let total = amms.len();
         let step = 100;
         let vaults = amms
             .iter()
@@ -458,7 +459,19 @@ impl ERC4626Vault {
             }
         }
 
-        Ok(valid_amms.into_iter().map(|(_, amm)| amm).collect())
+        let amms: Vec<AMM> = valid_amms.into_iter().map(|(_, amm)| amm).collect();
+
+        let valid = amms.len();
+        let invalid = invalid_amms.len();
+        info!(
+            target: "amms::erc_4626::init_batch",
+            total = total,
+            valid = valid,
+            invalid = invalid,
+            "Batch initialization complete"
+        );
+
+        Ok(amms)
     }
 
     // Returns a new, unsynced ERC4626 vault

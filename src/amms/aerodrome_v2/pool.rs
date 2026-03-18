@@ -977,29 +977,22 @@ impl AerodromeV2Factory {
             let return_data = match <Vec<(Address, Address, u128, u128, u32, u32, bool)> as SolValue>::abi_decode(&return_data) {
                 Ok(data) => data,
                 Err(e) => {
-                    tracing::error!(
+                    tracing::warn!(
                         target = "amms::aerodrome_v2::init_batch",
                         error = ?e,
                         return_data_len = return_data.len(),
-                        "Failed to decode batch return data"
+                        pools = ?group,
+                        "Failed to decode batch return data, skipping batch"
                     );
-                    return Err(AMMError::from(e));
+                    continue;
                 }
             };
 
-            tracing::debug!(
-                target = "amms::aerodrome_v2::init_batch",
-                group_len = group.len(),
-                return_data_len = return_data.len(),
-                "Batch data decoded"
-            );
-
-            for (idx, (pool_data, pool_address)) in return_data.iter().zip(group.iter()).enumerate() {
+            for (pool_data, pool_address) in return_data.iter().zip(group.iter()) {
                 if pool_data.0.is_zero() {
                     tracing::warn!(
                         target = "amms::aerodrome_v2::init_batch",
                         ?pool_address,
-                        idx,
                         "Pool returned zero tokenA address"
                     );
                     continue;
@@ -1126,25 +1119,26 @@ impl AerodromeV2Factory {
             let (group, return_data) = match res {
                 Ok(data) => data,
                 Err(e) => {
-                    tracing::error!(
+                    tracing::warn!(
                         target = "amms::aerodrome_v2::sync_all_pools",
                         error = ?e,
-                        "Batch contract call failed"
+                        "Batch contract call failed, skipping batch"
                     );
-                    return Err(e);
+                    continue;
                 }
             };
 
             let return_data = match <Vec<(Address, Address, u128, u128, u32, u32, bool)> as SolValue>::abi_decode(&return_data) {
                 Ok(data) => data,
                 Err(e) => {
-                    tracing::error!(
+                    tracing::warn!(
                         target = "amms::aerodrome_v2::sync_all_pools",
                         error = ?e,
                         return_data_len = return_data.len(),
-                        "Failed to decode batch return data"
+                        pools = ?group,
+                        "Failed to decode batch return data, skipping batch"
                     );
-                    return Err(AMMError::from(e));
+                    continue;
                 }
             };
 
