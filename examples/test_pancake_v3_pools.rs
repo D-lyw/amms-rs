@@ -1,18 +1,18 @@
 use std::sync::Arc;
 
 use alloy::{
-    eips::BlockId,
     primitives::address,
-    providers::{Provider, ProviderBuilder},
+    providers::ProviderBuilder,
     rpc::client::ClientBuilder,
     transports::layers::{RetryBackoffLayer, ThrottleLayer},
 };
-use amms::amms::{
-    amm::{AMM, AutomatedMarketMaker},
-    pancake_v3::{PancakeV3Factory, PancakeV3Pool},
+use amms::{
+    amms::{
+        amm::AMM,
+        pancake_v3::PancakeV3Pool,
+    },
+    state_space::StateSpaceBuilder,
 };
-
-const BASE_CHAIN_ID: u64 = 8453;
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
@@ -45,7 +45,7 @@ async fn main() -> eyre::Result<()> {
     ];
 
     tracing::info!(
-        "Starting sync for {} PancakeV3 pools on Base",
+        "Starting sync for {} PancakeV3 pools on Base using StateSpaceBuilder",
         pancake_v3_pools.len()
     );
 
@@ -59,77 +59,28 @@ async fn main() -> eyre::Result<()> {
         }
     }
 
-    let block = provider.get_block_number().await?;
-    tracing::info!("Current block: {}", block);
+    let manager = StateSpaceBuilder::new(provider.clone())
+        .with_amms(pancake_v3_pools)
+        .sync()
+        .await?;
 
-    match PancakeV3Factory::init_batch(
-        pancake_v3_pools.clone(),
-        BlockId::from(block),
-        provider.clone(),
-    )
-    .await
-    {
-        Ok(synced_amms) => {
-            tracing::info!("========== SYNC RESULT ==========");
-            tracing::info!("Total requested: {}", pancake_v3_pools.len());
-            tracing::info!("Successfully synced: {}", synced_amms.len());
-            tracing::info!("Failed/Skipped: {}", pancake_v3_pools.len() - synced_amms.len());
+    let state = manager.state.read().await;
+    tracing::info!("========== SYNC RESULT ==========");
+    tracing::info!("Successfully synced: {} AMMs", state.state.len());
 
-            for amm in &synced_amms {
-                if let AMM::PancakeV3Pool(pool) = amm {
-                    tracing::info!(
-                        "[OK] {} | token_a={} | token_b={} | tick_spacing={} | fee={} | liquidity={} | tick={} | sqrt_price={}",
-                        pool.address,
-                        pool.token_a.address,
-                        pool.token_b.address,
-                        pool.tick_spacing,
-                        pool.fee,
-                        pool.liquidity,
-                        pool.tick,
-                        pool.sqrt_price
-                    );
-                }
-            }
-        }
-        Err(e) => {
-            tracing::error!("Batch initialization failed: {}", e);
-            tracing::error!("Error type: {:?}", std::any::type_name_of_val(&e));
-
-            if let Some(source) = std::error::Error::source(&e) {
-                tracing::error!("Caused by: {}", source);
-            }
-
-            tracing::info!("Trying individual pool initialization to identify the problematic pool...");
-
-            for (i, amm) in pancake_v3_pools.iter().enumerate() {
-                if let AMM::PancakeV3Pool(pool) = amm {
-                    tracing::info!("--- Testing pool {}/{}: {} ---", i + 1, pancake_v3_pools.len(), pool.address);
-
-                    match pool.clone().init::<_, _>(BlockId::from(block), provider.clone()).await {
-                        Ok(synced_pool) => {
-                            tracing::info!(
-                                "[OK] {} | token_a={} | token_b={} | tick_spacing={} | fee={} | liquidity={} | tick={}",
-                                synced_pool.address,
-                                synced_pool.token_a.address,
-                                synced_pool.token_b.address,
-                                synced_pool.tick_spacing,
-                                synced_pool.fee,
-                                synced_pool.liquidity,
-                                synced_pool.tick
-                            );
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                "[FAILED] {} | Error: {}",
-                                pool.address,
-                                e
-                            );
-                        }
-                    }
-
-                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                }
-            }
+    for (addr, amm) in state.state.iter() {
+        if let AMM::PancakeV3Pool(pool) = amm {
+            tracing::info!(
+                "[OK] {} | token_a={} | token_b={} | tick_spacing={} | fee={} | liquidity={} | tick={} | sqrt_price={}",
+                addr,
+                pool.token_a.address,
+                pool.token_b.address,
+                pool.tick_spacing,
+                pool.fee,
+                pool.liquidity,
+                pool.tick,
+                pool.sqrt_price
+            );
         }
     }
 

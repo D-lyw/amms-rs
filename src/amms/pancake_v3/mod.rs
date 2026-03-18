@@ -1242,7 +1242,7 @@ impl PancakeV3Factory {
                 }
             }
 
-            sleep(Duration::from_millis(300)).await;
+            sleep(Duration::from_millis(500)).await;
         }
 
         Ok(())
