@@ -1062,11 +1062,13 @@ impl PancakeV3Factory {
             }
         }
 
-        // 6) Sync tick bitmaps and tick data
+        // 6) Sync tick bitmaps and tick data (chunked to reduce RPC pressure)
         let pools_step = 50;
         for group in pools.chunks_mut(pools_step) {
             PancakeV3Factory::sync_tick_bitmaps(group, block_number, provider.clone()).await?;
+            sleep(Duration::from_millis(500)).await;
             PancakeV3Factory::sync_tick_data(group, block_number, provider.clone()).await?;
+            sleep(Duration::from_millis(500)).await;
         }
 
         Ok(pools)
@@ -1130,10 +1132,13 @@ impl PancakeV3Factory {
         }
 
         // 5. Sync ticks (use PancakeV3 specific logic to avoid batch contract incompatibility)
+        // Chunked to reduce RPC pressure
         let pools_step = 50;
         for group in pools.chunks_mut(pools_step) {
             PancakeV3Factory::sync_tick_bitmaps(group, block_number, provider.clone()).await?;
+            sleep(Duration::from_millis(500)).await;
             PancakeV3Factory::sync_tick_data(group, block_number, provider.clone()).await?;
+            sleep(Duration::from_millis(500)).await;
         }
 
         // 6. Recalculate spot prices after full re-sync

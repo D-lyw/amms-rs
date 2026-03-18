@@ -8,7 +8,7 @@ use alloy::{
     transports::layers::{RetryBackoffLayer, ThrottleLayer},
 };
 use amms::amms::{
-    amm::AMM,
+    amm::{AMM, AutomatedMarketMaker},
     pancake_v3::{PancakeV3Factory, PancakeV3Pool},
 };
 
@@ -39,6 +39,9 @@ async fn main() -> eyre::Result<()> {
         PancakeV3Pool::new(address!("257FCbAE4Ac6B26A02E4FC5e1a11e4174B5ce395")).into(),
         PancakeV3Pool::new(address!("B775272E537cc670C65DC852908aD47015244EaF")).into(),
         PancakeV3Pool::new(address!("Bd59a718E60bd868123C6E949c9fd97185EFbDB7")).into(),
+        PancakeV3Pool::new(address!("b94b22332ABf5f89877A14Cc88f2aBC48c34B3Df")).into(),
+        PancakeV3Pool::new(address!("1Ca42C7219F0cB1B67927e26502320cB98F725bd")).into(),
+        PancakeV3Pool::new(address!("5b3613ef9a535b48e82e2800aCb77053DFeC93b1")).into(),
     ];
 
     tracing::info!(
