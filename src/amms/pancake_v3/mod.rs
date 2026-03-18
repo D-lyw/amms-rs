@@ -1270,8 +1270,7 @@ impl PancakeV3Factory {
         N: Network,
         P: Provider<N> + Clone,
     {
-        let mut futures: FuturesUnordered<BoxFuture<'_, _>> = FuturesUnordered::new();
-
+        let mut jobs: Vec<(Vec<Address>, Vec<TickBitmapInfo>)> = Vec::new();
         let max_range = 6900;
         let mut group_range = 0;
         let mut group = vec![];
@@ -1302,32 +1301,31 @@ impl PancakeV3Factory {
                 group_range += range;
 
                 if group_range >= max_range {
-                    let provider = provider.clone();
                     let pool_info = group.iter().map(|info| info.pool).collect::<Vec<_>>();
                     let calldata = std::mem::take(&mut group);
                     group_range = 0;
-
-                    futures.push(Box::pin(async move {
-                        Ok::<(Vec<Address>, Bytes), AMMError>((
-                            pool_info,
-                            GetUniswapV3PoolTickBitmapBatchRequest::deploy_builder(
-                                provider, calldata,
-                            )
-                            .call_raw()
-                            .block(block_number)
-                            .await?,
-                        ))
-                    }));
+                    jobs.push((pool_info, calldata));
                 }
             }
         }
 
         // Flush remaining group
         if !group.is_empty() {
-            let provider = provider.clone();
             let pool_info = group.iter().map(|info| info.pool).collect::<Vec<_>>();
             let calldata = std::mem::take(&mut group);
+            jobs.push((pool_info, calldata));
+        }
 
+        let mut pool_index = HashMap::new();
+        for (idx, pool) in pools.iter().enumerate() {
+            pool_index.insert(pool.address(), idx);
+        }
+
+        let max_in_flight = 4;
+        let mut futures: FuturesUnordered<BoxFuture<'_, _>> = FuturesUnordered::new();
+
+        for (pool_info, calldata) in jobs {
+            let provider = provider.clone();
             futures.push(Box::pin(async move {
                 Ok::<(Vec<Address>, Bytes), AMMError>((
                     pool_info,
@@ -1337,20 +1335,40 @@ impl PancakeV3Factory {
                         .await?,
                 ))
             }));
-        }
 
-        let mut pool_set = pools
-            .iter_mut()
-            .map(|pool| (pool.address(), pool))
-            .collect::<HashMap<Address, &mut AMM>>();
+            if futures.len() >= max_in_flight {
+                if let Some(res) = futures.next().await {
+                    let (pools_addrs, return_data) = res?;
+                    let return_data = <Vec<Vec<U256>> as SolValue>::abi_decode(&return_data)?;
+
+                    for (tick_bitmaps, pool_address) in return_data.iter().zip(pools_addrs.iter())
+                    {
+                        let Some(pool_idx) = pool_index.get(pool_address).copied() else {
+                            continue;
+                        };
+                        let AMM::PancakeV3Pool(ref mut pv3_pool) = pools[pool_idx] else {
+                            continue;
+                        };
+
+                        for chunk in tick_bitmaps.chunks_exact(2) {
+                            let word_pos = I256::from_raw(chunk[0]).as_i16();
+                            let tick_bitmap = chunk[1];
+                            pv3_pool.tick_bitmap.insert(word_pos, tick_bitmap);
+                        }
+                    }
+                }
+            }
+        }
 
         while let Some(res) = futures.next().await {
             let (pools_addrs, return_data) = res?;
             let return_data = <Vec<Vec<U256>> as SolValue>::abi_decode(&return_data)?;
 
             for (tick_bitmaps, pool_address) in return_data.iter().zip(pools_addrs.iter()) {
-                let pool = pool_set.get_mut(pool_address).unwrap();
-                let AMM::PancakeV3Pool(ref mut pv3_pool) = pool else {
+                let Some(pool_idx) = pool_index.get(pool_address).copied() else {
+                    continue;
+                };
+                let AMM::PancakeV3Pool(ref mut pv3_pool) = pools[pool_idx] else {
                     continue;
                 };
 
@@ -1419,6 +1437,7 @@ impl PancakeV3Factory {
         let max_ticks = 60;
         let mut group_ticks = 0;
         let mut group = vec![];
+        let mut jobs: Vec<Vec<TickDataInfo>> = Vec::new();
 
         for (pool_address, mut ticks) in pool_ticks {
             while !ticks.is_empty() {
@@ -1432,55 +1451,75 @@ impl PancakeV3Factory {
                 });
 
                 if group_ticks >= max_ticks {
-                    let provider = provider.clone();
                     let calldata = std::mem::take(&mut group);
                     group_ticks = 0;
-                    group.clear();
-
-                    futures.push(Box::pin(async move {
-                        Ok::<(Vec<TickDataInfo>, Bytes), AMMError>((
-                            calldata.clone(),
-                            GetUniswapV3PoolTickDataBatchRequest::deploy_builder(
-                                provider, calldata,
-                            )
-                            .call_raw()
-                            .block(block_number)
-                            .await?,
-                        ))
-                    }));
+                    jobs.push(calldata);
                 }
             }
         }
 
         // Flush remaining
         if !group.is_empty() {
-            let provider = provider.clone();
             let calldata = std::mem::take(&mut group);
+            jobs.push(calldata);
+        }
 
+        // Step 3: Apply results
+        let mut pool_index = HashMap::new();
+        for (idx, pool) in pools.iter().enumerate() {
+            pool_index.insert(pool.address(), idx);
+        }
+
+        let max_in_flight = 4;
+
+        for job in jobs {
+            let provider = provider.clone();
             futures.push(Box::pin(async move {
                 Ok::<(Vec<TickDataInfo>, Bytes), AMMError>((
-                    calldata.clone(),
-                    GetUniswapV3PoolTickDataBatchRequest::deploy_builder(provider, calldata)
+                    job.clone(),
+                    GetUniswapV3PoolTickDataBatchRequest::deploy_builder(provider, job)
                         .call_raw()
                         .block(block_number)
                         .await?,
                 ))
             }));
-        }
 
-        // Step 3: Apply results
-        let mut pool_set = pools
-            .iter_mut()
-            .map(|pool| (pool.address(), pool))
-            .collect::<HashMap<Address, &mut AMM>>();
+            if futures.len() >= max_in_flight {
+                if let Some(res) = futures.next().await {
+                    let (tick_info, return_data) = res?;
+                    let return_data =
+                        <Vec<Vec<(bool, u128, i128)>> as SolValue>::abi_decode(&return_data)?;
+
+                    for (tick_results, tick_info) in return_data.iter().zip(tick_info.iter()) {
+                        let Some(pool_idx) = pool_index.get(&tick_info.pool).copied() else {
+                            continue;
+                        };
+                        let AMM::PancakeV3Pool(ref mut pv3_pool) = pools[pool_idx] else {
+                            continue;
+                        };
+
+                        for (tick, tick_idx) in tick_results.iter().zip(tick_info.ticks.iter()) {
+                            let info = Info {
+                                liquidity_gross: tick.1,
+                                liquidity_net: tick.2,
+                                initialized: tick.0,
+                            };
+                            pv3_pool.ticks.insert(tick_idx.as_i32(), info);
+                        }
+                    }
+                }
+            }
+        }
 
         while let Some(res) = futures.next().await {
             let (tick_info, return_data) = res?;
             let return_data = <Vec<Vec<(bool, u128, i128)>> as SolValue>::abi_decode(&return_data)?;
 
             for (tick_results, tick_info) in return_data.iter().zip(tick_info.iter()) {
-                let pool = pool_set.get_mut(&tick_info.pool).unwrap();
-                let AMM::PancakeV3Pool(ref mut pv3_pool) = pool else {
+                let Some(pool_idx) = pool_index.get(&tick_info.pool).copied() else {
+                    continue;
+                };
+                let AMM::PancakeV3Pool(ref mut pv3_pool) = pools[pool_idx] else {
                     continue;
                 };
 
