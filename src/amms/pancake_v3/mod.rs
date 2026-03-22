@@ -703,6 +703,150 @@ impl AutomatedMarketMaker for PancakeV3Pool {
         Ok((-current_state.amount_calculated).into_raw())
     }
 
+    fn simulate_swap_exact_out(
+        &self,
+        base_token: Address,
+        _quote_token: Address,
+        amount_out: alloy::primitives::U256,
+    ) -> Result<alloy::primitives::U256, AMMError> {
+        if amount_out.is_zero() {
+            return Ok(U256::ZERO);
+        }
+
+        // Defensive check: prevent divide-by-zero panic in uniswap_v3_math
+        if self.sqrt_price.is_zero() {
+            return Err(AMMError::Msg("sqrt_price is zero".into()));
+        }
+        if self.liquidity == 0 {
+            return Err(AMMError::Msg("liquidity is zero".into()));
+        }
+
+        let zero_for_one = base_token == self.token_a.address;
+        let sqrt_price_limit_x_96 = if zero_for_one {
+            MIN_SQRT_RATIO + U256_1
+        } else {
+            MAX_SQRT_RATIO - U256_1
+        };
+
+        let mut current_state = CurrentState {
+            sqrt_price_x_96: self.sqrt_price,
+            amount_calculated: I256::ZERO,
+            amount_specified_remaining: I256::ZERO - I256::from_raw(amount_out),
+            tick: self.tick,
+            liquidity: self.liquidity,
+        };
+
+        while current_state.amount_specified_remaining != I256::ZERO
+            && current_state.sqrt_price_x_96 != sqrt_price_limit_x_96
+        {
+            let mut step = StepComputations {
+                sqrt_price_start_x_96: current_state.sqrt_price_x_96,
+                ..Default::default()
+            };
+
+            (step.tick_next, step.initialized) =
+                uniswap_v3_math::tick_bitmap::next_initialized_tick_within_one_word(
+                    &self.tick_bitmap,
+                    current_state.tick,
+                    self.tick_spacing,
+                    zero_for_one,
+                )
+                .map_err(UniswapV3Error::from)?;
+
+            step.tick_next = step.tick_next.clamp(MIN_TICK, MAX_TICK);
+
+            step.sqrt_price_next_x96 =
+                uniswap_v3_math::tick_math::get_sqrt_ratio_at_tick(step.tick_next)
+                    .map_err(UniswapV3Error::from)?;
+
+            let swap_target_sqrt_ratio = if zero_for_one {
+                if step.sqrt_price_next_x96 < sqrt_price_limit_x_96 {
+                    sqrt_price_limit_x_96
+                } else {
+                    step.sqrt_price_next_x96
+                }
+            } else if step.sqrt_price_next_x96 > sqrt_price_limit_x_96 {
+                sqrt_price_limit_x_96
+            } else {
+                step.sqrt_price_next_x96
+            };
+
+            if current_state.liquidity == 0 {
+                current_state.sqrt_price_x_96 = swap_target_sqrt_ratio;
+                step.amount_in = U256::ZERO;
+                step.amount_out = U256::ZERO;
+                step.fee_amount = U256::ZERO;
+            } else {
+                (
+                    current_state.sqrt_price_x_96,
+                    step.amount_in,
+                    step.amount_out,
+                    step.fee_amount,
+                ) = uniswap_v3_math::swap_math::compute_swap_step(
+                    current_state.sqrt_price_x_96,
+                    swap_target_sqrt_ratio,
+                    current_state.liquidity,
+                    current_state.amount_specified_remaining,
+                    self.fee,
+                )
+                .map_err(UniswapV3Error::from)?;
+            }
+
+            // Exact output: decrement remaining output, increment calculated input
+            current_state.amount_specified_remaining = current_state
+                .amount_specified_remaining
+                .overflowing_add(I256::from_raw(step.amount_out))
+                .0;
+
+            current_state.amount_calculated +=
+                I256::from_raw(step.amount_in.overflowing_add(step.fee_amount).0);
+
+            if current_state.sqrt_price_x_96 == step.sqrt_price_next_x96 {
+                if step.initialized {
+                    let mut liquidity_net = if let Some(info) = self.ticks.get(&step.tick_next) {
+                        info.liquidity_net
+                    } else {
+                        return Err(AMMError::from(UniswapV3Error::TickDataMissing(
+                            step.tick_next,
+                        )));
+                    };
+
+                    if zero_for_one {
+                        liquidity_net = -liquidity_net;
+                    }
+
+                    current_state.liquidity = if liquidity_net < 0 {
+                        if current_state.liquidity < (-liquidity_net as u128) {
+                            return Err(AMMError::from(UniswapV3Error::LiquidityUnderflow));
+                        } else {
+                            current_state.liquidity - (-liquidity_net as u128)
+                        }
+                    } else {
+                        current_state.liquidity + (liquidity_net as u128)
+                    };
+                }
+                current_state.tick = if zero_for_one {
+                    step.tick_next.wrapping_sub(1)
+                } else {
+                    step.tick_next
+                }
+            } else if current_state.sqrt_price_x_96 != step.sqrt_price_start_x_96 {
+                current_state.tick = uniswap_v3_math::tick_math::get_tick_at_sqrt_ratio(
+                    current_state.sqrt_price_x_96,
+                )
+                .map_err(UniswapV3Error::from)?;
+            }
+        }
+
+        if current_state.amount_specified_remaining != I256::ZERO {
+            return Err(AMMError::Msg(
+                "insufficient liquidity for exact out".to_string(),
+            ));
+        }
+
+        Ok(current_state.amount_calculated.into_raw())
+    }
+
     async fn init<N, P>(self, block_number: BlockId, provider: P) -> Result<Self, AMMError>
     where
         Self: Sized,
@@ -836,7 +980,15 @@ contract IQuoterV2 {
         uint24 fee;
         uint160 sqrtPriceLimitX96;
     }
+    struct QuoteExactOutputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        uint256 amountOut;
+        uint24 fee;
+        uint160 sqrtPriceLimitX96;
+    }
     function quoteExactInputSingle(QuoteExactInputSingleParams memory params) external returns (uint256 amountOut, uint160 sqrtPriceX96After, uint32 initializedTicksCrossed, uint256 gasEstimate);
+    function quoteExactOutputSingle(QuoteExactOutputSingleParams memory params) external returns (uint256 amountIn, uint160 sqrtPriceX96After, uint32 initializedTicksCrossed, uint256 gasEstimate);
 }
 );
 
@@ -1692,6 +1844,75 @@ mod tests {
     }
 
     #[tokio::test]
+    pub async fn test_pancake_v3_eth_simulate_swap_exact_out_matches_quoter() -> eyre::Result<()> {
+        dotenv::dotenv().ok();
+        let provider_url = std::env::var("ETHEREUM_PROVIDER")?;
+        let provider = Arc::new(ProviderBuilder::new().connect_http(provider_url.parse().unwrap()));
+
+        let factory = IPancakeV3FactoryExtInstance::new(
+            address!("0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865"),
+            provider.clone(),
+        );
+
+        let usdc = address!("A0b86991c6218b36c1d19d4a2e9eb0ce3606eb48");
+        let usdt = address!("dAC17F958D2ee523a2206206994597C13D831ec7");
+
+        let mut fee: u32 = 0;
+        let mut pool_addr = Address::ZERO;
+        for f in [100u32, 500u32, 2500u32, 10000u32] {
+            let addr = factory.getPool(usdc, usdt, U24::from(f)).call().await?;
+            if !addr.is_zero() {
+                pool_addr = addr;
+                fee = f;
+                break;
+            }
+        }
+        if pool_addr.is_zero() {
+            return Ok(());
+        }
+
+        let tip = BlockId::from(provider.get_block_number().await?);
+        let pool = PancakeV3Pool::new(pool_addr)
+            .init::<_, _>(tip, provider.clone())
+            .await?;
+
+        let quoter = IQuoterV2Instance::new(
+            address!("B048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997"),
+            provider.clone(),
+        );
+
+        // Exact out: USDC -> USDT
+        for amount_out in [U256::from(1_000_000u64), U256::from(10_000_000u64)] {
+            let simulated = pool.simulate_swap_exact_out(usdc, usdt, amount_out)?;
+            let params = IQuoterV2::QuoteExactOutputSingleParams {
+                tokenIn: usdc,
+                tokenOut: usdt,
+                amountOut: amount_out,
+                fee: U24::from(fee),
+                sqrtPriceLimitX96: U160::from(0),
+            };
+            let quoted = quoter.quoteExactOutputSingle(params).call().await?;
+            assert_eq!(simulated, quoted.amountIn);
+        }
+
+        // Exact out: USDT -> USDC
+        for amount_out in [U256::from(1_000_000u64), U256::from(10_000_000u64)] {
+            let simulated = pool.simulate_swap_exact_out(usdt, usdc, amount_out)?;
+            let params = IQuoterV2::QuoteExactOutputSingleParams {
+                tokenIn: usdt,
+                tokenOut: usdc,
+                amountOut: amount_out,
+                fee: U24::from(fee),
+                sqrtPriceLimitX96: U160::from(0),
+            };
+            let quoted = quoter.quoteExactOutputSingle(params).call().await?;
+            assert_eq!(simulated, quoted.amountIn);
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
     pub async fn test_pancake_v3_eth_weth_usdt_matches_quoter() -> eyre::Result<()> {
         dotenv::dotenv().ok();
         let provider_url = match std::env::var("ETHEREUM_PROVIDER") {
@@ -1758,6 +1979,70 @@ mod tests {
             diff.to_string().parse::<f64>().unwrap() / quoted.to_string().parse::<f64>().unwrap();
         println!("diff ratio: {diff_ratio}");
         assert!(diff_ratio < 0.005, "diff ratio too high: {diff_ratio}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    pub async fn test_pancake_v3_eth_weth_usdt_exact_out_matches_quoter() -> eyre::Result<()> {
+        dotenv::dotenv().ok();
+        let provider_url = match std::env::var("ETHEREUM_PROVIDER") {
+            Ok(u) => u,
+            Err(_) => return Ok(()),
+        };
+        let provider = Arc::new(ProviderBuilder::new().connect_http(provider_url.parse().unwrap()));
+
+        let factory = IPancakeV3FactoryExtInstance::new(
+            address!("0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865"),
+            provider.clone(),
+        );
+
+        let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let usdt = address!("dAC17F958D2ee523a2206206994597C13D831ec7");
+
+        let mut fee: u32 = 0;
+        let mut pool_addr = Address::ZERO;
+        for f in [500u32, 2500u32, 10000u32] {
+            let addr = factory.getPool(weth, usdt, U24::from(f)).call().await?;
+            if !addr.is_zero() {
+                pool_addr = addr;
+                fee = f;
+                break;
+            }
+        }
+        if pool_addr.is_zero() {
+            return Ok(());
+        }
+
+        let tip = BlockId::from(provider.get_block_number().await?);
+        let pool = PancakeV3Pool::new(pool_addr)
+            .init::<_, _>(tip, provider.clone())
+            .await?;
+
+        let quoter = IQuoterV2Instance::new(
+            address!("B048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997"),
+            provider.clone(),
+        );
+
+        for amount_out in [U256::from(1_000_000u64), U256::from(100_000_000u64)] {
+            let simulated = pool.simulate_swap_exact_out(weth, usdt, amount_out)?;
+            let params = IQuoterV2::QuoteExactOutputSingleParams {
+                tokenIn: weth,
+                tokenOut: usdt,
+                amountOut: amount_out,
+                fee: U24::from(fee),
+                sqrtPriceLimitX96: U160::from(0),
+            };
+            let quoted = quoter.quoteExactOutputSingle(params).call().await?;
+            let diff = if simulated > quoted.amountIn {
+                simulated - quoted.amountIn
+            } else {
+                quoted.amountIn - simulated
+            };
+            let diff_ratio = diff.to_string().parse::<f64>().unwrap()
+                / quoted.amountIn.to_string().parse::<f64>().unwrap();
+            assert!(diff_ratio < 0.005, "diff ratio too high: {diff_ratio}");
+        }
+
         Ok(())
     }
 

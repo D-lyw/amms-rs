@@ -99,6 +99,17 @@ pub trait AutomatedMarketMaker: Send + Sync + 'static {
         amount_in: U256,
     ) -> Result<U256, AMMError>;
 
+    /// Simulate a swap with an exact output amount.
+    /// Returns the amount_in in `base token` required to receive `amount_out` of `quote token`.
+    fn simulate_swap_exact_out(
+        &self,
+        _base_token: Address,
+        _quote_token: Address,
+        _amount_out: U256,
+    ) -> Result<U256, AMMError> {
+        Err(AMMError::UnsupportedSwapExactOut)
+    }
+
     /// Initializes an empty pool and syncs state up to `block_number`
     async fn init<N, P>(self, block_number: BlockId, provider: P) -> Result<Self, AMMError>
     where

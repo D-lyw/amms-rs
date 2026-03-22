@@ -1181,11 +1181,11 @@ impl AerodromeSlipstreamFactory {
     {
         use crate::amms::uniswap_v3::GetUniswapV3PoolTickBitmapBatchRequest::TickBitmapInfo;
 
-        let mut futures: FuturesUnordered<BoxFuture<'_, _>> = FuturesUnordered::new();
-
         let max_range = 300;
+        let max_in_flight = 8;
         let mut group_range = 0;
         let mut group = vec![];
+        let mut jobs: Vec<(Vec<Address>, Vec<TickBitmapInfo>)> = Vec::new();
 
         for pool in pools.iter() {
             let AMM::AerodromeSlipstreamPool(slipstream_pool) = pool else {
@@ -1213,32 +1213,29 @@ impl AerodromeSlipstreamFactory {
                 group_range += range;
 
                 if group_range >= max_range {
-                    let provider = provider.clone();
                     let pool_info = group.iter().map(|info| info.pool).collect::<Vec<_>>();
                     let calldata = std::mem::take(&mut group);
+                    jobs.push((pool_info, calldata));
                     group_range = 0;
-
-                    futures.push(Box::pin(async move {
-                        Ok::<(Vec<Address>, Bytes), AMMError>((
-                            pool_info,
-                            GetUniswapV3PoolTickBitmapBatchRequest::deploy_builder(
-                                provider, calldata,
-                            )
-                            .call_raw()
-                            .block(block_number)
-                            .await?,
-                        ))
-                    }));
                 }
             }
         }
 
-        // Flush remaining group
         if !group.is_empty() {
-            let provider = provider.clone();
             let pool_info = group.iter().map(|info| info.pool).collect::<Vec<_>>();
             let calldata = std::mem::take(&mut group);
+            jobs.push((pool_info, calldata));
+        }
 
+        let mut pool_index = HashMap::new();
+        for (idx, pool) in pools.iter().enumerate() {
+            pool_index.insert(pool.address(), idx);
+        }
+
+        let mut futures: FuturesUnordered<BoxFuture<'_, _>> = FuturesUnordered::new();
+
+        for (pool_info, calldata) in jobs {
+            let provider = provider.clone();
             futures.push(Box::pin(async move {
                 Ok::<(Vec<Address>, Bytes), AMMError>((
                     pool_info,
@@ -1248,12 +1245,51 @@ impl AerodromeSlipstreamFactory {
                         .await?,
                 ))
             }));
-        }
 
-        let mut pool_set = pools
-            .iter_mut()
-            .map(|pool| (pool.address(), pool))
-            .collect::<HashMap<Address, &mut AMM>>();
+            if futures.len() >= max_in_flight {
+                if let Some(res) = futures.next().await {
+                    let (pools_addrs, return_data) = match res {
+                        Ok(data) => data,
+                        Err(e) => {
+                            tracing::warn!(
+                                target = "amms::aerodrome_slipstream::sync_tick_bitmaps",
+                                error = ?e,
+                                "Batch tick bitmap call failed, skipping batch"
+                            );
+                            continue;
+                        }
+                    };
+                    let return_data = match <Vec<Vec<U256>> as SolValue>::abi_decode(&return_data) {
+                        Ok(data) => data,
+                        Err(e) => {
+                            tracing::warn!(
+                                target = "amms::aerodrome_slipstream::sync_tick_bitmaps",
+                                error = ?e,
+                                return_data_len = return_data.len(),
+                                "Failed to decode tick bitmap data, skipping batch"
+                            );
+                            continue;
+                        }
+                    };
+
+                    for (tick_bitmaps, pool_address) in return_data.iter().zip(pools_addrs.iter()) {
+                        let Some(pool_idx) = pool_index.get(pool_address).copied() else {
+                            continue;
+                        };
+                        let AMM::AerodromeSlipstreamPool(ref mut slipstream_pool) = pools[pool_idx]
+                        else {
+                            continue;
+                        };
+
+                        for chunk in tick_bitmaps.chunks_exact(2) {
+                            let word_pos = I256::from_raw(chunk[0]).as_i16();
+                            let tick_bitmap = chunk[1];
+                            slipstream_pool.tick_bitmap.insert(word_pos, tick_bitmap);
+                        }
+                    }
+                }
+            }
+        }
 
         while let Some(res) = futures.next().await {
             let (pools_addrs, return_data) = match res {
@@ -1281,8 +1317,10 @@ impl AerodromeSlipstreamFactory {
             };
 
             for (tick_bitmaps, pool_address) in return_data.iter().zip(pools_addrs.iter()) {
-                let pool = pool_set.get_mut(pool_address).unwrap();
-                let AMM::AerodromeSlipstreamPool(ref mut slipstream_pool) = pool else {
+                let Some(pool_idx) = pool_index.get(pool_address).copied() else {
+                    continue;
+                };
+                let AMM::AerodromeSlipstreamPool(ref mut slipstream_pool) = pools[pool_idx] else {
                     continue;
                 };
 
@@ -1348,10 +1386,11 @@ impl AerodromeSlipstreamFactory {
             })
             .collect::<Vec<(Address, Vec<Signed<24, 1>>)>>();
 
-        let mut futures: FuturesUnordered<BoxFuture<'_, _>> = FuturesUnordered::new();
+        let max_in_flight = 8;
         let max_ticks = 60;
         let mut group_ticks = 0;
         let mut group = vec![];
+        let mut jobs: Vec<Vec<TickDataInfo>> = Vec::new();
 
         for (pool_address, mut ticks) in pool_ticks {
             while !ticks.is_empty() {
@@ -1365,45 +1404,87 @@ impl AerodromeSlipstreamFactory {
                 });
 
                 if group_ticks >= max_ticks {
-                    let provider = provider.clone();
                     let calldata = std::mem::take(&mut group);
+                    jobs.push(calldata);
                     group_ticks = 0;
                     group.clear();
-
-                    futures.push(Box::pin(async move {
-                        Ok::<(Vec<TickDataInfo>, Bytes), AMMError>((
-                            calldata.clone(),
-                            GetAerodromeSlipstreamPoolTickDataBatchRequest::deploy_builder(
-                                provider, calldata,
-                            )
-                            .call_raw()
-                            .block(block_number)
-                            .await?,
-                        ))
-                    }));
                 }
             }
         }
 
         if !group.is_empty() {
-            let provider = provider.clone();
             let calldata = std::mem::take(&mut group);
+            jobs.push(calldata);
+        }
 
+        let mut pool_index = HashMap::new();
+        for (idx, pool) in pools.iter().enumerate() {
+            pool_index.insert(pool.address(), idx);
+        }
+
+        let mut futures: FuturesUnordered<BoxFuture<'_, _>> = FuturesUnordered::new();
+
+        for calldata in jobs {
+            let provider = provider.clone();
+            let calldata_clone = calldata.clone();
             futures.push(Box::pin(async move {
                 Ok::<(Vec<TickDataInfo>, Bytes), AMMError>((
-                    calldata.clone(),
+                    calldata_clone,
                     GetAerodromeSlipstreamPoolTickDataBatchRequest::deploy_builder(provider, calldata)
                         .call_raw()
                         .block(block_number)
                         .await?,
                 ))
             }));
-        }
 
-        let mut pool_set = pools
-            .iter_mut()
-            .map(|pool| (pool.address(), pool))
-            .collect::<HashMap<Address, &mut AMM>>();
+            if futures.len() >= max_in_flight {
+                if let Some(res) = futures.next().await {
+                    let (tick_info, return_data) = match res {
+                        Ok(data) => data,
+                        Err(e) => {
+                            tracing::warn!(
+                                target = "amms::aerodrome_slipstream::sync_tick_data",
+                                error = ?e,
+                                "Batch tick data call failed, skipping batch"
+                            );
+                            continue;
+                        }
+                    };
+                    let return_data = match <Vec<Vec<(u128, i128)>> as SolValue>::abi_decode(&return_data) {
+                        Ok(data) => data,
+                        Err(e) => {
+                            tracing::warn!(
+                                target = "amms::aerodrome_slipstream::sync_tick_data",
+                                error = ?e,
+                                return_data_len = return_data.len(),
+                                "Failed to decode tick data, skipping batch"
+                            );
+                            continue;
+                        }
+                    };
+
+                    for (tick_results, tick_info_item) in return_data.iter().zip(tick_info.iter()) {
+                        let Some(pool_idx) = pool_index.get(&tick_info_item.pool).copied() else {
+                            continue;
+                        };
+                        let AMM::AerodromeSlipstreamPool(ref mut slipstream_pool) = pools[pool_idx]
+                        else {
+                            continue;
+                        };
+
+                        for (tick, tick_idx) in tick_results.iter().zip(tick_info_item.ticks.iter())
+                        {
+                            let info = TickInfo {
+                                liquidity_gross: tick.0,
+                                liquidity_net: tick.1,
+                                initialized: tick.0 > 0,
+                            };
+                            slipstream_pool.ticks.insert(tick_idx.as_i32(), info);
+                        }
+                    }
+                }
+            }
+        }
 
         while let Some(res) = futures.next().await {
             let (tick_info, return_data) = match res {
@@ -1430,13 +1511,15 @@ impl AerodromeSlipstreamFactory {
                 }
             };
 
-            for (tick_results, tick_info) in return_data.iter().zip(tick_info.iter()) {
-                let pool = pool_set.get_mut(&tick_info.pool).unwrap();
-                let AMM::AerodromeSlipstreamPool(ref mut slipstream_pool) = pool else {
+            for (tick_results, tick_info_item) in return_data.iter().zip(tick_info.iter()) {
+                let Some(pool_idx) = pool_index.get(&tick_info_item.pool).copied() else {
+                    continue;
+                };
+                let AMM::AerodromeSlipstreamPool(ref mut slipstream_pool) = pools[pool_idx] else {
                     continue;
                 };
 
-                for (tick, tick_idx) in tick_results.iter().zip(tick_info.ticks.iter()) {
+                for (tick, tick_idx) in tick_results.iter().zip(tick_info_item.ticks.iter()) {
                     let info = TickInfo {
                         liquidity_gross: tick.0,
                         liquidity_net: tick.1,

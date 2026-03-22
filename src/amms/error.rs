@@ -61,6 +61,8 @@ pub enum AMMError {
     Msg(String),
     #[error("Token Out Does Not Exist")]
     TokenOutDoesNotExist,
+    #[error("SwapExactOut not supported for this AMM")]
+    UnsupportedSwapExactOut,
 }
 
 #[derive(Error, Debug)]
