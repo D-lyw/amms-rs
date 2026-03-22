@@ -192,6 +192,8 @@ pub struct StepComputations {
     pub fee_amount: U256,
 }
 
+const MAX_IN_FLIGHT_REQUESTS: usize = 8;
+
 pub struct Tick {
     pub liquidity_gross: u128,
     pub liquidity_net: i128,
@@ -1476,30 +1478,57 @@ impl UniswapV3Factory {
     {
         let step = 255;
 
-        let mut futures = FuturesUnordered::new();
-        pools.chunks_mut(step).for_each(|group| {
-            let provider = provider.clone();
-            let pool_addresses = group
+        let mut requests: Vec<(usize, Vec<Address>)> = Vec::new();
+        let mut start = 0usize;
+        while start < pools.len() {
+            let end = (start + step).min(pools.len());
+            let pool_addresses = pools[start..end]
                 .iter_mut()
                 .map(|pool| pool.address())
                 .collect::<Vec<_>>();
+            requests.push((start, pool_addresses));
+            start = end;
+        }
 
+        let mut futures = FuturesUnordered::new();
+        let mut iter = requests.into_iter();
+
+        while let Some((start, pool_addresses)) = iter.next() {
+            let provider = provider.clone();
             futures.push(async move {
-                Ok::<(&mut [AMM], Bytes), AMMError>((
-                    group,
+                Ok::<(usize, Bytes), AMMError>((
+                    start,
                     GetUniswapV3PoolSlot0BatchRequest::deploy_builder(provider, pool_addresses)
                         .call_raw()
                         .block(block_number)
                         .await?,
                 ))
             });
-        });
+
+            if futures.len() >= MAX_IN_FLIGHT_REQUESTS {
+                if let Some(res) = futures.next().await {
+                    let (start, return_data) = res?;
+                    let return_data =
+                        <Vec<(i32, u128, U256)> as SolValue>::abi_decode(&return_data)?;
+                    let end = (start + return_data.len()).min(pools.len());
+                    for (slot_0_data, pool) in return_data.iter().zip(pools[start..end].iter_mut())
+                    {
+                        let AMM::UniswapV3Pool(ref mut uv3_pool) = pool else {
+                            unreachable!()
+                        };
+                        uv3_pool.tick = slot_0_data.0;
+                        uv3_pool.liquidity = slot_0_data.1;
+                        uv3_pool.sqrt_price = slot_0_data.2;
+                    }
+                }
+            }
+        }
 
         while let Some(res) = futures.next().await {
-            let (pools, return_data) = res?;
+            let (start, return_data) = res?;
             let return_data = <Vec<(i32, u128, U256)> as SolValue>::abi_decode(&return_data)?;
-
-            for (slot_0_data, pool) in return_data.iter().zip(pools.iter_mut()) {
+            let end = (start + return_data.len()).min(pools.len());
+            for (slot_0_data, pool) in return_data.iter().zip(pools[start..end].iter_mut()) {
                 let AMM::UniswapV3Pool(ref mut uv3_pool) = pool else {
                     unreachable!()
                 };
@@ -1522,14 +1551,13 @@ impl UniswapV3Factory {
         N: Network,
         P: Provider<N> + Clone,
     {
-        let mut futures: FuturesUnordered<BoxFuture<'_, _>> = FuturesUnordered::new();
-
         // Keep returned "runtime code" under EVM max code size (24KB).
         // Each word returns 2 * U256 (64 bytes), so 300 words ~= 19.2KB + ABI overhead.
         // This avoids "max code size exceeded" on Arbitrum during constructor-return batching.
         let max_range = 300;
         let mut group_range = 0;
         let mut group = vec![];
+        let mut requests: Vec<(Vec<Address>, Vec<TickBitmapInfo>)> = Vec::new();
 
         for pool in pools.iter() {
             let AMM::UniswapV3Pool(uniswap_v3_pool) = pool else {
@@ -1558,36 +1586,31 @@ impl UniswapV3Factory {
 
                 // If group is full, fire it off and reset
                 if group_range >= max_range {
-                    // if group_range >= max_range || word_range <= 0 {
-                    let provider = provider.clone();
                     let pool_info = group.iter().map(|info| info.pool).collect::<Vec<_>>();
-
                     let calldata = std::mem::take(&mut group);
-
                     group_range = 0;
-
-                    futures.push(Box::pin(async move {
-                        Ok::<(Vec<Address>, Bytes), AMMError>((
-                            pool_info,
-                            GetUniswapV3PoolTickBitmapBatchRequest::deploy_builder(
-                                provider, calldata,
-                            )
-                            .call_raw()
-                            .block(block_number)
-                            .await?,
-                        ))
-                    }));
+                    requests.push((pool_info, calldata));
                 }
             }
         }
 
         // Flush group if not empty
         if !group.is_empty() {
-            let provider = provider.clone();
             let pool_info = group.iter().map(|info| info.pool).collect::<Vec<_>>();
-
             let calldata = std::mem::take(&mut group);
+            requests.push((pool_info, calldata));
+        }
 
+        let mut pool_set = pools
+            .iter_mut()
+            .map(|pool| (pool.address(), pool))
+            .collect::<HashMap<Address, &mut AMM>>();
+
+        let mut futures: FuturesUnordered<BoxFuture<'_, _>> = FuturesUnordered::new();
+        let mut iter = requests.into_iter();
+
+        while let Some((pool_info, calldata)) = iter.next() {
+            let provider = provider.clone();
             futures.push(Box::pin(async move {
                 Ok::<(Vec<Address>, Bytes), AMMError>((
                     pool_info,
@@ -1597,12 +1620,29 @@ impl UniswapV3Factory {
                         .await?,
                 ))
             }));
-        }
 
-        let mut pool_set = pools
-            .iter_mut()
-            .map(|pool| (pool.address(), pool))
-            .collect::<HashMap<Address, &mut AMM>>();
+            if futures.len() >= MAX_IN_FLIGHT_REQUESTS {
+                if let Some(res) = futures.next().await {
+                    let (pools, return_data) = res?;
+                    let return_data = <Vec<Vec<U256>> as SolValue>::abi_decode(&return_data)?;
+
+                    for (tick_bitmaps, pool_address) in return_data.iter().zip(pools.iter()) {
+                        let pool = pool_set.get_mut(pool_address).unwrap();
+
+                        let AMM::UniswapV3Pool(ref mut uv3_pool) = pool else {
+                            unreachable!()
+                        };
+
+                        for chunk in tick_bitmaps.chunks_exact(2) {
+                            let word_pos = I256::from_raw(chunk[0]).as_i16();
+                            let tick_bitmap = chunk[1];
+
+                            uv3_pool.tick_bitmap.insert(word_pos, tick_bitmap);
+                        }
+                    }
+                }
+            }
+        }
 
         while let Some(res) = futures.next().await {
             let (pools, return_data) = res?;
@@ -1679,10 +1719,10 @@ impl UniswapV3Factory {
             })
             .collect::<Vec<(Address, Vec<Signed<24, 1>>)>>();
 
-        let mut futures: FuturesUnordered<BoxFuture<'_, _>> = FuturesUnordered::new();
         let max_ticks = 60;
         let mut group_ticks = 0;
         let mut group = vec![];
+        let mut requests: Vec<Vec<TickDataInfo>> = Vec::new();
 
         for (pool_address, mut ticks) in pool_ticks {
             while !ticks.is_empty() {
@@ -1696,31 +1736,31 @@ impl UniswapV3Factory {
                 });
 
                 if group_ticks >= max_ticks {
-                    let provider = provider.clone();
                     let calldata = std::mem::take(&mut group);
 
                     group_ticks = 0;
                     group.clear();
 
-                    futures.push(Box::pin(async move {
-                        Ok::<(Vec<TickDataInfo>, Bytes), AMMError>((
-                            calldata.clone(),
-                            GetUniswapV3PoolTickDataBatchRequest::deploy_builder(
-                                provider, calldata,
-                            )
-                            .call_raw()
-                            .block(block_number)
-                            .await?,
-                        ))
-                    }));
+                    requests.push(calldata);
                 }
             }
         }
 
         if !group.is_empty() {
-            let provider = provider.clone();
             let calldata = std::mem::take(&mut group);
+            requests.push(calldata);
+        }
 
+        let mut pool_set = pools
+            .iter_mut()
+            .map(|pool| (pool.address(), pool))
+            .collect::<HashMap<Address, &mut AMM>>();
+
+        let mut futures: FuturesUnordered<BoxFuture<'_, _>> = FuturesUnordered::new();
+        let mut iter = requests.into_iter();
+
+        while let Some(calldata) = iter.next() {
+            let provider = provider.clone();
             futures.push(Box::pin(async move {
                 Ok::<(Vec<TickDataInfo>, Bytes), AMMError>((
                     calldata.clone(),
@@ -1730,12 +1770,33 @@ impl UniswapV3Factory {
                         .await?,
                 ))
             }));
-        }
 
-        let mut pool_set = pools
-            .iter_mut()
-            .map(|pool| (pool.address(), pool))
-            .collect::<HashMap<Address, &mut AMM>>();
+            if futures.len() >= MAX_IN_FLIGHT_REQUESTS {
+                if let Some(res) = futures.next().await {
+                    let (tick_info, return_data) = res?;
+                    let return_data =
+                        <Vec<Vec<(bool, u128, i128)>> as SolValue>::abi_decode(&return_data)?;
+
+                    for (tick_bitmaps, tick_info) in return_data.iter().zip(tick_info.iter()) {
+                        let pool = pool_set.get_mut(&tick_info.pool).unwrap();
+
+                        let AMM::UniswapV3Pool(ref mut uv3_pool) = pool else {
+                            unreachable!()
+                        };
+
+                        for (tick, tick_idx) in tick_bitmaps.iter().zip(tick_info.ticks.iter()) {
+                            let info = Info {
+                                liquidity_gross: tick.1,
+                                liquidity_net: tick.2,
+                                initialized: tick.0,
+                            };
+
+                            uv3_pool.ticks.insert(tick_idx.as_i32(), info);
+                        }
+                    }
+                }
+            }
+        }
 
         while let Some(res) = futures.next().await {
             let (tick_info, return_data) = res?;
