@@ -692,17 +692,35 @@ where
         for (variant, remaining_amms) in amm_variants.drain() {
             info!(target: "state_space::sync", variant = ?variant, count = remaining_amms.len(), "Syncing batch");
             let provider = self.provider.clone();
-            let synced = variant
-                .init_batch::<N, _>(remaining_amms, chain_tip, provider.clone())
-                .await?;
+            if variant == crate::amms::amm::Variant::UniswapV3Pool {
+                let chunk_size = 25;
+                for chunk in remaining_amms.chunks(chunk_size) {
+                    let synced = variant
+                        .init_batch::<N, _>(chunk.to_vec(), chain_tip, provider.clone())
+                        .await?;
 
-            // 在每次循环结束时短暂 sleep，避免超出 RPC 调用频率
-            sleep(Duration::from_millis(1500)).await;
+                    // 在每次循环结束时短暂 sleep，避免超出 RPC 调用频率
+                    sleep(Duration::from_millis(1500)).await;
 
-            for amm in synced {
-                let mut amm = amm;
-                amm.set_last_synced_block(chain_tip_u64);
-                state_space.state.insert(amm.address(), amm);
+                    for amm in synced {
+                        let mut amm = amm;
+                        amm.set_last_synced_block(chain_tip_u64);
+                        state_space.state.insert(amm.address(), amm);
+                    }
+                }
+            } else {
+                let synced = variant
+                    .init_batch::<N, _>(remaining_amms, chain_tip, provider.clone())
+                    .await?;
+
+                // 在每次循环结束时短暂 sleep，避免超出 RPC 调用频率
+                sleep(Duration::from_millis(1500)).await;
+
+                for amm in synced {
+                    let mut amm = amm;
+                    amm.set_last_synced_block(chain_tip_u64);
+                    state_space.state.insert(amm.address(), amm);
+                }
             }
         }
 
