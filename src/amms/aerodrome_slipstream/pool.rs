@@ -1183,7 +1183,7 @@ impl AerodromeSlipstreamFactory {
 
         let mut futures: FuturesUnordered<BoxFuture<'_, _>> = FuturesUnordered::new();
 
-        let max_range = 6900;
+        let max_range = 300;
         let mut group_range = 0;
         let mut group = vec![];
 

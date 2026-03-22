@@ -1271,7 +1271,7 @@ impl PancakeV3Factory {
         P: Provider<N> + Clone,
     {
         let mut jobs: Vec<(Vec<Address>, Vec<TickBitmapInfo>)> = Vec::new();
-        let max_range = 6900;
+        let max_range = 300;
         let mut group_range = 0;
         let mut group = vec![];
 

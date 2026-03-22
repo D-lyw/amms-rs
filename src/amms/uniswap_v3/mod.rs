@@ -1365,7 +1365,10 @@ impl UniswapV3Factory {
     {
         let mut futures: FuturesUnordered<BoxFuture<'_, _>> = FuturesUnordered::new();
 
-        let max_range = 6900;
+        // Keep returned "runtime code" under EVM max code size (24KB).
+        // Each word returns 2 * U256 (64 bytes), so 300 words ~= 19.2KB + ABI overhead.
+        // This avoids "max code size exceeded" on Arbitrum during constructor-return batching.
+        let max_range = 300;
         let mut group_range = 0;
         let mut group = vec![];
 
