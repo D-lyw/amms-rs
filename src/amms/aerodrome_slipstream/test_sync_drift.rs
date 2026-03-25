@@ -4,7 +4,7 @@ mod tests {
 
     use alloy::{
         eips::BlockId,
-        primitives::{address, Address, U256},
+        primitives::{address, aliases::I24, aliases::U160, Address, U256},
         providers::{Provider, ProviderBuilder},
         rpc::types::{Filter, Log},
         sol,
@@ -49,6 +49,53 @@ mod tests {
                 uint256 amount1
             );
         }
+    }
+
+    // Aerodrome Slipstream QuoterV2 (Base)
+    // Signature aligns with on-chain verified QuoterV2 for Slipstream:
+    // quoteExactOutputSingle((tokenIn, tokenOut, amount, tickSpacing, sqrtPriceLimitX96))
+    sol! {
+        #[allow(missing_docs)]
+        #[derive(Debug, PartialEq, Eq)]
+        #[sol(rpc)]
+        contract ICLQuoterV2 {
+            struct QuoteExactOutputSingleParams {
+                address tokenIn;
+                address tokenOut;
+                uint256 amount;
+                int24 tickSpacing;
+                uint160 sqrtPriceLimitX96;
+            }
+
+            function quoteExactOutputSingle(QuoteExactOutputSingleParams memory params)
+                external
+                returns (
+                    uint256 amountIn,
+                    uint160 sqrtPriceX96After,
+                    uint32 initializedTicksCrossed,
+                    uint256 gasEstimate
+                );
+        }
+    }
+
+    const DEFAULT_SLIPSTREAM_QUOTER_V2_BASE: Address =
+        address!("254cf9e1e6e233aa1ac962cb9b05b2cfeaae15b0");
+
+    fn exact_out_amounts_by_decimals(decimals: u8) -> Vec<U256> {
+        let one = U256::from(10u8).pow(U256::from(decimals));
+        let thousand = U256::from(1_000u16);
+        let hundred = U256::from(100u8);
+        let ten = U256::from(10u8);
+
+        let a = if one >= thousand {
+            one / thousand
+        } else {
+            U256::from(1u8)
+        };
+        let b = if one >= hundred { one / hundred } else { one };
+        let c = if one >= ten { one / ten } else { one };
+
+        vec![a, b, c]
     }
 
     /// Helper: fetch pool events (Swap, Mint, Burn) in a block range
@@ -646,6 +693,121 @@ mod tests {
         Ok(())
     }
 
+    /// Test 4: SwapExactOut parity against on-chain Slipstream QuoterV2
+    ///
+    /// Requires:
+    /// - `BASE_PROVIDER` set to a Base RPC (recommended: local mainnet-fork RPC)
+    /// - Optional `AERODROME_SLIPSTREAM_QUOTER_V2` override
+    async fn run_exact_out_quoter_parity_test(
+        pool_address: Address,
+        label: &str,
+    ) -> eyre::Result<()> {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .try_init();
+
+        dotenv::dotenv().ok();
+        let rpc_endpoint = match std::env::var("BASE_PROVIDER") {
+            Ok(u) => u,
+            Err(_) => {
+                println!("Skipping test: BASE_PROVIDER not set");
+                return Ok(());
+            }
+        };
+
+        let quoter_addr = std::env::var("AERODROME_SLIPSTREAM_QUOTER_V2")
+            .ok()
+            .and_then(|s| s.parse::<Address>().ok())
+            .unwrap_or(DEFAULT_SLIPSTREAM_QUOTER_V2_BASE);
+
+        let provider = Arc::new(ProviderBuilder::new().connect_http(rpc_endpoint.parse()?));
+        let latest = provider.get_block_number().await?;
+        let block_num = latest.saturating_sub(3);
+        let block = BlockId::from(block_num);
+
+        let pool = match AerodromeSlipstreamPool::new(pool_address)
+            .init::<_, _>(block, provider.clone())
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                println!("[{label}] Skipping test: cannot initialize pool: {:?}", e);
+                return Ok(());
+            }
+        };
+
+        let quoter = ICLQuoterV2::new(quoter_addr, provider.clone());
+
+        println!("\n[{label}] ======== EXACT OUT QUOTER PARITY ========");
+        println!(
+            "[{label}] block={} quoter={} pool={} tick_spacing={}",
+            block_num, quoter_addr, pool.address, pool.tick_spacing
+        );
+
+        let test_directions = vec![
+            (pool.token_a.address, pool.token_b.address, pool.token_b.decimals, "A->B"),
+            (pool.token_b.address, pool.token_a.address, pool.token_a.decimals, "B->A"),
+        ];
+
+        for (token_in, token_out, out_decimals, dir) in test_directions {
+            let amounts = exact_out_amounts_by_decimals(out_decimals);
+            println!("[{label}] direction={dir}, out_decimals={out_decimals}, samples={amounts:?}");
+
+            for amount_out in amounts {
+                let simulated_in =
+                    match pool.simulate_swap_exact_out(token_in, token_out, amount_out) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            println!(
+                                "[{label}] direction={dir} amount_out={} local error={:?}",
+                                amount_out, e
+                            );
+                            continue;
+                        }
+                    };
+
+                let params = ICLQuoterV2::QuoteExactOutputSingleParams {
+                    tokenIn: token_in,
+                    tokenOut: token_out,
+                    amount: amount_out,
+                    tickSpacing: I24::try_from(pool.tick_spacing)
+                        .map_err(|_| eyre::eyre!("tick_spacing out of int24 range"))?,
+                    sqrtPriceLimitX96: U160::ZERO,
+                };
+
+                let quoted = match quoter
+                    .quoteExactOutputSingle(params)
+                    .block(block)
+                    .call()
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        println!(
+                            "[{label}] direction={dir} amount_out={} quoter call error={:?}",
+                            amount_out, e
+                        );
+                        continue;
+                    }
+                };
+
+                println!(
+                    "[{label}] direction={dir} out={} local_in={} quote_in={} ticks_crossed={}",
+                    amount_out, simulated_in, quoted.amountIn, quoted.initializedTicksCrossed
+                );
+
+                assert_eq!(
+                    simulated_in, quoted.amountIn,
+                    "[{label}] exact_out mismatch direction={dir}, amount_out={}, local={}, quote={}",
+                    amount_out, simulated_in, quoted.amountIn
+                );
+            }
+        }
+
+        println!("[{label}] ✅ EXACT OUT QUOTER PARITY PASSED");
+        Ok(())
+    }
+
     /// Test 3: Fee Change Event Handling
     ///
     /// This test verifies that CustomFeeSet events can be properly decoded
@@ -764,6 +926,12 @@ mod tests {
         run_fee_event_test(pool_address, "WETH/USDC-Fee").await
     }
 
+    #[tokio::test]
+    async fn test_weth_usdc_exact_out_quoter_parity() -> eyre::Result<()> {
+        let pool_address = address!("b2cc224c1c9fee385f8ad6a55b4d94e92359dc59");
+        run_exact_out_quoter_parity_test(pool_address, "WETH/USDC-ExactOut").await
+    }
+
     /// Slipstream Pool: USDC / cbBTC
     /// Pool: 0x3e66e55e97ce60096f74b7c475e8249f2d31a9fb
     #[tokio::test]
@@ -782,5 +950,11 @@ mod tests {
     async fn test_usdc_cbbtc_fee_event() -> eyre::Result<()> {
         let pool_address = address!("3e66e55e97ce60096f74b7c475e8249f2d31a9fb");
         run_fee_event_test(pool_address, "USDC/cbBTC-Fee").await
+    }
+
+    #[tokio::test]
+    async fn test_usdc_cbbtc_exact_out_quoter_parity() -> eyre::Result<()> {
+        let pool_address = address!("3e66e55e97ce60096f74b7c475e8249f2d31a9fb");
+        run_exact_out_quoter_parity_test(pool_address, "USDC/cbBTC-ExactOut").await
     }
 }

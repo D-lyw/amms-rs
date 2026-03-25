@@ -15,10 +15,20 @@ interface IStablePool {
     function getAmplificationParameter() external view returns (uint256 value, bool isUpdating, uint256 precision);
     function getSwapFeePercentage() external view returns (uint256);
     function getRateProviders() external view returns (address[] memory);
+    function getScalingFactors() external view returns (uint256[] memory);
 }
 
 interface IComposableStablePool {
     function getBptIndex() external view returns (uint256);
+    function getTokenRateCache(IERC20 token)
+        external
+        view
+        returns (
+            uint256 rate,
+            uint256 oldRate,
+            uint256 duration,
+            uint256 expires
+        );
 }
 
 interface IERC20 {
@@ -43,6 +53,7 @@ contract GetBalancerV2PoolDataBatchRequest {
         uint256 bptIndex;
         address[] rateProviders;
         uint256[] rates;
+        uint256[] scalingFactors;
     }
 
     constructor(address vault, bytes32[] memory poolIds, address[] memory poolAddresses, uint16[] memory poolTypes) {
@@ -106,16 +117,42 @@ contract GetBalancerV2PoolDataBatchRequest {
              uint256[] memory rates = new uint256[](tokens.length);
              for(uint256 j=0; j<tokens.length; j++) {
                  if (j < rps.length && rps[j] != address(0)) {
-                     try IRateProvider(rps[j]).getRate() returns (uint256 r) {
-                         rates[j] = r;
-                     } catch {
-                         rates[j] = 1e18;
+                     // ComposableStable swaps use pool token-rate cache values.
+                     // Use cached rate first to mirror on-chain querySwap path.
+                     if (pType == 2) {
+                         try IComposableStablePool(poolAddr).getTokenRateCache(IERC20(tokens[j])) returns (
+                             uint256 cachedRate,
+                             uint256,
+                             uint256,
+                             uint256
+                         ) {
+                             rates[j] = cachedRate;
+                         } catch {
+                             try IRateProvider(rps[j]).getRate() returns (uint256 r) {
+                                 rates[j] = r;
+                             } catch {
+                                 rates[j] = 1e18;
+                             }
+                         }
+                     } else {
+                         try IRateProvider(rps[j]).getRate() returns (uint256 r) {
+                             rates[j] = r;
+                         } catch {
+                             rates[j] = 1e18;
+                         }
                      }
                  } else {
                      rates[j] = 1e18;
                  }
              }
-             data[i].rates = rates;
+            data[i].rates = rates;
+
+            // Fetch scaling factors when available (Stable/ComposableStable/MetaStable family).
+            try IStablePool(poolAddr).getScalingFactors() returns (uint256[] memory sfs) {
+                data[i].scalingFactors = sfs;
+            } catch {
+                data[i].scalingFactors = new uint256[](0);
+            }
 
              if (pType == 0) { // Weighted
                 try IWeightedPool(poolAddr).getNormalizedWeights() returns (uint256[] memory w) {

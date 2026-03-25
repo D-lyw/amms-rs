@@ -32,6 +32,7 @@ async fn setup_provider() -> Result<impl alloy::providers::Provider<Ethereum> + 
 }
 
 /// 验证本地模拟与链上结果的偏差
+#[allow(dead_code)]
 fn verify_diff(local: U256, chain: U256, threshold_ppm: u64) {
     if local == chain {
         return;
@@ -106,6 +107,7 @@ async fn test_sync_real_pool_eth_usdc() -> Result<()> {
 }
 
 // 占位: 旧的 mock 数据函数保留但不再作为主要的 verification source
+#[allow(dead_code)]
 fn get_pool_usdc_usdt() -> EkuboPoolKey {
     EkuboPoolKey::new_concentrated(
         address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"), // USDC
@@ -117,6 +119,7 @@ fn get_pool_usdc_usdt() -> EkuboPoolKey {
 }
 
 // 测试不同的 fee tier
+#[allow(dead_code)]
 fn get_pool_usdc_usdt_fee_100() -> EkuboPoolKey {
     EkuboPoolKey::new_concentrated(
         address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
@@ -127,6 +130,7 @@ fn get_pool_usdc_usdt_fee_100() -> EkuboPoolKey {
     )
 }
 
+#[allow(dead_code)]
 fn get_pool_usdc_usdt_fee_500() -> EkuboPoolKey {
     EkuboPoolKey::new_concentrated(
         address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
@@ -138,6 +142,7 @@ fn get_pool_usdc_usdt_fee_500() -> EkuboPoolKey {
 }
 
 // WBTC/WETH 池子 (更常见的交易对)
+#[allow(dead_code)]
 fn get_pool_wbtc_weth() -> EkuboPoolKey {
     EkuboPoolKey::new_concentrated(
         address!("2260fac5e5542a773aa44fbcfedf7c193bc2c599"), // WBTC
@@ -149,6 +154,7 @@ fn get_pool_wbtc_weth() -> EkuboPoolKey {
 }
 
 // WETH/USDC 池子
+#[allow(dead_code)]
 fn get_pool_weth_usdc() -> EkuboPoolKey {
     EkuboPoolKey::new_concentrated(
         address!("c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"), // WETH

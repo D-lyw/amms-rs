@@ -123,7 +123,8 @@ impl AutomatedMarketMaker for ERC4626Vault {
             }
 
             _ => {
-                return Err(AMMError::UnrecognizedEventSignature(event_signature));
+                // Ignore non-ERC4626 events (e.g., ERC20 Transfer) to avoid noisy logs.
+                return Ok(SyncAction::None);
             }
         }
 

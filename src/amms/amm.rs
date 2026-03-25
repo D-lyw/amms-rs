@@ -180,6 +180,17 @@ macro_rules! amm {
                 }
             }
 
+            fn simulate_swap_exact_out(
+                &self,
+                base_token: Address,
+                quote_token: Address,
+                amount_out: U256,
+            ) -> Result<U256, AMMError> {
+                match self {
+                    $(AMM::$pool_type(pool) => pool.simulate_swap_exact_out(base_token, quote_token, amount_out),)+
+                }
+            }
+
             async fn update<N, P>(&mut self, provider: P) -> Result<(), AMMError>
             where
                 N: Network,

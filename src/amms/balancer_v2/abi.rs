@@ -12,6 +12,7 @@ sol! {
     #[sol(rpc)]
     interface IVault {
         function getPoolTokens(bytes32 poolId) external view returns (address[] memory tokens, uint256[] memory balances, uint256 lastChangeBlock);
+        function getPoolTokenInfo(bytes32 poolId, address token) external view returns (uint256 cash, uint256 managed, uint256 lastChangeBlock, address assetManager);
         function queryBatchSwap(uint8 kind, SwapStep[] memory swaps, address[] memory assets, FundManagement memory funds) external returns (int256[] memory assetDeltas);
         event Swap(bytes32 indexed poolId, address indexed tokenIn, address indexed tokenOut, uint256 amountIn, uint256 amountOut);
         event PoolBalanceChanged(bytes32 indexed poolId, address indexed liquidityProvider, address[] tokens, int256[] deltas, uint256[] protocolFeeAmounts);

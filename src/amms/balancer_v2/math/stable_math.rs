@@ -1,92 +1,191 @@
 use crate::amms::balancer_v2::BalancerV2Error;
-use crate::amms::consts::MPFR_T_PRECISION;
-use crate::amms::float::u256_to_float;
+use crate::amms::consts::BONE;
 use alloy::primitives::U256;
-use rug::Float;
 
 /// Balancer V2 Stable Pool AMP_PRECISION constant
 /// The amplification parameter is stored with this precision factor
 /// See: https://github.com/balancer/balancer-v2-monorepo/blob/master/pkg/pool-stable/contracts/StableMath.sol
-const AMP_PRECISION: f64 = 1000.0;
+const AMP_PRECISION: u64 = 1000;
+const MAX_STABLE_ITERATIONS: usize = 255;
 
-pub fn calculate_invariant(amp: U256, balances: &[U256]) -> Result<Float, BalancerV2Error> {
-    let mut sum = Float::with_val(MPFR_T_PRECISION, 0.0);
-    let n_coins_u = balances.len();
-    let n_coins = Float::with_val(MPFR_T_PRECISION, n_coins_u as f64);
+fn abs_diff(a: U256, b: U256) -> U256 {
+    if a >= b { a - b } else { b - a }
+}
 
-    if n_coins_u == 0 {
-        return Ok(Float::with_val(MPFR_T_PRECISION, 0.0));
+fn div_down(a: U256, b: U256) -> Result<U256, BalancerV2Error> {
+    if b.is_zero() {
+        return Err(BalancerV2Error::DivZero);
     }
+    Ok(a / b)
+}
 
-    let mut balances_f = Vec::with_capacity(n_coins_u);
-    for b in balances {
-        let bf = u256_to_float(*b).map_err(|e| BalancerV2Error::NotSupported(e.to_string()))?;
-        sum = Float::with_val(MPFR_T_PRECISION, &sum + &bf);
-        balances_f.push(bf);
+fn mul_div_down(a: U256, b: U256, d: U256) -> Result<U256, BalancerV2Error> {
+    let p = a.checked_mul(b).ok_or(BalancerV2Error::MulOverflow)?;
+    div_down(p, d)
+}
+
+fn div_up(a: U256, b: U256) -> Result<U256, BalancerV2Error> {
+    if b.is_zero() {
+        return Err(BalancerV2Error::DivZero);
     }
+    let q = a / b;
+    let r = a % b;
+    if r.is_zero() {
+        Ok(q)
+    } else {
+        q.checked_add(U256::from(1u8))
+            .ok_or(BalancerV2Error::AddOverflow)
+    }
+}
 
+#[allow(dead_code)]
+fn mul_div_up(a: U256, b: U256, d: U256) -> Result<U256, BalancerV2Error> {
+    let p = a.checked_mul(b).ok_or(BalancerV2Error::MulOverflow)?;
+    div_up(p, d)
+}
+
+fn calculate_invariant_u256(amp: U256, balances: &[U256]) -> Result<U256, BalancerV2Error> {
+    let num_tokens = balances.len();
+    if num_tokens == 0 {
+        return Ok(U256::ZERO);
+    }
+    let n = U256::from(num_tokens as u64);
+    let n_plus_1 = U256::from((num_tokens + 1) as u64);
+    let amp_precision = U256::from(AMP_PRECISION);
+
+    let sum = balances.iter().try_fold(U256::ZERO, |acc, b| {
+        acc.checked_add(*b).ok_or(BalancerV2Error::AddOverflow)
+    })?;
     if sum.is_zero() {
-        return Ok(Float::with_val(MPFR_T_PRECISION, 0.0));
+        return Ok(U256::ZERO);
     }
 
-    let amp_f = u256_to_float(amp).map_err(|e| BalancerV2Error::NotSupported(e.to_string()))?;
-    // Ann = A * n (already includes AMP_PRECISION from getAmplificationParameter)
-    let amp_times_n = Float::with_val(MPFR_T_PRECISION, &amp_f * &n_coins);
-    let amp_precision = Float::with_val(MPFR_T_PRECISION, AMP_PRECISION);
+    let mut invariant = sum;
+    let amp_times_total = amp.checked_mul(n).ok_or(BalancerV2Error::MulOverflow)?;
 
-    let mut d = sum.clone();
-    let mut prev_d;
-
-    let one = Float::with_val(MPFR_T_PRECISION, 1.0);
-
-    // Newton's method - following Balancer V2 StableMath._calculateInvariant
-    for _ in 0..255 {
-        let mut d_p = d.clone();
-        for b in &balances_f {
-            // D_P = (D_P * D) / (balances[j] * numTokens)
-            // If balance is zero, denom is zero -> division by zero
-            // We should catch this early or check b
-            if b.is_zero() {
-                return Err(BalancerV2Error::DivZero);
-            }
-            let denom = Float::with_val(MPFR_T_PRECISION, &n_coins * b);
-            let num = Float::with_val(MPFR_T_PRECISION, &d_p * &d);
-            d_p = Float::with_val(MPFR_T_PRECISION, num / denom);
+    for _ in 0..MAX_STABLE_ITERATIONS {
+        let mut p_d = invariant;
+        for balance in balances {
+            let bn = balance.checked_mul(n).ok_or(BalancerV2Error::MulOverflow)?;
+            p_d = mul_div_down(p_d, invariant, bn)?;
         }
 
-        prev_d = d.clone();
+        let prev = invariant;
 
-        // Numerator: ((ampTimesTotal * sum) / AMP_PRECISION + D_P * numTokens) * invariant
-        let term1 = Float::with_val(MPFR_T_PRECISION, &amp_times_n * &sum);
-        let term1_scaled = Float::with_val(MPFR_T_PRECISION, &term1 / &amp_precision);
-        let term2 = Float::with_val(MPFR_T_PRECISION, &d_p * &n_coins);
-        let sum_terms = Float::with_val(MPFR_T_PRECISION, &term1_scaled + &term2);
-        let num = Float::with_val(MPFR_T_PRECISION, &sum_terms * &d);
+        let term1 = mul_div_down(amp_times_total, sum, amp_precision)?;
+        let term2 = p_d.checked_mul(n).ok_or(BalancerV2Error::MulOverflow)?;
+        let numerator_base = term1.checked_add(term2).ok_or(BalancerV2Error::AddOverflow)?;
+        let numerator = numerator_base
+            .checked_mul(invariant)
+            .ok_or(BalancerV2Error::MulOverflow)?;
 
-        // Denominator: ((ampTimesTotal - AMP_PRECISION) * invariant) / AMP_PRECISION + (numTokens + 1) * D_P
-        let amp_minus_precision = Float::with_val(MPFR_T_PRECISION, &amp_times_n - &amp_precision);
-        let term3_unscaled = Float::with_val(MPFR_T_PRECISION, &amp_minus_precision * &d);
-        let term3 = Float::with_val(MPFR_T_PRECISION, &term3_unscaled / &amp_precision);
+        let amp_minus_precision = amp_times_total
+            .checked_sub(amp_precision)
+            .ok_or(BalancerV2Error::SubUnderflow)?;
+        let den_term1 = mul_div_down(amp_minus_precision, invariant, amp_precision)?;
+        let den_term2 = n_plus_1
+            .checked_mul(p_d)
+            .ok_or(BalancerV2Error::MulOverflow)?;
+        let denominator = den_term1
+            .checked_add(den_term2)
+            .ok_or(BalancerV2Error::AddOverflow)?;
 
-        let n_plus_1 = Float::with_val(MPFR_T_PRECISION, &n_coins + &one);
-        let term4 = Float::with_val(MPFR_T_PRECISION, &n_plus_1 * &d_p);
-
-        let den = Float::with_val(MPFR_T_PRECISION, &term3 + &term4);
-
-        d = Float::with_val(MPFR_T_PRECISION, num / den);
-
-        let diff = if d > prev_d {
-            Float::with_val(MPFR_T_PRECISION, &d - &prev_d)
-        } else {
-            Float::with_val(MPFR_T_PRECISION, &prev_d - &d)
-        };
-
-        if diff <= one {
-            break;
+        invariant = div_down(numerator, denominator)?;
+        if abs_diff(invariant, prev) <= U256::from(1u8) {
+            return Ok(invariant);
         }
     }
 
-    Ok(d)
+    Ok(invariant)
+}
+
+fn get_token_balance_given_invariant_and_all_other_balances_u256(
+    amp: U256,
+    balances: &[U256],
+    token_index: usize,
+    invariant: U256,
+) -> Result<U256, BalancerV2Error> {
+    let num_tokens = balances.len();
+    let n = U256::from(num_tokens as u64);
+    let amp_precision = U256::from(AMP_PRECISION);
+    let amp_times_total = amp.checked_mul(n).ok_or(BalancerV2Error::MulOverflow)?;
+    if balances.is_empty() || token_index >= balances.len() {
+        return Err(BalancerV2Error::NotSupported(
+            "stable get_token_balance index out of bounds".to_string(),
+        ));
+    }
+
+    // Solidity parity:
+    // sum = balances[0] + ... + balances[n-1] - balances[tokenIndex]
+    // P_D = balances[0] * n; for j=1..n-1: P_D = divDown(P_D * balances[j] * n, invariant)
+    let mut sum = balances[0];
+    let mut p_d = balances[0]
+        .checked_mul(n)
+        .ok_or(BalancerV2Error::MulOverflow)?;
+    for balance in balances.iter().skip(1) {
+        let pd_mul_b = p_d
+            .checked_mul(*balance)
+            .ok_or(BalancerV2Error::MulOverflow)?;
+        let pd_mul_bn = pd_mul_b.checked_mul(n).ok_or(BalancerV2Error::MulOverflow)?;
+        p_d = div_down(pd_mul_bn, invariant)?;
+        sum = sum.checked_add(*balance).ok_or(BalancerV2Error::AddOverflow)?;
+    }
+    sum = sum
+        .checked_sub(balances[token_index])
+        .ok_or(BalancerV2Error::SubUnderflow)?;
+
+    let inv2 = invariant
+        .checked_mul(invariant)
+        .ok_or(BalancerV2Error::MulOverflow)?;
+
+    // Solidity parity:
+    // c = divUp(inv2, ampTimesTotal * P_D) * AMP_PRECISION * balances[tokenIndex]
+    let amp_pd = amp_times_total
+        .checked_mul(p_d)
+        .ok_or(BalancerV2Error::MulOverflow)?;
+    let c_div = div_up(inv2, amp_pd)?;
+    let c_scaled = c_div
+        .checked_mul(amp_precision)
+        .ok_or(BalancerV2Error::MulOverflow)?;
+    let c = c_scaled
+        .checked_mul(balances[token_index])
+        .ok_or(BalancerV2Error::MulOverflow)?;
+
+    // b = sum + divDown(invariant, ampTimesTotal) * AMP_PRECISION
+    let b_term = div_down(invariant, amp_times_total)?
+        .checked_mul(amp_precision)
+        .ok_or(BalancerV2Error::MulOverflow)?;
+    let b = sum.checked_add(b_term).ok_or(BalancerV2Error::AddOverflow)?;
+
+    // Newton iteration for token balance
+    let mut token_balance = div_up(
+        inv2.checked_add(c).ok_or(BalancerV2Error::AddOverflow)?,
+        invariant
+            .checked_add(b)
+            .ok_or(BalancerV2Error::AddOverflow)?,
+    )?;
+
+    for _ in 0..MAX_STABLE_ITERATIONS {
+        let prev = token_balance;
+        let num = token_balance
+            .checked_mul(token_balance)
+            .ok_or(BalancerV2Error::MulOverflow)?
+            .checked_add(c)
+            .ok_or(BalancerV2Error::AddOverflow)?;
+        let den = token_balance
+            .checked_mul(U256::from(2u8))
+            .ok_or(BalancerV2Error::MulOverflow)?
+            .checked_add(b)
+            .ok_or(BalancerV2Error::AddOverflow)?
+            .checked_sub(invariant)
+            .ok_or(BalancerV2Error::SubUnderflow)?;
+        token_balance = div_up(num, den)?;
+        if abs_diff(token_balance, prev) <= U256::from(1u8) {
+            return Ok(token_balance);
+        }
+    }
+
+    Ok(token_balance)
 }
 
 pub fn calculate_out_given_in(
@@ -95,93 +194,80 @@ pub fn calculate_out_given_in(
     token_index_in: usize,
     token_index_out: usize,
     amount_in: U256,
-    fee: U256,
 ) -> Result<U256, BalancerV2Error> {
-    // 1. Current Invariant
-    let d = calculate_invariant(amp, balances)?;
-
-    let balances_f: Vec<Float> = balances
-        .iter()
-        .map(|b| u256_to_float(*b).map_err(|e| BalancerV2Error::NotSupported(e.to_string())))
-        .collect::<Result<_, _>>()?;
-    let amount_in_f =
-        u256_to_float(amount_in).map_err(|e| BalancerV2Error::NotSupported(e.to_string()))?;
-    let fee_f = u256_to_float(fee).map_err(|e| BalancerV2Error::NotSupported(e.to_string()))?;
-    let bone_f = Float::with_val(MPFR_T_PRECISION, 1e18);
-
-    // 2. New Balance In (after fee)
-    let fee_ratio = Float::with_val(MPFR_T_PRECISION, &fee_f / &bone_f);
-    let one = Float::with_val(MPFR_T_PRECISION, 1.0);
-    let one_minus_fee = Float::with_val(MPFR_T_PRECISION, &one - &fee_ratio);
-    let amount_in_after_fee = Float::with_val(MPFR_T_PRECISION, &amount_in_f * one_minus_fee);
-    let new_balance_in = Float::with_val(
-        MPFR_T_PRECISION,
-        &balances_f[token_index_in] + &amount_in_after_fee,
-    );
-
-    // 3. Solve for New Balance Out
-    let n_coins_u = balances.len();
-    let n_coins = Float::with_val(MPFR_T_PRECISION, n_coins_u as f64);
-    let amp_f = u256_to_float(amp).map_err(|e| BalancerV2Error::NotSupported(e.to_string()))?;
-    let ann = Float::with_val(MPFR_T_PRECISION, &amp_f * &n_coins);
-
-    let mut s_prime = Float::with_val(MPFR_T_PRECISION, 0.0);
-    let mut p = d.clone();
-
-    for (i, b) in balances_f.iter().enumerate() {
-        if i == token_index_out {
-            continue;
-        }
-        let balance = if i == token_index_in {
-            &new_balance_in
-        } else {
-            b
-        };
-        s_prime = Float::with_val(MPFR_T_PRECISION, &s_prime + balance);
-
-        let denom = Float::with_val(MPFR_T_PRECISION, &n_coins * balance);
-        let p_num = Float::with_val(MPFR_T_PRECISION, &p * &d);
-        p = Float::with_val(MPFR_T_PRECISION, p_num / denom);
+    if amount_in.is_zero() {
+        return Ok(U256::ZERO);
+    }
+    if token_index_in >= balances.len() || token_index_out >= balances.len() {
+        return Err(BalancerV2Error::NotSupported(
+            "stable out_given_in index out of bounds".to_string(),
+        ));
     }
 
-    // Apply AMP_PRECISION: ann (from getAmplificationParameter) already includes 1000x factor
-    let amp_precision = Float::with_val(MPFR_T_PRECISION, AMP_PRECISION);
+    let invariant = calculate_invariant_u256(amp, balances)?;
+    let mut new_balances = balances.to_vec();
+    new_balances[token_index_in] = new_balances[token_index_in]
+        .checked_add(amount_in)
+        .ok_or(BalancerV2Error::AddOverflow)?;
 
-    // c = (p * d * AMP_PRECISION) / (ann * n)
-    // This is equivalent to: c = D^(n+1) / (A * n^2n * P) where A is already scaled by PRECISION
-    let term = Float::with_val(MPFR_T_PRECISION, &ann * &n_coins);
-    let p_d = Float::with_val(MPFR_T_PRECISION, &p * &d);
-    let p_d_scaled = Float::with_val(MPFR_T_PRECISION, &p_d * &amp_precision);
-    let c = Float::with_val(MPFR_T_PRECISION, p_d_scaled / term);
+    let final_balance_out = get_token_balance_given_invariant_and_all_other_balances_u256(
+        amp,
+        &new_balances,
+        token_index_out,
+        invariant,
+    )?;
 
-    // b = s_prime + (d * AMP_PRECISION) / ann
-    let d_scaled = Float::with_val(MPFR_T_PRECISION, &d * &amp_precision);
-    let d_div_ann = Float::with_val(MPFR_T_PRECISION, &d_scaled / &ann);
-    let b_term = Float::with_val(MPFR_T_PRECISION, &s_prime + &d_div_ann);
+    if balances[token_index_out] <= final_balance_out {
+        return Ok(U256::ZERO);
+    }
+    let raw_out = balances[token_index_out] - final_balance_out;
+    // round down to stay conservative for GIVEN_IN queries.
+    if raw_out > U256::ZERO {
+        Ok(raw_out - U256::from(1u8))
+    } else {
+        Ok(U256::ZERO)
+    }
+}
 
-    // Quadratic: y^2 + (b - D)y - c = 0
-    let b_minus_d = Float::with_val(MPFR_T_PRECISION, &b_term - &d);
-    let b_minus_d_sq = Float::with_val(MPFR_T_PRECISION, &b_minus_d * &b_minus_d);
-    let c_4 = Float::with_val(MPFR_T_PRECISION, &c * 4.0);
-    let discriminant = Float::with_val(MPFR_T_PRECISION, b_minus_d_sq + c_4);
-    let sqrt_disc = Float::with_val(MPFR_T_PRECISION, discriminant.sqrt());
+/// Stable math exact-out solver in fixed-point domain.
+pub fn calculate_in_given_out(
+    amp: U256,
+    balances: &[U256],
+    token_index_in: usize,
+    token_index_out: usize,
+    amount_out: U256,
+) -> Result<U256, BalancerV2Error> {
+    if amount_out.is_zero() {
+        return Ok(U256::ZERO);
+    }
+    if token_index_in >= balances.len() || token_index_out >= balances.len() {
+        return Err(BalancerV2Error::NotSupported(
+            "stable in_given_out index out of bounds".to_string(),
+        ));
+    }
+    if amount_out >= balances[token_index_out] {
+        return Err(BalancerV2Error::SubUnderflow);
+    }
+    let invariant = calculate_invariant_u256(amp, balances)?;
+    let mut new_balances = balances.to_vec();
+    new_balances[token_index_out] = new_balances[token_index_out]
+        .checked_sub(amount_out)
+        .ok_or(BalancerV2Error::SubUnderflow)?;
 
-    let num_y = Float::with_val(MPFR_T_PRECISION, sqrt_disc - &b_minus_d);
-    let y = Float::with_val(MPFR_T_PRECISION, num_y / 2.0);
+    let final_balance_in = get_token_balance_given_invariant_and_all_other_balances_u256(
+        amp,
+        &new_balances,
+        token_index_in,
+        invariant,
+    )?;
 
-    let new_balance_out = y;
-    let amount_out_f = Float::with_val(
-        MPFR_T_PRECISION,
-        &balances_f[token_index_out] - &new_balance_out,
-    );
-
-    let amount_out_str = amount_out_f.to_string_radix(10, None);
-    let parts: Vec<&str> = amount_out_str.split('.').collect();
-    let integer_part = parts[0];
-
-    let result =
-        U256::from_str_radix(integer_part, 10).map_err(|_| BalancerV2Error::MulOverflow)?;
-    Ok(result)
+    let amount_in = final_balance_in
+        .checked_sub(balances[token_index_in])
+        .ok_or(BalancerV2Error::SubUnderflow)?;
+    // GIVEN_OUT path rounds input up overall in StableMath.
+    amount_in
+        .checked_add(U256::from(1u8))
+        .ok_or(BalancerV2Error::AddOverflow)
 }
 
 pub fn calculate_spot_price(
@@ -190,41 +276,54 @@ pub fn calculate_spot_price(
     token_index_in: usize,
     token_index_out: usize,
 ) -> Result<f64, BalancerV2Error> {
-    let d = calculate_invariant(amp, balances)?;
-    let balances_f: Vec<Float> = balances
-        .iter()
-        .map(|b| u256_to_float(*b).map_err(|e| BalancerV2Error::NotSupported(e.to_string())))
-        .collect::<Result<_, _>>()?;
-    let amp_f = u256_to_float(amp).map_err(|e| BalancerV2Error::NotSupported(e.to_string()))?;
-    let n_coins = Float::with_val(MPFR_T_PRECISION, balances.len() as f64);
-    let amp_precision = Float::with_val(MPFR_T_PRECISION, AMP_PRECISION);
-    // ann = A * n, but A already includes AMP_PRECISION factor, so we need to divide
-    let ann_unscaled = Float::with_val(MPFR_T_PRECISION, &amp_f * &n_coins);
-    let ann = Float::with_val(MPFR_T_PRECISION, &ann_unscaled / &amp_precision);
+    let unit = BONE;
+    let out = calculate_out_given_in(amp, balances, token_index_in, token_index_out, unit)?;
+    let out_f = out
+        .to_string()
+        .parse::<f64>()
+        .map_err(|_| BalancerV2Error::NotSupported("u256->f64 conversion failed".to_string()))?;
+    Ok(out_f / 1e18f64)
+}
 
-    let x_in = &balances_f[token_index_in];
-    let x_out = &balances_f[token_index_out];
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let mut alpha = d.clone();
-    for b in &balances_f {
-        let denom = Float::with_val(MPFR_T_PRECISION, &n_coins * b);
-        let num = Float::with_val(MPFR_T_PRECISION, &alpha * &d);
-        alpha = Float::with_val(MPFR_T_PRECISION, num / denom);
+    #[test]
+    fn test_stable_in_given_out_inverse_property() {
+        let amp = U256::from(20_000u64); // includes AMP precision scale
+        let balances = vec![
+            U256::from(5_000_000_000_000u64),
+            U256::from(4_900_000_000_000u64),
+            U256::from(5_100_000_000_000u64),
+        ];
+        let target_out = U256::from(50_000_000u64);
+
+        let amount_in = calculate_in_given_out(amp, &balances, 0, 1, target_out)
+            .expect("stable in_given_out should solve");
+
+        let out = calculate_out_given_in(amp, &balances, 0, 1, amount_in)
+            .expect("stable out_given_in should work");
+        let diff = if out > target_out {
+            out - target_out
+        } else {
+            target_out - out
+        };
+        let tolerance = std::cmp::max(target_out / U256::from(100_000u64), U256::from(1u8));
+        assert!(
+            diff <= tolerance,
+            "stable inverse mismatch target_out={} amount_in={} out={} diff={} tolerance={}",
+            target_out,
+            amount_in,
+            out,
+            diff,
+            tolerance
+        );
+
+        if amount_in > U256::ZERO {
+            let out_less = calculate_out_given_in(amp, &balances, 0, 1, amount_in - U256::from(1u8))
+                .expect("stable out_given_in should work");
+            assert!(out_less <= out);
+        }
     }
-
-    let ann_x_in = Float::with_val(MPFR_T_PRECISION, &ann * x_in);
-    let term_in = Float::with_val(MPFR_T_PRECISION, ann_x_in + &alpha);
-
-    let ann_x_out = Float::with_val(MPFR_T_PRECISION, &ann * x_out);
-    let term_out = Float::with_val(MPFR_T_PRECISION, ann_x_out + &alpha);
-
-    let num = Float::with_val(MPFR_T_PRECISION, x_out * term_in);
-    let den = Float::with_val(MPFR_T_PRECISION, x_in * term_out);
-
-    if den.is_zero() {
-        return Err(BalancerV2Error::DivZero);
-    }
-
-    let price = Float::with_val(MPFR_T_PRECISION, num / den);
-    Ok(price.to_f64())
 }

@@ -14,6 +14,7 @@ use std::future::Future;
 use std::time::Duration;
 use tokio::time::sleep;
 
+use super::abi::IVault;
 use super::{AmpState, BalancerV2Factory, BalancerV2Pool, BalancerV2PoolType, TokenState};
 use crate::amms::{
     amm::{AutomatedMarketMaker, AMM},
@@ -40,6 +41,7 @@ sol! {
         uint256 bptIndex;
         address[] rateProviders;
         uint256[] rates;
+        uint256[] scalingFactors;
     }
 }
 
@@ -210,6 +212,7 @@ impl BalancerV2Factory {
 
         // 串行处理每个批次，避免并发请求过多
         for chunk in address_chunks {
+            let vault = IVault::new(vault_address, provider.clone());
             let mut pool_ids = Vec::new();
             let mut pool_addresses = Vec::new();
             let mut pool_types = Vec::new();
@@ -249,12 +252,24 @@ impl BalancerV2Factory {
                 let bpt_idx_val = data.bptIndex;
                 let rate_providers = data.rateProviders;
                 let rates = data.rates;
+                let scaling_factors = data.scalingFactors;
 
                 if let Some(AMM::BalancerV2Pool(pool)) = amms_map.get_mut(&pool_addr) {
                     pool.swap_fee = swap_fee;
 
                     for (i, &token_addr) in tokens.iter().enumerate() {
-                        let balance = balances[i];
+                        let total_balance = balances[i];
+                        // Swaps operate on Vault cash balances. Prefer cash from getPoolTokenInfo
+                        // to avoid drift on pools with non-zero managed balances.
+                        let balance = match vault
+                            .getPoolTokenInfo(pool.pool_id, token_addr)
+                            .block(block_number)
+                            .call()
+                            .await
+                        {
+                            Ok(info) => info.cash,
+                            Err(_) => total_balance,
+                        };
                         let decimal = if i < decimals.len() {
                             decimals[i] as u8
                         } else {
@@ -298,6 +313,12 @@ impl BalancerV2Factory {
                         } else {
                             None
                         };
+                        let scaling_factor = if i < scaling_factors.len() {
+                            let sf = scaling_factors[i];
+                            if sf.is_zero() { None } else { Some(sf) }
+                        } else {
+                            None
+                        };
 
                         if let Some(state) = pool.tokens.get_mut(&token_addr) {
                             state.balance = balance;
@@ -305,6 +326,7 @@ impl BalancerV2Factory {
                             state.weight = weight;
                             state.rate_provider = rate_provider;
                             state.rate = rate;
+                            state.scaling_factor = scaling_factor;
                         }
                     }
 
@@ -371,6 +393,7 @@ impl BalancerV2Factory {
 
         // 串行处理每个批次，避免并发请求过多
         for chunk in address_chunks {
+            let vault = IVault::new(vault_address, provider.clone());
             let mut pool_ids = Vec::new();
             let mut pool_addresses = Vec::new();
             let mut pool_types = Vec::new();
@@ -410,6 +433,7 @@ impl BalancerV2Factory {
                 let bpt_idx_val = data.bptIndex;
                 let rate_providers = data.rateProviders;
                 let rates = data.rates;
+                let scaling_factors = data.scalingFactors;
 
                 if let Some(AMM::BalancerV2Pool(pool)) = amms_map.get_mut(&pool_addr) {
                     pool.swap_fee = swap_fee;
@@ -418,7 +442,18 @@ impl BalancerV2Factory {
                     pool.token_list.clear();
 
                     for (i, &token_addr) in tokens.iter().enumerate() {
-                        let balance = balances[i];
+                        let total_balance = balances[i];
+                        // Swaps operate on Vault cash balances. Prefer cash from getPoolTokenInfo
+                        // to avoid drift on pools with non-zero managed balances.
+                        let balance = match vault
+                            .getPoolTokenInfo(pool.pool_id, token_addr)
+                            .block(block_number)
+                            .call()
+                            .await
+                        {
+                            Ok(info) => info.cash,
+                            Err(_) => total_balance,
+                        };
                         let weight = if pool.pool_type == BalancerV2PoolType::Weighted
                             && i < weights.len()
                         {
@@ -477,6 +512,12 @@ impl BalancerV2Factory {
                         } else {
                             None
                         };
+                        let scaling_factor = if i < scaling_factors.len() {
+                            let sf = scaling_factors[i];
+                            if sf.is_zero() { None } else { Some(sf) }
+                        } else {
+                            None
+                        };
 
                         pool.tokens.insert(
                             token_addr,
@@ -487,6 +528,7 @@ impl BalancerV2Factory {
                                 weight,
                                 rate_provider,
                                 rate,
+                                scaling_factor,
                                 index: i,
                             },
                         );

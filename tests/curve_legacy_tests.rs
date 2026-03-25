@@ -5,7 +5,7 @@ use alloy::{
 };
 use amms::amms::{
     amm::AutomatedMarketMaker,
-    curve_legacy::types::{CurveLegacyPool, CurveLegacyPoolType, LegacyStableSwapType},
+    curve_legacy::types::{CurveLegacyPool, CurveLegacyPoolType},
 };
 use eyre::Result;
 use std::env;

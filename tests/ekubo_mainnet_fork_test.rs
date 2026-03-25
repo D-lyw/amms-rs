@@ -23,7 +23,6 @@ use std::env;
 // ========== Constants ==========
 
 const EKUBO_CORE: Address = address!("e0e0e08a6a4b9dc7bd67bcb7aade5cf48157d444");
-const CORE_DATA_FETCHER: Address = address!("208bb00c6b142351e4a431f6dd323691ebb7c285");
 const EKUBO_ROUTER: Address = address!("9995855C00494d039aB6792f18e368e530DFf931");
 
 sol! {

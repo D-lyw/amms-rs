@@ -42,7 +42,7 @@ use alloy::{
     providers::Provider,
     rpc::types::Log,
     sol,
-    sol_types::{SolCall, SolEvent},
+    sol_types::SolEvent,
 };
 use eyre::Result;
 
@@ -1676,7 +1676,6 @@ impl CurveLegacyPool {
     fn get_rates(&self) -> Result<Vec<U256>, AMMError> {
         let n = self.n_coins as usize;
         let mut rates = Vec::with_capacity(n);
-        let precision_1e18 = U256::from(10).pow(U256::from(18));
 
         // 1. Lending Pool / Custom Rates
         if self.stable_type == LegacyStableSwapType::Lending && self.rates.len() == n {

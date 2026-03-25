@@ -1,9 +1,8 @@
 use crate::amms::{
     amm::{AutomatedMarketMaker, SyncAction},
-    balancer_v2::{
-        math::{stable_math, weighted_math},
-        BalancerV2Error,
-    },
+    balancer_v2::BalancerV2Error,
+    balancer_v3::math::{stable_math, weighted_math},
+    consts::BONE,
     error::AMMError,
     float::u256_to_float,
 };
@@ -19,6 +18,8 @@ use alloy::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+pub mod math;
 
 pub fn get_vault_address(_chain_id: u64) -> Option<Address> {
     // Balancer V3 Vault is deployed using Create2 at the same address on all supported chains.
@@ -190,6 +191,21 @@ sol!(
             int256[] deltas,
             uint256[] protocolFeeAmounts
         );
+
+        // ERC4626 buffer events emitted by the Vault (not relevant to pool state sync)
+        event Wrap(
+            address pool,
+            uint256 amountIn,
+            uint256 amountOut,
+            bytes32 bufferId
+        );
+
+        event Unwrap(
+            address pool,
+            uint256 amountIn,
+            uint256 amountOut,
+            bytes32 bufferId
+        );
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -202,6 +218,30 @@ sol!(
 
     #[derive(Debug, PartialEq, Eq)]
     #[sol(rpc)]
+    struct LiquidityManagement {
+        bool disableUnbalancedLiquidity;
+        bool enableAddLiquidityCustom;
+        bool enableRemoveLiquidityCustom;
+        bool enableDonation;
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    #[sol(rpc)]
+    struct PoolConfig {
+        LiquidityManagement liquidityManagement;
+        uint256 staticSwapFeePercentage;
+        uint256 aggregateSwapFeePercentage;
+        uint256 aggregateYieldFeePercentage;
+        uint40 tokenDecimalDiffs;
+        uint32 pauseWindowEndTime;
+        bool isPoolRegistered;
+        bool isPoolInitialized;
+        bool isPoolPaused;
+        bool isPoolInRecoveryMode;
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    #[sol(rpc)]
     contract IVaultExplorer {
         function getPoolTokenInfo(address pool) external view returns (
             address[] memory tokens,
@@ -209,6 +249,7 @@ sol!(
             uint256[] memory balancesRaw,
             uint256[] memory lastLiveBalances
         );
+        function getPoolConfig(address pool) external view returns (PoolConfig memory poolConfig);
     }
 
     #[sol(rpc)]
@@ -412,33 +453,118 @@ impl BalancerV3Pool {
         Ok(final_scaled)
     }
 
-    // Scale down using Rate Provider logic
-    // Reverse: (AmountScaled * 1e18) / Rate / ScalingFactor
-    fn scale_down(
+    #[inline]
+    fn fixed_mul_down(a: U256, b: U256) -> Result<U256, BalancerV3Error> {
+        let product = a
+            .checked_mul(b)
+            .ok_or(BalancerV3Error::MathError("mul overflow".to_string()))?;
+        Ok(product / BONE)
+    }
+
+    #[inline]
+    fn fixed_mul_up(a: U256, b: U256) -> Result<U256, BalancerV3Error> {
+        let product = a
+            .checked_mul(b)
+            .ok_or(BalancerV3Error::MathError("mul overflow".to_string()))?;
+        if product.is_zero() {
+            Ok(U256::ZERO)
+        } else {
+            Ok((product - U256::from(1u8)) / BONE + U256::from(1u8))
+        }
+    }
+
+    #[inline]
+    fn fixed_div_down(a: U256, b: U256) -> Result<U256, BalancerV3Error> {
+        if b.is_zero() {
+            return Err(BalancerV3Error::MathError("div zero".to_string()));
+        }
+        let inflated = a
+            .checked_mul(BONE)
+            .ok_or(BalancerV3Error::MathError("mul overflow".to_string()))?;
+        Ok(inflated / b)
+    }
+
+    #[inline]
+    fn fixed_mul_div_up(a: U256, b: U256, c: U256) -> Result<U256, BalancerV3Error> {
+        if c.is_zero() {
+            return Err(BalancerV3Error::MathError("div zero".to_string()));
+        }
+        let product = a
+            .checked_mul(b)
+            .ok_or(BalancerV3Error::MathError("mul overflow".to_string()))?;
+        if product.is_zero() {
+            Ok(U256::ZERO)
+        } else {
+            Ok((product - U256::from(1u8)) / c + U256::from(1u8))
+        }
+    }
+
+    #[inline]
+    fn fixed_div_up(a: U256, b: U256) -> Result<U256, BalancerV3Error> {
+        Self::fixed_mul_div_up(a, BONE, b)
+    }
+
+    #[inline]
+    fn compute_rate_round_up(rate: U256) -> U256 {
+        let rounded = (rate / BONE) * BONE;
+        if rounded == rate {
+            rate
+        } else {
+            rate + U256::from(1u8)
+        }
+    }
+
+    fn to_scaled_18_apply_rate_round_down(
+        &self,
+        amount_raw: U256,
+        token_state: &V3TokenState,
+    ) -> Result<U256, BalancerV3Error> {
+        let scaled = amount_raw
+            .checked_mul(token_state.scaling_factor)
+            .ok_or(BalancerV3Error::MathError("mul overflow".to_string()))?;
+        Self::fixed_mul_down(scaled, token_state.rate)
+    }
+
+    fn to_scaled_18_apply_rate_round_up(
+        &self,
+        amount_raw: U256,
+        token_state: &V3TokenState,
+        rate_override: U256,
+    ) -> Result<U256, BalancerV3Error> {
+        let scaled = amount_raw
+            .checked_mul(token_state.scaling_factor)
+            .ok_or(BalancerV3Error::MathError("mul overflow".to_string()))?;
+        Self::fixed_mul_up(scaled, rate_override)
+    }
+
+    fn to_raw_undo_rate_round_down(
         &self,
         amount_scaled: U256,
         token_state: &V3TokenState,
+        rate_override: U256,
     ) -> Result<U256, BalancerV3Error> {
-        // 1. Reverse Rate
-        // DecimalScaled = (AmountScaled * 1e18) / Rate
-        let decimal_scaled = amount_scaled
-            .checked_mul(U256::from(1000000000000000000u128))
-            .ok_or(BalancerV3Error::MathError(
-                "Mul overflow (scale down)".to_string(),
-            ))?
-            .checked_div(token_state.rate)
-            .ok_or(BalancerV3Error::MathError("Div zero (rate)".to_string()))?;
-
-        // 2. Reverse Decimals
-        // Raw = DecimalScaled / ScalingFactor
-        let raw = decimal_scaled
-            .checked_div(token_state.scaling_factor)
-            .ok_or(BalancerV3Error::MathError(
-                "Div zero (scaling factor)".to_string(),
-            ))?;
-
-        Ok(raw)
+        let denom = token_state
+            .scaling_factor
+            .checked_mul(rate_override)
+            .ok_or(BalancerV3Error::MathError("mul overflow".to_string()))?;
+        Self::fixed_div_down(amount_scaled, denom)
     }
+
+    fn to_raw_undo_rate_round_up(
+        &self,
+        amount_scaled: U256,
+        token_state: &V3TokenState,
+        rate_override: U256,
+    ) -> Result<U256, BalancerV3Error> {
+        let denom = token_state
+            .scaling_factor
+            .checked_mul(rate_override)
+            .ok_or(BalancerV3Error::MathError("mul overflow".to_string()))?;
+        Self::fixed_div_up(amount_scaled, denom)
+    }
+
+    // NOTE: legacy scale_down / scale_down_up / add_swap_fee_amount / normalize_exact_out_amount_in
+    // helpers removed after bit-exact Vault alignment. The new FixedPoint+ScalingHelpers path is used instead.
 }
 
 impl AutomatedMarketMaker for BalancerV3Pool {
@@ -467,6 +593,13 @@ impl AutomatedMarketMaker for BalancerV3Pool {
         }
 
         let topic0 = log.topics()[0];
+
+        // Ignore ERC4626 buffer Wrap/Unwrap events emitted by the Vault
+        if topic0 == IVaultV3::Wrap::SIGNATURE_HASH
+            || topic0 == IVaultV3::Unwrap::SIGNATURE_HASH
+        {
+            return Ok(SyncAction::None);
+        }
 
         if topic0 == IVaultV3::Swap::SIGNATURE_HASH {
             let swap = IVaultV3::Swap::decode_raw_log(log.topics(), log.data().data.as_ref())?;
@@ -697,10 +830,17 @@ impl AutomatedMarketMaker for BalancerV3Pool {
             .get(&quote_token)
             .ok_or(BalancerV3Error::TokenOutDoesNotExist)?;
 
-        // Scale Inputs
-        let balance_in_scaled = self.scale_up(token_in_state.balance, token_in_state)?;
-        let balance_out_scaled = self.scale_up(token_out_state.balance, token_out_state)?;
-        let amount_in_scaled = self.scale_up(amount_in, token_in_state)?;
+        // Exact-In scaling (Vault rules)
+        let balance_in_scaled =
+            self.to_scaled_18_apply_rate_round_down(token_in_state.balance, token_in_state)?;
+        let balance_out_scaled =
+            self.to_scaled_18_apply_rate_round_down(token_out_state.balance, token_out_state)?;
+        let amount_in_scaled = self.to_scaled_18_apply_rate_round_down(amount_in, token_in_state)?;
+
+        let fee_amount_scaled = Self::fixed_mul_up(amount_in_scaled, self.swap_fee)?;
+        let amount_in_after_fee_scaled = amount_in_scaled
+            .checked_sub(fee_amount_scaled)
+            .ok_or(BalancerV3Error::MathError("sub underflow".to_string()))?;
 
         match self.pool_type {
             BalancerV3PoolType::Weighted => {
@@ -720,12 +860,15 @@ impl AutomatedMarketMaker for BalancerV3Pool {
                     *w_in,
                     balance_out_scaled,
                     *w_out,
-                    amount_in_scaled,
-                    self.swap_fee,
+                    amount_in_after_fee_scaled,
                 )
                 .map_err(BalancerV3Error::from)?;
-
-                let amount_out = self.scale_down(amount_out_scaled, token_out_state)?;
+                let rate_out_up = Self::compute_rate_round_up(token_out_state.rate);
+                let amount_out = self.to_raw_undo_rate_round_down(
+                    amount_out_scaled,
+                    token_out_state,
+                    rate_out_up,
+                )?;
                 Ok(amount_out)
             }
             BalancerV3PoolType::Stable => {
@@ -741,7 +884,7 @@ impl AutomatedMarketMaker for BalancerV3Pool {
                         .tokens
                         .get(token_addr)
                         .ok_or(BalancerV3Error::InitializationError)?;
-                    let scaled = self.scale_up(state.balance, state)?;
+                    let scaled = self.to_scaled_18_apply_rate_round_down(state.balance, state)?;
                     scaled_balances.push(scaled);
 
                     if *token_addr == base_token {
@@ -757,13 +900,148 @@ impl AutomatedMarketMaker for BalancerV3Pool {
                     &scaled_balances,
                     index_in,
                     index_out,
-                    amount_in_scaled,
-                    self.swap_fee,
+                    amount_in_after_fee_scaled,
+                )
+                .map_err(BalancerV3Error::from)?;
+                let rate_out_up = Self::compute_rate_round_up(token_out_state.rate);
+                let amount_out = self.to_raw_undo_rate_round_down(
+                    amount_out_scaled,
+                    token_out_state,
+                    rate_out_up,
+                )?;
+                Ok(amount_out)
+            }
+        }
+    }
+
+    fn simulate_swap_exact_out(
+        &self,
+        base_token: Address,
+        quote_token: Address,
+        amount_out: U256,
+    ) -> Result<U256, AMMError> {
+        if amount_out.is_zero() {
+            return Ok(U256::ZERO);
+        }
+
+        let token_in_state = self
+            .tokens
+            .get(&base_token)
+            .ok_or(BalancerV3Error::TokenInDoesNotExist)?;
+        let token_out_state = self
+            .tokens
+            .get(&quote_token)
+            .ok_or(BalancerV3Error::TokenOutDoesNotExist)?;
+
+        if amount_out >= token_out_state.balance {
+            return Err(AMMError::Msg(
+                "insufficient liquidity for BalancerV3 exact out".to_string(),
+            ));
+        }
+
+        match self.pool_type {
+            BalancerV3PoolType::Weighted => {
+                let weights = self
+                    .weights
+                    .as_ref()
+                    .ok_or(BalancerV3Error::InitializationError)?;
+                let w_in = weights
+                    .get(token_in_state.index)
+                    .ok_or(BalancerV3Error::InitializationError)?;
+                let w_out = weights
+                    .get(token_out_state.index)
+                    .ok_or(BalancerV3Error::InitializationError)?;
+
+                let balance_in_scaled =
+                    self.to_scaled_18_apply_rate_round_down(token_in_state.balance, token_in_state)?;
+                let balance_out_scaled =
+                    self.to_scaled_18_apply_rate_round_down(token_out_state.balance, token_out_state)?;
+                let rate_out_up = Self::compute_rate_round_up(token_out_state.rate);
+                let amount_out_scaled = self.to_scaled_18_apply_rate_round_up(
+                    amount_out,
+                    token_out_state,
+                    rate_out_up,
+                )?;
+
+                let amount_in_scaled = weighted_math::calculate_in_given_out(
+                    balance_in_scaled,
+                    *w_in,
+                    balance_out_scaled,
+                    *w_out,
+                    amount_out_scaled,
                 )
                 .map_err(BalancerV3Error::from)?;
 
-                let amount_out = self.scale_down(amount_out_scaled, token_out_state)?;
-                Ok(amount_out)
+                let fee_scaled = Self::fixed_mul_div_up(
+                    amount_in_scaled,
+                    self.swap_fee,
+                    BONE.checked_sub(self.swap_fee)
+                        .ok_or(BalancerV3Error::MathError("sub overflow".to_string()))?,
+                )?;
+                let amount_in_scaled = amount_in_scaled
+                    .checked_add(fee_scaled)
+                    .ok_or(BalancerV3Error::MathError("add overflow".to_string()))?;
+                let raw_in = self.to_raw_undo_rate_round_up(
+                    amount_in_scaled,
+                    token_in_state,
+                    token_in_state.rate,
+                )?;
+
+                Ok(raw_in)
+            }
+            BalancerV3PoolType::Stable => {
+                let amp = self.amp.ok_or(BalancerV3Error::InitializationError)?;
+
+                let mut scaled_balances = Vec::with_capacity(self.token_list.len());
+                let mut index_in = 0usize;
+                let mut index_out = 0usize;
+
+                for (i, token_addr) in self.token_list.iter().enumerate() {
+                    let state = self
+                        .tokens
+                        .get(token_addr)
+                        .ok_or(BalancerV3Error::InitializationError)?;
+                    let scaled = self.to_scaled_18_apply_rate_round_down(state.balance, state)?;
+                    scaled_balances.push(scaled);
+
+                    if *token_addr == base_token {
+                        index_in = i;
+                    }
+                    if *token_addr == quote_token {
+                        index_out = i;
+                    }
+                }
+
+                let rate_out_up = Self::compute_rate_round_up(token_out_state.rate);
+                let amount_out_scaled = self.to_scaled_18_apply_rate_round_up(
+                    amount_out,
+                    token_out_state,
+                    rate_out_up,
+                )?;
+                let amount_in_scaled = stable_math::calculate_in_given_out(
+                    amp,
+                    &scaled_balances,
+                    index_in,
+                    index_out,
+                    amount_out_scaled,
+                )
+                .map_err(BalancerV3Error::from)?;
+                let fee_scaled = Self::fixed_mul_div_up(
+                    amount_in_scaled,
+                    self.swap_fee,
+                    BONE.checked_sub(self.swap_fee)
+                        .ok_or(BalancerV3Error::MathError("sub overflow".to_string()))?,
+                )?;
+                let amount_in_scaled = amount_in_scaled
+                    .checked_add(fee_scaled)
+                    .ok_or(BalancerV3Error::MathError("add overflow".to_string()))?;
+                let raw_in = self.to_raw_undo_rate_round_up(
+                    amount_in_scaled,
+                    token_in_state,
+                    token_in_state.rate,
+                )?;
+
+                Ok(raw_in)
             }
         }
     }
@@ -909,6 +1187,22 @@ impl AutomatedMarketMaker for BalancerV3Pool {
 
         self.token_list = tokens.clone();
 
+        let mut aggregate_yield_fee_percentage = U256::ZERO;
+        let mut pool_subject_to_yield_fees = false;
+        if !explorer_failed {
+            if let Ok(cfg) = vault_explorer
+                .getPoolConfig(self.address)
+                .block(block_number)
+                .call()
+                .await
+            {
+                aggregate_yield_fee_percentage = cfg.aggregateYieldFeePercentage;
+                pool_subject_to_yield_fees = cfg.isPoolInitialized
+                    && !cfg.isPoolInRecoveryMode
+                    && !aggregate_yield_fee_percentage.is_zero();
+            }
+        }
+
         // 4. Populate Token State
         for (i, token_addr) in tokens.iter().enumerate() {
             let balance = if i < balances.len() {
@@ -916,7 +1210,7 @@ impl AutomatedMarketMaker for BalancerV3Pool {
             } else {
                 U256::ZERO
             };
-            let _live_balance = if i < last_live_balances.len() {
+            let last_live_balance = if i < last_live_balances.len() {
                 last_live_balances[i]
             } else {
                 U256::ZERO
@@ -981,11 +1275,51 @@ impl AutomatedMarketMaker for BalancerV3Pool {
                 }
             }
 
+            let mut balance_adj = balance;
+            if pool_subject_to_yield_fees && i < token_infos.len() {
+                let info = &token_infos[i];
+                // TokenType::WITH_RATE == 1
+                if info.paysYieldFees && info.tokenType == 1u8 && !last_live_balance.is_zero() {
+                    let temp_state = V3TokenState {
+                        address: *token_addr,
+                        decimals,
+                        index: i,
+                        balance: balance_adj,
+                        scaling_factor,
+                        rate,
+                        rate_provider: rate_provider_addr,
+                    };
+
+                    let current_live = self.to_scaled_18_apply_rate_round_down(
+                        balance_adj,
+                        &temp_state,
+                    )?;
+
+                    if current_live > last_live_balance {
+                        let delta = current_live - last_live_balance;
+                        let fee_scaled = Self::fixed_mul_up(
+                            delta,
+                            aggregate_yield_fee_percentage,
+                        )?;
+                        let fee_raw = self.to_raw_undo_rate_round_down(
+                            fee_scaled,
+                            &temp_state,
+                            rate,
+                        )?;
+                        if fee_raw > U256::ZERO {
+                            balance_adj = balance_adj
+                                .checked_sub(fee_raw)
+                                .ok_or(AMMError::Msg("BalancerV3 yield fee underflow".into()))?;
+                        }
+                    }
+                }
+            }
+
             let token_state = V3TokenState {
                 address: *token_addr,
                 decimals,
                 index: i,
-                balance,
+                balance: balance_adj,
                 scaling_factor,
                 rate,
                 rate_provider: rate_provider_addr,

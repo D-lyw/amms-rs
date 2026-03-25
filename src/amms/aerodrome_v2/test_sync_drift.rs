@@ -140,6 +140,54 @@ mod tests {
         Ok((reserves.reserve0.to::<u128>(), reserves.reserve1.to::<u128>()))
     }
 
+    async fn find_onchain_amount_in_for_exact_out<P: Provider + Clone>(
+        onchain_pool: &IAerodromeV2PoolOnchain::IAerodromeV2PoolOnchainInstance<P>,
+        token_in: Address,
+        amount_out_target: U256,
+    ) -> eyre::Result<U256> {
+        if amount_out_target.is_zero() {
+            return Ok(U256::ZERO);
+        }
+
+        let mut high = U256::from(1u8);
+        let max = U256::from(u128::MAX);
+        let two = U256::from(2u8);
+        let one = U256::from(1u8);
+
+        loop {
+            let out = onchain_pool.getAmountOut(high, token_in).call().await?;
+            if out >= amount_out_target {
+                break;
+            }
+
+            if high >= max {
+                return Err(eyre::eyre!("on-chain exact-out target is not reachable"));
+            }
+            high = if high > max / two { max } else { high * two };
+
+            if high == max {
+                let out_max = onchain_pool.getAmountOut(high, token_in).call().await?;
+                if out_max < amount_out_target {
+                    return Err(eyre::eyre!("on-chain exact-out target is not reachable"));
+                }
+                break;
+            }
+        }
+
+        let mut low = U256::ZERO;
+        while low < high {
+            let mid = low + (high - low) / two;
+            let out_mid = onchain_pool.getAmountOut(mid, token_in).call().await?;
+            if out_mid >= amount_out_target {
+                high = mid;
+            } else {
+                low = mid + one;
+            }
+        }
+
+        Ok(low)
+    }
+
     // ============================================================================
     // Test 1: Swap Simulation Tests
     // ============================================================================
@@ -342,6 +390,90 @@ mod tests {
 
         println!("\n[ReverseSwap] ✅ REVERSE SWAP TEST PASSED");
         Ok(())
+    }
+
+    // ============================================================================
+    // Test 2.5: Exact-Out Parity Tests
+    // ============================================================================
+
+    async fn run_exact_out_parity_test(
+        pool_address: Address,
+        label: &str,
+        is_stable: bool,
+    ) -> eyre::Result<()> {
+        let provider = match get_provider() {
+            Ok(p) => p,
+            Err(_) => return Ok(()),
+        };
+
+        let latest_block = BlockId::from(provider.get_block_number().await?);
+        let mut pool = if is_stable {
+            AerodromeV2Pool::new_stable(pool_address)
+        } else {
+            AerodromeV2Pool::new_volatile(pool_address)
+        };
+        pool = pool.init::<_, _>(latest_block, provider.clone()).await?;
+
+        let onchain_pool = IAerodromeV2PoolOnchain::new(pool_address, provider.clone());
+
+        // Keep targets moderate to avoid very expensive remote calls.
+        let targets = if is_stable {
+            vec![
+                U256::from(10u64).pow(U256::from(pool.token_b.decimals)),
+                U256::from(5u64) * U256::from(10u64).pow(U256::from(pool.token_b.decimals)),
+            ]
+        } else {
+            vec![
+                U256::from(10_000u64),
+                U256::from(100_000u64),
+                U256::from(1_000_000u64),
+            ]
+        };
+
+        println!("\n[{label}] ========== EXACT OUT PARITY TEST ==========");
+        println!(
+            "[{label}] stable={}, token_in={:?}, token_out={:?}",
+            is_stable, pool.token_a.address, pool.token_b.address
+        );
+
+        for target_out in targets {
+            let local_in =
+                pool.simulate_swap_exact_out(pool.token_a.address, pool.token_b.address, target_out)?;
+            let chain_in = find_onchain_amount_in_for_exact_out(
+                &onchain_pool,
+                pool.token_a.address,
+                target_out,
+            )
+            .await?;
+
+            println!(
+                "[{label}] target_out={} local_in={} chain_in={}",
+                target_out, local_in, chain_in
+            );
+
+            assert_eq!(
+                local_in, chain_in,
+                "[{label}] exact-out mismatch for target_out={}",
+                target_out
+            );
+        }
+
+        println!("\n[{label}] ✅ EXACT OUT PARITY TEST PASSED");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_exact_out_parity_volatile_pool() -> eyre::Result<()> {
+        // USDC/AERO Volatile Pool on Base
+        let pool_address = address!("6cdcb1c4a4d1c3c6d054b27ac5b77e89eafb971d");
+        run_exact_out_parity_test(pool_address, "ExactOut-Volatile-USDC/AERO", false).await
+    }
+
+    #[tokio::test]
+    async fn test_exact_out_parity_stable_pool() -> eyre::Result<()> {
+        // WETH/msETH Stable Pool on Base
+        let pool_address = address!("de4fb30ccc2f1210fce2c8ad66410c586c8d1f9a");
+        run_exact_out_parity_test(pool_address, "ExactOut-Stable-WETH/msETH", true).await
     }
 
     // ============================================================================

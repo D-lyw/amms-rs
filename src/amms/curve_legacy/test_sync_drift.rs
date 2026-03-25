@@ -7,14 +7,12 @@ mod tests {
         primitives::{address, Address, U256},
         providers::{Provider, ProviderBuilder},
         rpc::types::{Filter, Log},
-        sol_types::SolEvent,
     };
 
     use crate::amms::{
         amm::AutomatedMarketMaker,
         curve_legacy::{
-            CurveLegacyPool, CurveLegacyPoolType, ICurveLegacyCryptoSwapUpdate, ICurveLegacyPool,
-            ICurveTricrypto2Event,
+            CurveLegacyPool, CurveLegacyPoolType, ICurveLegacyCryptoSwapUpdate,
         },
     };
 

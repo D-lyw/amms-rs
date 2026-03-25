@@ -707,6 +707,151 @@ impl AutomatedMarketMaker for AerodromeSlipstreamPool {
         Ok(amount_out)
     }
 
+    fn simulate_swap_exact_out(
+        &self,
+        base_token: Address,
+        _quote_token: Address,
+        amount_out: U256,
+    ) -> Result<U256, AMMError> {
+        if amount_out.is_zero() {
+            return Ok(U256::ZERO);
+        }
+
+        if self.sqrt_price.is_zero() {
+            return Err(AMMError::Msg("sqrt_price is zero".into()));
+        }
+        if self.liquidity == 0 {
+            return Err(AMMError::Msg("liquidity is zero".into()));
+        }
+
+        let zero_for_one = base_token == self.token_a.address;
+        let sqrt_price_limit_x_96 = if zero_for_one {
+            MIN_SQRT_RATIO + U256_1
+        } else {
+            MAX_SQRT_RATIO - U256_1
+        };
+
+        let mut current_state = CurrentState {
+            sqrt_price_x_96: self.sqrt_price,
+            amount_calculated: I256::ZERO,
+            amount_specified_remaining: I256::ZERO - I256::from_raw(amount_out),
+            tick: self.tick,
+            liquidity: self.liquidity,
+        };
+
+        while current_state.amount_specified_remaining != I256::ZERO
+            && current_state.sqrt_price_x_96 != sqrt_price_limit_x_96
+        {
+            let mut step = StepComputations {
+                sqrt_price_start_x_96: current_state.sqrt_price_x_96,
+                ..Default::default()
+            };
+
+            (step.tick_next, step.initialized) =
+                uniswap_v3_math::tick_bitmap::next_initialized_tick_within_one_word(
+                    &self.tick_bitmap,
+                    current_state.tick,
+                    self.tick_spacing,
+                    zero_for_one,
+                )
+                .map_err(AerodromeSlipstreamError::from)?;
+
+            step.tick_next = step.tick_next.clamp(MIN_TICK, MAX_TICK);
+
+            step.sqrt_price_next_x96 =
+                uniswap_v3_math::tick_math::get_sqrt_ratio_at_tick(step.tick_next)
+                    .map_err(AerodromeSlipstreamError::from)?;
+
+            let swap_target_sqrt_ratio = if zero_for_one {
+                if step.sqrt_price_next_x96 < sqrt_price_limit_x_96 {
+                    sqrt_price_limit_x_96
+                } else {
+                    step.sqrt_price_next_x96
+                }
+            } else if step.sqrt_price_next_x96 > sqrt_price_limit_x_96 {
+                sqrt_price_limit_x_96
+            } else {
+                step.sqrt_price_next_x96
+            };
+
+            if current_state.liquidity == 0 {
+                current_state.sqrt_price_x_96 = swap_target_sqrt_ratio;
+                step.amount_in = U256::ZERO;
+                step.amount_out = U256::ZERO;
+                step.fee_amount = U256::ZERO;
+            } else {
+                (
+                    current_state.sqrt_price_x_96,
+                    step.amount_in,
+                    step.amount_out,
+                    step.fee_amount,
+                ) = uniswap_v3_math::swap_math::compute_swap_step(
+                    current_state.sqrt_price_x_96,
+                    swap_target_sqrt_ratio,
+                    current_state.liquidity,
+                    current_state.amount_specified_remaining,
+                    self.fee,
+                )
+                .map_err(AerodromeSlipstreamError::from)?;
+            }
+
+            // Exact output path:
+            // - remaining specified output moves toward 0 by produced amount_out
+            // - calculated input accumulates amount_in + fee
+            current_state.amount_specified_remaining = current_state
+                .amount_specified_remaining
+                .overflowing_add(I256::from_raw(step.amount_out))
+                .0;
+
+            current_state.amount_calculated +=
+                I256::from_raw(step.amount_in.overflowing_add(step.fee_amount).0);
+
+            if current_state.sqrt_price_x_96 == step.sqrt_price_next_x96 {
+                if step.initialized {
+                    let mut liquidity_net = if let Some(info) = self.ticks.get(&step.tick_next) {
+                        info.liquidity_net
+                    } else {
+                        return Err(
+                            AerodromeSlipstreamError::TickDataMissing(step.tick_next).into()
+                        );
+                    };
+
+                    if zero_for_one {
+                        liquidity_net = -liquidity_net;
+                    }
+
+                    current_state.liquidity = if liquidity_net < 0 {
+                        if current_state.liquidity < (-liquidity_net as u128) {
+                            return Err(AerodromeSlipstreamError::LiquidityUnderflow.into());
+                        } else {
+                            current_state.liquidity - (-liquidity_net as u128)
+                        }
+                    } else {
+                        current_state.liquidity + (liquidity_net as u128)
+                    };
+                }
+                current_state.tick = if zero_for_one {
+                    step.tick_next.wrapping_sub(1)
+                } else {
+                    step.tick_next
+                }
+            } else if current_state.sqrt_price_x_96 != step.sqrt_price_start_x_96 {
+                current_state.tick = uniswap_v3_math::tick_math::get_tick_at_sqrt_ratio(
+                    current_state.sqrt_price_x_96,
+                )
+                .map_err(AerodromeSlipstreamError::from)?;
+            }
+        }
+
+        if current_state.amount_specified_remaining != I256::ZERO {
+            return Err(AMMError::Msg(
+                "insufficient liquidity for exact out".to_string(),
+            ));
+        }
+
+        Ok(current_state.amount_calculated.into_raw())
+    }
+
     fn tokens(&self) -> Vec<Address> {
         vec![self.token_a.address, self.token_b.address]
     }

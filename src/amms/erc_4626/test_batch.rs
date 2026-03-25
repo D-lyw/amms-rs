@@ -19,9 +19,6 @@ mod tests {
 
         // sDAI (Savings DAI)
         let sdai_address = address!("83F20F44975D03b1b09e64809B757c47f942BEeA");
-        // wstETH (Wrapped stETH)
-        let wsteth_address = address!("7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0");
-
         let vaults = vec![
             AMM::ERC4626Vault(ERC4626Vault::new(sdai_address)),
             // AMM::ERC4626Vault(ERC4626Vault::new(wsteth_address)),

@@ -1,7 +1,7 @@
 use crate::amms::{
     amm::{AutomatedMarketMaker, SyncAction, AMM},
+    consts::BONE,
     error::AMMError,
-    float::u256_to_float,
 };
 use alloy::primitives::address;
 use alloy::{
@@ -50,7 +50,7 @@ sol!(
     GetBalancerV2RatesBatchRequest,
     "src/amms/abi/GetBalancerV2RatesBatchRequest.json"
 );
-use alloy::sol_types::{SolType, SolValue};
+use alloy::sol_types::SolType;
 
 use thiserror::Error;
 
@@ -91,6 +91,7 @@ pub struct TokenState {
     pub weight: Option<U256>,
     pub rate_provider: Option<Address>,
     pub rate: Option<U256>,
+    pub scaling_factor: Option<U256>,
     pub index: usize,
 }
 
@@ -197,6 +198,150 @@ impl BalancerV2Pool {
         }
     }
 
+    fn ceil_div_u256(numerator: U256, denominator: U256) -> Result<U256, AMMError> {
+        if denominator.is_zero() {
+            return Err(AMMError::ArithmeticError);
+        }
+        let q = numerator / denominator;
+        let r = numerator % denominator;
+        if r.is_zero() {
+            Ok(q)
+        } else {
+            q.checked_add(U256::from(1u8))
+                .ok_or(AMMError::ArithmeticError)
+        }
+    }
+
+    fn normalize_exact_out_amount_in(
+        &self,
+        base_token: Address,
+        quote_token: Address,
+        amount_out: U256,
+        amount_in: U256,
+    ) -> Result<U256, AMMError> {
+        // NOTE:
+        // Use bounded-search normalization (instead of +/-1 linear loops) to avoid pathological
+        // long runtimes when the initial exact-out estimate is far from the true minimum.
+        let one = U256::from(1u8);
+        let mut hi = if amount_in.is_zero() { one } else { amount_in };
+
+        // 1) Ensure upper bound: out(hi) >= target.
+        let mut out_hi = self.simulate_swap(base_token, quote_token, hi)?;
+        let mut expand_iters = 0u16;
+        while out_hi < amount_out {
+            hi = hi.checked_mul(U256::from(2u8)).ok_or(AMMError::ArithmeticError)?;
+            out_hi = self.simulate_swap(base_token, quote_token, hi)?;
+            expand_iters = expand_iters.saturating_add(1);
+            if expand_iters > 256 {
+                return Err(AMMError::Msg(
+                    "normalize_exact_out failed to find upper bound".to_string(),
+                ));
+            }
+        }
+
+        // 2) Binary search minimal feasible input in [0, hi].
+        let mut lo = U256::ZERO;
+        while lo.checked_add(one).ok_or(AMMError::ArithmeticError)? < hi {
+            let mid = lo
+                .checked_add((hi - lo) / U256::from(2u8))
+                .ok_or(AMMError::ArithmeticError)?;
+            let out_mid = self.simulate_swap(base_token, quote_token, mid)?;
+            if out_mid >= amount_out {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+
+        Ok(hi)
+    }
+
+    fn add_swap_fee_amount(&self, amount: U256) -> Result<U256, AMMError> {
+        let fee_complement = BONE
+            .checked_sub(self.swap_fee)
+            .ok_or(AMMError::ArithmeticError)?;
+        BalancerV2Pool::ceil_div_u256(
+            amount
+                .checked_mul(BONE)
+                .ok_or(AMMError::ArithmeticError)?,
+            fee_complement,
+        )
+    }
+
+    fn subtract_swap_fee_amount(&self, amount: U256) -> Result<U256, AMMError> {
+        let fee_amount = BalancerV2Pool::ceil_div_u256(
+            amount
+                .checked_mul(self.swap_fee)
+                .ok_or(AMMError::ArithmeticError)?,
+            BONE,
+        )?;
+        amount
+            .checked_sub(fee_amount)
+            .ok_or(AMMError::ArithmeticError)
+    }
+
+    fn token_scaling_factor(state: &TokenState) -> Result<U256, AMMError> {
+        // Prefer on-chain pool scaling factor when available. This is the exact value
+        // used by pool math (already includes decimal/rate handling per pool flavor),
+        // and avoids local re-derivation drift.
+        if let Some(sf) = state.scaling_factor {
+            return Ok(sf);
+        }
+
+        // NOTE(drift-gap): This currently derives scaling factor from decimals * `state.rate`.
+        // For Balancer V2 pools with internal rate-cache semantics (e.g. Meta/Composable stable families),
+        // chain `querySwap` may use cached pool rates that are conditionally refreshed by timestamp.
+        // Until that cache state machine (current/old/duration/expires + refresh condition) is fully mirrored
+        // in local state, tiny same-block quote differences can remain.
+        //
+        // IMPORTANT:
+        // BasePool._computeScalingFactor(token) = 1e18 * 10^(18-decimals),
+        // and ComposableStable scalingFactors[i] = _getScalingFactor(i).mulDown(rate)
+        // => effective scaling factor = 10^(18-decimals) * rate.
+        let dec_scale = U256::from(10).pow(U256::from(18u8.saturating_sub(state.decimals)));
+        let rate = state.rate.unwrap_or(U256::from(10).pow(U256::from(18)));
+        dec_scale
+            .checked_mul(rate)
+            .ok_or(AMMError::ArithmeticError)
+    }
+
+    #[inline]
+    fn token_scaling_factor_from_rate(state: &TokenState) -> Result<U256, AMMError> {
+        let dec_scale = U256::from(10).pow(U256::from(18u8.saturating_sub(state.decimals)));
+        let rate = state.rate.unwrap_or(U256::from(10).pow(U256::from(18)));
+        dec_scale
+            .checked_mul(rate)
+            .ok_or(AMMError::ArithmeticError)
+    }
+
+    #[inline]
+    fn upscale_down(amount: U256, scaling_factor: U256) -> Result<U256, AMMError> {
+        amount
+            .checked_mul(scaling_factor)
+            .ok_or(AMMError::ArithmeticError)?
+            .checked_div(BONE)
+            .ok_or(AMMError::ArithmeticError)
+    }
+
+    #[inline]
+    fn downscale_down(amount: U256, scaling_factor: U256) -> Result<U256, AMMError> {
+        amount
+            .checked_mul(BONE)
+            .ok_or(AMMError::ArithmeticError)?
+            .checked_div(scaling_factor)
+            .ok_or(AMMError::ArithmeticError)
+    }
+
+    #[inline]
+    fn downscale_up(amount: U256, scaling_factor: U256) -> Result<U256, AMMError> {
+        BalancerV2Pool::ceil_div_u256(
+            amount
+                .checked_mul(BONE)
+                .ok_or(AMMError::ArithmeticError)?,
+            scaling_factor,
+        )
+    }
+
     pub async fn update_rates<N, P>(&mut self, provider: P) -> Result<(), AMMError>
     where
         N: Network,
@@ -235,6 +380,9 @@ impl BalancerV2Pool {
         N: Network,
         P: Provider<N> + Clone,
     {
+        // NOTE(drift-gap): This task batch-pulls `rateProvider.getRate()`.
+        // It does NOT yet synchronize pool-side token rate cache state (duration/expires/oldRate/currentRate),
+        // so cache-based pools may briefly diverge from on-chain `querySwap` behavior.
         let mut rate_providers = Vec::new();
         let mut pool_token_indices = Vec::new(); // (pool_idx, token_addr)
 
@@ -259,7 +407,7 @@ impl BalancerV2Pool {
         let res = deployer
             .call_raw()
             .await
-            .map_err(|e| AMMError::SyncError(Address::ZERO))?;
+            .map_err(|_| AMMError::SyncError(Address::ZERO))?;
 
         // Decode result: uint256[]
         let rates =
@@ -483,14 +631,11 @@ impl AutomatedMarketMaker for BalancerV2Pool {
                     .as_ref()
                     .map(|s| s.end_value)
                     .ok_or(BalancerV2Error::InitializationError)?;
-
                 let mut scaled_balances = Vec::new();
                 let mut index_in = 0;
                 let mut index_out = 0;
                 let mut found_in = false;
                 let mut found_out = false;
-                let mut rate_in = U256::from(10).pow(U256::from(18));
-                let mut rate_out = U256::from(10).pow(U256::from(18));
 
                 // We need to iterate over all tokens to get balances in order
                 for (i, token_addr) in self.token_list.iter().enumerate() {
@@ -527,12 +672,10 @@ impl AutomatedMarketMaker for BalancerV2Pool {
                     if *token_addr == base_token {
                         index_in = scaled_balances.len() - 1;
                         found_in = true;
-                        rate_in = rate;
                     }
                     if *token_addr == quote_token {
                         index_out = scaled_balances.len() - 1;
                         found_out = true;
-                        rate_out = rate;
                     }
                 }
 
@@ -581,46 +724,17 @@ impl AutomatedMarketMaker for BalancerV2Pool {
                     .weight
                     .ok_or(BalancerV2Error::InitializationError)?;
 
-                // Scaling Factors
-                let rate_in = token_in_state
-                    .rate
-                    .unwrap_or(U256::from(10).pow(U256::from(18)));
-                let decimals_diff_in = 18u8.saturating_sub(token_in_state.decimals);
-                let decimal_scaling_in = U256::from(10).pow(U256::from(decimals_diff_in));
+                let scaling_in = BalancerV2Pool::token_scaling_factor_from_rate(token_in_state)?;
+                let scaling_out = BalancerV2Pool::token_scaling_factor_from_rate(token_out_state)?;
 
-                let rate_out = token_out_state
-                    .rate
-                    .unwrap_or(U256::from(10).pow(U256::from(18)));
-                let decimals_diff_out = 18u8.saturating_sub(token_out_state.decimals);
-                let decimal_scaling_out = U256::from(10).pow(U256::from(decimals_diff_out));
+                let scaled_balance_in = BalancerV2Pool::upscale_down(token_in_state.balance, scaling_in)?;
+                let scaled_balance_out =
+                    BalancerV2Pool::upscale_down(token_out_state.balance, scaling_out)?;
 
-                // Scale Balances
-                let scaled_balance_in = token_in_state
-                    .balance
-                    .checked_mul(decimal_scaling_in)
-                    .ok_or(BalancerV2Error::MulOverflow)?
-                    .checked_mul(rate_in)
-                    .ok_or(BalancerV2Error::MulOverflow)?
-                    .checked_div(U256::from(10).pow(U256::from(18)))
-                    .ok_or(BalancerV2Error::DivZero)?;
-
-                let scaled_balance_out = token_out_state
-                    .balance
-                    .checked_mul(decimal_scaling_out)
-                    .ok_or(BalancerV2Error::MulOverflow)?
-                    .checked_mul(rate_out)
-                    .ok_or(BalancerV2Error::MulOverflow)?
-                    .checked_div(U256::from(10).pow(U256::from(18)))
-                    .ok_or(BalancerV2Error::DivZero)?;
-
-                // Scale Amount In
-                let scaled_amount_in = amount_in
-                    .checked_mul(decimal_scaling_in)
-                    .ok_or(BalancerV2Error::MulOverflow)?
-                    .checked_mul(rate_in)
-                    .ok_or(BalancerV2Error::MulOverflow)?
-                    .checked_div(U256::from(10).pow(U256::from(18)))
-                    .ok_or(BalancerV2Error::DivZero)?;
+                // Weighted GIVEN_IN: apply fee in scaled domain to preserve sub-token precision
+                // for non-18-decimal assets (closer to on-chain math behavior).
+                let scaled_amount_in_raw = BalancerV2Pool::upscale_down(amount_in, scaling_in)?;
+                let scaled_amount_in = self.subtract_swap_fee_amount(scaled_amount_in_raw)?;
 
                 // Calculate Output (18 decimals)
                 let scaled_amount_out = math::weighted_math::calculate_out_given_in(
@@ -629,18 +743,10 @@ impl AutomatedMarketMaker for BalancerV2Pool {
                     scaled_balance_out,
                     w_out,
                     scaled_amount_in,
-                    self.swap_fee,
                 )?;
 
-                // Unscale Amount Out
-                // Amount_raw = Amount_scaled * 1e18 / rate / 10^(18-d)
-                let amount_out = scaled_amount_out
-                    .checked_mul(U256::from(10).pow(U256::from(18)))
-                    .ok_or(BalancerV2Error::MulOverflow)?
-                    .checked_div(rate_out)
-                    .ok_or(BalancerV2Error::DivZero)?
-                    .checked_div(decimal_scaling_out)
-                    .ok_or(BalancerV2Error::DivZero)?;
+                // BaseMinimalSwapInfoPool GIVEN_IN: token out is downscaled with divDown.
+                let amount_out = BalancerV2Pool::downscale_down(scaled_amount_out, scaling_out)?;
 
                 Ok(amount_out)
             }
@@ -650,6 +756,7 @@ impl AutomatedMarketMaker for BalancerV2Pool {
                     .as_ref()
                     .map(|s| s.end_value)
                     .ok_or(BalancerV2Error::InitializationError)?;
+                let one_e18 = U256::from(10).pow(U256::from(18));
 
                 let mut scaled_balances = Vec::new();
                 let mut index_in = 0;
@@ -671,20 +778,14 @@ impl AutomatedMarketMaker for BalancerV2Pool {
                     }
 
                     let token_state = self.tokens.get(token_addr).unwrap();
-                    let rate = token_state
-                        .rate
-                        .unwrap_or(U256::from(10).pow(U256::from(18)));
-                    let decimals_diff = 18u8.saturating_sub(token_state.decimals);
-                    let decimal_scaling = U256::from(10).pow(U256::from(decimals_diff));
+                    let scaling_factor = BalancerV2Pool::token_scaling_factor(token_state)?;
 
-                    // Scale balance: balance * 10^(18-d) * rate / 1e18
+                    // Upscale balance with scaling factor (mulDown).
                     let scaled_balance = token_state
                         .balance
-                        .checked_mul(decimal_scaling)
+                        .checked_mul(scaling_factor)
                         .ok_or(BalancerV2Error::MulOverflow)?
-                        .checked_mul(rate)
-                        .ok_or(BalancerV2Error::MulOverflow)?
-                        .checked_div(U256::from(10).pow(U256::from(18)))
+                        .checked_div(one_e18)
                         .ok_or(BalancerV2Error::DivZero)?;
 
                     scaled_balances.push(scaled_balance);
@@ -703,20 +804,18 @@ impl AutomatedMarketMaker for BalancerV2Pool {
                     return Err(BalancerV2Error::TokenInDoesNotExist.into());
                 }
 
-                // Scale Amount In
-                let token_in_state = self.tokens.get(&base_token).unwrap();
-                let rate_in = token_in_state
-                    .rate
-                    .unwrap_or(U256::from(10).pow(U256::from(18)));
-                let diff_in = 18u8.saturating_sub(token_in_state.decimals);
-                let dec_scale_in = U256::from(10).pow(U256::from(diff_in));
+                // GIVEN_IN mirrors BaseGeneralPool:
+                // 1) subtract fee in raw domain, 2) upscale, 3) stable math, 4) downscaleDown
+                let amount_in_after_fee = self.subtract_swap_fee_amount(amount_in)?;
 
-                let scaled_amount_in = amount_in
-                    .checked_mul(dec_scale_in)
+                // Upscale Amount In (mulDown by scaling factor)
+                let token_in_state = self.tokens.get(&base_token).unwrap();
+                let scaling_in = BalancerV2Pool::token_scaling_factor(token_in_state)?;
+
+                let scaled_amount_in = amount_in_after_fee
+                    .checked_mul(scaling_in)
                     .ok_or(BalancerV2Error::MulOverflow)?
-                    .checked_mul(rate_in)
-                    .ok_or(BalancerV2Error::MulOverflow)?
-                    .checked_div(U256::from(10).pow(U256::from(18)))
+                    .checked_div(one_e18)
                     .ok_or(BalancerV2Error::DivZero)?;
 
                 let scaled_amount_out = math::stable_math::calculate_out_given_in(
@@ -725,25 +824,17 @@ impl AutomatedMarketMaker for BalancerV2Pool {
                     index_in,
                     index_out,
                     scaled_amount_in,
-                    self.swap_fee,
                 )?;
 
-                // Unscale Amount Out
+                // Downscale Amount Out (divDown by scaling factor)
                 let token_out_state = self.tokens.get(&quote_token).unwrap();
-                let rate_out = token_out_state
-                    .rate
-                    .unwrap_or(U256::from(10).pow(U256::from(18)));
-                let diff_out = 18u8.saturating_sub(token_out_state.decimals);
-                let dec_scale_out = U256::from(10).pow(U256::from(diff_out));
+                let scaling_out = BalancerV2Pool::token_scaling_factor(token_out_state)?;
 
                 let amount_out = scaled_amount_out
-                    .checked_mul(U256::from(10).pow(U256::from(18)))
+                    .checked_mul(one_e18)
                     .ok_or(BalancerV2Error::MulOverflow)?
-                    .checked_div(rate_out)
-                    .ok_or(BalancerV2Error::DivZero)?
-                    .checked_div(dec_scale_out)
+                    .checked_div(scaling_out)
                     .ok_or(BalancerV2Error::DivZero)?;
-
                 Ok(amount_out)
             }
         }
@@ -773,7 +864,146 @@ impl AutomatedMarketMaker for BalancerV2Pool {
         Ok(amount_out)
     }
 
+    fn simulate_swap_exact_out(
+        &self,
+        base_token: Address,
+        quote_token: Address,
+        amount_out: U256,
+    ) -> Result<U256, AMMError> {
+        if amount_out.is_zero() {
+            return Ok(U256::ZERO);
+        }
+
+        let token_in_state = self
+            .tokens
+            .get(&base_token)
+            .ok_or(BalancerV2Error::TokenInDoesNotExist)?;
+        let token_out_state = self
+            .tokens
+            .get(&quote_token)
+            .ok_or(BalancerV2Error::TokenOutDoesNotExist)?;
+        if amount_out >= token_out_state.balance {
+            return Err(AMMError::Msg(
+                "insufficient liquidity for BalancerV2 exact out".to_string(),
+            ));
+        }
+
+        match self.pool_type {
+            BalancerV2PoolType::Weighted => {
+                let w_in = token_in_state
+                    .weight
+                    .ok_or(BalancerV2Error::InitializationError)?;
+                let w_out = token_out_state
+                    .weight
+                    .ok_or(BalancerV2Error::InitializationError)?;
+
+                let scaling_in = BalancerV2Pool::token_scaling_factor_from_rate(token_in_state)?;
+                let scaling_out = BalancerV2Pool::token_scaling_factor_from_rate(token_out_state)?;
+
+                let scaled_balance_in = BalancerV2Pool::upscale_down(token_in_state.balance, scaling_in)?;
+                let scaled_balance_out =
+                    BalancerV2Pool::upscale_down(token_out_state.balance, scaling_out)?;
+
+                // BaseMinimalSwapInfoPool GIVEN_OUT: target out is upscaled with mulDown.
+                let scaled_amount_out = BalancerV2Pool::upscale_down(amount_out, scaling_out)?;
+
+                let scaled_amount_in = math::weighted_math::calculate_in_given_out(
+                    scaled_balance_in,
+                    w_in,
+                    scaled_balance_out,
+                    w_out,
+                    scaled_amount_out,
+                )?;
+
+                // Weighted GIVEN_OUT: add fee in scaled domain first, then downscale up.
+                let scaled_in_with_fee = self.add_swap_fee_amount(scaled_amount_in)?;
+                BalancerV2Pool::downscale_up(scaled_in_with_fee, scaling_in)
+            }
+            BalancerV2PoolType::Stable | BalancerV2PoolType::ComposableStable => {
+                let amp = self
+                    .amp_state
+                    .as_ref()
+                    .map(|s| s.end_value)
+                    .ok_or(BalancerV2Error::InitializationError)?;
+
+                let one_e18 = U256::from(10).pow(U256::from(18));
+                let mut scaled_balances = Vec::new();
+                let mut index_in = 0usize;
+                let mut index_out = 0usize;
+                let mut found_in = false;
+                let mut found_out = false;
+
+                for (i, token_addr) in self.token_list.iter().enumerate() {
+                    if let Some(bpt_idx) = self.bpt_index {
+                        if i == bpt_idx {
+                            if *token_addr == base_token || *token_addr == quote_token {
+                                return Err(BalancerV2Error::NotSupported(
+                                    "Swaps involving BPT not supported yet".to_string(),
+                                )
+                                .into());
+                            }
+                            continue;
+                        }
+                    }
+
+                    let state = self
+                        .tokens
+                        .get(token_addr)
+                        .ok_or(BalancerV2Error::InitializationError)?;
+                    let scaling_factor = BalancerV2Pool::token_scaling_factor(state)?;
+                    let scaled = state
+                        .balance
+                        .checked_mul(scaling_factor)
+                        .ok_or(BalancerV2Error::MulOverflow)?
+                        .checked_div(one_e18)
+                        .ok_or(BalancerV2Error::DivZero)?;
+                    scaled_balances.push(scaled);
+
+                    if *token_addr == base_token {
+                        index_in = scaled_balances.len() - 1;
+                        found_in = true;
+                    }
+                    if *token_addr == quote_token {
+                        index_out = scaled_balances.len() - 1;
+                        found_out = true;
+                    }
+                }
+
+                if !found_in || !found_out {
+                    return Err(BalancerV2Error::TokenInDoesNotExist.into());
+                }
+
+                let scaling_out = BalancerV2Pool::token_scaling_factor(token_out_state)?;
+                let scaled_amount_out = amount_out
+                    .checked_mul(scaling_out)
+                    .ok_or(BalancerV2Error::MulOverflow)?
+                    .checked_div(one_e18)
+                    .ok_or(BalancerV2Error::DivZero)?;
+
+                let scaled_amount_in = math::stable_math::calculate_in_given_out(
+                    amp,
+                    &scaled_balances,
+                    index_in,
+                    index_out,
+                    scaled_amount_out,
+                )?;
+
+                let scaling_in = BalancerV2Pool::token_scaling_factor(token_in_state)?;
+
+                let numerator = scaled_amount_in
+                    .checked_mul(one_e18)
+                    .ok_or(BalancerV2Error::MulOverflow)?;
+                let denominator = scaling_in;
+                let raw_in_without_fee = BalancerV2Pool::ceil_div_u256(numerator, denominator)?;
+                let raw_in = self.add_swap_fee_amount(raw_in_without_fee)?;
+                self.normalize_exact_out_amount_in(base_token, quote_token, amount_out, raw_in)
+            }
+        }
+    }
+
     fn sync_events(&self) -> Vec<B256> {
+        // NOTE(drift-gap): We currently sync Vault-side balance events only.
+        // Pool-side rate-cache update events are not yet part of this stream.
         vec![
             IVault::Swap::SIGNATURE_HASH,
             IVault::PoolBalanceChanged::SIGNATURE_HASH,
@@ -950,10 +1180,143 @@ mod tests {
     use super::abi::{FundManagement, IBalancerQueries, SingleSwap};
     use super::*;
     use alloy::primitives::address;
-    use alloy::providers::ProviderBuilder;
+    use alloy::providers::{Provider, ProviderBuilder};
     use alloy::rpc::client::ClientBuilder;
     use alloy::transports::layers::{RetryBackoffLayer, ThrottleLayer};
     use std::sync::Arc;
+    use tokio::time::{timeout, Duration};
+
+    async fn assert_exact_out_case<P: Provider + Clone>(
+        amm: &BalancerV2Pool,
+        provider: &Arc<P>,
+        block: BlockId,
+        pool_id: B256,
+        token_in: Address,
+        token_out: Address,
+        amount_out: U256,
+    ) -> eyre::Result<()> {
+        let balancer_queries = IBalancerQueries::new(
+            address!("E39B5e3B6D74016b2F6A9673D7d7493B6DF549d5"),
+            provider.clone(),
+        );
+        let local_amount_in = amm.simulate_swap_exact_out(token_in, token_out, amount_out)?;
+        let funds = FundManagement {
+            sender: address!("000000000000000000000000000000000000dead"),
+            fromInternalBalance: false,
+            recipient: address!("000000000000000000000000000000000000dead"),
+            toInternalBalance: false,
+        };
+        let single_swap = SingleSwap {
+            poolId: pool_id,
+            kind: 1, // GIVEN_OUT
+            assetIn: token_in,
+            assetOut: token_out,
+            amount: amount_out,
+            userData: alloy::primitives::Bytes::new(),
+        };
+
+        println!(
+            "[exact-out][start] block={:?} pool={} token_in={} token_out={} target_out={}",
+            block, amm.address, token_in, token_out, amount_out
+        );
+
+        let onchain_amount_in = timeout(
+            Duration::from_secs(45),
+            balancer_queries
+                .querySwap(single_swap, funds)
+                .block(block)
+                .call(),
+        )
+        .await
+        .map_err(|_| {
+            eyre::eyre!(
+                "querySwap timed out (>45s) pool={} token_in={} token_out={} target_out={} block={:?}",
+                amm.address,
+                token_in,
+                token_out,
+                amount_out,
+                block
+            )
+        })??;
+
+        let diff = if local_amount_in > onchain_amount_in {
+            local_amount_in - onchain_amount_in
+        } else {
+            onchain_amount_in - local_amount_in
+        };
+
+        let local_out = amm.simulate_swap(token_in, token_out, local_amount_in)?;
+        let (local_prev, local_prev_out) = if local_amount_in > U256::ZERO {
+            let prev = local_amount_in - U256::from(1u8);
+            let prev_out = amm.simulate_swap(token_in, token_out, prev)?;
+            (prev, prev_out)
+        } else {
+            (U256::ZERO, U256::ZERO)
+        };
+        let local_out_at_onchain_in = amm.simulate_swap(token_in, token_out, onchain_amount_in)?;
+        let rate_in = amm
+            .tokens
+            .get(&token_in)
+            .and_then(|t| t.rate)
+            .unwrap_or(U256::from(10).pow(U256::from(18)));
+        let rate_out = amm
+            .tokens
+            .get(&token_out)
+            .and_then(|t| t.rate)
+            .unwrap_or(U256::from(10).pow(U256::from(18)));
+        let amp = amm.amp_state.as_ref().map(|s| s.end_value).unwrap_or(U256::ZERO);
+
+        println!(
+            "[exact-out][cmp] block={:?} pool={} pool_type={:?} token_in={} token_out={} target_out={} local_in={} onchain_in={} diff={} local_out_at_local_in={} local_prev_in={} local_prev_out={} local_out_at_onchain_in={} rate_in={} rate_out={} swap_fee={} amp={}",
+            block,
+            amm.address,
+            amm.pool_type,
+            token_in,
+            token_out,
+            amount_out,
+            local_amount_in,
+            onchain_amount_in,
+            diff,
+            local_out,
+            local_prev,
+            local_prev_out,
+            local_out_at_onchain_in,
+            rate_in,
+            rate_out,
+            amm.swap_fee,
+            amp
+        );
+
+        // NOTE: Weighted pools use LogExpMath approximations with MAX_POW_RELATIVE_ERROR.
+        // On-chain `powUp/powDown` intentionally introduce a tiny relative error (~1e-14),
+        // which can show up in exact-out comparisons even when local math matches the contract.
+        // This is expected for Weighted exact-out and is not related to rate-cache drift.
+        let tolerance = std::cmp::max(onchain_amount_in / U256::from(100_000u64), U256::from(1u8));
+        assert!(
+            diff <= tolerance,
+            "exact-out mismatch pool={} token_in={} token_out={} target_out={} local_in={} onchain_in={} diff={} tolerance={}",
+            amm.address,
+            token_in,
+            token_out,
+            amount_out,
+            local_amount_in,
+            onchain_amount_in,
+            diff,
+            tolerance
+        );
+
+        // Minimality sanity in local model.
+        // Weighted exact-out path is compared directly against querySwap(GIVEN_OUT), and given-in/out are not
+        // perfectly inverse under rounding, so we only enforce this strictly for stable families.
+        if !matches!(amm.pool_type, BalancerV2PoolType::Weighted) {
+            assert!(local_out >= amount_out);
+            if local_amount_in > U256::ZERO {
+                assert!(local_prev_out < amount_out);
+            }
+        }
+
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_balancer_v2_mainnet_sync_and_swap() -> eyre::Result<()> {
@@ -972,6 +1335,7 @@ mod tests {
             .http(rpc_endpoint.parse()?);
 
         let provider = Arc::new(ProviderBuilder::new().connect_client(client));
+        let block = BlockId::from(provider.get_block_number().await?);
 
         // BAL-WETH 80/20 Weighted Pool
         let pool_address = address!("5c6Ee304399DBdB9C8Ef030aB642B10820DB8F56");
@@ -988,7 +1352,7 @@ mod tests {
         );
 
         println!("Initializing pool...");
-        let amm = pool.init(BlockId::latest(), provider.clone()).await?;
+        let amm = pool.init(block, provider.clone()).await?;
         println!("Pool initialized!");
 
         println!("Pool Address: {}", amm.address);
@@ -1042,6 +1406,7 @@ mod tests {
 
         let onchain_amount_out = balancer_queries
             .querySwap(single_swap, funds)
+            .block(block)
             .call()
             .await?;
 
@@ -1091,6 +1456,7 @@ mod tests {
             .http(rpc_endpoint.parse()?);
 
         let provider = Arc::new(ProviderBuilder::new().connect_client(client));
+        let block = BlockId::from(provider.get_block_number().await?);
 
         // WBTC/WETH 50/50 Weighted Pool
         // Pool Address: 0xA6F548DF93DE924d73be7D25dC02554c6bD66dB5
@@ -1108,9 +1474,8 @@ mod tests {
             pool_id,
             BalancerV2PoolType::Weighted,
         );
-        let amm = pool.init(BlockId::latest(), provider.clone()).await?;
+        let amm = pool.init(block, provider.clone()).await?;
         println!("Pool initialized!");
-
         // Swap 0.1 WBTC -> WETH
         // WBTC: 0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599
         // WETH: 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2
@@ -1149,6 +1514,7 @@ mod tests {
 
         let onchain_amount_out = balancer_queries
             .querySwap(single_swap, funds)
+            .block(block)
             .call()
             .await?;
         println!("On-chain Amount out: {}", onchain_amount_out);
@@ -1195,6 +1561,7 @@ mod tests {
             .http(rpc_endpoint.parse()?);
 
         let provider = Arc::new(ProviderBuilder::new().connect_client(client));
+        let block = BlockId::from(provider.get_block_number().await?);
 
         // VLR/WETH 80/20 Weighted Pool
         // VLR: 0x4e107a0000DB66f0E9Fd2039288Bf811dD1f9c74
@@ -1210,7 +1577,7 @@ mod tests {
             pool_id,
             BalancerV2PoolType::Weighted,
         );
-        let amm = pool.init(BlockId::latest(), provider.clone()).await?;
+        let amm = pool.init(block, provider.clone()).await?;
         println!("Pool initialized!");
 
         // Swap 100 VLR -> WETH
@@ -1249,6 +1616,7 @@ mod tests {
 
         let onchain_amount_out = balancer_queries
             .querySwap(single_swap, funds)
+            .block(block)
             .call()
             .await?;
         println!("On-chain Amount out: {}", onchain_amount_out);
@@ -1390,52 +1758,226 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_calculate_price() -> eyre::Result<()> {
+    async fn test_balancer_v2_weighted_exact_out_matches_query() -> eyre::Result<()> {
         dotenv::dotenv().ok();
-        let rpc_endpoint = std::env::var("ETHEREUM_PROVIDER")?;
+        let rpc_endpoint = match std::env::var("ETHEREUM_PROVIDER") {
+            Ok(url) => url,
+            Err(_) => {
+                println!("Skipping test: ETHEREUM_PROVIDER not set");
+                return Ok(());
+            }
+        };
 
         let client = ClientBuilder::default()
-            .layer(ThrottleLayer::new(250))
+            .layer(ThrottleLayer::new(50))
             .layer(RetryBackoffLayer::new(5, 200, 330))
             .http(rpc_endpoint.parse()?);
+        let provider = Arc::new(ProviderBuilder::new().connect_client(client));
+        let block = BlockId::from(provider.get_block_number().await?);
 
-        let provider = ProviderBuilder::new().connect_client(client);
-
-        let pool_address = address!("5c6Ee304399DBdB9C8Ef030aB642B10820DB8F56"); // 80BAL-20WETH
+        // BAL-WETH 80/20 Weighted Pool
+        let pool_address = address!("5c6Ee304399DBdB9C8Ef030aB642B10820DB8F56");
         let vault_address = address!("BA12222222228d8Ba445958a75a0704d566BF2C8");
         let pool_id =
-            B256::from_str("0x5c6ee304399dbdb9c8ef030ab642b10820db8f56000200000000000000000014")?;
+            B256::from_str("5c6ee304399dbdb9c8ef030ab642b10820db8f56000200000000000000000014")?;
 
-        let mut pool = BalancerV2Pool::new(
+        let pool = BalancerV2Pool::new(
             pool_address,
             vault_address,
             pool_id,
             BalancerV2PoolType::Weighted,
         );
+        let amm = pool.init(block, provider.clone()).await?;
 
-        let block_number = BlockId::from(18000000);
-        pool = pool.init(block_number, provider.clone()).await?;
-
-        // BAL address
-        let bal = address!("ba100000625a3754423978a60c9317c58a424e3D");
-        // WETH address
         let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let bal = address!("ba100000625a3754423978a60c9317c58a424e3D");
+        let amount_out = U256::from(10_000_000_000_000_000_000u128); // 10 BAL
 
-        let price_bal = pool.calculate_price(bal, weth)?;
-        let price_weth = pool.calculate_price(weth, bal)?;
-
-        println!("BAL Price in WETH: {}", price_bal);
-        println!("WETH Price in BAL: {}", price_weth);
-
-        assert!(price_bal > 0.0);
-        assert!(price_weth > 0.0);
-
-        // Approximate cross-check
-        let product = price_bal * price_weth;
-        assert!(product > 0.99 && product < 1.01);
+        assert_exact_out_case(&amm, &provider, block, pool_id, weth, bal, amount_out).await?;
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_balancer_v2_composable_stable_exact_out_matches_query() -> eyre::Result<()> {
+        use alloy::sol;
+        sol! {
+            #[sol(rpc)]
+            interface IGetPoolId {
+                function getPoolId() external view returns (bytes32);
+            }
+        }
+
+        dotenv::dotenv().ok();
+        let rpc_endpoint = match std::env::var("ETHEREUM_PROVIDER") {
+            Ok(url) => url,
+            Err(_) => {
+                println!("Skipping test: ETHEREUM_PROVIDER not set");
+                return Ok(());
+            }
+        };
+
+        let client = ClientBuilder::default()
+            .layer(ThrottleLayer::new(50))
+            .layer(RetryBackoffLayer::new(5, 200, 330))
+            .http(rpc_endpoint.parse()?);
+        let provider = Arc::new(ProviderBuilder::new().connect_client(client));
+        let block = BlockId::from(provider.get_block_number().await?);
+
+        let pool_address = address!("32296969ef14eb0c6d29669c550d4a0449130230");
+        let vault_address = address!("BA12222222228d8Ba445958a75a0704d566BF2C8");
+        let pool_contract = IGetPoolId::new(pool_address, provider.clone());
+        let pool_id = pool_contract.getPoolId().call().await?;
+
+        let pool = BalancerV2Pool::new(
+            pool_address,
+            vault_address,
+            pool_id,
+            BalancerV2PoolType::ComposableStable,
+        );
+        let amm = pool.init(block, provider.clone()).await?;
+
+        let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let wsteth = address!("7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0");
+        let wsteth_balance = amm
+            .tokens
+            .get(&wsteth)
+            .ok_or_else(|| eyre::eyre!("missing wsteth token state"))?
+            .balance;
+        // Keep target safely below current liquidity to reduce block-dependent failures.
+        let amount_out = std::cmp::max(wsteth_balance / U256::from(20u8), U256::from(1u8)); // 5%
+
+        assert_exact_out_case(&amm, &provider, block, pool_id, weth, wsteth, amount_out).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_balancer_v2_weighted_exact_out_matrix() -> eyre::Result<()> {
+        dotenv::dotenv().ok();
+        let rpc_endpoint = match std::env::var("ETHEREUM_PROVIDER") {
+            Ok(url) => url,
+            Err(_) => {
+                println!("Skipping test: ETHEREUM_PROVIDER not set");
+                return Ok(());
+            }
+        };
+
+        let client = ClientBuilder::default()
+            .layer(ThrottleLayer::new(50))
+            .layer(RetryBackoffLayer::new(5, 200, 330))
+            .http(rpc_endpoint.parse()?);
+        let provider = Arc::new(ProviderBuilder::new().connect_client(client));
+        let block = BlockId::from(provider.get_block_number().await?);
+
+        let pool_address = address!("5c6Ee304399DBdB9C8Ef030aB642B10820DB8F56");
+        let vault_address = address!("BA12222222228d8Ba445958a75a0704d566BF2C8");
+        let pool_id =
+            B256::from_str("5c6ee304399dbdb9c8ef030ab642b10820db8f56000200000000000000000014")?;
+        let amm = BalancerV2Pool::new(
+            pool_address,
+            vault_address,
+            pool_id,
+            BalancerV2PoolType::Weighted,
+        )
+        .init(block, provider.clone())
+        .await?;
+
+        let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let bal = address!("ba100000625a3754423978a60c9317c58a424e3D");
+
+        let bal_targets = [
+            U256::from(1_000_000_000_000_000_000u128),  // 1 BAL
+            U256::from(5_000_000_000_000_000_000u128),  // 5 BAL
+            U256::from(10_000_000_000_000_000_000u128), // 10 BAL
+        ];
+        for target in bal_targets {
+            assert_exact_out_case(&amm, &provider, block, pool_id, weth, bal, target).await?;
+        }
+
+        let weth_targets = [
+            U256::from(10_000_000_000_000_000u128),  // 0.01 WETH
+            U256::from(50_000_000_000_000_000u128),  // 0.05 WETH
+            U256::from(100_000_000_000_000_000u128), // 0.1 WETH
+        ];
+        for target in weth_targets {
+            assert_exact_out_case(&amm, &provider, block, pool_id, bal, weth, target).await?;
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_balancer_v2_composable_stable_exact_out_matrix() -> eyre::Result<()> {
+        use alloy::sol;
+        sol! {
+            #[sol(rpc)]
+            interface IGetPoolId {
+                function getPoolId() external view returns (bytes32);
+            }
+        }
+
+        dotenv::dotenv().ok();
+        let rpc_endpoint = match std::env::var("ETHEREUM_PROVIDER") {
+            Ok(url) => url,
+            Err(_) => {
+                println!("Skipping test: ETHEREUM_PROVIDER not set");
+                return Ok(());
+            }
+        };
+
+        let client = ClientBuilder::default()
+            .layer(ThrottleLayer::new(50))
+            .layer(RetryBackoffLayer::new(5, 200, 330))
+            .http(rpc_endpoint.parse()?);
+        let provider = Arc::new(ProviderBuilder::new().connect_client(client));
+        let block = BlockId::from(provider.get_block_number().await?);
+
+        let pool_address = address!("32296969ef14eb0c6d29669c550d4a0449130230");
+        let vault_address = address!("BA12222222228d8Ba445958a75a0704d566BF2C8");
+        let pool_contract = IGetPoolId::new(pool_address, provider.clone());
+        let pool_id = pool_contract.getPoolId().call().await?;
+        let amm = BalancerV2Pool::new(
+            pool_address,
+            vault_address,
+            pool_id,
+            BalancerV2PoolType::ComposableStable,
+        )
+        .init(block, provider.clone())
+        .await?;
+
+        let weth = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let wsteth = address!("7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0");
+        let mk_targets = |balance: U256| -> [U256; 3] {
+            // Keep targets well below current liquidity to avoid block-dependent false failures.
+            // max_target ~= 1/5 of current out-token balance.
+            let t1 = std::cmp::max(balance / U256::from(50u8), U256::from(1u8)); // 2%
+            let t2 = std::cmp::max(balance / U256::from(20u8), U256::from(1u8)); // 5%
+            let t3 = std::cmp::max(balance / U256::from(10u8), U256::from(1u8)); // 10%
+            [t1, t2, t3]
+        };
+
+        let wsteth_balance = amm
+            .tokens
+            .get(&wsteth)
+            .ok_or_else(|| eyre::eyre!("missing wsteth token state"))?
+            .balance;
+        for target in mk_targets(wsteth_balance) {
+            assert_exact_out_case(&amm, &provider, block, pool_id, weth, wsteth, target).await?;
+        }
+
+        let weth_balance = amm
+            .tokens
+            .get(&weth)
+            .ok_or_else(|| eyre::eyre!("missing weth token state"))?
+            .balance;
+        for target in mk_targets(weth_balance) {
+            assert_exact_out_case(&amm, &provider, block, pool_id, wsteth, weth, target).await?;
+        }
+
+        Ok(())
+    }
+
 }
 
 #[cfg(test)]

@@ -646,7 +646,7 @@ impl FluidDexPool {
 
     pub(crate) fn compute_ranges_from_dex(
         &mut self,
-        dex_variables: U256,
+        _dex_variables: U256,
         dex_variables2: U256,
         now_ts: u64,
     ) {

@@ -10,7 +10,7 @@ use crate::amms::amm::{AutomatedMarketMaker, AMM};
 use alloy::{
     eips::BlockId,
     network::Network,
-    primitives::{address, Address, U256},
+    primitives::{Address, U256},
     providers::Provider,
     sol,
     sol_types::SolValue,

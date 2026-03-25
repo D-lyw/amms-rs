@@ -38,7 +38,6 @@ serde = { version = "1.0", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
 serde_json = { version = "1.0", features = ["arbitrary_precision"] }
 ruint = "1.17.2"
-dotenv = "0.15"
 
 [dev-dependencies]
 rand = "0.9.2"
@@ -64,11 +63,13 @@ lto = true
 codegen-units = 1
 panic = "abort"
 
+ # 开发模式：追求编译速度
 [profile.dev]
-opt-level = 3
-lto = true
-codegen-units = 1
-debug = "full"
+opt-level = 0
+lto = false
+codegen-units = 256
+debug = 1
+incremental = true
 
 
 [[bench]]

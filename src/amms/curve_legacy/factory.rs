@@ -73,7 +73,6 @@ sol!(
 );
 
 // 从 JSON 生成的模块导入 PoolInput 类型
-use GetCurveLegacyPoolDataBatchRequest::PoolInput;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Hash, PartialEq, Eq)]
 pub struct CurveLegacyFactory {

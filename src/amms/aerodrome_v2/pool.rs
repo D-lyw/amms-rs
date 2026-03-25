@@ -163,82 +163,54 @@ impl AerodromeV2Pool {
         (amount_in_after_fee * reserve_out) / (reserve_in + amount_in_after_fee)
     }
 
-    /// Calculates the amount received for a given `amount_in` for stable pools
-    /// using the Aerodrome/Solidly formula: `x³y + y³x = k`
-    ///
-    /// This matches the implementation in Aerodrome's Pool.sol contract.
-    /// Uses f64 for calculations to avoid U256 overflow issues.
-    ///
-    /// Fee is deducted BEFORE calculation, matching Solidity:
-    /// ```solidity
-    /// amountIn -= (amountIn * fee) / 10000;
-    /// ```
+    /// Calculates the amount received for stable pools using the same integer
+    /// arithmetic as Aerodrome Pool.sol.
     pub fn get_amount_out_stable(&self, amount_in: U256, reserve_in: U256, reserve_out: U256) -> U256 {
+        let decimals_in = Self::decimals_scale(self.token_a.decimals);
+        let decimals_out = Self::decimals_scale(self.token_b.decimals);
+        self.get_amount_out_stable_with_decimals(
+            amount_in,
+            reserve_in,
+            reserve_out,
+            decimals_in,
+            decimals_out,
+        )
+    }
+
+    fn get_amount_out_stable_with_decimals(
+        &self,
+        amount_in: U256,
+        reserve_in: U256,
+        reserve_out: U256,
+        decimals_in: U256,
+        decimals_out: U256,
+    ) -> U256 {
         if amount_in.is_zero() || reserve_in.is_zero() || reserve_out.is_zero() {
             return U256::ZERO;
         }
 
-        // Deduct fee BEFORE swap calculation (matching Solidity)
-        // Fee is in hundredths of a percent (base 10000)
-        let fee_amount = (amount_in * U256::from(self.fee)) / U256::from(10000u64);
+        let precision = U256::from(1_000_000_000_000_000_000u64); // 1e18
+
+        // amountIn -= (amountIn * fee) / 10000;
+        let fee_amount = (amount_in * U256::from(self.fee)) / U256::from(10_000u64);
         let amount_in_after_fee = amount_in - fee_amount;
 
-        // Get decimals SCALE for both tokens (10^decimals, not decimals itself)
-        // Solidity: decimals0 = 10 ** ERC20(_token0).decimals()
-        let decimals0_scale = 10f64.powi(self.token_a.decimals as i32);
-        let decimals1_scale = 10f64.powi(self.token_b.decimals as i32);
+        // xy = _k(reserveIn, reserveOut)
+        let xy = self.k_stable(reserve_in, reserve_out, decimals_in, decimals_out);
 
-        // Convert to f64 for calculation
-        let reserve_in_f = reserve_in.to::<u128>() as f64;
-        let reserve_out_f = reserve_out.to::<u128>() as f64;
-        let amount_in_f = amount_in_after_fee.to::<u128>() as f64;
+        // x0 = ((reserveIn + amountIn) * 1e18) / decimalsIn
+        let x0 = (reserve_in + amount_in_after_fee) * precision / decimals_in;
+        // y = (reserveOut * 1e18) / decimalsOut
+        let y = (reserve_out * precision) / decimals_out;
 
-        // Normalize to 18 decimals (same as Solidity: (reserve * 1e18) / decimalsScale)
-        let precision = 1e18;
-        let x = reserve_in_f * precision / decimals0_scale;
-        let y = reserve_out_f * precision / decimals1_scale;
-
-        // Calculate K = (x³y + y³x) / 10³⁶
-        let xy = self.k_stable_f64(x, y);
-
-        // Add amount_in and normalize
-        let dx = amount_in_f * precision / decimals0_scale;
-        let x0 = x + dx;
-
-        // Use Newton-Raphson iteration to find y_new such that: f(x0, y_new) = xy
-        let y_new = self.get_y_stable_f64(x0, xy, y);
-
-        // Calculate output amount
-        let dy = y - y_new;
-        if dy <= 0.0 {
+        // y_new = _get_y(x0, xy, y)
+        let y_new = self.get_y_stable(x0, xy, y);
+        if y_new > y {
             return U256::ZERO;
         }
 
-        // Denormalize to output token decimals: (y * decimalsScale) / 1e18
-        let y_out = dy * decimals1_scale / precision;
-
-        // Convert back to U256
-        if y_out < 0.0 || y_out >= (u128::MAX as f64) {
-            return U256::ZERO;
-        }
-
-        U256::from(y_out as u128)
-    }
-
-    /// Calculate K = (x³y + y³x) / 10³⁶ for stable pools (f64 version)
-    fn k_stable_f64(&self, x: f64, y: f64) -> f64 {
-        let precision = 1e18;
-
-        // _a = (x * y) / 1e18
-        let a = (x * y) / precision;
-
-        // _b = (x² / 1e18) + (y² / 1e18)
-        let x_squared = (x * x) / precision;
-        let y_squared = (y * y) / precision;
-        let b = x_squared + y_squared;
-
-        // K = (_a * _b) / 1e18 = (x³y + y³x) / 10³⁶
-        (a * b) / precision
+        // amountOut = (y - y_new) * decimalsOut / 1e18
+        ((y - y_new) * decimals_out) / precision
     }
 
     /// Calculate K = (x³y + y³x) / 10³⁶ for stable pools
@@ -280,83 +252,6 @@ impl AerodromeV2Pool {
         tracing::trace!("k_stable: ab={}, k={}", ab, k);
 
         k
-    }
-
-    /// Calculate y using Newton-Raphson iteration for stable swap (f64 version)
-    fn get_y_stable_f64(&self, x0: f64, xy: f64, mut y: f64) -> f64 {
-        let precision = 1e18;
-
-        for _ in 0..255 {
-            let k = self.f_stable_f64(x0, y);
-
-            if k < xy {
-                // Need to increase y
-                let d = self.d_stable_f64(x0, y);
-                if d == 0.0 {
-                    return y;
-                }
-                let dy = ((xy - k) * precision) / d;
-                if dy == 0.0 {
-                    if (k - xy).abs() < 1.0 {
-                        return y;
-                    }
-                    if self.f_stable_f64(x0, y + 1.0) > xy {
-                        return y + 1.0;
-                    }
-                    y += 1.0;
-                } else {
-                    y += dy;
-                }
-            } else {
-                // Need to decrease y
-                let d = self.d_stable_f64(x0, y);
-                if d == 0.0 {
-                    return y;
-                }
-                let dy = ((k - xy) * precision) / d;
-                if dy == 0.0 {
-                    if (k - xy).abs() < 1.0 || self.f_stable_f64(x0, y - 1.0) < xy {
-                        return y;
-                    }
-                    if y > 1.0 {
-                        y -= 1.0;
-                    }
-                } else {
-                    if y > dy {
-                        y -= dy;
-                    } else {
-                        return y;
-                    }
-                }
-            }
-        }
-
-        y
-    }
-
-    /// f(x, y) = (x³y + y³x) / 10³⁶ for Newton-Raphson iteration (f64 version)
-    fn f_stable_f64(&self, x0: f64, y: f64) -> f64 {
-        let precision = 1e18;
-
-        let a = (x0 * y) / precision;
-        let x0_squared = (x0 * x0) / precision;
-        let y_squared = (y * y) / precision;
-        let b = x0_squared + y_squared;
-
-        (a * b) / precision
-    }
-
-    /// Derivative of f for Newton-Raphson: f'(x, y) = 3xy² + x³ (f64 version)
-    fn d_stable_f64(&self, x0: f64, y: f64) -> f64 {
-        let precision = 1e18;
-
-        let y_squared = (y * y) / precision;
-        let term1 = (3.0 * x0 * y_squared) / precision;
-
-        let x0_squared = (x0 * x0) / precision;
-        let term2 = (x0_squared * x0) / precision;
-
-        term1 + term2
     }
 
     /// Calculate y using Newton-Raphson iteration for stable swap
@@ -478,6 +373,10 @@ impl AerodromeV2Pool {
         term1.saturating_add(term2)
     }
 
+    fn decimals_scale(decimals: u8) -> U256 {
+        U256::from(10u8).pow(U256::from(decimals))
+    }
+
     /// Get amount out based on pool type (volatile or stable)
     pub fn get_amount_out(&self, amount_in: U256, reserve_in: U256, reserve_out: U256) -> U256 {
         if self.stable {
@@ -485,6 +384,156 @@ impl AerodromeV2Pool {
         } else {
             self.get_amount_out_volatile(amount_in, reserve_in, reserve_out)
         }
+    }
+
+    /// Calculates exact input required for volatile pools.
+    pub fn get_amount_in_volatile(
+        &self,
+        amount_out: U256,
+        reserve_in: U256,
+        reserve_out: U256,
+    ) -> Result<U256, AMMError> {
+        if amount_out.is_zero() {
+            return Ok(U256::ZERO);
+        }
+        if reserve_in.is_zero() || reserve_out.is_zero() || amount_out >= reserve_out {
+            return Err(AMMError::Msg(
+                "insufficient liquidity for exact out".to_string(),
+            ));
+        }
+
+        let fee_base = U256::from(10_000u64);
+        let fee_factor = fee_base
+            .checked_sub(U256::from(self.fee))
+            .ok_or(AMMError::ArithmeticError)?;
+        if fee_factor.is_zero() {
+            return Err(AMMError::ArithmeticError);
+        }
+
+        let numerator = reserve_in
+            .checked_mul(fee_base)
+            .and_then(|v| v.checked_mul(amount_out))
+            .ok_or(AMMError::ArithmeticError)?;
+        let denominator = reserve_out
+            .checked_sub(amount_out)
+            .and_then(|v| v.checked_mul(fee_factor))
+            .ok_or(AMMError::ArithmeticError)?;
+
+        Ok(Self::ceil_div_u256(numerator, denominator))
+    }
+
+    /// Calculates exact input required for stable pools via binary search.
+    ///
+    /// Returns the minimum `amount_in` such that `get_amount_out(amount_in) >= amount_out`.
+    pub fn get_amount_in_stable(
+        &self,
+        amount_out: U256,
+        reserve_in: U256,
+        reserve_out: U256,
+    ) -> Result<U256, AMMError> {
+        if amount_out.is_zero() {
+            return Ok(U256::ZERO);
+        }
+        if reserve_in.is_zero() || reserve_out.is_zero() || amount_out >= reserve_out {
+            return Err(AMMError::Msg(
+                "insufficient liquidity for exact out".to_string(),
+            ));
+        }
+
+        let decimals_in = Self::decimals_scale(self.token_a.decimals);
+        let decimals_out = Self::decimals_scale(self.token_b.decimals);
+        self.get_amount_in_stable_with_decimals(
+            amount_out,
+            reserve_in,
+            reserve_out,
+            decimals_in,
+            decimals_out,
+        )
+    }
+
+    fn get_amount_in_stable_with_decimals(
+        &self,
+        amount_out: U256,
+        reserve_in: U256,
+        reserve_out: U256,
+        decimals_in: U256,
+        decimals_out: U256,
+    ) -> Result<U256, AMMError> {
+        let max_input = U256::from(u128::MAX);
+        let two = U256::from(2u8);
+        let one = U256::from(1u8);
+
+        let mut high = one;
+        while self.get_amount_out_stable_with_decimals(
+            high,
+            reserve_in,
+            reserve_out,
+            decimals_in,
+            decimals_out,
+        ) < amount_out
+        {
+            if high >= max_input {
+                return Err(AMMError::Msg(
+                    "insufficient liquidity for exact out".to_string(),
+                ));
+            }
+            high = if high > (max_input / two) {
+                max_input
+            } else {
+                high * two
+            };
+            if high == max_input
+                && self.get_amount_out_stable_with_decimals(
+                    high,
+                    reserve_in,
+                    reserve_out,
+                    decimals_in,
+                    decimals_out,
+                ) < amount_out
+            {
+                return Err(AMMError::Msg(
+                    "insufficient liquidity for exact out".to_string(),
+                ));
+            }
+        }
+
+        let mut low = U256::ZERO;
+        while low < high {
+            let mid = low + (high - low) / two;
+            let out_mid = self.get_amount_out_stable_with_decimals(
+                mid,
+                reserve_in,
+                reserve_out,
+                decimals_in,
+                decimals_out,
+            );
+            if out_mid >= amount_out {
+                high = mid;
+            } else {
+                low = mid + one;
+            }
+        }
+
+        if self.get_amount_out_stable_with_decimals(
+            low,
+            reserve_in,
+            reserve_out,
+            decimals_in,
+            decimals_out,
+        ) < amount_out
+        {
+            return Err(AMMError::Msg(
+                "insufficient liquidity for exact out".to_string(),
+            ));
+        }
+
+        Ok(low)
+    }
+
+    fn ceil_div_u256(numerator: U256, denominator: U256) -> U256 {
+        let q = numerator / denominator;
+        let r = numerator % denominator;
+        if r.is_zero() { q } else { q + U256::from(1u8) }
     }
 
     /// Generate calldata for a swap operation on this pool.
@@ -581,17 +630,37 @@ impl AutomatedMarketMaker for AerodromeV2Pool {
         amount_in: U256,
     ) -> Result<U256, AMMError> {
         if self.token_a.address == base_token {
-            Ok(self.get_amount_out(
-                amount_in,
-                U256::from(self.reserve_0),
-                U256::from(self.reserve_1),
-            ))
+            if self.stable {
+                Ok(self.get_amount_out_stable_with_decimals(
+                    amount_in,
+                    U256::from(self.reserve_0),
+                    U256::from(self.reserve_1),
+                    Self::decimals_scale(self.token_a.decimals),
+                    Self::decimals_scale(self.token_b.decimals),
+                ))
+            } else {
+                Ok(self.get_amount_out_volatile(
+                    amount_in,
+                    U256::from(self.reserve_0),
+                    U256::from(self.reserve_1),
+                ))
+            }
         } else {
-            Ok(self.get_amount_out(
-                amount_in,
-                U256::from(self.reserve_1),
-                U256::from(self.reserve_0),
-            ))
+            if self.stable {
+                Ok(self.get_amount_out_stable_with_decimals(
+                    amount_in,
+                    U256::from(self.reserve_1),
+                    U256::from(self.reserve_0),
+                    Self::decimals_scale(self.token_b.decimals),
+                    Self::decimals_scale(self.token_a.decimals),
+                ))
+            } else {
+                Ok(self.get_amount_out_volatile(
+                    amount_in,
+                    U256::from(self.reserve_1),
+                    U256::from(self.reserve_0),
+                ))
+            }
         }
     }
 
@@ -602,11 +671,21 @@ impl AutomatedMarketMaker for AerodromeV2Pool {
         amount_in: U256,
     ) -> Result<U256, AMMError> {
         if self.token_a.address == base_token {
-            let amount_out = self.get_amount_out(
-                amount_in,
-                U256::from(self.reserve_0),
-                U256::from(self.reserve_1),
-            );
+            let amount_out = if self.stable {
+                self.get_amount_out_stable_with_decimals(
+                    amount_in,
+                    U256::from(self.reserve_0),
+                    U256::from(self.reserve_1),
+                    Self::decimals_scale(self.token_a.decimals),
+                    Self::decimals_scale(self.token_b.decimals),
+                )
+            } else {
+                self.get_amount_out_volatile(
+                    amount_in,
+                    U256::from(self.reserve_0),
+                    U256::from(self.reserve_1),
+                )
+            };
 
             let amount_in_u128 = amount_in.try_into().map_err(|_| {
                 AMMError::Msg("simulate_swap_mut: amount_in overflow to u128".to_string())
@@ -630,11 +709,21 @@ impl AutomatedMarketMaker for AerodromeV2Pool {
 
             Ok(amount_out)
         } else {
-            let amount_out = self.get_amount_out(
-                amount_in,
-                U256::from(self.reserve_1),
-                U256::from(self.reserve_0),
-            );
+            let amount_out = if self.stable {
+                self.get_amount_out_stable_with_decimals(
+                    amount_in,
+                    U256::from(self.reserve_1),
+                    U256::from(self.reserve_0),
+                    Self::decimals_scale(self.token_b.decimals),
+                    Self::decimals_scale(self.token_a.decimals),
+                )
+            } else {
+                self.get_amount_out_volatile(
+                    amount_in,
+                    U256::from(self.reserve_1),
+                    U256::from(self.reserve_0),
+                )
+            };
 
             let amount_in_u128 = amount_in.try_into().map_err(|_| {
                 AMMError::Msg("simulate_swap_mut: amount_in overflow to u128".to_string())
@@ -657,6 +746,42 @@ impl AutomatedMarketMaker for AerodromeV2Pool {
                 ))?;
 
             Ok(amount_out)
+        }
+    }
+
+    fn simulate_swap_exact_out(
+        &self,
+        base_token: Address,
+        _quote_token: Address,
+        amount_out: U256,
+    ) -> Result<U256, AMMError> {
+        let (reserve_in, reserve_out) = if self.token_a.address == base_token {
+            (U256::from(self.reserve_0), U256::from(self.reserve_1))
+        } else {
+            (U256::from(self.reserve_1), U256::from(self.reserve_0))
+        };
+
+        if self.stable {
+            let (decimals_in, decimals_out) = if self.token_a.address == base_token {
+                (
+                    Self::decimals_scale(self.token_a.decimals),
+                    Self::decimals_scale(self.token_b.decimals),
+                )
+            } else {
+                (
+                    Self::decimals_scale(self.token_b.decimals),
+                    Self::decimals_scale(self.token_a.decimals),
+                )
+            };
+            self.get_amount_in_stable_with_decimals(
+                amount_out,
+                reserve_in,
+                reserve_out,
+                decimals_in,
+                decimals_out,
+            )
+        } else {
+            self.get_amount_in_volatile(amount_out, reserve_in, reserve_out)
         }
     }
 
@@ -1167,5 +1292,66 @@ impl AerodromeV2Factory {
         }
 
         Ok(amms_map.into_iter().map(|(_, amm)| amm).collect())
+    }
+}
+
+#[cfg(test)]
+mod tests_exact_out {
+    use super::*;
+    use alloy::primitives::address;
+
+    #[test]
+    fn test_get_amount_in_volatile_exact_out_inverse() {
+        let pool = AerodromeV2Pool {
+            fee: 30, // 0.3%
+            stable: false,
+            ..Default::default()
+        };
+
+        let reserve_in = U256::from(1_000_000u64);
+        let reserve_out = U256::from(2_000_000u64);
+        let target_out = U256::from(123_456u64);
+
+        let amount_in = pool
+            .get_amount_in_volatile(target_out, reserve_in, reserve_out)
+            .expect("exact out should be solvable");
+        let out_with_in = pool.get_amount_out_volatile(amount_in, reserve_in, reserve_out);
+        assert!(out_with_in >= target_out);
+
+        if amount_in > U256::ZERO {
+            let out_with_less = pool.get_amount_out_volatile(
+                amount_in - U256::from(1u8),
+                reserve_in,
+                reserve_out,
+            );
+            assert!(out_with_less < target_out);
+        }
+    }
+
+    #[test]
+    fn test_get_amount_in_stable_binary_search_minimality() {
+        let pool = AerodromeV2Pool {
+            fee: 5, // 0.05% stable
+            stable: true,
+            token_a: Token::new_with_decimals(address!("4200000000000000000000000000000000000006"), 18),
+            token_b: Token::new_with_decimals(address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"), 6),
+            ..Default::default()
+        };
+
+        let reserve_in = U256::from(100_000u64) * U256::from(10u64).pow(U256::from(18u8));
+        let reserve_out = U256::from(200_000_000u64) * U256::from(10u64).pow(U256::from(6u8));
+        let target_out = U256::from(1_000u64) * U256::from(10u64).pow(U256::from(6u8));
+
+        let amount_in = pool
+            .get_amount_in_stable(target_out, reserve_in, reserve_out)
+            .expect("stable exact out should be solvable");
+        let out_with_in = pool.get_amount_out_stable(amount_in, reserve_in, reserve_out);
+        assert!(out_with_in >= target_out);
+
+        if amount_in > U256::ZERO {
+            let out_with_less =
+                pool.get_amount_out_stable(amount_in - U256::from(1u8), reserve_in, reserve_out);
+            assert!(out_with_less < target_out);
+        }
     }
 }

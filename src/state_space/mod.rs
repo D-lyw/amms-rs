@@ -20,7 +20,7 @@ use alloy::consensus::BlockHeader;
 use alloy::eips::BlockId;
 use alloy::network::Network;
 
-use alloy::primitives::{address, Address, FixedBytes, B256};
+use alloy::primitives::{Address, FixedBytes};
 use alloy::providers::Provider;
 use alloy::rpc::types::{eth::Log, Block, Filter, FilterSet};
 use async_stream::stream;

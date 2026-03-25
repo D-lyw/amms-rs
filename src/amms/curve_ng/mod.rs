@@ -52,7 +52,6 @@ pub use types::{CurveNGPool, CurveNGPoolType};
 
 // Curve NG 池合约 ABI (简化版)
 pub mod contracts {
-    use super::*;
     alloy::sol! {
     #[allow(missing_docs)]
     #[sol(rpc)]
@@ -810,6 +809,31 @@ impl AutomatedMarketMaker for CurveNGPool {
         }
     }
 
+    fn simulate_swap_exact_out(
+        &self,
+        base_token: Address,
+        quote_token: Address,
+        amount_out: U256,
+    ) -> Result<U256, AMMError> {
+        let i = self
+            .coins
+            .iter()
+            .position(|&c| c == base_token)
+            .ok_or(AMMError::Msg("Base token not found".into()))?;
+        let j = self
+            .coins
+            .iter()
+            .position(|&c| c == quote_token)
+            .ok_or(AMMError::Msg("Quote token not found".into()))?;
+
+        match self.pool_type {
+            CurveNGPoolType::StableSwap => self.simulate_stableswap_exact_out(i, j, amount_out),
+            CurveNGPoolType::TwoCrypto | CurveNGPoolType::TriCrypto => {
+                self.simulate_cryptoswap_exact_out(i, j, amount_out)
+            }
+        }
+    }
+
     fn simulate_swap_mut(
         &mut self,
         base_token: Address,
@@ -1074,6 +1098,7 @@ impl AutomatedMarketMaker for CurveNGPool {
 
 impl CurveNGPool {
     // Helper to allow init to call update_spot_prices before returning
+    #[allow(dead_code)]
     fn with_cache(mut self) -> Self {
         self.update_spot_prices();
         self
@@ -1196,24 +1221,6 @@ impl CurveNGPool {
         // 1. 获取必要参数
         let amp = self.amp.ok_or(AMMError::Msg("Amp not found".into()))?;
         let gamma = self.gamma.ok_or(AMMError::Msg("Gamma not found".into()))?;
-        let d = self.d.ok_or(AMMError::Msg("D not found".into()))?;
-
-        // 链上安全检查: assert _D > 10**17 - 1 and _D < 10**15 * 10**18 + 1
-        // 即 D 必须 > 0.1 ETH 才能进行交换
-        let d_min = U256::from(10).pow(U256::from(17)); // 0.1 ETH
-        let d_max = U256::from(10).pow(U256::from(33)); // 10^15 ETH
-        if d < d_min {
-            return Err(AMMError::Msg(format!(
-                "Curve TwoCrypto: D value {} too small (min: {}). Pool has insufficient liquidity.",
-                d, d_min
-            )));
-        }
-        if d > d_max {
-            return Err(AMMError::Msg(format!(
-                "Curve TwoCrypto: D value {} exceeds maximum (max: {})",
-                d, d_max
-            )));
-        }
 
         let mid_fee = self
             .mid_fee
@@ -1221,7 +1228,8 @@ impl CurveNGPool {
         let out_fee = self
             .out_fee
             .ok_or(AMMError::Msg("Out fee not found".into()))?;
-        let fee_gamma = self.fee_gamma.unwrap_or(gamma);
+        // fee_gamma should be used as-is; if missing, default to 0 (no extra adjustment)
+        let fee_gamma = self.fee_gamma.unwrap_or(U256::ZERO);
         let price_scale = self
             .price_scale
             .as_ref()
@@ -1244,81 +1252,111 @@ impl CurveNGPool {
             .map(|d| U256::from(10).pow(U256::from(18 - *d)))
             .collect();
 
-        // 3. 准备原始余额并加入输入量 dx（原始代币单位）
-        //    这是关键修正：链上先加 dx 再统一缩放
-        let mut xp_raw: Vec<U256> = self.balances.clone();
-        xp_raw[i] += dx;
-
-        // 4. 应用精度和价格缩放
-        //    xp[0] = xp_raw[0] * precisions[0]
-        //    xp[k] = xp_raw[k] * price_scale[k-1] * precisions[k] / PRECISION  (k > 0)
-        let mut xp: Vec<U256> = vec![xp_raw[0] * precisions[0]];
+        // 3. 应用精度和价格缩放 (链上 _prep_calc)
+        //    xp[0] = balance[0] * precisions[0]
+        //    xp[k] = balance[k] * price_scale[k-1] * precisions[k] / PRECISION  (k > 0)
+        let mut xp: Vec<U256> = vec![self.balances[0] * precisions[0]];
         for k in 1..n_coins {
             let ps = price_scale.get(k - 1).copied().unwrap_or(precision);
-            xp.push(xp_raw[k] * ps * precisions[k] / precision);
+            xp.push(self.balances[k] * ps * precisions[k] / precision);
         }
 
-        // 5. 传入 newton_y / get_y_optimized 的参数 ANN
-        //    Chain Uses ANN = A (scaled).
-        //    newton_y expects ann = amp.
-        let ann = amp;
-
-        tracing::debug!(
-            target = "amms::curve_ng::simulate_cryptoswap",
-            pool = ?self.address,
-            amp = ?amp,
-            ann = ?ann,
-            n_coins = n_coins,
-            "Using optimized get_y for CryptoSwap"
-        );
-
-        // 6. 调用优化版 get_y 获取新的 y
-        //    对于 TriCrypto (n_coins == 3) 使用优化版立方根解法
-        //    对于 TwoCrypto (n_coins == 2) 使用 newton_y
-        let y_out = if n_coins == 3 {
-            // TriCrypto: 使用优化版 get_y (立方根封闭解)
-            math::cryptoswap::get_y_optimized(ann, gamma, &xp, d, j)
-                .map(|(y, _k0)| y)
-                .map_err(|e| AMMError::Msg(e.into()))?
+        // 4. 计算 D
+        let d = if self.pool_type == CurveNGPoolType::TwoCrypto {
+            // TwoCrypto views use stored D unless ramping; we don't track ramping, so prefer stored.
+            if let Some(chain_d) = self.d {
+                chain_d
+            } else {
+                let x2 = [xp[0], xp[1]];
+                math::cryptoswap::twocrypto_newton_d(amp, gamma, x2, U256::ZERO)
+                    .map_err(|e| AMMError::Msg(e.into()))?
+            }
         } else {
-            // TwoCrypto: 使用 newton_y
-            math::cryptoswap::newton_y(ann, gamma, &xp, d, j)
+            math::cryptoswap::newton_d(amp, gamma, &xp)
                 .map_err(|e| AMMError::Msg(e.into()))?
         };
 
-        // 7. 计算 dy（价格缩放单位）
-        //    需要获取交换前 xp[j] 来计算差值
-        let xp_j_before = if j == 0 {
-            self.balances[0] * precisions[0]
+        // 链上安全检查: assert _D > 10**17 - 1 and _D < 10**15 * 10**18 + 1
+        // 即 D 必须 > 0.1 ETH 才能进行交换
+        let d_min = U256::from(10).pow(U256::from(17)); // 0.1 ETH
+        let d_max = U256::from(10).pow(U256::from(33)); // 10^15 ETH
+        if d < d_min {
+            return Err(AMMError::Msg(format!(
+                "Curve TwoCrypto: D value {} too small (min: {}). Pool has insufficient liquidity.",
+                d, d_min
+            )));
+        }
+        if d > d_max {
+            return Err(AMMError::Msg(format!(
+                "Curve TwoCrypto: D value {} exceeds maximum (max: {})",
+                d, d_max
+            )));
+        }
+
+        // 5. 将 dx 转成缩放域 (与 xp 同尺度)
+        let dx_scaled = if i == 0 {
+            dx * precisions[0]
         } else {
-            let ps = price_scale.get(j - 1).copied().unwrap_or(precision);
-            self.balances[j] * ps * precisions[j] / precision
+            let ps = price_scale.get(i - 1).copied().unwrap_or(precision);
+            dx * ps * precisions[i] / precision
         };
 
-        let dy_scaled = xp_j_before
-            .checked_sub(y_out)
-            .ok_or(AMMError::Msg("Swap would result in negative output".into()))?;
-        let dy_scaled = dy_scaled.saturating_sub(U256::from(1)); // 舍入保护
+        // 6. 按链上 _get_dy_nofee 流程计算
+        let mut x = xp.clone();
+        x[i] = x[i]
+            .checked_add(dx_scaled)
+            .ok_or(AMMError::Msg("Overflow in x[i] add dx".into()))?;
+
+        // Compute y
+        let y = if self.pool_type == CurveNGPoolType::TwoCrypto {
+            let x2 = [x[0], x[1]];
+            let (y_out, _) = math::cryptoswap::twocrypto_get_y(amp, gamma, x2, d, j)
+                .map_err(|e| AMMError::Msg(e.into()))?;
+            y_out
+        } else {
+            // TriCryptoNG: use optimized get_y to track on-chain behavior. If we still see
+            // tiny (<几十 wei) drifts, the remaining gap is likely from bit-exact rounding in
+            // the math helpers and should be aligned with Vyper line-by-line.
+            let (y_out, _) = math::cryptoswap::get_y_optimized(amp, gamma, &x, d, j)
+                .map_err(|e| AMMError::Msg(e.into()))?;
+            y_out
+        };
+
+        // dy_scaled = xp[j] - y - 1
+        let dy_scaled = xp[j]
+            .checked_sub(y)
+            .ok_or(AMMError::Msg("New y is larger than old y (slippage?)".into()))?
+            .checked_sub(U256::from(1u8))
+            .ok_or(AMMError::Msg("Underflow in dy_scaled - 1".into()))?;
+
+        // 7. 动态手续费（使用缩放后的 x/y 计算费率）
+        x[j] = y;
+        let fee_percent = if self.pool_type == CurveNGPoolType::TwoCrypto {
+            math::cryptoswap::twocrypto_fee(&x, mid_fee, out_fee, fee_gamma)
+                .map_err(|e| AMMError::Msg(e.into()))?
+        } else {
+            let f = math::cryptoswap::reduction_coefficient(&x, fee_gamma);
+            (mid_fee * f + out_fee * (precision - f)) / precision
+        };
+        let fee_denominator = U256::from(10).pow(U256::from(10));
 
         // 8. 反向价格缩放：将 dy 从价格缩放单位转回原始代币单位
         let mut dy = dy_scaled;
         if j > 0 {
             let ps = price_scale.get(j - 1).copied().unwrap_or(precision);
-            dy = dy * precision / ps;
+            dy = dy
+                .checked_mul(precision)
+                .ok_or(AMMError::Msg("Mul overflow in dy downscale".into()))?
+                / ps;
+            dy = dy / precisions[j];
+        } else {
+            dy = dy / precisions[j];
         }
-        dy = dy / precisions[j];
 
-        // 9. 计算并扣除动态费用
-        //    更新 xp[j] 为交换后状态以计算费用
-        let mut xp_after = xp.clone();
-        xp_after[j] = y_out;
-
-        let f = math::cryptoswap::reduction_coefficient(&xp_after, fee_gamma);
-        let fee_rate = (mid_fee * f + out_fee * (precision - f)) / precision;
-        let fee_denominator = U256::from(10).pow(U256::from(10));
-        let fee = dy * fee_rate / fee_denominator;
-
-        dy = dy.saturating_sub(fee);
+        let fee = dy * fee_percent / fee_denominator;
+        let dy = dy
+            .checked_sub(fee)
+            .ok_or(AMMError::Msg("Underflow in fee subtraction".into()))?;
 
         Ok(dy)
     }
@@ -1429,6 +1467,129 @@ impl CurveNGPool {
         let dy = scaled_dy * precision / effective_rates[j];
 
         Ok(dy)
+    }
+
+    /// StableSwap Exact-Out simulation (binary search on dx).
+    fn simulate_stableswap_exact_out(
+        &self,
+        i: usize,
+        j: usize,
+        amount_out: U256,
+    ) -> Result<U256, AMMError> {
+        if amount_out.is_zero() {
+            return Ok(U256::ZERO);
+        }
+        if j >= self.balances.len() || i >= self.balances.len() {
+            return Err(AMMError::Msg("Token index out of bounds".into()));
+        }
+        if amount_out >= self.balances[j] {
+            return Err(AMMError::Msg("Insufficient liquidity for exact out".into()));
+        }
+
+        // Find upper bound by exponential search.
+        let mut low = U256::ZERO;
+        let mut high = U256::from(1u8);
+        let max_high = self
+            .balances
+            .get(i)
+            .copied()
+            .unwrap_or(U256::ZERO)
+            .saturating_mul(U256::from(1000u64));
+
+        loop {
+            let dy = self.simulate_stableswap(i, j, high)?;
+            if dy >= amount_out {
+                break;
+            }
+            if max_high.is_zero() || high >= max_high {
+                return Err(AMMError::Msg(
+                    "Exact out not reachable within max search bound".into(),
+                ));
+            }
+            high = high.saturating_mul(U256::from(2u8));
+            if high > max_high {
+                high = max_high;
+            }
+        }
+
+        // Binary search for minimal dx that yields dy >= amount_out.
+        while high > low + U256::from(1u8) {
+            let mid = (low + high) / U256::from(2u8);
+            let dy = self.simulate_stableswap(i, j, mid)?;
+            if dy >= amount_out {
+                high = mid;
+            } else {
+                low = mid;
+            }
+        }
+
+        Ok(high)
+    }
+
+    /// CryptoSwap Exact-Out simulation (binary search on dx).
+    fn simulate_cryptoswap_exact_out(
+        &self,
+        i: usize,
+        j: usize,
+        amount_out: U256,
+    ) -> Result<U256, AMMError> {
+        if amount_out.is_zero() {
+            return Ok(U256::ZERO);
+        }
+        if j >= self.balances.len() || i >= self.balances.len() {
+            return Err(AMMError::Msg("Token index out of bounds".into()));
+        }
+        if amount_out >= self.balances[j] {
+            return Err(AMMError::Msg("Insufficient liquidity for exact out".into()));
+        }
+
+        // Find upper bound by exponential search.
+        let mut low = U256::ZERO;
+        let mut high = U256::from(1u8);
+        let max_high = self
+            .balances
+            .get(i)
+            .copied()
+            .unwrap_or(U256::ZERO)
+            .saturating_mul(U256::from(1000u64));
+
+        loop {
+            let dy = match self.simulate_cryptoswap(i, j, high) {
+                Ok(v) => v,
+                Err(_) => U256::ZERO,
+            };
+            if dy >= amount_out {
+                break;
+            }
+            if max_high.is_zero() || high >= max_high {
+                return Err(AMMError::Msg(
+                    "Exact out not reachable within max search bound".into(),
+                ));
+            }
+            high = high.saturating_mul(U256::from(2u8));
+            if high > max_high {
+                high = max_high;
+            }
+        }
+
+        // Binary search for minimal dx that yields dy >= amount_out.
+        while high > low + U256::from(1u8) {
+            let mid = (low + high) / U256::from(2u8);
+            let dy = match self.simulate_cryptoswap(i, j, mid) {
+                Ok(v) => v,
+                Err(_) => {
+                    low = mid;
+                    continue;
+                }
+            };
+            if dy >= amount_out {
+                high = mid;
+            } else {
+                low = mid;
+            }
+        }
+
+        Ok(high)
     }
 }
 

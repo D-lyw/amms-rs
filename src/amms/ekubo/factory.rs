@@ -195,8 +195,6 @@ impl EkuboFactory {
         N: Network,
         P: Provider<N> + Clone,
     {
-        use crate::amms::amm::AutomatedMarketMaker;
-        use crate::amms::Token;
         use futures::stream::{self, StreamExt};
 
         // Removed GetEkuboPoolStateBatchRequest usage due to incorrect sqrtRatio format parsing (uint96 packed vs Q64.128)
@@ -324,7 +322,6 @@ impl EkuboFactory {
         P: Provider<N> + Clone,
     {
         use alloy::sol_types::SolValue;
-        use std::collections::HashMap;
         use GetEkuboTickBitmapBatchRequest::TickBitmapInfo;
 
         // Ekubo V2 bitmap offset

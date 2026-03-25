@@ -80,6 +80,47 @@ impl SushiV2Pool {
         numerator / denominator
     }
 
+    pub fn get_amount_in(
+        &self,
+        amount_out: U256,
+        reserve_in: U256,
+        reserve_out: U256,
+    ) -> Result<U256, AMMError> {
+        if amount_out.is_zero() {
+            return Ok(U256::ZERO);
+        }
+        if reserve_in.is_zero() || reserve_out.is_zero() || amount_out >= reserve_out {
+            return Err(AMMError::Msg(
+                "insufficient liquidity for exact out".to_string(),
+            ));
+        }
+
+        let fee_base = U256_100000;
+        let fee_factor = fee_base
+            .checked_sub(U256::from(self.fee))
+            .ok_or(AMMError::ArithmeticError)?;
+        if fee_factor.is_zero() {
+            return Err(AMMError::ArithmeticError);
+        }
+
+        let numerator = reserve_in
+            .checked_mul(fee_base)
+            .and_then(|v| v.checked_mul(amount_out))
+            .ok_or(AMMError::ArithmeticError)?;
+        let denominator = reserve_out
+            .checked_sub(amount_out)
+            .and_then(|v| v.checked_mul(fee_factor))
+            .ok_or(AMMError::ArithmeticError)?;
+
+        Ok(Self::ceil_div_u256(numerator, denominator))
+    }
+
+    fn ceil_div_u256(numerator: U256, denominator: U256) -> U256 {
+        let q = numerator / denominator;
+        let r = numerator % denominator;
+        if r.is_zero() { q } else { q + U256::from(1u8) }
+    }
+
     pub fn calculate_price_64_x_64(&self, base_token: Address) -> Result<u128, AMMError> {
         let decimal_shift = self.token_a.decimals as i8 - self.token_b.decimals as i8;
 
@@ -316,6 +357,27 @@ impl AutomatedMarketMaker for SushiV2Pool {
                 U256::from(self.reserve_1),
                 U256::from(self.reserve_0),
             ))
+        }
+    }
+
+    fn simulate_swap_exact_out(
+        &self,
+        base_token: Address,
+        _quote_token: Address,
+        amount_out: U256,
+    ) -> Result<U256, AMMError> {
+        if self.token_a.address == base_token {
+            self.get_amount_in(
+                amount_out,
+                U256::from(self.reserve_0),
+                U256::from(self.reserve_1),
+            )
+        } else {
+            self.get_amount_in(
+                amount_out,
+                U256::from(self.reserve_1),
+                U256::from(self.reserve_0),
+            )
         }
     }
 
@@ -695,3 +757,45 @@ impl DiscoverySync for SushiV2Factory {
 
 #[cfg(test)]
 mod test_price;
+
+#[cfg(test)]
+mod tests_exact_out {
+    use super::*;
+
+    #[test]
+    fn test_get_amount_in_exact_out_inverse() {
+        let pool = SushiV2Pool {
+            fee: 300,
+            ..Default::default()
+        };
+
+        let reserve_in = U256::from(1_000_000u64);
+        let reserve_out = U256::from(2_000_000u64);
+        let target_out = U256::from(123_456u64);
+
+        let amount_in = pool
+            .get_amount_in(target_out, reserve_in, reserve_out)
+            .expect("exact out should be solvable");
+        let out_with_in = pool.get_amount_out(amount_in, reserve_in, reserve_out);
+        assert!(out_with_in >= target_out);
+
+        if amount_in > U256::ZERO {
+            let out_with_less =
+                pool.get_amount_out(amount_in - U256::from(1u8), reserve_in, reserve_out);
+            assert!(out_with_less < target_out);
+        }
+    }
+
+    #[test]
+    fn test_get_amount_in_insufficient_liquidity() {
+        let pool = SushiV2Pool {
+            fee: 300,
+            ..Default::default()
+        };
+
+        let err = pool
+            .get_amount_in(U256::from(100u64), U256::from(1000u64), U256::from(100u64))
+            .expect_err("must fail when amount_out >= reserve_out");
+        assert!(format!("{err}").contains("insufficient liquidity"));
+    }
+}
