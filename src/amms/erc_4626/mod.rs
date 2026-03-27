@@ -227,6 +227,25 @@ impl AutomatedMarketMaker for ERC4626Vault {
         }
     }
 
+    fn simulate_swap_exact_out(
+        &self,
+        base_token: Address,
+        _quote_token: Address,
+        amount_out: U256,
+    ) -> Result<U256, AMMError> {
+        if amount_out.is_zero() {
+            return Ok(U256::ZERO);
+        }
+
+        if self.vault_token == base_token {
+            // Withdraw: vault_token -> asset_token
+            self.get_amount_in(amount_out, self.vault_reserve, self.asset_reserve, self.withdraw_fee)
+        } else {
+            // Deposit: asset_token -> vault_token
+            self.get_amount_in(amount_out, self.asset_reserve, self.vault_reserve, self.deposit_fee)
+        }
+    }
+
     // TODO: clean up this function
     async fn init<N, P>(mut self, block_number: BlockId, provider: P) -> Result<Self, AMMError>
     where
@@ -508,6 +527,67 @@ impl ERC4626Vault {
         }
 
         Ok(amount_in * reserve_out / reserve_in * U256::from(10000 - fee) / U256_10000)
+    }
+
+    /// Calculate the amount of input tokens needed to receive a desired output amount.
+    /// This is the inverse of get_amount_out.
+    ///
+    /// Formula derivation:
+    /// amount_out = amount_in * reserve_out / reserve_in * (10000 - fee) / 10000
+    /// =>
+    /// amount_in = amount_out * reserve_in * 10000 / (reserve_out * (10000 - fee))
+    ///
+    /// We use ceiling division to ensure we get at least the desired output.
+    pub fn get_amount_in(
+        &self,
+        amount_out: U256,
+        reserve_in: U256,
+        reserve_out: U256,
+        fee: u32,
+    ) -> Result<U256, AMMError> {
+        if amount_out.is_zero() {
+            return Ok(U256::ZERO);
+        }
+
+        if reserve_out.is_zero() {
+            return Err(AMMError::Msg("insufficient liquidity".into()));
+        }
+
+        // Check if desired output exceeds available reserve
+        if amount_out >= reserve_out {
+            return Err(AMMError::Msg("insufficient liquidity for exact out".into()));
+        }
+
+        // fee cannot be 100% (10000 basis points)
+        if fee >= 10000 {
+            return Err(AMMError::Msg("fee too high".into()));
+        }
+
+        let fee_factor = U256::from(10000 - fee);
+
+        // numerator = amount_out * reserve_in * 10000
+        let numerator = amount_out
+            .checked_mul(reserve_in)
+            .and_then(|v| v.checked_mul(U256_10000))
+            .ok_or(AMMError::ArithmeticError)?;
+
+        // denominator = (reserve_out - amount_out) * fee_factor
+        // Note: We subtract amount_out from reserve_out because we're computing
+        // the input needed to get exactly amount_out, and the formula accounts
+        // for the reserve change during the swap.
+        let denominator = reserve_out
+            .checked_sub(amount_out)
+            .and_then(|v| v.checked_mul(fee_factor))
+            .ok_or(AMMError::ArithmeticError)?;
+
+        // Ceiling division: (numerator + denominator - 1) / denominator
+        let result = numerator
+            .checked_add(denominator)
+            .and_then(|v| v.checked_sub(U256::from(1u64)))
+            .and_then(|v| v.checked_div(denominator))
+            .ok_or(AMMError::ArithmeticError)?;
+
+        Ok(result)
     }
 
     pub fn calculate_price_64_x_64(&self, base_token: Address) -> Result<u128, AMMError> {
