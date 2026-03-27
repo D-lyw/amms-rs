@@ -1413,6 +1413,122 @@ impl FluidDexPool {
         };
         Ok(unscale_from_1e12(amount_out_1e12, out_decimals))
     }
+
+    /// Exact-Out simulation using binary search.
+    /// Given a target output amount, find the minimal input amount required.
+    pub fn simulate_swap_exact_out_internal(
+        &self,
+        base_token: Address,
+        quote_token: Address,
+        amount_out: U256,
+    ) -> Result<U256, AMMError> {
+        // 1. Zero amount check
+        if amount_out.is_zero() {
+            return Ok(U256::ZERO);
+        }
+
+        // 2. Validate token pair and determine direction
+        let swap0to1 = base_token == self.token_a.address
+            && quote_token == self.token_b.address;
+        let swap1to0 = base_token == self.token_b.address
+            && quote_token == self.token_a.address;
+
+        if !swap0to1 && !swap1to0 {
+            return Err(AMMError::Msg("Token pair not in pool".to_string()));
+        }
+
+        // 3. Get decimals for scaling
+        let in_decimals = if swap0to1 {
+            self.token_a.decimals
+        } else {
+            self.token_b.decimals
+        };
+        let out_decimals = if swap0to1 {
+            self.token_b.decimals
+        } else {
+            self.token_a.decimals
+        };
+        let amount_out_1e12 = scale_to_1e12(amount_out, out_decimals);
+
+        // 4. Liquidity check - use imaginary reserves as upper bound
+        // Real reserves may be split across col/debt pools, so we check against
+        // imaginary reserves which represent the total trading capacity
+        let (imag_reserve_out, real_reserve_out) = if swap0to1 {
+            (
+                self.token1_imag_reserves_1e12,
+                self.token1_real_reserves_1e12,
+            )
+        } else {
+            (
+                self.token0_imag_reserves_1e12,
+                self.token0_real_reserves_1e12,
+            )
+        };
+
+        // Use imaginary reserves as the upper bound for available liquidity
+        // This is more accurate than summing col/debt real reserves
+        let total_available = imag_reserve_out.max(real_reserve_out);
+
+        if amount_out_1e12 >= total_available {
+            return Err(AMMError::Msg("Insufficient liquidity for exact out".to_string()));
+        }
+
+        // 5. Set search bounds
+        let (reserve_in_col, reserve_in_debt) = if swap0to1 {
+            (self.col_token0_real_1e12, self.debt_token0_real_1e12)
+        } else {
+            (self.col_token1_real_1e12, self.debt_token1_real_1e12)
+        };
+        let total_reserve_in = reserve_in_col.saturating_add(reserve_in_debt);
+        let max_high = total_reserve_in.saturating_mul(U256::from(1000u64));
+
+        // 6. Exponential search for upper bound
+        let mut low = U256::ZERO;
+        let mut high = U256::from(1u8);
+
+        loop {
+            let high_original = unscale_from_1e12(high, in_decimals);
+            let dy_1e12 = match self.simulate_swap_internal(base_token, quote_token, high_original) {
+                Ok(calc) => calc.amount_out_1e12,
+                Err(_) => U256::ZERO,
+            };
+
+            if dy_1e12 >= amount_out_1e12 {
+                break;
+            }
+
+            if high >= max_high {
+                return Err(AMMError::Msg(
+                    "Exact out not reachable within max search bound".to_string(),
+                ));
+            }
+
+            high = high.saturating_mul(U256::from(2u8));
+            if high > max_high {
+                high = max_high;
+            }
+        }
+
+        // 7. Binary search for minimal input that yields output >= amount_out
+        while high > low.saturating_add(U256::from(1u8)) {
+            let mid = (low + high) / U256::from(2u8);
+            let mid_original = unscale_from_1e12(mid, in_decimals);
+
+            let dy_1e12 = match self.simulate_swap_internal(base_token, quote_token, mid_original) {
+                Ok(calc) => calc.amount_out_1e12,
+                Err(_) => U256::ZERO,
+            };
+
+            if dy_1e12 >= amount_out_1e12 {
+                high = mid;
+            } else {
+                low = mid;
+            }
+        }
+
+        // 8. Return result in original decimals
+        Ok(unscale_from_1e12(high, in_decimals))
+    }
 }
 
 impl AutomatedMarketMaker for FluidDexPool {
@@ -1761,6 +1877,15 @@ impl AutomatedMarketMaker for FluidDexPool {
 
         self.refresh_prices();
         Ok(calc.amount_out)
+    }
+
+    fn simulate_swap_exact_out(
+        &self,
+        base_token: Address,
+        quote_token: Address,
+        amount_out: U256,
+    ) -> Result<U256, AMMError> {
+        self.simulate_swap_exact_out_internal(base_token, quote_token, amount_out)
     }
 
     async fn init<N, P>(mut self, block_number: BlockId, provider: P) -> Result<Self, AMMError>

@@ -24,7 +24,7 @@ sol! {
 
 #[tokio::test]
 async fn test_curve_legacy_3pool_simulation() -> Result<()> {
-    let rpc_url = env::var("ETHEREUM_RPC_URL").unwrap_or("https://eth.merkle.io".to_string());
+    let rpc_url = env::var("ETHEREUM_PROVIDER").unwrap_or("https://ethereum-rpc.publicnode.com".to_string());
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
 
     // 3pool Address (DAI/USDC/USDT)
@@ -83,7 +83,7 @@ async fn test_curve_legacy_3pool_simulation() -> Result<()> {
 
 #[tokio::test]
 async fn test_curve_legacy_tricrypto2_simulation() -> Result<()> {
-    let rpc_url = env::var("ETHEREUM_RPC_URL").unwrap_or("https://rpc.flashbots.net".to_string());
+    let rpc_url = env::var("ETHEREUM_PROVIDER").unwrap_or("https://eth.merkle.io".to_string());
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
 
     // Tricrypto2 Address (USDT/WBTC/WETH)
@@ -168,6 +168,157 @@ async fn test_curve_legacy_tricrypto2_simulation() -> Result<()> {
                     amount_out_chain
                 );
             }
+        }
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_curve_legacy_3pool_exact_out() -> Result<()> {
+    let rpc_url = env::var("ETHEREUM_PROVIDER").unwrap_or("https://eth.merkle.io".to_string());
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+
+    // 3pool Address (DAI/USDC/USDT)
+    let pool_addr = address!("bEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7");
+
+    let pool = CurveLegacyPool::new(pool_addr, CurveLegacyPoolType::StableSwap);
+    let pool = pool
+        .init(alloy::eips::BlockId::latest(), provider.clone())
+        .await?;
+
+    println!("3pool Exact-Out Test");
+    println!("Coins: {:?}", pool.coins);
+
+    // Test Cases: DAI -> USDC (exact-out)
+    let dai_idx = 0;
+    let usdc_idx = 1;
+
+    let target_outs = vec![
+        U256::from(100) * U256::from(10).pow(U256::from(6)),   // 100 USDC
+        U256::from(1000) * U256::from(10).pow(U256::from(6)),  // 1000 USDC
+        U256::from(10000) * U256::from(10).pow(U256::from(6)), // 10k USDC
+    ];
+
+    for target_out in target_outs {
+        let amount_in = pool.simulate_swap_exact_out(
+            pool.coins[dai_idx],
+            pool.coins[usdc_idx],
+            target_out,
+        )?;
+
+        // Verify: use calculated amount_in to do exact-in, should get >= target_out
+        let actual_out =
+            pool.simulate_swap(pool.coins[dai_idx], pool.coins[usdc_idx], amount_in)?;
+
+        println!(
+            "DAI->USDC Target: {}, Amount In: {}, Actual Out: {}",
+            target_out, amount_in, actual_out
+        );
+
+        assert!(
+            actual_out >= target_out,
+            "Exact-out verification failed: actual_out {} < target_out {}",
+            actual_out,
+            target_out
+        );
+
+        // Check error: should be minimal (ideally <= 1 unit)
+        let diff = actual_out - target_out;
+        let diff_pct = if target_out > U256::ZERO {
+            (diff * U256::from(10000) / target_out).to::<u64>() as f64 / 100.0
+        } else {
+            0.0
+        };
+        println!("Diff: {} ({:.4}%)", diff, diff_pct);
+
+        // Allow up to 0.1% slippage (conservative for binary search)
+        assert!(diff_pct < 0.1, "Exact-out diff {}% too high", diff_pct);
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_curve_legacy_tricrypto2_exact_out() -> Result<()> {
+    dotenv::dotenv().ok();
+    let rpc_url = env::var("ETHEREUM_PROVIDER").unwrap_or("https://rpc.flashbots.net".to_string());
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+
+    // Tricrypto2 Address (USDT/WBTC/WETH)
+    let pool_addr = address!("D51a44d3FaE010294C616388b506AcdA1bfAAE46");
+
+    let pool = CurveLegacyPool::new(pool_addr, CurveLegacyPoolType::CryptoSwap);
+    let pool = pool
+        .init(alloy::eips::BlockId::latest(), provider.clone())
+        .await?;
+
+    println!("Tricrypto2 Exact-Out Test");
+
+    // Test cases for exact-out
+    let test_cases = vec![
+        // USDT (0) -> WBTC (1): target WBTC output
+        (
+            0,
+            1,
+            vec![
+                U256::from(100000),    // 100000 satoshi ~ 0.001 BTC
+                U256::from(1000000),   // 0.01 BTC
+                U256::from(10000000),  // 0.1 BTC
+            ],
+        ),
+        // WBTC (1) -> USDT (0): target USDT output
+        (
+            1,
+            0,
+            vec![
+                U256::from(1000) * U256::from(10).pow(U256::from(6)),  // 1000 USDT
+                U256::from(10000) * U256::from(10).pow(U256::from(6)), // 10k USDT
+            ],
+        ),
+        // WETH (2) -> USDT (0): target USDT output
+        (
+            2,
+            0,
+            vec![
+                U256::from(1000) * U256::from(10).pow(U256::from(6)),  // 1000 USDT
+            ],
+        ),
+    ];
+
+    for (i, j, targets) in test_cases {
+        for target_out in targets {
+            let amount_in =
+                pool.simulate_swap_exact_out(pool.coins[i], pool.coins[j], target_out)?;
+
+            // Verify: use calculated amount_in to do exact-in
+            let actual_out = pool.simulate_swap(pool.coins[i], pool.coins[j], amount_in)?;
+
+            println!(
+                "{}->{} Target: {}, Amount In: {}, Actual Out: {}",
+                i, j, target_out, amount_in, actual_out
+            );
+
+            assert!(
+                actual_out >= target_out,
+                "Exact-out verification failed for {}->{}: actual_out {} < target_out {}",
+                i,
+                j,
+                actual_out,
+                target_out
+            );
+
+            // Check error
+            let diff = actual_out - target_out;
+            let diff_pct = if target_out > U256::ZERO {
+                (diff * U256::from(10000) / target_out).to::<u64>() as f64 / 100.0
+            } else {
+                0.0
+            };
+            println!("Diff: {} ({:.4}%)", diff, diff_pct);
+
+            // Allow up to 0.1% slippage for CryptoSwap (more complex)
+            assert!(diff_pct < 0.1, "Exact-out diff {}% too high", diff_pct);
         }
     }
 

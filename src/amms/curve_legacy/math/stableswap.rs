@@ -85,14 +85,13 @@ fn get_d(xp: &[U256], amp: U256, uses_a_precision: bool) -> Result<U256, AMMErro
             d = numer / denom;
         }
 
+        // 与原始 Vyper 合约一致的收敛逻辑：
+        // - 如果 D 增加，回退到 D_prev 并继续迭代
+        // - 如果 D 减少且差值 <= 1，返回
         if d > d_prev {
-            if d - d_prev <= U256::from(1) {
-                return Ok(d);
-            }
-        } else {
-            if d_prev - d <= U256::from(1) {
-                return Ok(d);
-            }
+            d = d_prev;
+        } else if d_prev - d <= U256::from(1) {
+            return Ok(d);
         }
     }
     Err(AMMError::Msg(
@@ -183,14 +182,13 @@ fn get_y(
 
         y = numer / denom;
 
+        // 与原始 Vyper 合约一致的收敛逻辑：
+        // - 如果 y 增加，回退到 y_prev 并继续迭代
+        // - 如果 y 减少且差值 <= 1，返回
         if y > y_prev {
-            if y - y_prev <= U256::from(1) {
-                return Ok(y);
-            }
-        } else {
-            if y_prev - y <= U256::from(1) {
-                return Ok(y);
-            }
+            y = y_prev;
+        } else if y_prev - y <= U256::from(1) {
+            return Ok(y);
         }
     }
 

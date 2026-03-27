@@ -139,6 +139,7 @@ sol! {
             bytes hookData;
         }
         function quoteExactInputSingle(QuoteExactSingleParams memory params) external returns (uint256 amountOut, uint256 gasEstimate);
+        function quoteExactOutputSingle(QuoteExactSingleParams memory params) external returns (uint256 amountIn, uint256 gasEstimate);
     }
 }
 
@@ -447,6 +448,171 @@ impl AutomatedMarketMaker for UniswapV4Pool {
         }
 
         Ok((-current_state.amount_calculated).into_raw())
+    }
+
+    fn simulate_swap_exact_out(
+        &self,
+        base_token: Address,
+        _quote_token: Address,
+        amount_out: U256,
+    ) -> Result<U256, AMMError> {
+        if amount_out.is_zero() {
+            return Ok(U256::ZERO);
+        }
+
+        // Defensive check: prevent divide-by-zero panic in uniswap_v3_math
+        if self.sqrt_price.is_zero() {
+            return Err(AMMError::Msg("sqrt_price is zero".into()));
+        }
+
+        let zero_for_one = base_token == self.token_a.address;
+
+        // Set sqrt_price_limit_x_96 to the max or min sqrt price in the pool depending on zero_for_one
+        let sqrt_price_limit_x_96 = if zero_for_one {
+            MIN_SQRT_RATIO + U256_1
+        } else {
+            MAX_SQRT_RATIO - U256_1
+        };
+
+        // Initialize a mutable state struct to hold the dynamic simulated state of the pool
+        let mut current_state = CurrentState {
+            sqrt_price_x_96: self.sqrt_price, // Active price on the pool
+            amount_calculated: I256::ZERO,    // Amount of token_in that has been calculated
+            amount_specified_remaining: I256::ZERO - I256::from_raw(amount_out), // Negative for exact-out
+            tick: self.tick,                  // Current i24 tick of the pool
+            liquidity: self.liquidity,        // Current available liquidity in the tick range
+        };
+
+        while current_state.amount_specified_remaining != I256::ZERO
+            && current_state.sqrt_price_x_96 != sqrt_price_limit_x_96
+        {
+            // Initialize a new step struct to hold the dynamic state of the pool at each step
+            let mut step = StepComputations {
+                // Set the sqrt_price_start_x_96 to the current sqrt_price_x_96
+                sqrt_price_start_x_96: current_state.sqrt_price_x_96,
+                ..Default::default()
+            };
+
+            // Get the next tick from the current tick
+            (step.tick_next, step.initialized) =
+                uniswap_v3_math::tick_bitmap::next_initialized_tick_within_one_word(
+                    &self.tick_bitmap,
+                    current_state.tick,
+                    self.tick_spacing,
+                    zero_for_one,
+                )
+                .map_err(UniswapV4Error::from)?;
+
+            // ensure that we do not overshoot the min/max tick, as the tick bitmap is not aware of these bounds
+            step.tick_next = step.tick_next.clamp(MIN_TICK, MAX_TICK);
+
+            // Get the next sqrt price from the input amount
+            step.sqrt_price_next_x96 =
+                uniswap_v3_math::tick_math::get_sqrt_ratio_at_tick(step.tick_next)
+                    .map_err(UniswapV4Error::from)?;
+
+            // Target spot price
+            let swap_target_sqrt_ratio = if zero_for_one {
+                if step.sqrt_price_next_x96 < sqrt_price_limit_x_96 {
+                    sqrt_price_limit_x_96
+                } else {
+                    step.sqrt_price_next_x96
+                }
+            } else if step.sqrt_price_next_x96 > sqrt_price_limit_x_96 {
+                sqrt_price_limit_x_96
+            } else {
+                step.sqrt_price_next_x96
+            };
+
+            // Compute swap step and update the current state
+            let (sqrt_price_x_96, amount_in, amount_out, fee_amount);
+            if current_state.liquidity == 0 {
+                // If liquidity is zero, we move instantly to the target price without consuming any amount
+                sqrt_price_x_96 = swap_target_sqrt_ratio;
+                amount_in = U256::ZERO;
+                amount_out = U256::ZERO;
+                fee_amount = U256::ZERO;
+            } else {
+                // V4 dynamic fee calculation
+                let fee_pips: u32 = ((self.protocol_fee as u64)
+                    + ((self.lp_fee as u64) * (1_000_000u64 - self.protocol_fee as u64))
+                        .div_ceil(1_000_000u64))
+                .min(1_000_000u64) as u32;
+
+                (sqrt_price_x_96, amount_in, amount_out, fee_amount) = compute_swap_step(
+                    current_state.sqrt_price_x_96,
+                    swap_target_sqrt_ratio,
+                    current_state.liquidity,
+                    current_state.amount_specified_remaining,
+                    fee_pips,
+                )
+                .map_err(UniswapV4Error::from)?;
+            }
+
+            current_state.sqrt_price_x_96 = sqrt_price_x_96;
+            step.amount_in = amount_in;
+            step.amount_out = amount_out;
+            step.fee_amount = fee_amount;
+
+            // Exact output: decrement remaining output (add since it's negative), increment calculated input
+            current_state.amount_specified_remaining = current_state
+                .amount_specified_remaining
+                .overflowing_add(I256::from_raw(step.amount_out))
+                .0;
+
+            current_state.amount_calculated +=
+                I256::from_raw(step.amount_in.overflowing_add(step.fee_amount).0);
+
+            // If the price moved all the way to the next price, recompute the liquidity change for the next iteration
+            if current_state.sqrt_price_x_96 == step.sqrt_price_next_x96 {
+                if step.initialized {
+                    let mut liquidity_net = if let Some(info) = self.ticks.get(&step.tick_next) {
+                        info.liquidity_net
+                    } else {
+                        return Err(AMMError::UniswapV4Error(UniswapV4Error::TickDataMissing(
+                            step.tick_next,
+                        )));
+                    };
+
+                    // we are on a tick boundary, and the next tick is initialized
+                    if zero_for_one {
+                        liquidity_net = -liquidity_net;
+                    }
+
+                    current_state.liquidity = if liquidity_net < 0 {
+                        if current_state.liquidity < (-liquidity_net as u128) {
+                            return Err(UniswapV3Error::LiquidityUnderflow.into());
+                        } else {
+                            current_state.liquidity - (-liquidity_net as u128)
+                        }
+                    } else {
+                        current_state.liquidity + (liquidity_net as u128)
+                    };
+                }
+                // Increment the current tick
+                current_state.tick = if zero_for_one {
+                    step.tick_next.wrapping_sub(1)
+                } else {
+                    step.tick_next
+                }
+                // If the current_state sqrt price is not equal to the step sqrt price, then we are not on the same tick.
+                // Update the current_state.tick to the tick at the current_state.sqrt_price_x_96
+            } else if current_state.sqrt_price_x_96 != step.sqrt_price_start_x_96 {
+                current_state.tick = uniswap_v3_math::tick_math::get_tick_at_sqrt_ratio(
+                    current_state.sqrt_price_x_96,
+                )
+                .map_err(UniswapV4Error::from)?;
+            }
+        }
+
+        if current_state.amount_specified_remaining != I256::ZERO {
+            return Err(AMMError::Msg(
+                "insufficient liquidity for exact out".to_string(),
+            ));
+        }
+
+        let amount_in = current_state.amount_calculated.into_raw();
+        Ok(amount_in)
     }
 
     fn tokens(&self) -> Vec<Address> {
@@ -1521,6 +1687,757 @@ mod test {
 
         assert!(price_a > 2000.0 && price_a < 4000.0);
         assert!(price_b > 0.0002 && price_b < 0.0005);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_simulate_swap_exact_out_usdc_weth_v4_005() -> eyre::Result<()> {
+        dotenv().ok();
+        let rpc_endpoint = std::env::var("ETHEREUM_PROVIDER")?;
+
+        let client = ClientBuilder::default()
+            .layer(ThrottleLayer::new(250))
+            .layer(RetryBackoffLayer::new(5, 200, 330))
+            .http(rpc_endpoint.parse()?);
+
+        let provider = ProviderBuilder::new().connect_client(client);
+
+        let manager = address!("000000000004444c5dc75cB358380D2e3dE08A90");
+        let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+
+        let key = IPoolManager::PoolKey {
+            currency0: Address::ZERO,
+            currency1: usdc,
+            fee: U24::from(500u64),
+            tickSpacing: I24::from_str("10").unwrap(),
+            hooks: Address::ZERO,
+        };
+
+        let block_id = BlockId::number(23_994_800u64);
+
+        let pool = UniswapV4Pool::new(manager, key)
+            .init(block_id, provider.clone())
+            .await?;
+
+        // Exact out: USDC -> ETH (want ETH out)
+        // Since token_a is ETH (Address::ZERO) and token_b is USDC,
+        // to get ETH out we need to swap USDC in: base_token = USDC (token_b)
+        let exact_outs_eth = [
+            U256::from(10_000_000_000_000_u128),   // 0.00001 ETH
+            U256::from(100_000_000_000_000_u128),  // 0.0001 ETH
+            U256::from(1_000_000_000_000_000u128), // 0.001 ETH
+        ];
+
+        for amount_out in exact_outs_eth {
+            let amount_in = pool.simulate_swap_exact_out(
+                pool.token_b.address, // base_token = USDC (input)
+                Address::ZERO,
+                amount_out,
+            )?;
+
+            // Verify: simulate_swap with USDC amount_in should produce >= ETH amount_out
+            let actual_out = pool.simulate_swap(pool.token_b.address, Address::ZERO, amount_in)?;
+            println!(
+                "exact_out: want {} ETH, computed amount_in {} USDC, actual_out {} ETH",
+                amount_out, amount_in, actual_out
+            );
+            assert!(actual_out >= amount_out, "actual_out {} < amount_out {}", actual_out, amount_out);
+        }
+
+        // Exact out: ETH -> USDC (want USDC out)
+        // To get USDC out, swap ETH in: base_token = ETH (token_a)
+        let exact_outs_usdc = [
+            U256::from(1_000_000u64),      // 1 USDC
+            U256::from(100_000_000u64),    // 100 USDC
+            U256::from(1_000_000_000_000u64), // 1,000,000 USDC
+        ];
+
+        for amount_out in exact_outs_usdc {
+            let amount_in = pool.simulate_swap_exact_out(
+                pool.token_a.address, // base_token = ETH (input)
+                Address::ZERO,
+                amount_out,
+            )?;
+
+            // Verify: simulate_swap with ETH amount_in should produce >= USDC amount_out
+            let actual_out = pool.simulate_swap(pool.token_a.address, Address::ZERO, amount_in)?;
+            println!(
+                "exact_out: want {} USDC, computed amount_in {} ETH, actual_out {} USDC",
+                amount_out, amount_in, actual_out
+            );
+            assert!(actual_out >= amount_out, "actual_out {} < amount_out {}", actual_out, amount_out);
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_simulate_swap_exact_out_weth_usdc_v4_003() -> eyre::Result<()> {
+        dotenv().ok();
+        let rpc_endpoint = std::env::var("ETHEREUM_PROVIDER")?;
+
+        let client = ClientBuilder::default()
+            .layer(ThrottleLayer::new(250))
+            .layer(RetryBackoffLayer::new(5, 200, 330))
+            .http(rpc_endpoint.parse()?);
+
+        let provider = ProviderBuilder::new().connect_client(client);
+
+        let manager = address!("000000000004444c5dc75cB358380D2e3dE08A90");
+        let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+
+        let block_id = BlockId::number(23_994_800u64);
+
+        let candidates = vec![
+            IPoolManager::PoolKey {
+                currency0: Address::ZERO,
+                currency1: usdc,
+                fee: U24::from(3000u64),
+                tickSpacing: I24::from_str("60").unwrap(),
+                hooks: Address::ZERO,
+            },
+            IPoolManager::PoolKey {
+                currency0: Address::ZERO,
+                currency1: usdc,
+                fee: U24::from(3000u64),
+                tickSpacing: I24::from_str("10").unwrap(),
+                hooks: Address::ZERO,
+            },
+        ];
+
+        let ipm = IPoolManagerInstance::new(manager, provider.clone());
+
+        let mut key = None;
+        for cand in candidates.into_iter() {
+            let pool_id = keccak256(cand.abi_encode());
+            let slot0 = ipm
+                .extsload_2(vec![B256::from(
+                    crate::amms::uniswap_v4::lense::get_pool_state_slot(pool_id),
+                )])
+                .block(block_id)
+                .call()
+                .await?;
+            let sqrt_price_x96 = U160::from_be_slice(&slot0[0][12..32]);
+            if !sqrt_price_x96.is_zero() {
+                key = Some(cand);
+                break;
+            }
+        }
+        let key = key.expect("No matching pool key for USDC/ETH 0.3% at block");
+
+        let pool = UniswapV4Pool::new(manager, key)
+            .init(block_id, provider.clone())
+            .await?;
+
+        // Exact out: ETH -> USDC (want USDC out)
+        // base_token = ETH (token_a) for ETH input
+        let exact_outs_usdc = [
+            U256::from(1_000_000u64),      // 1 USDC
+            U256::from(100_000_000u64),    // 100 USDC
+            U256::from(1_000_000_000_000u64), // 1,000,000 USDC
+        ];
+
+        for amount_out in exact_outs_usdc {
+            let amount_in = pool.simulate_swap_exact_out(
+                pool.token_a.address, // base_token = ETH (input)
+                Address::ZERO,
+                amount_out,
+            )?;
+
+            let actual_out = pool.simulate_swap(pool.token_a.address, Address::ZERO, amount_in)?;
+            println!(
+                "exact_out: want {} USDC, computed amount_in {} ETH, actual_out {} USDC",
+                amount_out, amount_in, actual_out
+            );
+            assert!(actual_out >= amount_out, "actual_out {} < amount_out {}", actual_out, amount_out);
+        }
+
+        // Exact out: USDC -> ETH (want ETH out)
+        // base_token = USDC (token_b) for USDC input
+        let exact_outs_eth = [
+            U256::from(100_000_000_000_000_u128),   // 0.0001 ETH
+            U256::from(1_000_000_000_000_000_u128), // 0.001 ETH
+            U256::from(10_000_000_000_000_000u128), // 0.01 ETH
+        ];
+
+        for amount_out in exact_outs_eth {
+            let amount_in = pool.simulate_swap_exact_out(
+                pool.token_b.address, // base_token = USDC (input)
+                Address::ZERO,
+                amount_out,
+            )?;
+
+            let actual_out = pool.simulate_swap(pool.token_b.address, Address::ZERO, amount_in)?;
+            println!(
+                "exact_out: want {} ETH, computed amount_in {} USDC, actual_out {} ETH",
+                amount_out, amount_in, actual_out
+            );
+            assert!(actual_out >= amount_out, "actual_out {} < amount_out {}", actual_out, amount_out);
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_simulate_swap_exact_out_zero_amount() -> eyre::Result<()> {
+        dotenv().ok();
+        let rpc_endpoint = std::env::var("ETHEREUM_PROVIDER")?;
+
+        let client = ClientBuilder::default()
+            .layer(ThrottleLayer::new(250))
+            .layer(RetryBackoffLayer::new(5, 200, 330))
+            .http(rpc_endpoint.parse()?);
+
+        let provider = ProviderBuilder::new().connect_client(client);
+
+        let manager = address!("000000000004444c5dc75cB358380D2e3dE08A90");
+        let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+
+        let key = IPoolManager::PoolKey {
+            currency0: Address::ZERO,
+            currency1: usdc,
+            fee: U24::from(500u64),
+            tickSpacing: I24::from_str("10").unwrap(),
+            hooks: Address::ZERO,
+        };
+
+        let block_id = BlockId::number(23_994_800u64);
+
+        let pool = UniswapV4Pool::new(manager, key)
+            .init(block_id, provider.clone())
+            .await?;
+
+        // Zero amount should return zero
+        let amount_in = pool.simulate_swap_exact_out(pool.token_a.address, Address::ZERO, U256::ZERO)?;
+        assert!(amount_in.is_zero());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_simulate_swap_exact_out_insufficient_liquidity() -> eyre::Result<()> {
+        dotenv().ok();
+        let rpc_endpoint = std::env::var("ETHEREUM_PROVIDER")?;
+
+        let client = ClientBuilder::default()
+            .layer(ThrottleLayer::new(250))
+            .layer(RetryBackoffLayer::new(5, 200, 330))
+            .http(rpc_endpoint.parse()?);
+
+        let provider = ProviderBuilder::new().connect_client(client);
+
+        let manager = address!("000000000004444c5dc75cB358380D2e3dE08A90");
+        let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+
+        let key = IPoolManager::PoolKey {
+            currency0: Address::ZERO,
+            currency1: usdc,
+            fee: U24::from(500u64),
+            tickSpacing: I24::from_str("10").unwrap(),
+            hooks: Address::ZERO,
+        };
+
+        let block_id = BlockId::number(23_994_800u64);
+
+        let pool = UniswapV4Pool::new(manager, key)
+            .init(block_id, provider.clone())
+            .await?;
+
+        // Request an absurdly large exact-out amount to force exhaustion
+        let huge_out = U256::from(10u8).pow(U256::from(36u8));
+        let res = pool.simulate_swap_exact_out(pool.token_a.address, Address::ZERO, huge_out);
+        assert!(res.is_err(), "Should fail with insufficient liquidity error");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_simulate_swap_exact_out_round_trip() -> eyre::Result<()> {
+        // Round-trip test: exact_in -> exact_out should be approximately the same
+        dotenv().ok();
+        let rpc_endpoint = std::env::var("ETHEREUM_PROVIDER")?;
+
+        let client = ClientBuilder::default()
+            .layer(ThrottleLayer::new(250))
+            .layer(RetryBackoffLayer::new(5, 200, 330))
+            .http(rpc_endpoint.parse()?);
+
+        let provider = ProviderBuilder::new().connect_client(client);
+
+        let manager = address!("000000000004444c5dc75cB358380D2e3dE08A90");
+        let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+
+        let key = IPoolManager::PoolKey {
+            currency0: Address::ZERO,
+            currency1: usdc,
+            fee: U24::from(500u64),
+            tickSpacing: I24::from_str("10").unwrap(),
+            hooks: Address::ZERO,
+        };
+
+        let block_id = BlockId::number(23_994_800u64);
+
+        let pool = UniswapV4Pool::new(manager, key)
+            .init(block_id, provider.clone())
+            .await?;
+
+        // Round trip: ETH -> USDC -> ETH
+        let original_amount_in = U256::from(1_000_000_000_000_000_000u128); // 1 ETH
+
+        // Step 1: exact_in to get amount_out
+        let amount_out = pool.simulate_swap(pool.token_a.address, Address::ZERO, original_amount_in)?;
+
+        // Step 2: exact_out to get back amount_in
+        let round_trip_amount_in = pool.simulate_swap_exact_out(
+            pool.token_a.address, // base_token = ETH
+            Address::ZERO,
+            amount_out,
+        )?;
+
+        println!(
+            "Round trip: {} ETH -> {} USDC -> {} ETH",
+            original_amount_in, amount_out, round_trip_amount_in
+        );
+
+        // The round trip amount should be very close to original (within 0.01% tolerance due to fees)
+        let diff = if round_trip_amount_in > original_amount_in {
+            round_trip_amount_in - original_amount_in
+        } else {
+            original_amount_in - round_trip_amount_in
+        };
+        let tolerance = original_amount_in / U256::from(10000u64); // 0.01%
+        assert!(
+            diff <= tolerance,
+            "Round trip difference {} exceeds tolerance {}",
+            diff,
+            tolerance
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_simulate_swap_exact_out_chain_compare_usdc_weth_v4_005() -> eyre::Result<()> {
+        // Compare simulate_swap_exact_out with chain quoteExactOutputSingle
+        dotenv().ok();
+        let rpc_endpoint = std::env::var("ETHEREUM_PROVIDER")?;
+
+        let client = ClientBuilder::default()
+            .layer(ThrottleLayer::new(250))
+            .layer(RetryBackoffLayer::new(5, 200, 330))
+            .http(rpc_endpoint.parse()?);
+
+        let provider = ProviderBuilder::new().connect_client(client);
+
+        let manager = address!("000000000004444c5dc75cB358380D2e3dE08A90");
+        let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+
+        let key = IPoolManager::PoolKey {
+            currency0: Address::ZERO,
+            currency1: usdc,
+            fee: U24::from(500u64),
+            tickSpacing: I24::from_str("10").unwrap(),
+            hooks: Address::ZERO,
+        };
+
+        let block_id = BlockId::number(23_994_800u64);
+
+        let pool = UniswapV4Pool::new(manager, key.clone())
+            .init(block_id, provider.clone())
+            .await?;
+
+        let quoter_addr = address!("52f0e24d1c21c8a0cb1e5a5dd6198556bd9e1203");
+        let quoter = IV4Quoter::new(quoter_addr, provider.clone());
+        let qkey = IV4Quoter::PoolKey {
+            currency0: key.currency0,
+            currency1: key.currency1,
+            fee: key.fee,
+            tickSpacing: key.tickSpacing,
+            hooks: key.hooks,
+        };
+
+        // Exact out: USDC -> ETH (want ETH out)
+        // base_token = USDC (token_b), zeroForOne = false
+        let exact_outs_eth = [
+            U256::from(10_000_000_000_000_u128),   // 0.00001 ETH
+            U256::from(100_000_000_000_000_u128),  // 0.0001 ETH
+            U256::from(1_000_000_000_000_000u128), // 0.001 ETH
+        ];
+
+        for amount_out in exact_outs_eth {
+            let amount_in_local = pool.simulate_swap_exact_out(
+                pool.token_b.address, // base_token = USDC (input)
+                Address::ZERO,
+                amount_out,
+            )?;
+
+            // Chain quote via V4 Quoter quoteExactOutputSingle
+            let exact_amount: u128 = amount_out.try_into().unwrap();
+            let qparams = IV4Quoter::QuoteExactSingleParams {
+                poolKey: qkey.clone(),
+                zeroForOne: false, // USDC -> ETH
+                exactAmount: exact_amount,
+                hookData: Bytes::new(),
+            };
+
+            match quoter
+                .quoteExactOutputSingle(qparams)
+                .block(block_id)
+                .call()
+                .await
+            {
+                Ok(ret) => {
+                    let amount_in_chain = ret.amountIn;
+                    println!(
+                        "exact_out: want {} ETH, local amount_in {} USDC, chain amount_in {} USDC",
+                        amount_out, amount_in_local, amount_in_chain
+                    );
+                    assert_eq!(
+                        amount_in_local, amount_in_chain,
+                        "Local ({}) != Chain ({}) for amount_out {}",
+                        amount_in_local, amount_in_chain, amount_out
+                    );
+                }
+                Err(e) => {
+                    eprintln!("skip chain compare: {e}");
+                }
+            }
+        }
+
+        // Exact out: ETH -> USDC (want USDC out)
+        // base_token = ETH (token_a), zeroForOne = true
+        let exact_outs_usdc = [
+            U256::from(1_000_000u64),      // 1 USDC
+            U256::from(100_000_000u64),    // 100 USDC
+            U256::from(1_000_000_000_000u64), // 1,000,000 USDC
+        ];
+
+        for amount_out in exact_outs_usdc {
+            let amount_in_local = pool.simulate_swap_exact_out(
+                pool.token_a.address, // base_token = ETH (input)
+                Address::ZERO,
+                amount_out,
+            )?;
+
+            // Chain quote via V4 Quoter quoteExactOutputSingle
+            let exact_amount: u128 = amount_out.try_into().unwrap();
+            let qparams = IV4Quoter::QuoteExactSingleParams {
+                poolKey: qkey.clone(),
+                zeroForOne: true, // ETH -> USDC
+                exactAmount: exact_amount,
+                hookData: Bytes::new(),
+            };
+
+            match quoter
+                .quoteExactOutputSingle(qparams)
+                .block(block_id)
+                .call()
+                .await
+            {
+                Ok(ret) => {
+                    let amount_in_chain = ret.amountIn;
+                    println!(
+                        "exact_out: want {} USDC, local amount_in {} ETH, chain amount_in {} ETH",
+                        amount_out, amount_in_local, amount_in_chain
+                    );
+                    assert_eq!(
+                        amount_in_local, amount_in_chain,
+                        "Local ({}) != Chain ({}) for amount_out {}",
+                        amount_in_local, amount_in_chain, amount_out
+                    );
+                }
+                Err(e) => {
+                    eprintln!("skip chain compare: {e}");
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_simulate_swap_exact_out_chain_compare_weth_usdc_v4_003() -> eyre::Result<()> {
+        // Compare simulate_swap_exact_out with chain quoteExactOutputSingle for 0.3% pool
+        dotenv().ok();
+        let rpc_endpoint = std::env::var("ETHEREUM_PROVIDER")?;
+
+        let client = ClientBuilder::default()
+            .layer(ThrottleLayer::new(250))
+            .layer(RetryBackoffLayer::new(5, 200, 330))
+            .http(rpc_endpoint.parse()?);
+
+        let provider = ProviderBuilder::new().connect_client(client);
+
+        let manager = address!("000000000004444c5dc75cB358380D2e3dE08A90");
+        let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+
+        let block_id = BlockId::number(23_994_800u64);
+
+        let candidates = vec![
+            IPoolManager::PoolKey {
+                currency0: Address::ZERO,
+                currency1: usdc,
+                fee: U24::from(3000u64),
+                tickSpacing: I24::from_str("60").unwrap(),
+                hooks: Address::ZERO,
+            },
+            IPoolManager::PoolKey {
+                currency0: Address::ZERO,
+                currency1: usdc,
+                fee: U24::from(3000u64),
+                tickSpacing: I24::from_str("10").unwrap(),
+                hooks: Address::ZERO,
+            },
+        ];
+
+        let ipm = IPoolManagerInstance::new(manager, provider.clone());
+
+        let mut key = None;
+        for cand in candidates.into_iter() {
+            let pool_id = keccak256(cand.abi_encode());
+            let slot0 = ipm
+                .extsload_2(vec![B256::from(
+                    crate::amms::uniswap_v4::lense::get_pool_state_slot(pool_id),
+                )])
+                .block(block_id)
+                .call()
+                .await?;
+            let sqrt_price_x96 = U160::from_be_slice(&slot0[0][12..32]);
+            if !sqrt_price_x96.is_zero() {
+                key = Some(cand);
+                break;
+            }
+        }
+        let key = key.expect("No matching pool key for USDC/ETH 0.3% at block");
+
+        let pool = UniswapV4Pool::new(manager, key.clone())
+            .init(block_id, provider.clone())
+            .await?;
+
+        let quoter_addr = address!("52f0e24d1c21c8a0cb1e5a5dd6198556bd9e1203");
+        let quoter = IV4Quoter::new(quoter_addr, provider.clone());
+        let qkey = IV4Quoter::PoolKey {
+            currency0: key.currency0,
+            currency1: key.currency1,
+            fee: key.fee,
+            tickSpacing: key.tickSpacing,
+            hooks: key.hooks,
+        };
+
+        // Exact out: ETH -> USDC (want USDC out)
+        // base_token = ETH (token_a), zeroForOne = true
+        let exact_outs_usdc = [
+            U256::from(1_000_000u64),      // 1 USDC
+            U256::from(100_000_000u64),    // 100 USDC
+            U256::from(1_000_000_000_000u64), // 1,000,000 USDC
+        ];
+
+        for amount_out in exact_outs_usdc {
+            let amount_in_local = pool.simulate_swap_exact_out(
+                pool.token_a.address, // base_token = ETH (input)
+                Address::ZERO,
+                amount_out,
+            )?;
+
+            let exact_amount: u128 = amount_out.try_into().unwrap();
+            let qparams = IV4Quoter::QuoteExactSingleParams {
+                poolKey: qkey.clone(),
+                zeroForOne: true, // ETH -> USDC
+                exactAmount: exact_amount,
+                hookData: Bytes::new(),
+            };
+
+            match quoter
+                .quoteExactOutputSingle(qparams)
+                .block(block_id)
+                .call()
+                .await
+            {
+                Ok(ret) => {
+                    let amount_in_chain = ret.amountIn;
+                    println!(
+                        "exact_out: want {} USDC, local amount_in {} ETH, chain amount_in {} ETH",
+                        amount_out, amount_in_local, amount_in_chain
+                    );
+                    assert_eq!(
+                        amount_in_local, amount_in_chain,
+                        "Local ({}) != Chain ({}) for amount_out {}",
+                        amount_in_local, amount_in_chain, amount_out
+                    );
+                }
+                Err(e) => {
+                    eprintln!("skip chain compare: {e}");
+                }
+            }
+        }
+
+        // Exact out: USDC -> ETH (want ETH out)
+        // base_token = USDC (token_b), zeroForOne = false
+        let exact_outs_eth = [
+            U256::from(100_000_000_000_000_u128),   // 0.0001 ETH
+            U256::from(1_000_000_000_000_000_u128), // 0.001 ETH
+            U256::from(10_000_000_000_000_000u128), // 0.01 ETH
+        ];
+
+        for amount_out in exact_outs_eth {
+            let amount_in_local = pool.simulate_swap_exact_out(
+                pool.token_b.address, // base_token = USDC (input)
+                Address::ZERO,
+                amount_out,
+            )?;
+
+            let exact_amount: u128 = amount_out.try_into().unwrap();
+            let qparams = IV4Quoter::QuoteExactSingleParams {
+                poolKey: qkey.clone(),
+                zeroForOne: false, // USDC -> ETH
+                exactAmount: exact_amount,
+                hookData: Bytes::new(),
+            };
+
+            match quoter
+                .quoteExactOutputSingle(qparams)
+                .block(block_id)
+                .call()
+                .await
+            {
+                Ok(ret) => {
+                    let amount_in_chain = ret.amountIn;
+                    println!(
+                        "exact_out: want {} ETH, local amount_in {} USDC, chain amount_in {} USDC",
+                        amount_out, amount_in_local, amount_in_chain
+                    );
+                    assert_eq!(
+                        amount_in_local, amount_in_chain,
+                        "Local ({}) != Chain ({}) for amount_out {}",
+                        amount_in_local, amount_in_chain, amount_out
+                    );
+                }
+                Err(e) => {
+                    eprintln!("skip chain compare: {e}");
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_simulate_swap_exact_out_chain_compare_wbtc_usdt_v4_003() -> eyre::Result<()> {
+        // Compare simulate_swap_exact_out with chain quoteExactOutputSingle for WBTC/USDT 0.3% pool
+        dotenv().ok();
+        let rpc_endpoint = std::env::var("ETHEREUM_PROVIDER")?;
+
+        let client = ClientBuilder::default()
+            .layer(ThrottleLayer::new(250))
+            .layer(RetryBackoffLayer::new(5, 200, 330))
+            .http(rpc_endpoint.parse()?);
+
+        let provider = ProviderBuilder::new().connect_client(client);
+
+        let manager = address!("000000000004444c5dc75cB358380D2e3dE08A90");
+        let wbtc = address!("2260fac5e5542a773aa44fbcfedf7c193bc2c599");
+        let usdt = address!("dac17f958d2ee523a2206206994597c13d831ec7");
+
+        let block_id = BlockId::number(23_994_800u64);
+
+        let candidates = vec![
+            IPoolManager::PoolKey {
+                currency0: wbtc,
+                currency1: usdt,
+                fee: U24::from(3000u64),
+                tickSpacing: I24::from_str("60").unwrap(),
+                hooks: Address::ZERO,
+            },
+            IPoolManager::PoolKey {
+                currency0: wbtc,
+                currency1: usdt,
+                fee: U24::from(3000u64),
+                tickSpacing: I24::from_str("10").unwrap(),
+                hooks: Address::ZERO,
+            },
+        ];
+
+        let ipm = IPoolManagerInstance::new(manager, provider.clone());
+
+        let mut key = None;
+        for cand in candidates.into_iter() {
+            let pool_id = keccak256(cand.abi_encode());
+            let slot0 = ipm
+                .extsload_2(vec![B256::from(
+                    crate::amms::uniswap_v4::lense::get_pool_state_slot(pool_id),
+                )])
+                .block(block_id)
+                .call()
+                .await?;
+            let sqrt_price_x96 = U160::from_be_slice(&slot0[0][12..32]);
+            if !sqrt_price_x96.is_zero() {
+                key = Some(cand);
+                break;
+            }
+        }
+        let key = key.expect("No matching pool key for WBTC/USDT 0.3% at block");
+
+        let pool = UniswapV4Pool::new(manager, key.clone())
+            .init(block_id, provider.clone())
+            .await?;
+
+        let quoter_addr = address!("52f0e24d1c21c8a0cb1e5a5dd6198556bd9e1203");
+        let quoter = IV4Quoter::new(quoter_addr, provider.clone());
+        let qkey = IV4Quoter::PoolKey {
+            currency0: key.currency0,
+            currency1: key.currency1,
+            fee: key.fee,
+            tickSpacing: key.tickSpacing,
+            hooks: key.hooks,
+        };
+
+        // Exact out: WBTC -> USDT (want USDT out)
+        // base_token = WBTC (token_a), zeroForOne = true
+        let exact_outs_usdt = [
+            U256::from(1_000_000u64),      // 1 USDT
+            U256::from(100_000_000u64),    // 100 USDT
+            U256::from(10_000_000_000u64), // 10,000 USDT
+        ];
+
+        for amount_out in exact_outs_usdt {
+            let amount_in_local = pool.simulate_swap_exact_out(
+                pool.token_a.address, // base_token = WBTC (input)
+                Address::ZERO,
+                amount_out,
+            )?;
+
+            let exact_amount: u128 = amount_out.try_into().unwrap();
+            let qparams = IV4Quoter::QuoteExactSingleParams {
+                poolKey: qkey.clone(),
+                zeroForOne: true, // WBTC -> USDT
+                exactAmount: exact_amount,
+                hookData: Bytes::new(),
+            };
+
+            match quoter
+                .quoteExactOutputSingle(qparams)
+                .block(block_id)
+                .call()
+                .await
+            {
+                Ok(ret) => {
+                    let amount_in_chain = ret.amountIn;
+                    println!(
+                        "exact_out: want {} USDT, local amount_in {} WBTC, chain amount_in {} WBTC",
+                        amount_out, amount_in_local, amount_in_chain
+                    );
+                    assert_eq!(
+                        amount_in_local, amount_in_chain,
+                        "Local ({}) != Chain ({}) for amount_out {}",
+                        amount_in_local, amount_in_chain, amount_out
+                    );
+                }
+                Err(e) => {
+                    eprintln!("skip chain compare: {e}");
+                }
+            }
+        }
 
         Ok(())
     }

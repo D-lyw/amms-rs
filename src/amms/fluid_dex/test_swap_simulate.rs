@@ -493,7 +493,7 @@ async fn test_reproduce_0xc065_panic() -> Result<()> {
     
     println!("\n=== Reproduction: Debt Health Check (1000 ETH, 5000 osETH Debt) ===");
     let result = pool.simulate_swap(oseth, eth, amount_in);
-    
+
     match result {
         Ok(out) => {
             println!("SIMULATION BUG: Returned {} ETH (Should have failed/returned 0)", out);
@@ -503,5 +503,176 @@ async fn test_reproduce_0xc065_panic() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_fluid_dex_exact_out_zero_amount() -> Result<()> {
+    let mut pool = FluidDexPool::default();
+    pool.token_a = crate::amms::Token {
+        address: address!("0000000000000000000000000000000000000001"),
+        decimals: 18,
+        symbol: "T0".to_string(),
+        chain_id: 1,
+    };
+    pool.token_b = crate::amms::Token {
+        address: address!("0000000000000000000000000000000000000002"),
+        decimals: 18,
+        symbol: "T1".to_string(),
+        chain_id: 1,
+    };
+
+    // Zero amount_out should return 0
+    let result = pool.simulate_swap_exact_out(pool.token_a.address, pool.token_b.address, U256::ZERO)?;
+    assert_eq!(result, U256::ZERO, "Zero amount_out should return zero input");
+
+    println!("✅ Exact-out zero amount test PASSED");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_fluid_dex_exact_out_token_not_in_pool() -> Result<()> {
+    let pool = FluidDexPool::default();
+    let wrong_token = address!("0000000000000000000000000000000000000003");
+    let other_token = address!("0000000000000000000000000000000000000004");
+
+    let result = pool.simulate_swap_exact_out(wrong_token, other_token, U256::from(100u64));
+    assert!(result.is_err(), "Should error for token not in pool");
+
+    println!("✅ Exact-out token not in pool test PASSED");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_fluid_dex_exact_out_roundtrip() -> Result<()> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+
+    dotenv::dotenv().ok();
+    let rpc_endpoint = match std::env::var("ETHEREUM_PROVIDER") {
+        Ok(u) => u,
+        Err(_) => {
+            println!("Skipping test: ETHEREUM_PROVIDER not set");
+            return Ok(());
+        }
+    };
+
+    let provider = ProviderBuilder::new().connect_http(rpc_endpoint.parse()?);
+    let current_block = provider.get_block_number().await?;
+    let block_id = BlockId::from(current_block);
+
+    let pool = FluidDexPool::new(OSETH_ETH_POOL, FLUID_DEX_RESOLVER);
+    let pool = pool.init(block_id, provider.clone()).await?;
+
+    // First simulate a normal swap to get a reasonable amount_out
+    let amount_in = U256::from(10u64) * U256::from(10u64).pow(U256::from(18u64)); // 10 osETH
+    let amount_out = pool.simulate_swap(OSETH_TOKEN, ETH_ADDRESS, amount_in)?;
+
+    if amount_out.is_zero() {
+        println!("Skipping test: simulate_swap returned zero (liquidity constraints)");
+        return Ok(());
+    }
+
+    println!("\n=== Exact-Out Roundtrip Test ===");
+    println!("Original amount_in: 10 osETH");
+    println!("Simulated amount_out: {} wei ETH", amount_out);
+
+    // Now use exact-out to find the input needed for this output
+    let exact_in = pool.simulate_swap_exact_out(OSETH_TOKEN, ETH_ADDRESS, amount_out)?;
+    println!("Exact-out calculated amount_in: {} wei osETH", exact_in);
+
+    // Verify: simulate_swap(exact_in) should be >= amount_out
+    let verify_out = pool.simulate_swap(OSETH_TOKEN, ETH_ADDRESS, exact_in)?;
+    println!("Verification: simulate_swap(exact_in) = {} wei ETH", verify_out);
+
+    assert!(
+        verify_out >= amount_out,
+        "simulate_swap(exact_in) should be >= amount_out. Got {}, expected >= {}",
+        verify_out,
+        amount_out
+    );
+
+    // Also verify that exact_in - 1 would give less than amount_out (if exact_in > 0)
+    if exact_in > U256::ZERO {
+        let smaller_in = exact_in - U256::from(1u8);
+        let smaller_out = pool.simulate_swap(OSETH_TOKEN, ETH_ADDRESS, smaller_in)?;
+        println!("Verification: simulate_swap(exact_in - 1) = {} wei ETH", smaller_out);
+        assert!(
+            smaller_out < amount_out,
+            "simulate_swap(exact_in - 1) should be < amount_out. Got {}, expected < {}",
+            smaller_out,
+            amount_out
+        );
+    }
+
+    // Check that exact_in is close to original amount_in
+    let diff = if exact_in > amount_in {
+        exact_in - amount_in
+    } else {
+        amount_in - exact_in
+    };
+    let diff_pct = diff.as_limbs()[0] as f64 / amount_in.as_limbs()[0] as f64 * 100.0;
+    println!("Difference from original input: {} wei ({:.4}%)", diff, diff_pct);
+
+    // Allow some tolerance due to binary search precision
+    assert!(
+        diff_pct < 1.0,
+        "Exact-out input should be within 1% of original input. Diff: {:.4}%",
+        diff_pct
+    );
+
+    println!("✅ Exact-out roundtrip test PASSED");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_fluid_dex_exact_out_reverse_direction() -> Result<()> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+
+    dotenv::dotenv().ok();
+    let rpc_endpoint = match std::env::var("ETHEREUM_PROVIDER") {
+        Ok(u) => u,
+        Err(_) => {
+            println!("Skipping test: ETHEREUM_PROVIDER not set");
+            return Ok(());
+        }
+    };
+
+    let provider = ProviderBuilder::new().connect_http(rpc_endpoint.parse()?);
+    let current_block = provider.get_block_number().await?;
+    let block_id = BlockId::from(current_block);
+
+    let pool = FluidDexPool::new(OSETH_ETH_POOL, FLUID_DEX_RESOLVER);
+    let pool = pool.init(block_id, provider.clone()).await?;
+
+    // Test reverse direction: ETH -> osETH
+    let amount_in = U256::from(5u64) * U256::from(10u64).pow(U256::from(18u64)); // 5 ETH
+    let amount_out = pool.simulate_swap(ETH_ADDRESS, OSETH_TOKEN, amount_in)?;
+
+    if amount_out.is_zero() {
+        println!("Skipping test: simulate_swap returned zero (liquidity constraints)");
+        return Ok(());
+    }
+
+    println!("\n=== Exact-Out Reverse Direction Test ===");
+    println!("Original amount_in: 5 ETH");
+    println!("Simulated amount_out: {} wei osETH", amount_out);
+
+    let exact_in = pool.simulate_swap_exact_out(ETH_ADDRESS, OSETH_TOKEN, amount_out)?;
+    println!("Exact-out calculated amount_in: {} wei ETH", exact_in);
+
+    // Verify
+    let verify_out = pool.simulate_swap(ETH_ADDRESS, OSETH_TOKEN, exact_in)?;
+    println!("Verification: simulate_swap(exact_in) = {} wei osETH", verify_out);
+
+    assert!(
+        verify_out >= amount_out,
+        "simulate_swap(exact_in) should be >= amount_out"
+    );
+
+    println!("✅ Exact-out reverse direction test PASSED");
     Ok(())
 }

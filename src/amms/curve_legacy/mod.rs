@@ -949,6 +949,29 @@ impl AutomatedMarketMaker for CurveLegacyPool {
         Ok(amount_out)
     }
 
+    fn simulate_swap_exact_out(
+        &self,
+        base_token: Address,
+        quote_token: Address,
+        amount_out: U256,
+    ) -> Result<U256, AMMError> {
+        let i = self
+            .coins
+            .iter()
+            .position(|&c| c == base_token)
+            .ok_or(AMMError::TokenNotFound(base_token))?;
+        let j = self
+            .coins
+            .iter()
+            .position(|&c| c == quote_token)
+            .ok_or(AMMError::TokenNotFound(quote_token))?;
+
+        match self.pool_type {
+            StableSwap => self.simulate_stableswap_exact_out(i, j, amount_out),
+            CryptoSwap => self.simulate_cryptoswap_exact_out(i, j, amount_out),
+        }
+    }
+
     async fn init<N, P>(mut self, block_number: BlockId, provider: P) -> Result<Self, AMMError>
     where
         Self: Sized,
@@ -1923,6 +1946,131 @@ impl CurveLegacyPool {
         self.fee = new_fee;
 
         Ok(())
+    }
+
+    /// StableSwap Exact-Out simulation (binary search on dx).
+    /// Given a target output amount, find the minimal input amount required.
+    pub fn simulate_stableswap_exact_out(
+        &self,
+        i: usize,
+        j: usize,
+        amount_out: U256,
+    ) -> Result<U256, AMMError> {
+        if amount_out.is_zero() {
+            return Ok(U256::ZERO);
+        }
+        if j >= self.balances.len() || i >= self.balances.len() {
+            return Err(AMMError::Msg("Token index out of bounds".into()));
+        }
+        if amount_out >= self.balances[j] {
+            return Err(AMMError::Msg("Insufficient liquidity for exact out".into()));
+        }
+
+        // Find upper bound by exponential search.
+        let mut low = U256::ZERO;
+        let mut high = U256::from(1u8);
+        let max_high = self
+            .balances
+            .get(i)
+            .copied()
+            .unwrap_or(U256::ZERO)
+            .saturating_mul(U256::from(1000u64));
+
+        loop {
+            let dy = self.simulate_stableswap(i, j, high)?;
+            if dy >= amount_out {
+                break;
+            }
+            if max_high.is_zero() || high >= max_high {
+                return Err(AMMError::Msg(
+                    "Exact out not reachable within max search bound".into(),
+                ));
+            }
+            high = high.saturating_mul(U256::from(2u8));
+            if high > max_high {
+                high = max_high;
+            }
+        }
+
+        // Binary search for minimal dx that yields dy >= amount_out.
+        while high > low + U256::from(1u8) {
+            let mid = (low + high) / U256::from(2u8);
+            let dy = self.simulate_stableswap(i, j, mid)?;
+            if dy >= amount_out {
+                high = mid;
+            } else {
+                low = mid;
+            }
+        }
+
+        Ok(high)
+    }
+
+    /// CryptoSwap Exact-Out simulation (binary search on dx).
+    /// Given a target output amount, find the minimal input amount required.
+    pub fn simulate_cryptoswap_exact_out(
+        &self,
+        i: usize,
+        j: usize,
+        amount_out: U256,
+    ) -> Result<U256, AMMError> {
+        if amount_out.is_zero() {
+            return Ok(U256::ZERO);
+        }
+        if j >= self.balances.len() || i >= self.balances.len() {
+            return Err(AMMError::Msg("Token index out of bounds".into()));
+        }
+        if amount_out >= self.balances[j] {
+            return Err(AMMError::Msg("Insufficient liquidity for exact out".into()));
+        }
+
+        // Find upper bound by exponential search.
+        let mut low = U256::ZERO;
+        let mut high = U256::from(1u8);
+        let max_high = self
+            .balances
+            .get(i)
+            .copied()
+            .unwrap_or(U256::ZERO)
+            .saturating_mul(U256::from(1000u64));
+
+        loop {
+            let dy = match self.simulate_cryptoswap(i, j, high) {
+                Ok(v) => v,
+                Err(_) => U256::ZERO,
+            };
+            if dy >= amount_out {
+                break;
+            }
+            if max_high.is_zero() || high >= max_high {
+                return Err(AMMError::Msg(
+                    "Exact out not reachable within max search bound".into(),
+                ));
+            }
+            high = high.saturating_mul(U256::from(2u8));
+            if high > max_high {
+                high = max_high;
+            }
+        }
+
+        // Binary search for minimal dx that yields dy >= amount_out.
+        while high > low + U256::from(1u8) {
+            let mid = (low + high) / U256::from(2u8);
+            let dy = match self.simulate_cryptoswap(i, j, mid) {
+                Ok(v) => v,
+                Err(_) => {
+                    low = mid;
+                    continue;
+                }
+            };
+            if dy >= amount_out {
+                high = mid;
+            } else {
+                low = mid;
+            }
+        }
+
+        Ok(high)
     }
 }
 pub mod test_sync_drift;

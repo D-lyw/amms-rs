@@ -1,4 +1,70 @@
+//! Curve NG Cryptoswap 数学模块
+//!
+//! ## 当前状态 (2024-03)
+//!
+//! ### TwoCrypto-NG 1 wei 误差问题
+//!
+//! 在 `1->0` 交换方向存在 1 wei 误差（模拟值比链上少 1 wei）。
+//!
+//! **测试案例**:
+//! - Pool: `0x660a554fc97fabecff47d200367ca1a8bf49c82b` (rETH/crvUSD)
+//! - 1->0 大额输入: `sim=2397054479132494`, `chain=2397054479132495` (差 1 wei)
+//!
+//! **根本原因**: Vyper 使用 floor division (向负无穷取整)，Rust 使用 truncation (向零取整)。
+//! 对于负数除法，两者结果差 1。
+//!
+//! ### 已应用的修复
+//!
+//! 1. 添加了 `floor_div` 函数来匹配 Vyper 的 `//` 操作符语义
+//! 2. 在 `twocrypto_get_y` 函数中应用了 floor_div:
+//!    - `delta0` 计算 (缩放前后)
+//!    - `delta1` 计算中的中间除法
+//!    - `sqrt_arg` 计算
+//!    - `term_b_div_c1` 和 `root` 计算
+//!    - 缩放系数 `a2`, `b2`, `c2`, `d2` 的计算
+//!    - `c1` (cubic root 组合) 计算
+//!
+//! ### 后续 0 误差对齐方向
+//!
+//! 1. **逐行对比 Vyper 源码**: 获取 curvefi/twocrypto-ng 仓库中的 CurveCryptoMathTwoCoins.vy，
+//!    逐行对比所有除法操作，确认是否有遗漏的 floor_div 位置
+//!
+//! 2. **检查 cbrt 函数精度**: 当前 `cbrt` 实现可能与 Vyper 的 `_cbrt` 存在微小差异
+//!
+//! 3. **检查 isqrt 函数精度**: 确认整数平方根实现与 Vyper 完全一致
+//!
+//! 4. **验证中间计算溢出/精度损失**: 某些中间结果可能在极端情况下有精度损失
+//!
+//! 5. **考虑使用更高精度整数运算库**: 如 num-bigint 或专门的高精度库
+//!
+//! 6. **添加更多测试用例**: 覆盖不同价格范围和交易方向
+
 use alloy::primitives::{I256, U256};
+
+/// Floor division for signed integers, matching Vyper's // operator behavior.
+/// Vyper uses floor division (rounds towards negative infinity),
+/// while Rust's / uses truncation (rounds towards zero).
+/// For same-sign operands, they're equivalent.
+/// For different-sign operands where result is negative, they differ by 1.
+#[inline]
+fn floor_div(a: I256, b: I256) -> Result<I256, &'static str> {
+    if b == I256::ZERO {
+        return Err("floor_div: division by zero");
+    }
+    // Rust's / is truncation towards zero
+    let truncated = a / b;
+    // If a and b have different signs and there's a remainder, adjust
+    // Floor division: rounds towards negative infinity
+    // Truncation: rounds towards zero
+    // They differ when: (a < 0) != (b < 0) && a % b != 0
+    let remainder = a % b;
+    if remainder != I256::ZERO && (a < I256::ZERO) != (b < I256::ZERO) {
+        // Adjust by 1 towards negative infinity
+        Ok(truncated - I256::ONE)
+    } else {
+        Ok(truncated)
+    }
+}
 
 pub const N_COINS: usize = 3;
 pub const A_MULTIPLIER: u64 = 10000;
@@ -777,16 +843,27 @@ pub fn twocrypto_get_y(
         - i_3 * a
         - i_2 * gamma_i * i_1e14;
 
+    // Vyper: _c = 10**32*3 + 4*gamma*10**14 + gamma2/10**4 + (4*ann_gamma2/400000000) * x_j / D - 4*ann_gamma2/400000000
+    // 注意: (4*ann_gamma2/400000000) * x_j / D 的运算顺序是先除后乘再除
     let c = i_3 * a
         + i_4 * gamma_i * i_1e14
         + gamma2 / i_1e4
-        + (i_4 * ann_gamma2 / i_400m) * x_j / d_i
+        + ((i_4 * ann_gamma2 / i_400m) * x_j) / d_i
         - (i_4 * ann_gamma2 / i_400m);
 
     let d_i2 = -((i_wad + gamma_i) * (i_wad + gamma_i) / i_1e4);
 
-    let mut delta0 = i_3 * a * c / b - b;
-    let mut delta1 = i_3 * delta0 + b - i_27 * a * a / b * d_i2 / b;
+    // Vyper: delta0 = unsafe_div(unsafe_mul(unsafe_mul(3, a), _c), b) - b
+    // 使用 floor_div 确保与 Vyper floor division 一致
+    let mut delta0 = floor_div(i_3 * a * c, b)? - b;
+
+    // Vyper: delta1 = 3 * delta0 + b - 27*a**2//b*d//b
+    // 这里 27*a**2//b 涉及正数 // 负数，结果是负数
+    // 使用 floor_div 确保与 Vyper floor division 一致
+    let term_27a2_div_b = floor_div(i_27 * a * a, b)?;
+    let term_mul_d = term_27a2_div_b * d_i2;
+    let term_div_b = floor_div(term_mul_d, b)?;
+    let mut delta1 = i_3 * delta0 + b - term_div_b;
 
     let threshold = {
         let t1 = abs_i256(delta0);
@@ -827,17 +904,25 @@ pub fn twocrypto_get_y(
         i256_from_u256(U256::from(1u64))?
     };
 
-    let a2 = a / divider;
-    let b2 = b / divider;
-    let c2 = c / divider;
-    let d2 = d_i2 / divider;
+    // Vyper 使用 floor division，对于负数除以正数，结果与 Rust truncation 不同
+    let a2 = floor_div(a, divider)?;
+    let b2 = floor_div(b, divider)?;
+    let c2 = floor_div(c, divider)?;
+    let d2 = floor_div(d_i2, divider)?;
 
-    delta0 = i_3 * a2 * c2 / b2 - b2;
-    delta1 = i_3 * delta0
-        + b2
-        - i_27 * a2 * a2 / b2 * d2 / b2;
+    // Vyper: delta0 = unsafe_div(unsafe_mul(unsafe_mul(3, a), _c), b) - b
+    delta0 = floor_div(i_3 * a2 * c2, b2)? - b2;
 
-    let sqrt_arg = delta1 * delta1 + (i_4 * delta0 * delta0 / b2) * delta0;
+    // Vyper: delta1 = 3 * delta0 + b - unsafe_div(unsafe_mul(unsafe_div(unsafe_mul(27, a**2), b), d), b)
+    let term_27a2_div_b2 = floor_div(i_27 * a2 * a2, b2)?;
+    let term_mul_d2 = term_27a2_div_b2 * d2;
+    let term_div_b2 = floor_div(term_mul_d2, b2)?;
+    delta1 = i_3 * delta0 + b2 - term_div_b2;
+
+    // Vyper: sqrt_arg = delta1**2 + unsafe_mul(unsafe_div(4*delta0**2, b), delta0)
+    // 注意: 4*delta0**2 先计算，再除以 b，再乘以 delta0
+    let term_4d0sq_div_b = floor_div(i_4 * delta0 * delta0, b2)?;
+    let sqrt_arg = delta1 * delta1 + term_4d0sq_div_b * delta0;
     if sqrt_arg <= I256::ZERO {
         let y = twocrypto_newton_y_internal(ann, gamma, x, d, i, lim_mul)?;
         return Ok((y, U256::ZERO));
@@ -854,28 +939,54 @@ pub fn twocrypto_get_y(
         -I256::try_from(cbrt(b_u)).map_err(|_| "b cbrt overflow")?
     };
 
+    // Vyper: second_cbrt = convert(self._cbrt(convert(unsafe_add(delta1, sqrt_val), uint256) // 2), int256)
+    // 关键: 先转换为 uint256 再除以 2，而不是在 int256 中除法
     let second_cbrt = if delta1 > I256::ZERO {
-        let arg = (delta1 + sqrt_val) / i_2;
-        let arg_u = U256::try_from(arg).map_err(|_| "cbrt arg overflow")?;
+        let sum_u = U256::try_from(delta1 + sqrt_val).map_err(|_| "cbrt arg overflow")?;
+        let arg_u = sum_u / U256::from(2u64);  // 在 uint256 中除法
         I256::try_from(cbrt(arg_u)).map_err(|_| "second cbrt overflow")?
     } else {
-        let arg = (sqrt_val - delta1) / i_2;
-        let arg_u = U256::try_from(arg).map_err(|_| "cbrt arg overflow")?;
+        // Vyper: -convert(self._cbrt(unsafe_div(convert(unsafe_sub(sqrt_val, delta1), uint256), 2)), int256)
+        let diff_u = U256::try_from(sqrt_val - delta1).map_err(|_| "cbrt arg overflow")?;
+        let arg_u = diff_u / U256::from(2u64);  // 在 uint256 中除法
         -I256::try_from(cbrt(arg_u)).map_err(|_| "second cbrt overflow")?
     };
 
-    let c1 = b_cbrt
-        .checked_mul(b_cbrt)
-        .and_then(|v| v.checked_div(i_wad))
-        .and_then(|v| v.checked_mul(second_cbrt))
-        .and_then(|v| v.checked_div(i_wad))
-        .ok_or("c1 overflow")?;
+    // Vyper: C1 = unsafe_div(unsafe_mul(unsafe_div(b_cbrt**2, 10**18), second_cbrt), 10**18)
+    // 即: (b_cbrt * b_cbrt / 10**18) * second_cbrt / 10**18
+    // 注意: second_cbrt 可能是负数，导致中间结果为负数，除以 i_wad 需要 floor_div
+    let b_cbrt_sq = b_cbrt.checked_mul(b_cbrt).ok_or("c1 overflow")?;
+    let b_cbrt_sq_div_wad = floor_div(b_cbrt_sq, i_wad)?;
+    let mul_second_cbrt = b_cbrt_sq_div_wad.checked_mul(second_cbrt).ok_or("c1 overflow")?;
+    let c1 = floor_div(mul_second_cbrt, i_wad)?;
 
-    let root = (i_wad * c1 - i_wad * b2 - (i_wad * b2 / c1) * delta0) / (i_3 * a2);
+    // Vyper: root = (10**18*C1 - 10**18*b - 10**18*b//C1*delta0) // (3*a)
+    // 关键: 整个表达式的 // 也需要使用 floor division
+    let term_b_div_c1 = floor_div(i_wad * b2, c1)?;
+    let root = floor_div(i_wad * c1 - i_wad * b2 - term_b_div_c1 * delta0, i_3 * a2)?;
 
-    let y_out0 = (d_i * d_i / x_j * root / i_4 / i_wad)
-        .try_into()
-        .map_err(|_| "y overflow")?;
+    // Vyper: y_out = convert(unsafe_div(unsafe_div(unsafe_mul(unsafe_div(D**2, x_j), root), 4), 10**18), uint256)
+    // 即: ((D**2 / x_j) * root) / 4 / 10**18
+    // 注意: Vyper 使用 unsafe_div，即截断除法，与 Rust 的 / 一致
+    //
+    // TODO(1-wei-error): 当前在 1->0 交换方向存在 1 wei 误差（模拟值比链上少 1）
+    // 已应用的 floor_div 修复位置:
+    //   1. delta0 计算 (缩放前后)
+    //   2. delta1 计算 (缩放前后)
+    //   3. sqrt_arg 计算
+    //   4. term_b_div_c1 计算
+    //   5. root 计算
+    //   6. c1 计算中的中间除法
+    //   7. 缩放系数 a2, b2, c2, d2 的除法
+    //
+    // 后续 0 误差对齐方向:
+    //   1. 对比 Vyper 源码中所有除法操作，确认是否有遗漏的 floor_div 位置
+    //   2. 检查 cbrt 函数的精度是否与 Vyper 完全一致
+    //   3. 检查 isqrt 函数的精度
+    //   4. 验证所有中间计算是否有溢出或精度损失
+    //   5. 考虑使用更高精度的整数运算库
+    let y_out0_raw = d_i * d_i / x_j * root / i_4 / i_wad;
+    let y_out0 = U256::try_from(y_out0_raw).map_err(|_| "y overflow")?;
     let k0_prev = U256::try_from(root).map_err(|_| "k0 prev overflow")?;
 
     let frac = y_out0 * U256::from(WAD) / d;
@@ -1011,51 +1122,39 @@ pub fn cbrt(x: U256) -> U256 {
     let pow_val = log2x_usize / 3;
     let remainder = log2x_usize % 3;
 
-    // 使用 wrapping 计算 2^pow 和 1260^remainder / 1000^remainder
-    let base = U256::from(1u64) << pow_val;
+    // 使用左移计算 2^pow (与 Vyper pow_mod256(2, pow) 等价)
+    // pow_mod256(2, pow) = 2**pow (with wrapping at 2^256)
+    // 在 Rust 中，左移操作会自动 wrapping
+    let pow_2 = U256::from(1u64) << pow_val;
 
-    // 精确计算 1260^remainder / 1000^remainder
-    // remainder = 0: 1
-    // remainder = 1: 1260/1000 = 1.26
-    // remainder = 2: 1260^2/1000^2 = 1587600/1000000 = 1.5876
-    let (cbrt2_num, cbrt2_den) = match remainder {
-        0 => (U256::from(1u64), U256::from(1u64)),
-        1 => (U256::from(1260u64), U256::from(1000u64)),
-        2 => (U256::from(1587600u64), U256::from(1000000u64)), // 更精确: 1260*1260 = 1587600
-        _ => (U256::from(1u64), U256::from(1u64)),
+    // 计算 pow_mod256(1260, remainder) 和 pow_mod256(1000, remainder)
+    // remainder 只能是 0, 1, 2，所以直接计算
+    let pow_1260_r = match remainder {
+        0 => U256::from(1u64),
+        1 => U256::from(1260u64),
+        2 => U256::from(1587600u64), // 1260 * 1260 = 1587600
+        _ => U256::from(1u64),
+    };
+    let pow_1000_r = match remainder {
+        0 => U256::from(1u64),
+        1 => U256::from(1000u64),
+        2 => U256::from(1000000u64), // 1000 * 1000 = 1000000
+        _ => U256::from(1u64),
     };
 
-    let mut a = base * cbrt2_num / cbrt2_den;
+    // Vyper: a = unsafe_div(unsafe_mul(pow_2, pow_1260_r), pow_1000_r)
+    let mut a = pow_2 * pow_1260_r / pow_1000_r;
 
-    // 7 轮 Newton-Raphson 迭代 (与链上完全一致)
-    // a = (2*a + xx/(a*a)) / 3
-    if a.is_zero() {
-        return U256::ZERO;
-    }
+    // 7 轮 Newton-Raphson 迭代 (完全对齐 Vyper)
+    // Vyper: a = unsafe_div(unsafe_add(unsafe_mul(2, a), unsafe_div(xx, unsafe_mul(a, a))), 3)
+    // 注意: unsafe_div 和 unsafe_mul 在 Vyper 中只是 unchecked 操作
+    // 对于正数，这与 Rust 的常规 / 和 * 行为一致
     a = (U256::from(2u64) * a + xx / (a * a)) / U256::from(3u64);
-    if a.is_zero() {
-        return U256::ZERO;
-    }
     a = (U256::from(2u64) * a + xx / (a * a)) / U256::from(3u64);
-    if a.is_zero() {
-        return U256::ZERO;
-    }
     a = (U256::from(2u64) * a + xx / (a * a)) / U256::from(3u64);
-    if a.is_zero() {
-        return U256::ZERO;
-    }
     a = (U256::from(2u64) * a + xx / (a * a)) / U256::from(3u64);
-    if a.is_zero() {
-        return U256::ZERO;
-    }
     a = (U256::from(2u64) * a + xx / (a * a)) / U256::from(3u64);
-    if a.is_zero() {
-        return U256::ZERO;
-    }
     a = (U256::from(2u64) * a + xx / (a * a)) / U256::from(3u64);
-    if a.is_zero() {
-        return U256::ZERO;
-    }
     a = (U256::from(2u64) * a + xx / (a * a)) / U256::from(3u64);
 
     // 恢复缩放
@@ -1364,17 +1463,19 @@ pub fn get_y_optimized(
     };
 
     // 计算 second_cbrt
+    // Vyper: if delta1 > 0: second_cbrt = convert(self._cbrt(convert(unsafe_add(delta1, sqrt_val), uint256) // 2), int256)
+    // Vyper: else: second_cbrt = -convert(self._cbrt(unsafe_div(convert(unsafe_sub(sqrt_val, delta1), uint256), 2)), int256)
+    // 关键: Vyper 先转换为 uint256 再除以 2，确保是正数 floor division
     let second_cbrt = if delta1 > I256::ZERO {
-        let arg = delta1
-            .checked_add(sqrt_val)
-            .and_then(|v| v.checked_div(i2))
-            .ok_or("overflow")?;
-        let arg_u = U256::try_from(arg).map_err(|_| "cbrt arg overflow")?;
+        // delta1 + sqrt_val 肯定是正数，先转 uint256 再除
+        let sum_u = U256::try_from(delta1 + sqrt_val).map_err(|_| "cbrt arg overflow")?;
+        let arg_u = sum_u / U256::from(2u64);
         to_i256(cbrt(arg_u))?
     } else {
-        let neg_delta1_minus_sqrt = (-delta1).checked_add(sqrt_val).ok_or("overflow")?;
-        let arg = neg_delta1_minus_sqrt.checked_div(i2).ok_or("overflow")?;
-        let arg_u = U256::try_from(arg).map_err(|_| "cbrt arg overflow")?;
+        // sqrt_val - delta1 = sqrt_val + (-delta1)，这总是正数
+        // Vyper: convert(unsafe_sub(sqrt_val, delta1), uint256) 然后 unsafe_div by 2
+        let diff_u = U256::try_from(sqrt_val - delta1).map_err(|_| "cbrt arg overflow")?;
+        let arg_u = diff_u / U256::from(2u64);
         -to_i256(cbrt(arg_u))?
     };
 
