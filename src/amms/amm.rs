@@ -9,6 +9,7 @@ use crate::amms::fluid_dex::FluidDexPool;
 use crate::amms::pancake_infinity::PancakeInfinityPool;
 use crate::amms::pancake_v2::PancakeV2Pool;
 use crate::amms::pancake_v3::PancakeV3Pool;
+use crate::amms::sky::SkyConverter;
 use crate::amms::sushi_v2::SushiV2Pool;
 use crate::amms::uniswap_v4::UniswapV4Pool;
 
@@ -307,4 +308,5 @@ amm!(
     EkuboPool,
     AerodromeV2Pool,
     AerodromeSlipstreamPool,
+    SkyConverter,
 );

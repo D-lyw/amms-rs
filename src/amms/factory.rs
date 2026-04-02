@@ -204,6 +204,9 @@ impl Variant {
             Variant::AerodromeSlipstreamPool => {
                 AerodromeSlipstreamFactory::init_batch::<N, _>(amms, to_block, provider).await
             }
+            Variant::skyConverter => {
+                SkyConverter::init_batch::<N, _>(amms, to_block, provider).await
+            }
         }
     }
 }
