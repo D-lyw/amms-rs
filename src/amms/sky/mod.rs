@@ -22,7 +22,6 @@ use alloy::{
     providers::Provider,
     rpc::types::Log,
     sol,
-    sol_types::SolValue,
 };
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -499,10 +498,10 @@ impl SkyConverter {
         let (effective_rate, decimal_adjustment) = if base_token == self.token_0 {
             // Selling token_0 for token_1: apply tout fee
             // Rate = (10000 - tout) / 10000, adjusted for decimals
-            let rate = if self.tout == 0 {
+            let rate: U256 = if self.tout == 0 {
                 U256::from(1u64) << 64 // 1.0 in Q64
             } else {
-                U256::from(10000 - self.tout) << 64 / U256_10000
+                (U256::from(10000 - self.tout) << 64) / U256_10000
             };
             (rate, decimal_shift)
         } else if base_token == self.token_1 {
@@ -510,7 +509,7 @@ impl SkyConverter {
             let rate = if self.tin == 0 {
                 U256::from(1u64) << 64 // 1.0 in Q64
             } else {
-                U256::from(10000 - self.tin) << 64 / U256_10000
+                (U256::from(10000 - self.tin) << 64) / U256_10000
             };
             (rate, -decimal_shift)
         } else {
@@ -556,7 +555,8 @@ impl SkyConverter {
 
         for amm in amms {
             match amm {
-                AMM::SkyConverter(mut converter) => {
+                AMM::SkyConverter(converter) => {
+                    let addr = converter.address;
                     match converter.init(block_number, provider.clone()).await {
                         Ok(init_converter) => {
                             initialized.push(AMM::SkyConverter(init_converter));
@@ -564,7 +564,7 @@ impl SkyConverter {
                         Err(e) => {
                             info!(
                                 target: "amms::sky::init_batch",
-                                address = ?converter.address,
+                                address = ?addr,
                                 error = ?e,
                                 "Failed to initialize SKY converter"
                             );

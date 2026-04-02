@@ -106,6 +106,7 @@ where
                     AMM::EkuboPool(_) => 2, // Ekubo uses concentrated liquidity like V3
                     AMM::AerodromeV2Pool(_) => 1, // Aerodrome V2 uses x*y=k like V2
                     AMM::AerodromeSlipstreamPool(_) => 2, // Aerodrome Slipstream uses CL like V3
+                    AMM::SkyConverter(_) => 0, // SKY converters use fixed rates, skip in value filter
                 };
 
                 PoolInfo {

@@ -11,6 +11,7 @@ use crate::amms::pancake_v3::PancakeV3Factory;
 use crate::amms::sushi_v2::SushiV2Factory;
 use crate::amms::uniswap_v4::UniswapV4Factory;
 use crate::amms::{balancer_v2::BalancerV2Factory, balancer_v3::BalancerV3Factory};
+use crate::amms::sky::SkyConverter;
 
 use super::{amm::Variant, uniswap_v2::UniswapV2Factory, uniswap_v3::UniswapV3Factory};
 use super::{
@@ -136,6 +137,9 @@ impl Variant {
             Variant::AerodromeSlipstreamPool => {
                 AerodromeSlipstreamFactory::init_batch::<N, _>(amms, to_block, provider).await
             }
+            Variant::SkyConverter => {
+                SkyConverter::init_batch::<N, _>(amms, to_block, provider).await
+            }
         }
     }
 
@@ -204,7 +208,7 @@ impl Variant {
             Variant::AerodromeSlipstreamPool => {
                 AerodromeSlipstreamFactory::init_batch::<N, _>(amms, to_block, provider).await
             }
-            Variant::skyConverter => {
+            Variant::SkyConverter => {
                 SkyConverter::init_batch::<N, _>(amms, to_block, provider).await
             }
         }
