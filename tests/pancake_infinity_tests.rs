@@ -9,7 +9,7 @@
 use alloy::primitives::{Address, U256};
 use amms::amms::{
     amm::AutomatedMarketMaker,
-    pancake_infinity::{PancakeInfinityPool, ICLPoolManager::PoolKey},
+    pancake_infinity::{ICLPoolManager::PoolKey, PancakeInfinityPool},
     uniswap_v3::Info,
     Token,
 };
@@ -17,19 +17,16 @@ use std::collections::HashMap;
 
 // Pancake Infinity CLPoolManager on BNB Chain
 #[allow(dead_code)]
-const POOL_MANAGER: Address = alloy::primitives::address!(
-    "0x41ff9AA7e16B8B1a6a673e28D9aC80dD556c5864"
-);
+const POOL_MANAGER: Address =
+    alloy::primitives::address!("0x41ff9AA7e16B8B1a6a673e28D9aC80dD556c5864");
 
 // Example tokens on BNB Chain
 #[allow(dead_code)]
-const CAKE_TOKEN: Address = alloy::primitives::address!(
-    "0x0E09FaBB73Bd3Ade0a17ECC321fD13a19e81cE82"
-);
+const CAKE_TOKEN: Address =
+    alloy::primitives::address!("0x0E09FaBB73Bd3Ade0a17ECC321fD13a19e81cE82");
 #[allow(dead_code)]
-const WBNB_TOKEN: Address = alloy::primitives::address!(
-    "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"
-);
+const WBNB_TOKEN: Address =
+    alloy::primitives::address!("0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c");
 
 /// Create a test pool manually with specified parameters
 fn create_test_pool(
@@ -183,7 +180,10 @@ fn test_simulate_swap_exact_out_sqrt_price_zero() {
     // 应该返回错误
     let result = pool.simulate_swap_exact_out(CAKE_TOKEN, WBNB_TOKEN, U256::from(1000u64));
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("sqrt_price is zero"));
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("sqrt_price is zero"));
 }
 
 #[test]
@@ -247,7 +247,7 @@ fn test_simulate_swap_exact_out_direction_consistency() {
     let pool = create_test_pool(
         POOL_MANAGER,
         CAKE_TOKEN, // token_a
-        WBNB_TOKEN,  // token_b
+        WBNB_TOKEN, // token_b
         U256::from(79228162514264337593543950336u128),
         0,
         1000000000000000000000000000u128,
@@ -286,9 +286,9 @@ fn test_simulate_swap_exact_out_reverse_verify() {
     );
 
     let test_amounts = [
-        U256::from(100000000000000000u128),   // 0.1e18
-        U256::from(500000000000000000u128),   // 0.5e18
-        U256::from(1000000000000000000u128),  // 1e18
+        U256::from(100000000000000000u128),  // 0.1e18
+        U256::from(500000000000000000u128),  // 0.5e18
+        U256::from(1000000000000000000u128), // 1e18
     ];
 
     for target_out in test_amounts {
@@ -363,4 +363,3 @@ fn test_simulate_swap_exact_out_protocol_fee() {
     // 总费率 = protocol_fee + lp_fee * (1 - protocol_fee) ≈ 0.1% + 0.3% * 0.999 ≈ 0.3997%
     assert!(exact_in_with_protocol >= exact_in_no_protocol);
 }
-

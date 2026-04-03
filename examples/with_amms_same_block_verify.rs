@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 use std::{
     collections::{HashMap, HashSet},
@@ -16,7 +16,7 @@ use alloy::{
 };
 use amms::{
     amms::{
-        amm::{AMM, AutomatedMarketMaker},
+        amm::{AutomatedMarketMaker, AMM},
         erc_4626::ERC4626Vault,
         fluid_dex::{FluidDexPool, FLUID_DEX_RESOLVER},
         pancake_v3::PancakeV3Pool,
@@ -315,7 +315,12 @@ where
         let remote = match local.clone().init::<N, _>(block_id, provider.clone()).await {
             Ok(v) => v,
             Err(e) => {
-                println!("[audit][WARN] init failed pool={:?} block={} err={}", local.address(), block, e);
+                println!(
+                    "[audit][WARN] init failed pool={:?} block={} err={}",
+                    local.address(),
+                    block,
+                    e
+                );
                 continue;
             }
         };
@@ -363,7 +368,10 @@ async fn main() -> eyre::Result<()> {
     });
     let amms = load_amms_from_pool_index(&pool_index_path, 20)?;
     if amms.is_empty() {
-        return Err(eyre::eyre!("No supported pools selected from {}", pool_index_path));
+        return Err(eyre::eyre!(
+            "No supported pools selected from {}",
+            pool_index_path
+        ));
     }
 
     println!(

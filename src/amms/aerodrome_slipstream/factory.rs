@@ -49,11 +49,11 @@ impl AerodromeSlipstreamFactoryConfig {
 ///
 /// These are the enabled tick spacings on the Factory contract.
 /// Note: The fee associated with each tickSpacing can be dynamic.
-pub const TICK_SPACING_1: i32 = 1;       // 0.01% default
-pub const TICK_SPACING_10: i32 = 10;     // 0.05% default
-pub const TICK_SPACING_50: i32 = 50;     // 0.05% default
-pub const TICK_SPACING_100: i32 = 100;   // 0.05% default
-pub const TICK_SPACING_200: i32 = 200;   // 0.3% default
+pub const TICK_SPACING_1: i32 = 1; // 0.01% default
+pub const TICK_SPACING_10: i32 = 10; // 0.05% default
+pub const TICK_SPACING_50: i32 = 50; // 0.05% default
+pub const TICK_SPACING_100: i32 = 100; // 0.05% default
+pub const TICK_SPACING_200: i32 = 200; // 0.3% default
 pub const TICK_SPACING_2000: i32 = 2000; // 1% default
 
 /// Legacy constants for backwards compatibility
@@ -110,9 +110,9 @@ pub fn get_default_fee(tick_spacing: i32) -> u32 {
 pub fn get_tick_spacing(fee: u32) -> i32 {
     match fee {
         100 => TICK_SPACING_1,
-        500 => TICK_SPACING_100,   // Most common 0.05% tier
+        500 => TICK_SPACING_100, // Most common 0.05% tier
         3000 => TICK_SPACING_200,
         10000 => TICK_SPACING_2000,
-        _ => TICK_SPACING_100,     // Default
+        _ => TICK_SPACING_100, // Default
     }
 }

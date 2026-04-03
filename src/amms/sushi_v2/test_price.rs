@@ -138,11 +138,17 @@ mod tests {
 
             let amount_out_ab = std::cmp::max(
                 U256::from(1u8),
-                std::cmp::min(unit_b / U256::from(1_000u64), reserve_b / U256::from(100_000u64)),
+                std::cmp::min(
+                    unit_b / U256::from(1_000u64),
+                    reserve_b / U256::from(100_000u64),
+                ),
             );
             let amount_out_ba = std::cmp::max(
                 U256::from(1u8),
-                std::cmp::min(unit_a / U256::from(1_000u64), reserve_a / U256::from(100_000u64)),
+                std::cmp::min(
+                    unit_a / U256::from(1_000u64),
+                    reserve_a / U256::from(100_000u64),
+                ),
             );
 
             if amount_out_ab > U256::ZERO {

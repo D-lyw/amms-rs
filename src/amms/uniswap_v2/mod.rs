@@ -437,7 +437,11 @@ impl UniswapV2Pool {
 
     fn ceil_div_u256(numerator: U256, denominator: U256) -> U256 {
         let (q, r) = (numerator / denominator, numerator % denominator);
-        if r.is_zero() { q } else { q + U256_1 }
+        if r.is_zero() {
+            q
+        } else {
+            q + U256_1
+        }
     }
 
     /// Calculates the price of the base token in terms of the quote token.
@@ -1223,8 +1227,10 @@ mod tests {
             .http(rpc_endpoint.parse()?);
         let provider = ProviderBuilder::new().connect_client(client);
 
-        let router =
-            IUniswapV2Router02::new(address!("7a250d5630B4cF539739dF2C5dAcb4c659F2488D"), provider.clone());
+        let router = IUniswapV2Router02::new(
+            address!("7a250d5630B4cF539739dF2C5dAcb4c659F2488D"),
+            provider.clone(),
+        );
         let block = BlockId::from(provider.get_block_number().await?);
 
         // Source: local DB query (2026-03-24)
@@ -1240,7 +1246,9 @@ mod tests {
         ];
 
         for pool_address in pool_addresses {
-            let pool = UniswapV2Pool::new(pool_address).init(block, provider.clone()).await?;
+            let pool = UniswapV2Pool::new(pool_address)
+                .init(block, provider.clone())
+                .await?;
 
             let unit_a = U256::from(10u64).pow(U256::from(pool.token_a.decimals));
             let unit_b = U256::from(10u64).pow(U256::from(pool.token_b.decimals));
@@ -1249,11 +1257,17 @@ mod tests {
 
             let amount_out_ab = std::cmp::max(
                 U256::from(1u8),
-                std::cmp::min(unit_b / U256::from(1_000u64), reserve_b / U256::from(100_000u64)),
+                std::cmp::min(
+                    unit_b / U256::from(1_000u64),
+                    reserve_b / U256::from(100_000u64),
+                ),
             );
             let amount_out_ba = std::cmp::max(
                 U256::from(1u8),
-                std::cmp::min(unit_a / U256::from(1_000u64), reserve_a / U256::from(100_000u64)),
+                std::cmp::min(
+                    unit_a / U256::from(1_000u64),
+                    reserve_a / U256::from(100_000u64),
+                ),
             );
 
             if amount_out_ab > U256::ZERO {

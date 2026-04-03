@@ -179,7 +179,11 @@ fn fp_div_up(a: U256, b: U256) -> Result<U256, BalancerV2Error> {
 }
 
 fn fp_complement(x: U256) -> U256 {
-    if x < one_u() { one_u() - x } else { U256::ZERO }
+    if x < one_u() {
+        one_u() - x
+    } else {
+        U256::ZERO
+    }
 }
 
 fn max_pow_relative_error() -> U256 {
@@ -286,7 +290,9 @@ fn logexp_pow(x: U256, y: U256) -> Result<U256, BalancerV2Error> {
 
 fn exp(mut x: I256) -> Result<I256, BalancerV2Error> {
     if x < min_natural_exponent() || x > max_natural_exponent() {
-        return Err(BalancerV2Error::NotSupported("INVALID_EXPONENT".to_string()));
+        return Err(BalancerV2Error::NotSupported(
+            "INVALID_EXPONENT".to_string(),
+        ));
     }
 
     let one18 = one_i18();
@@ -372,7 +378,10 @@ fn exp(mut x: I256) -> Result<I256, BalancerV2Error> {
         series_sum = add_i(series_sum, term)?;
     }
 
-    div_i(mul_i(div_i(mul_i(product, series_sum)?, one20)?, first_an)?, i(100))
+    div_i(
+        mul_i(div_i(mul_i(product, series_sum)?, one20)?, first_an)?,
+        i(100),
+    )
 }
 
 fn ln(a: I256) -> Result<I256, BalancerV2Error> {
@@ -574,23 +583,12 @@ mod tests {
         let weight_out = U256::from(2_000_000_000_000_000_000u128); // 0.2e18
         let target_out = U256::from(1_000_000u64);
 
-        let amount_in = calculate_in_given_out(
-            balance_in,
-            weight_in,
-            balance_out,
-            weight_out,
-            target_out,
-        )
-        .expect("in_given_out should solve");
+        let amount_in =
+            calculate_in_given_out(balance_in, weight_in, balance_out, weight_out, target_out)
+                .expect("in_given_out should solve");
 
-        let out = calculate_out_given_in(
-            balance_in,
-            weight_in,
-            balance_out,
-            weight_out,
-            amount_in,
-        )
-        .expect("out_given_in should work");
+        let out = calculate_out_given_in(balance_in, weight_in, balance_out, weight_out, amount_in)
+            .expect("out_given_in should work");
         assert!(out >= target_out);
 
         if amount_in > U256::ZERO {

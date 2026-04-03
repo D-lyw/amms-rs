@@ -1,10 +1,10 @@
 use super::*;
 
 use alloy::{
-    sol,
     primitives::{address, aliases::U24, U160, U256},
     providers::ProviderBuilder,
     rpc::client::ClientBuilder,
+    sol,
     transports::layers::{RetryBackoffLayer, ThrottleLayer},
 };
 
@@ -36,7 +36,8 @@ const WBTC: Address = address!("2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599");
 const LINK: Address = address!("514910771AF9Ca656af840dff83E8264EcF986CA");
 const UNI: Address = address!("1f9840a85d5aF5bf1D1762F925BDADdC4201F984");
 
-async fn build_provider() -> eyre::Result<impl alloy::providers::Provider<alloy::network::Ethereum> + Clone> {
+async fn build_provider(
+) -> eyre::Result<impl alloy::providers::Provider<alloy::network::Ethereum> + Clone> {
     let rpc_endpoint = std::env::var("ETHEREUM_PROVIDER")?;
     let client = ClientBuilder::default()
         .layer(ThrottleLayer::new(250))
@@ -68,9 +69,7 @@ async fn load_pool_from_factory<P: alloy::providers::Provider<alloy::network::Et
         return Ok(None);
     }
 
-    let pool = UniswapV3Pool::new(pool_addr)
-        .init(block, provider)
-        .await?;
+    let pool = UniswapV3Pool::new(pool_addr).init(block, provider).await?;
     Ok(Some(pool))
 }
 
@@ -113,8 +112,7 @@ async fn test_simulate_swap_usdc_weth() -> eyre::Result<()> {
     assert_eq!(amount_out, expected_amount_out);
 
     let amount_in_1 = U256::from(10000000000_u64); // 10_000 USDC
-    let amount_out_1 =
-        pool.simulate_swap(pool.token_a.address, Address::default(), amount_in_1)?;
+    let amount_out_1 = pool.simulate_swap(pool.token_a.address, Address::default(), amount_in_1)?;
 
     let expected_amount_out_1 = quoter
         .quoteExactInputSingle(
@@ -131,8 +129,7 @@ async fn test_simulate_swap_usdc_weth() -> eyre::Result<()> {
     assert_eq!(amount_out_1, expected_amount_out_1);
 
     let amount_in_2 = U256::from(10000000000000_u128); // 10_000_000 USDC
-    let amount_out_2 =
-        pool.simulate_swap(pool.token_a.address, Address::default(), amount_in_2)?;
+    let amount_out_2 = pool.simulate_swap(pool.token_a.address, Address::default(), amount_in_2)?;
 
     let expected_amount_out_2 = quoter
         .quoteExactInputSingle(
@@ -149,8 +146,7 @@ async fn test_simulate_swap_usdc_weth() -> eyre::Result<()> {
     assert_eq!(amount_out_2, expected_amount_out_2);
 
     let amount_in_3 = U256::from(100000000000000_u128); // 100_000_000 USDC
-    let amount_out_3 =
-        pool.simulate_swap(pool.token_a.address, Address::default(), amount_in_3)?;
+    let amount_out_3 = pool.simulate_swap(pool.token_a.address, Address::default(), amount_in_3)?;
 
     let expected_amount_out_3 = quoter
         .quoteExactInputSingle(
@@ -184,8 +180,7 @@ async fn test_simulate_swap_usdc_weth() -> eyre::Result<()> {
     assert_eq!(amount_out, expected_amount_out);
 
     let amount_in_1 = U256::from(10000000000000000000_u128); // 10 ETH
-    let amount_out_1 =
-        pool.simulate_swap(pool.token_b.address, Address::default(), amount_in_1)?;
+    let amount_out_1 = pool.simulate_swap(pool.token_b.address, Address::default(), amount_in_1)?;
     let expected_amount_out_1 = quoter
         .quoteExactInputSingle(
             pool.token_b.address,
@@ -200,8 +195,7 @@ async fn test_simulate_swap_usdc_weth() -> eyre::Result<()> {
     assert_eq!(amount_out_1, expected_amount_out_1);
 
     let amount_in_2 = U256::from(100000000000000000000_u128); // 100 ETH
-    let amount_out_2 =
-        pool.simulate_swap(pool.token_b.address, Address::default(), amount_in_2)?;
+    let amount_out_2 = pool.simulate_swap(pool.token_b.address, Address::default(), amount_in_2)?;
     let expected_amount_out_2 = quoter
         .quoteExactInputSingle(
             pool.token_b.address,
@@ -216,8 +210,7 @@ async fn test_simulate_swap_usdc_weth() -> eyre::Result<()> {
     assert_eq!(amount_out_2, expected_amount_out_2);
 
     let amount_in_3 = U256::from(100000000000000000000_u128); // 100_000 ETH
-    let amount_out_3 =
-        pool.simulate_swap(pool.token_b.address, Address::default(), amount_in_3)?;
+    let amount_out_3 = pool.simulate_swap(pool.token_b.address, Address::default(), amount_in_3)?;
     let expected_amount_out_3 = quoter
         .quoteExactInputSingle(
             pool.token_b.address,
@@ -253,16 +246,13 @@ async fn test_simulate_swap_exact_out_usdc_weth() -> eyre::Result<()> {
 
     // Exact out: USDC -> WETH (want WETH out)
     let exact_outs_weth = [
-        U256::from(100_000_000_000_000_u128),   // 0.0001 WETH
-        U256::from(1_000_000_000_000_000_u128), // 0.001 WETH
+        U256::from(100_000_000_000_000_u128),          // 0.0001 WETH
+        U256::from(1_000_000_000_000_000_u128),        // 0.001 WETH
         U256::from(1000_000_000_000_000_000_000_u128), // 1000 WETH
     ];
     for amount_out in exact_outs_weth {
-        let amount_in = pool.simulate_swap_exact_out(
-            pool.token_a.address,
-            Address::default(),
-            amount_out,
-        )?;
+        let amount_in =
+            pool.simulate_swap_exact_out(pool.token_a.address, Address::default(), amount_out)?;
 
         let expected_amount_in = quoter
             .quoteExactOutputSingle(
@@ -276,7 +266,10 @@ async fn test_simulate_swap_exact_out_usdc_weth() -> eyre::Result<()> {
             .call()
             .await?;
 
-        println!("amount_in: {:?}, expected_amount_in: {:?}", amount_in, expected_amount_in);
+        println!(
+            "amount_in: {:?}, expected_amount_in: {:?}",
+            amount_in, expected_amount_in
+        );
         assert_eq!(amount_in, expected_amount_in);
     }
 
@@ -287,11 +280,8 @@ async fn test_simulate_swap_exact_out_usdc_weth() -> eyre::Result<()> {
         U256::from(10_000_000_000u64), // 10,000 USDC
     ];
     for amount_out in exact_outs_usdc {
-        let amount_in = pool.simulate_swap_exact_out(
-            pool.token_b.address,
-            Address::default(),
-            amount_out,
-        )?;
+        let amount_in =
+            pool.simulate_swap_exact_out(pool.token_b.address, Address::default(), amount_out)?;
 
         let expected_amount_in = quoter
             .quoteExactOutputSingle(
@@ -335,16 +325,13 @@ async fn test_simulate_swap_exact_out_link_weth() -> eyre::Result<()> {
 
     // Exact out: LINK -> WETH (want WETH out)
     let exact_outs_weth = [
-        U256::from(100_000_000_000_000_u128),   // 0.0001 WETH
-        U256::from(1_000_000_000_000_000_u128), // 0.001 WETH
+        U256::from(100_000_000_000_000_u128),        // 0.0001 WETH
+        U256::from(1_000_000_000_000_000_u128),      // 0.001 WETH
         U256::from(10_000_000_000_000_000_000_u128), // 10 WETH
     ];
     for amount_out in exact_outs_weth {
-        let amount_in = pool.simulate_swap_exact_out(
-            pool.token_a.address,
-            Address::default(),
-            amount_out,
-        )?;
+        let amount_in =
+            pool.simulate_swap_exact_out(pool.token_a.address, Address::default(), amount_out)?;
 
         let expected_amount_in = quoter
             .quoteExactOutputSingle(
@@ -363,16 +350,13 @@ async fn test_simulate_swap_exact_out_link_weth() -> eyre::Result<()> {
 
     // Exact out: WETH -> LINK (want LINK out)
     let exact_outs_link = [
-        U256::from(1_000_000_000_000_000_000_u128),  // 1 LINK
-        U256::from(10_000_000_000_000_000_000_u128), // 10 LINK
+        U256::from(1_000_000_000_000_000_000_u128),   // 1 LINK
+        U256::from(10_000_000_000_000_000_000_u128),  // 10 LINK
         U256::from(100_000_000_000_000_000_000_u128), // 100 LINK
     ];
     for amount_out in exact_outs_link {
-        let amount_in = pool.simulate_swap_exact_out(
-            pool.token_b.address,
-            Address::default(),
-            amount_out,
-        )?;
+        let amount_in =
+            pool.simulate_swap_exact_out(pool.token_b.address, Address::default(), amount_out)?;
 
         let expected_amount_in = quoter
             .quoteExactOutputSingle(
@@ -426,8 +410,7 @@ async fn test_simulate_swap_link_weth() -> eyre::Result<()> {
     assert_eq!(amount_out, expected_amount_out);
 
     let amount_in_1 = U256::from(10000000000000000000_u128); // 10 LINK
-    let amount_out_1 =
-        pool.simulate_swap(pool.token_a.address, Address::default(), amount_in_1)?;
+    let amount_out_1 = pool.simulate_swap(pool.token_a.address, Address::default(), amount_in_1)?;
     let expected_amount_out_1 = quoter
         .quoteExactInputSingle(
             pool.token_a.address,
@@ -443,8 +426,7 @@ async fn test_simulate_swap_link_weth() -> eyre::Result<()> {
     assert_eq!(amount_out_1, expected_amount_out_1);
 
     let amount_in_2 = U256::from(100000000000000000000_u128); // 100 LINK
-    let amount_out_2 =
-        pool.simulate_swap(pool.token_a.address, Address::default(), amount_in_2)?;
+    let amount_out_2 = pool.simulate_swap(pool.token_a.address, Address::default(), amount_in_2)?;
     let expected_amount_out_2 = quoter
         .quoteExactInputSingle(
             pool.token_a.address,
@@ -460,8 +442,7 @@ async fn test_simulate_swap_link_weth() -> eyre::Result<()> {
     assert_eq!(amount_out_2, expected_amount_out_2);
 
     let amount_in_3 = U256::from(1000000000000000000000_u128); // 1000 LINK
-    let amount_out_3 =
-        pool.simulate_swap(pool.token_a.address, Address::default(), amount_in_3)?;
+    let amount_out_3 = pool.simulate_swap(pool.token_a.address, Address::default(), amount_in_3)?;
     let expected_amount_out_3 = quoter
         .quoteExactInputSingle(
             pool.token_a.address,
@@ -494,8 +475,7 @@ async fn test_simulate_swap_link_weth() -> eyre::Result<()> {
     assert_eq!(amount_out, expected_amount_out);
 
     let amount_in_1 = U256::from(10000000000000000000_u128); // 10 WETH
-    let amount_out_1 =
-        pool.simulate_swap(pool.token_b.address, Address::default(), amount_in_1)?;
+    let amount_out_1 = pool.simulate_swap(pool.token_b.address, Address::default(), amount_in_1)?;
     let expected_amount_out_1 = quoter
         .quoteExactInputSingle(
             pool.token_b.address,
@@ -511,8 +491,7 @@ async fn test_simulate_swap_link_weth() -> eyre::Result<()> {
     assert_eq!(amount_out_1, expected_amount_out_1);
 
     let amount_in_2 = U256::from(100000000000000000000_u128); // 100 WETH
-    let amount_out_2 =
-        pool.simulate_swap(pool.token_b.address, Address::default(), amount_in_2)?;
+    let amount_out_2 = pool.simulate_swap(pool.token_b.address, Address::default(), amount_in_2)?;
     let expected_amount_out_2 = quoter
         .quoteExactInputSingle(
             pool.token_b.address,
@@ -528,8 +507,7 @@ async fn test_simulate_swap_link_weth() -> eyre::Result<()> {
     assert_eq!(amount_out_2, expected_amount_out_2);
 
     let amount_in_3 = U256::from(1000000000000000000000_u128); // 1000 WETH
-    let amount_out_3 =
-        pool.simulate_swap(pool.token_b.address, Address::default(), amount_in_3)?;
+    let amount_out_3 = pool.simulate_swap(pool.token_b.address, Address::default(), amount_in_3)?;
     let expected_amount_out_3 = quoter
         .quoteExactInputSingle(
             pool.token_b.address,
@@ -561,42 +539,114 @@ async fn test_simulate_swap_exact_out_additional_pools() -> eyre::Result<()> {
     // (token_in, token_out, fee, exact_outs)
     let test_cases: Vec<(Address, Address, u32, Vec<U256>)> = vec![
         // Stable pools (fee 100)
-        (USDC, USDT, 100, vec![U256::from(1u64), U256::from(1_000_000u64), U256::from(10_000_000u64)]), // 1 wei, 1, 10 USDT
-        (USDT, USDC, 100, vec![U256::from(1u64), U256::from(1_000_000u64), U256::from(10_000_000u64)]), // reverse
-        (USDC, DAI, 100, vec![U256::from(1u64), U256::from(1_000_000_000_000_000_000u128), U256::from(10_000_000_000_000_000_000u128)]), // 1 wei, 1, 10 DAI
-        (DAI, USDC, 100, vec![U256::from(1u64), U256::from(1_000_000u64), U256::from(10_000_000u64)]), // reverse (USDC 6)
+        (
+            USDC,
+            USDT,
+            100,
+            vec![
+                U256::from(1u64),
+                U256::from(1_000_000u64),
+                U256::from(10_000_000u64),
+            ],
+        ), // 1 wei, 1, 10 USDT
+        (
+            USDT,
+            USDC,
+            100,
+            vec![
+                U256::from(1u64),
+                U256::from(1_000_000u64),
+                U256::from(10_000_000u64),
+            ],
+        ), // reverse
+        (
+            USDC,
+            DAI,
+            100,
+            vec![
+                U256::from(1u64),
+                U256::from(1_000_000_000_000_000_000u128),
+                U256::from(10_000_000_000_000_000_000u128),
+            ],
+        ), // 1 wei, 1, 10 DAI
+        (
+            DAI,
+            USDC,
+            100,
+            vec![
+                U256::from(1u64),
+                U256::from(1_000_000u64),
+                U256::from(10_000_000u64),
+            ],
+        ), // reverse (USDC 6)
         // Common volatile pools (fee 3000)
-        (WETH, DAI, 3000, vec![U256::from(1u64), U256::from(1_000_000_000_000_000u128), U256::from(10_000_000_000_000_000u128)]), // 1 wei, 0.001, 0.01 DAI
-        (DAI, WETH, 3000, vec![U256::from(1u64), U256::from(1_000_000_000_000_000u128), U256::from(10_000_000_000_000_000u128)]), // reverse (WETH 18)
-        (WETH, USDT, 3000, vec![U256::from(1u64), U256::from(1_000_000u64), U256::from(100_000_000u64)]), // 1 wei, 1, 100 USDT
-        (USDT, WETH, 3000, vec![U256::from(1u64), U256::from(1_000_000_000_000_000u128)]), // reverse small
-        (WETH, WBTC, 3000, vec![U256::from(1u64), U256::from(10_000u64), U256::from(100_000u64)]), // 1 sat, 0.0001, 0.001 WBTC (8 decimals)
-        (WBTC, WETH, 3000, vec![U256::from(1u64), U256::from(10_000u64)]), // reverse small
+        (
+            WETH,
+            DAI,
+            3000,
+            vec![
+                U256::from(1u64),
+                U256::from(1_000_000_000_000_000u128),
+                U256::from(10_000_000_000_000_000u128),
+            ],
+        ), // 1 wei, 0.001, 0.01 DAI
+        (
+            DAI,
+            WETH,
+            3000,
+            vec![
+                U256::from(1u64),
+                U256::from(1_000_000_000_000_000u128),
+                U256::from(10_000_000_000_000_000u128),
+            ],
+        ), // reverse (WETH 18)
+        (
+            WETH,
+            USDT,
+            3000,
+            vec![
+                U256::from(1u64),
+                U256::from(1_000_000u64),
+                U256::from(100_000_000u64),
+            ],
+        ), // 1 wei, 1, 100 USDT
+        (
+            USDT,
+            WETH,
+            3000,
+            vec![U256::from(1u64), U256::from(1_000_000_000_000_000u128)],
+        ), // reverse small
+        (
+            WETH,
+            WBTC,
+            3000,
+            vec![
+                U256::from(1u64),
+                U256::from(10_000u64),
+                U256::from(100_000u64),
+            ],
+        ), // 1 sat, 0.0001, 0.001 WBTC (8 decimals)
+        (
+            WBTC,
+            WETH,
+            3000,
+            vec![U256::from(1u64), U256::from(10_000u64)],
+        ), // reverse small
     ];
 
     for (token_in, token_out, fee, exact_outs) in test_cases {
-        let Some(pool) = load_pool_from_factory(
-            provider.clone(),
-            token_in,
-            token_out,
-            fee,
-            current_block,
-        )
-        .await?
+        let Some(pool) =
+            load_pool_from_factory(provider.clone(), token_in, token_out, fee, current_block)
+                .await?
         else {
             continue;
         };
 
         for amount_out in exact_outs {
-            let amount_in = pool.simulate_swap_exact_out(token_in, Address::default(), amount_out)?;
+            let amount_in =
+                pool.simulate_swap_exact_out(token_in, Address::default(), amount_out)?;
             let expected_amount_in = quoter
-                .quoteExactOutputSingle(
-                    token_in,
-                    token_out,
-                    U24::from(fee),
-                    amount_out,
-                    U160::ZERO,
-                )
+                .quoteExactOutputSingle(token_in, token_out, U24::from(fee), amount_out, U160::ZERO)
                 .block(current_block)
                 .call()
                 .await?;
@@ -662,7 +712,8 @@ async fn test_simulate_swap_exact_out_fee_10000() -> eyre::Result<()> {
         let exact_outs = vec![unit, unit * U256::from(10u8)];
 
         for amount_out in exact_outs {
-            let amount_in = pool.simulate_swap_exact_out(token_in, Address::default(), amount_out)?;
+            let amount_in =
+                pool.simulate_swap_exact_out(token_in, Address::default(), amount_out)?;
             let expected_amount_in = quoter
                 .quoteExactOutputSingle(
                     token_in,
@@ -702,7 +753,7 @@ async fn test_simulate_swap_exact_out_low_liquidity_pool() -> eyre::Result<()> {
         (WBTC, WETH, 3000),
         (WETH, USDT, 3000),
         (WETH, DAI, 3000),
-        (USDC, DAI, 500), // fee 0.05
+        (USDC, DAI, 500),  // fee 0.05
         (USDC, USDT, 100), // fee 0.01
     ];
 
@@ -726,7 +777,9 @@ async fn test_simulate_swap_exact_out_low_liquidity_pool() -> eyre::Result<()> {
     }
 
     let Some((pool, token_in, token_out, fee)) = selected else {
-        return Err(eyre::eyre!("no candidate pools found for low-liquidity test"));
+        return Err(eyre::eyre!(
+            "no candidate pools found for low-liquidity test"
+        ));
     };
 
     let out_decimals = pool.decimals(token_out);
@@ -736,13 +789,7 @@ async fn test_simulate_swap_exact_out_low_liquidity_pool() -> eyre::Result<()> {
     for amount_out in exact_outs {
         let amount_in = pool.simulate_swap_exact_out(token_in, Address::default(), amount_out)?;
         let expected_amount_in = quoter
-            .quoteExactOutputSingle(
-                token_in,
-                token_out,
-                U24::from(fee),
-                amount_out,
-                U160::ZERO,
-            )
+            .quoteExactOutputSingle(token_in, token_out, U24::from(fee), amount_out, U160::ZERO)
             .block(current_block)
             .call()
             .await?;

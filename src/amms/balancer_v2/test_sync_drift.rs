@@ -9,8 +9,8 @@ mod tests {
         rpc::types::{Filter, Log},
         sol_types::SolEvent,
     };
-    use std::str::FromStr;
     use std::collections::HashMap;
+    use std::str::FromStr;
 
     use crate::amms::{
         amm::AutomatedMarketMaker,
@@ -61,7 +61,11 @@ mod tests {
         block: BlockId,
     ) -> eyre::Result<HashMap<Address, U256>> {
         let vault_contract = IVault::new(vault_address, provider.clone());
-        let result = vault_contract.getPoolTokens(pool_id).block(block).call().await?;
+        let result = vault_contract
+            .getPoolTokens(pool_id)
+            .block(block)
+            .call()
+            .await?;
 
         let mut balances = HashMap::new();
         for (token, balance) in result.tokens.into_iter().zip(result.balances.into_iter()) {
@@ -114,17 +118,19 @@ mod tests {
         }
 
         // Verify initial state matches on-chain
-        let onchain_balances =
-            fetch_onchain_state(&*provider, vault_address, pool_id, BlockId::from(start_block))
-                .await?;
+        let onchain_balances = fetch_onchain_state(
+            &*provider,
+            vault_address,
+            pool_id,
+            BlockId::from(start_block),
+        )
+        .await?;
         for (addr, state) in &pool.tokens {
-            let oc_balance = onchain_balances
-                .get(addr)
-                .copied()
-                .unwrap_or_default();
+            let oc_balance = onchain_balances.get(addr).copied().unwrap_or_default();
             assert_eq!(
                 state.balance, oc_balance,
-                "[{label}] Initial balance mismatch for token {}!", addr
+                "[{label}] Initial balance mismatch for token {}!",
+                addr
             );
         }
         println!("[{label}] ✅ Initial state matches on-chain");
@@ -135,9 +141,14 @@ mod tests {
             start_block + 1,
             current_block
         );
-        let mut events =
-            fetch_pool_events(&*provider, vault_address, pool_id, start_block + 1, current_block)
-                .await?;
+        let mut events = fetch_pool_events(
+            &*provider,
+            vault_address,
+            pool_id,
+            start_block + 1,
+            current_block,
+        )
+        .await?;
         println!("[{label}] Found {} events", events.len());
 
         // CRITICAL: Sort events chronologically to prevent out-of-order processing issues
@@ -194,18 +205,17 @@ mod tests {
                         let mut all_match = true;
 
                         for (addr, state) in &pool.tokens {
-                            let oc_balance = oc_balances
-                                .get(addr)
-                                .copied()
-                                .unwrap_or_default();
+                            let oc_balance = oc_balances.get(addr).copied().unwrap_or_default();
 
                             let balance_matches = state.balance == oc_balance;
 
                             if !balance_matches {
                                 all_match = false;
                                 let drift_pct = if !oc_balance.is_zero() {
-                                    let local_f = state.balance.to_string().parse::<f64>().unwrap_or(0.0);
-                                    let remote_f = oc_balance.to_string().parse::<f64>().unwrap_or(1.0);
+                                    let local_f =
+                                        state.balance.to_string().parse::<f64>().unwrap_or(0.0);
+                                    let remote_f =
+                                        oc_balance.to_string().parse::<f64>().unwrap_or(1.0);
                                     ((local_f - remote_f) / remote_f * 100.0).abs()
                                 } else {
                                     100.0
@@ -252,18 +262,19 @@ mod tests {
                     total_checks += 1;
 
                     println!("\n[{label}] === FINAL STATE COMPARISON (block {final_block}) ===");
-                    
+
                     for (addr, state) in &pool.tokens {
-                        let oc_balance = oc_balances
-                            .get(addr)
-                            .copied()
-                            .unwrap_or_default();
-                        
+                        let oc_balance = oc_balances.get(addr).copied().unwrap_or_default();
+
                         println!(
                             "  Token {addr} balance: local={} vs on-chain={}  {}",
                             state.balance,
                             oc_balance,
-                            if state.balance == oc_balance { "✅" } else { "❌" }
+                            if state.balance == oc_balance {
+                                "✅"
+                            } else {
+                                "❌"
+                            }
                         );
 
                         // Assert final state matches
@@ -295,8 +306,17 @@ mod tests {
     #[tokio::test]
     async fn test_sync_drift_pool_0x3de2() -> eyre::Result<()> {
         let pool_address = address!("3de27efa2f1aa663ae5d458857e731c129069f29");
-        let pool_id = B256::from_str("0x3de27efa2f1aa663ae5d458857e731c129069f29000200000000000000000588").unwrap();
+        let pool_id =
+            B256::from_str("0x3de27efa2f1aa663ae5d458857e731c129069f29000200000000000000000588")
+                .unwrap();
         let vault_address = address!("BA12222222228d8Ba445958a75a0704d566BF2C8");
-        run_sync_drift_test(pool_address, pool_id, vault_address, BalancerV2PoolType::Weighted, "Pool-0x3de2").await
+        run_sync_drift_test(
+            pool_address,
+            pool_id,
+            vault_address,
+            BalancerV2PoolType::Weighted,
+            "Pool-0x3de2",
+        )
+        .await
     }
 }

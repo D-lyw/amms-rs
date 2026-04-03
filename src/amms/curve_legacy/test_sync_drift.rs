@@ -11,9 +11,7 @@ mod tests {
 
     use crate::amms::{
         amm::AutomatedMarketMaker,
-        curve_legacy::{
-            CurveLegacyPool, CurveLegacyPoolType, ICurveLegacyCryptoSwapUpdate,
-        },
+        curve_legacy::{CurveLegacyPool, CurveLegacyPoolType, ICurveLegacyCryptoSwapUpdate},
     };
 
     /// Helper: fetch all pool events in a block range using sync_events()

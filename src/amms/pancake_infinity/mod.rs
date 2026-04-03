@@ -193,7 +193,9 @@ impl AutomatedMarketMaker for PancakeInfinityPool {
         };
 
         // Efficient O(1) best-case check for any tick containing enough liquidity
-        self.ticks.values().any(|info| info.liquidity_gross >= l_thresh)
+        self.ticks
+            .values()
+            .any(|info| info.liquidity_gross >= l_thresh)
     }
 
     fn decimals(&self, token: Address) -> u8 {
@@ -474,7 +476,8 @@ impl AutomatedMarketMaker for PancakeInfinityPool {
             } else {
                 // Same dynamic fee calculation as simulate_swap_mut
                 let fee_pips: u32 = ((self.protocol_fee as u64)
-                    + (((self.lp_fee as u64) * (1_000_000u64 - self.protocol_fee as u64) + 999_999u64)
+                    + (((self.lp_fee as u64) * (1_000_000u64 - self.protocol_fee as u64)
+                        + 999_999u64)
                         / 1_000_000u64))
                     .min(1_000_000u64) as u32;
 

@@ -50,9 +50,10 @@ pub fn calculate_invariant(amp: U256, balances: &[U256]) -> Result<U256, Balance
             .ok_or_else(|| BalancerV3Error::MathError("mul overflow".to_string()))?
             .checked_div(U256::from(AMP_PRECISION_U64))
             .ok_or_else(|| BalancerV3Error::MathError("div zero".to_string()))?
-            .checked_add(d_p.checked_mul(U256::from(num_tokens)).ok_or_else(|| {
-                BalancerV3Error::MathError("mul overflow".to_string())
-            })?)
+            .checked_add(
+                d_p.checked_mul(U256::from(num_tokens))
+                    .ok_or_else(|| BalancerV3Error::MathError("mul overflow".to_string()))?,
+            )
             .ok_or_else(|| BalancerV3Error::MathError("add overflow".to_string()))?
             .checked_mul(invariant)
             .ok_or_else(|| BalancerV3Error::MathError("mul overflow".to_string()))?;
@@ -65,8 +66,7 @@ pub fn calculate_invariant(amp: U256, balances: &[U256]) -> Result<U256, Balance
             .checked_div(U256::from(AMP_PRECISION_U64))
             .ok_or_else(|| BalancerV3Error::MathError("div zero".to_string()))?
             .checked_add(
-                d_p
-                    .checked_mul(U256::from(num_tokens + 1))
+                d_p.checked_mul(U256::from(num_tokens + 1))
                     .ok_or_else(|| BalancerV3Error::MathError("mul overflow".to_string()))?,
             )
             .ok_or_else(|| BalancerV3Error::MathError("add overflow".to_string()))?;
@@ -127,8 +127,7 @@ pub fn compute_balance(
         .ok_or_else(|| BalancerV3Error::MathError("mul overflow".to_string()))?;
 
     let c = div_up_raw(
-        inv2
-            .checked_mul(U256::from(AMP_PRECISION_U64))
+        inv2.checked_mul(U256::from(AMP_PRECISION_U64))
             .ok_or_else(|| BalancerV3Error::MathError("mul overflow".to_string()))?,
         amp_times_total
             .checked_mul(p_d)
@@ -147,11 +146,13 @@ pub fn compute_balance(
         )
         .ok_or_else(|| BalancerV3Error::MathError("add overflow".to_string()))?;
 
-    let mut token_balance = div_up_raw(inv2.checked_add(c).ok_or_else(|| {
-        BalancerV3Error::MathError("add overflow".to_string())
-    })?, invariant.checked_add(b).ok_or_else(|| {
-        BalancerV3Error::MathError("add overflow".to_string())
-    })?)?;
+    let mut token_balance = div_up_raw(
+        inv2.checked_add(c)
+            .ok_or_else(|| BalancerV3Error::MathError("add overflow".to_string()))?,
+        invariant
+            .checked_add(b)
+            .ok_or_else(|| BalancerV3Error::MathError("add overflow".to_string()))?,
+    )?;
 
     for _ in 0..255u16 {
         let prev_token_balance = token_balance;

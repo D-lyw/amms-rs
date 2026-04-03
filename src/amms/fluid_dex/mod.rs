@@ -269,7 +269,6 @@ fn price_diff_check(old_price: U256, new_price: U256) -> bool {
     price_diff <= limit && price_diff >= -limit
 }
 
-
 /// Integer square root using Newton's method
 fn integer_sqrt(n: U256) -> U256 {
     if n.is_zero() {
@@ -680,8 +679,12 @@ impl FluidDexPool {
             let mut threshold_time = (dex_variables2 >> 88u32) & mask(24);
 
             if ((dex_variables2 >> 67u32) & U256::ONE) == U256::ONE {
-                let shifted =
-                    self.apply_threshold_shift(upper_threshold, lower_threshold, threshold_time, now_ts);
+                let shifted = self.apply_threshold_shift(
+                    upper_threshold,
+                    lower_threshold,
+                    threshold_time,
+                    now_ts,
+                );
                 upper_threshold = shifted.0;
                 lower_threshold = shifted.1;
                 threshold_time = shifted.2;
@@ -690,8 +693,7 @@ impl FluidDexPool {
             let time_elapsed = now_ts.saturating_sub(self.last_swap_timestamp);
             if last_stored_price
                 > center_price
-                    + ((upper_range - center_price)
-                        * (three_decimals - upper_threshold)
+                    + ((upper_range - center_price) * (three_decimals - upper_threshold)
                         / three_decimals)
             {
                 if threshold_time > U256::ZERO {
@@ -706,8 +708,7 @@ impl FluidDexPool {
                 }
             } else if last_stored_price
                 < center_price
-                    - ((center_price - lower_range)
-                        * (three_decimals - lower_threshold)
+                    - ((center_price - lower_range) * (three_decimals - lower_threshold)
                         / three_decimals)
             {
                 if threshold_time > U256::ZERO {
@@ -922,16 +923,13 @@ impl FluidDexPool {
         let (gp_adj, pb_adj, dx_adj, dy_adj) = if geometric_mean < u27 {
             (geometric_mean, lower_range, dx, dy)
         } else {
-            (
-                u54 / geometric_mean,
-                u54 / upper_range,
-                dy,
-                dx,
-            )
+            (u54 / geometric_mean, u54 / upper_range, dy, dx)
         };
 
         // part1 = ((dx * gp) - (dy * 1e27)) / (2 * 1e27)
-        let term1 = dx_adj.checked_mul(gp_adj).ok_or(AMMError::ArithmeticError)?;
+        let term1 = dx_adj
+            .checked_mul(gp_adj)
+            .ok_or(AMMError::ArithmeticError)?;
         let term2 = dy_adj.checked_mul(u27).ok_or(AMMError::ArithmeticError)?;
 
         let p1 = if term1 >= term2 {
@@ -941,27 +939,38 @@ impl FluidDexPool {
         };
 
         // p2 = (dx * dy * pb) / 1e27
-        let dx_dy = dx_adj.checked_mul(dy_adj).ok_or(AMMError::ArithmeticError)?;
+        let dx_dy = dx_adj
+            .checked_mul(dy_adj)
+            .ok_or(AMMError::ArithmeticError)?;
         let p2 = if dx_dy.is_zero() {
             U256::ZERO
         } else if pb_adj > u54 / dx_dy {
-            (dx_dy / u27).checked_mul(pb_adj).ok_or(AMMError::ArithmeticError)?
+            (dx_dy / u27)
+                .checked_mul(pb_adj)
+                .ok_or(AMMError::ArithmeticError)?
         } else {
             (dx_dy * pb_adj) / u27
         };
 
         // ry = p1 + sqrt(p2 + p1^2)
-        let p1_sq = p1.checked_mul(p1).ok_or(AMMError::ArithmeticError)?.into_raw();
+        let p1_sq = p1
+            .checked_mul(p1)
+            .ok_or(AMMError::ArithmeticError)?
+            .into_raw();
         let sqrt_val = integer_sqrt(p2.checked_add(p1_sq).ok_or(AMMError::ArithmeticError)?);
         let ry = if p1 >= I256::ZERO {
-            p1.into_raw().checked_add(sqrt_val).ok_or(AMMError::ArithmeticError)?
+            p1.into_raw()
+                .checked_add(sqrt_val)
+                .ok_or(AMMError::ArithmeticError)?
         } else {
             sqrt_val.saturating_sub(p1.abs().into_raw())
         };
 
         // iry_ = ((ry * 1e27) - (dx * pb))
         let ry_term = ry.checked_mul(u27).ok_or(AMMError::ArithmeticError)?;
-        let dx_pb_term = dx_adj.checked_mul(pb_adj).ok_or(AMMError::ArithmeticError)?;
+        let dx_pb_term = dx_adj
+            .checked_mul(pb_adj)
+            .ok_or(AMMError::ArithmeticError)?;
 
         if ry_term < dx_pb_term {
             return Err(AMMError::ArithmeticError); // Panic point!
@@ -1069,21 +1078,30 @@ impl FluidDexPool {
 
             // Even for simple swaps, we should check boundaries if possible
             let scale_1e27 = U256::from(10u64).pow(U256::from(27u64));
-            let r_in = if swap0to1 { self.token0_imag_reserves_1e12 } else { self.token1_imag_reserves_1e12 };
-            let r_out = if swap0to1 { self.token1_imag_reserves_1e12 } else { self.token0_imag_reserves_1e12 };
-            
+            let r_in = if swap0to1 {
+                self.token0_imag_reserves_1e12
+            } else {
+                self.token1_imag_reserves_1e12
+            };
+            let r_out = if swap0to1 {
+                self.token1_imag_reserves_1e12
+            } else {
+                self.token0_imag_reserves_1e12
+            };
+
             if !r_in.is_zero() && !r_out.is_zero() {
                 let revenue_cut = self.revenue_cut_1e8;
-                let amount_in_net = amount_to_swap.saturating_mul(revenue_cut) / U256::from(100_000_000u64);
+                let amount_in_net =
+                    amount_to_swap.saturating_mul(revenue_cut) / U256::from(100_000_000u64);
                 let new_i_in = r_in.saturating_add(amount_in_net);
                 let new_i_out = r_out.saturating_sub(amount_out_1e12);
-                
+
                 let new_price = if swap0to1 {
                     new_i_out.saturating_mul(scale_1e27) / new_i_in
                 } else {
                     new_i_in.saturating_mul(scale_1e27) / new_i_out
                 };
-                
+
                 if !self.check_price_boundary(new_price) {
                     return Ok(zero());
                 }
@@ -1162,7 +1180,6 @@ impl FluidDexPool {
             return Err(AMMError::ArithmeticError);
         }
 
-
         let a = if col_pool_enabled && debt_pool_enabled {
             self.swap_routing_in(
                 amount_to_swap,
@@ -1195,11 +1212,19 @@ impl FluidDexPool {
             (amount_to_swap, out, U256::ZERO, U256::ZERO)
         } else {
             let a_u256 = a.into_raw();
-            let out_col =
-                calc_amount_out(a_u256, col_i_reserve_in, col_i_reserve_out, U256::from(self.fee_1e6));
+            let out_col = calc_amount_out(
+                a_u256,
+                col_i_reserve_in,
+                col_i_reserve_out,
+                U256::from(self.fee_1e6),
+            );
             let in_debt = amount_to_swap - a_u256;
-            let out_debt =
-                calc_amount_out(in_debt, debt_i_reserve_in, debt_i_reserve_out, U256::from(self.fee_1e6));
+            let out_debt = calc_amount_out(
+                in_debt,
+                debt_i_reserve_in,
+                debt_i_reserve_out,
+                U256::from(self.fee_1e6),
+            );
             (a_u256, out_col, in_debt, out_debt)
         };
 
@@ -1248,8 +1273,12 @@ impl FluidDexPool {
         }
 
         if !amount_in_col.is_zero() {
-            let new_reserve_in = col_reserve_in.checked_add(amount_in_col).ok_or(AMMError::ArithmeticError)?;
-            let new_reserve_out = col_reserve_out.checked_sub(amount_out_col).ok_or(AMMError::ArithmeticError)?;
+            let new_reserve_in = col_reserve_in
+                .checked_add(amount_in_col)
+                .ok_or(AMMError::ArithmeticError)?;
+            let new_reserve_out = col_reserve_out
+                .checked_sub(amount_out_col)
+                .ok_or(AMMError::ArithmeticError)?;
             if !self.verify_reserves_ratio(
                 swap0to1,
                 new_reserve_in,
@@ -1261,8 +1290,12 @@ impl FluidDexPool {
             }
         }
         if !amount_in_debt.is_zero() {
-            let new_reserve_in = debt_reserve_in.checked_add(amount_in_debt).ok_or(AMMError::ArithmeticError)?;
-            let new_reserve_out = debt_reserve_out.checked_sub(amount_out_debt).ok_or(AMMError::ArithmeticError)?;
+            let new_reserve_in = debt_reserve_in
+                .checked_add(amount_in_debt)
+                .ok_or(AMMError::ArithmeticError)?;
+            let new_reserve_out = debt_reserve_out
+                .checked_sub(amount_out_debt)
+                .ok_or(AMMError::ArithmeticError)?;
             if !self.verify_reserves_ratio(
                 swap0to1,
                 new_reserve_in,
@@ -1281,20 +1314,40 @@ impl FluidDexPool {
             amount_in_debt.saturating_mul(self.revenue_cut_1e8) / U256::from(100_000_000u64);
 
         let new_price = if amount_in_col > amount_in_debt {
-            let new_i_in = col_i_reserve_in.checked_add(amount_in_col_net).ok_or(AMMError::ArithmeticError)?;
-            let new_i_out = col_i_reserve_out.checked_sub(amount_out_col).ok_or(AMMError::ArithmeticError)?;
+            let new_i_in = col_i_reserve_in
+                .checked_add(amount_in_col_net)
+                .ok_or(AMMError::ArithmeticError)?;
+            let new_i_out = col_i_reserve_out
+                .checked_sub(amount_out_col)
+                .ok_or(AMMError::ArithmeticError)?;
             if swap0to1 {
-                new_i_out.checked_mul(scale_1e27).ok_or(AMMError::ArithmeticError)? / new_i_in
+                new_i_out
+                    .checked_mul(scale_1e27)
+                    .ok_or(AMMError::ArithmeticError)?
+                    / new_i_in
             } else {
-                new_i_in.checked_mul(scale_1e27).ok_or(AMMError::ArithmeticError)? / new_i_out
+                new_i_in
+                    .checked_mul(scale_1e27)
+                    .ok_or(AMMError::ArithmeticError)?
+                    / new_i_out
             }
         } else {
-            let new_i_in = debt_i_reserve_in.checked_add(amount_in_debt_net).ok_or(AMMError::ArithmeticError)?;
-            let new_i_out = debt_i_reserve_out.checked_sub(amount_out_debt).ok_or(AMMError::ArithmeticError)?;
+            let new_i_in = debt_i_reserve_in
+                .checked_add(amount_in_debt_net)
+                .ok_or(AMMError::ArithmeticError)?;
+            let new_i_out = debt_i_reserve_out
+                .checked_sub(amount_out_debt)
+                .ok_or(AMMError::ArithmeticError)?;
             if swap0to1 {
-                new_i_out.checked_mul(scale_1e27).ok_or(AMMError::ArithmeticError)? / new_i_in
+                new_i_out
+                    .checked_mul(scale_1e27)
+                    .ok_or(AMMError::ArithmeticError)?
+                    / new_i_in
             } else {
-                new_i_in.checked_mul(scale_1e27).ok_or(AMMError::ArithmeticError)? / new_i_out
+                new_i_in
+                    .checked_mul(scale_1e27)
+                    .ok_or(AMMError::ArithmeticError)?
+                    / new_i_out
             }
         };
         if !self.check_price_boundary(new_price) {
@@ -1306,10 +1359,12 @@ impl FluidDexPool {
         if time_diff == 0 {
             if !self.last_center_price_1e27.is_zero() {
                 let scale_1e8 = U256::from(100_000_000u64);
-                let lower = (self.last_center_price_1e27
+                let lower = (self
+                    .last_center_price_1e27
                     .saturating_mul(scale_1e8.saturating_sub(U256::ONE)))
                     / scale_1e8;
-                let upper = (self.last_center_price_1e27
+                let upper = (self
+                    .last_center_price_1e27
                     .saturating_mul(scale_1e8.saturating_add(U256::ONE)))
                     / scale_1e8;
                 if center_price < lower || center_price > upper {
@@ -1428,10 +1483,8 @@ impl FluidDexPool {
         }
 
         // 2. Validate token pair and determine direction
-        let swap0to1 = base_token == self.token_a.address
-            && quote_token == self.token_b.address;
-        let swap1to0 = base_token == self.token_b.address
-            && quote_token == self.token_a.address;
+        let swap0to1 = base_token == self.token_a.address && quote_token == self.token_b.address;
+        let swap1to0 = base_token == self.token_b.address && quote_token == self.token_a.address;
 
         if !swap0to1 && !swap1to0 {
             return Err(AMMError::Msg("Token pair not in pool".to_string()));
@@ -1470,7 +1523,9 @@ impl FluidDexPool {
         let total_available = imag_reserve_out.max(real_reserve_out);
 
         if amount_out_1e12 >= total_available {
-            return Err(AMMError::Msg("Insufficient liquidity for exact out".to_string()));
+            return Err(AMMError::Msg(
+                "Insufficient liquidity for exact out".to_string(),
+            ));
         }
 
         // 5. Set search bounds
@@ -1488,7 +1543,8 @@ impl FluidDexPool {
 
         loop {
             let high_original = unscale_from_1e12(high, in_decimals);
-            let dy_1e12 = match self.simulate_swap_internal(base_token, quote_token, high_original) {
+            let dy_1e12 = match self.simulate_swap_internal(base_token, quote_token, high_original)
+            {
                 Ok(calc) => calc.amount_out_1e12,
                 Err(_) => U256::ZERO,
             };
@@ -1785,7 +1841,6 @@ impl AutomatedMarketMaker for FluidDexPool {
                     .col_token1_imag_1e12
                     .checked_sub(calc.amount_out_col)
                     .ok_or(AMMError::ArithmeticError)?;
-
             }
             if calc.amount_in_debt_net > U256::ZERO {
                 self.debt_token0_real_1e12 = self
@@ -1803,7 +1858,6 @@ impl AutomatedMarketMaker for FluidDexPool {
                     .debt_token1_imag_1e12
                     .checked_sub(calc.amount_out_debt)
                     .ok_or(AMMError::ArithmeticError)?;
-
             }
         } else {
             if calc.amount_in_col_net > U256::ZERO {
@@ -1822,7 +1876,6 @@ impl AutomatedMarketMaker for FluidDexPool {
                     .col_token0_imag_1e12
                     .checked_sub(calc.amount_out_col)
                     .ok_or(AMMError::ArithmeticError)?;
-
             }
             if calc.amount_in_debt_net > U256::ZERO {
                 self.debt_token1_real_1e12 = self
@@ -1840,18 +1893,13 @@ impl AutomatedMarketMaker for FluidDexPool {
                     .debt_token0_imag_1e12
                     .checked_sub(calc.amount_out_debt)
                     .ok_or(AMMError::ArithmeticError)?;
-
             }
         }
 
-        self.token0_real_reserves_1e12 =
-            self.col_token0_real_1e12 + self.debt_token0_real_1e12;
-        self.token1_real_reserves_1e12 =
-            self.col_token1_real_1e12 + self.debt_token1_real_1e12;
-        self.token0_imag_reserves_1e12 =
-            self.col_token0_imag_1e12 + self.debt_token0_imag_1e12;
-        self.token1_imag_reserves_1e12 =
-            self.col_token1_imag_1e12 + self.debt_token1_imag_1e12;
+        self.token0_real_reserves_1e12 = self.col_token0_real_1e12 + self.debt_token0_real_1e12;
+        self.token1_real_reserves_1e12 = self.col_token1_real_1e12 + self.debt_token1_real_1e12;
+        self.token0_imag_reserves_1e12 = self.col_token0_imag_1e12 + self.debt_token0_imag_1e12;
+        self.token1_imag_reserves_1e12 = self.col_token1_imag_1e12 + self.debt_token1_imag_1e12;
 
         let scale_1e27 = U256::from(10u64).pow(U256::from(27u64));
         let new_price_1e27 = if calc.swap0to1 {
@@ -2219,7 +2267,8 @@ impl FluidDexFactory {
                             decode_price_from_dex_variables(dex_variables, 41);
                         pool.last_center_price_1e27 =
                             decode_price_from_dex_variables(dex_variables, 81);
-                        pool.last_swap_timestamp = ((dex_variables >> 121u32) & mask(33)).to::<u64>();
+                        pool.last_swap_timestamp =
+                            ((dex_variables >> 121u32) & mask(33)).to::<u64>();
                         pool.range_shift = dex
                             .readFromStorage(B256::from(U256::from(7u64)))
                             .block(block_number)
@@ -2438,7 +2487,8 @@ mod tests {
         amm::{AutomatedMarketMaker, AMM},
         factory::DiscoverySync,
         fluid_dex::{
-            DexReservesResolver, FluidDexFactory, FluidDexPool, FluidDexT1, FLUID_DEX_RESOLVER, FLUID_NATIVE_ETH,
+            DexReservesResolver, FluidDexFactory, FluidDexPool, FluidDexT1, FLUID_DEX_RESOLVER,
+            FLUID_NATIVE_ETH,
         },
     };
 
@@ -2460,12 +2510,7 @@ mod tests {
             return Ok(());
         };
 
-        let factory = FluidDexFactory::new(
-            Address::ZERO,
-            0,
-            vec![],
-            Some(FLUID_DEX_RESOLVER),
-        );
+        let factory = FluidDexFactory::new(Address::ZERO, 0, vec![], Some(FLUID_DEX_RESOLVER));
         let pools = factory
             .discover::<alloy::network::Ethereum, _>(BlockId::latest(), provider.clone())
             .await?;
@@ -2706,12 +2751,7 @@ mod tests {
             return Ok(());
         };
 
-        let factory = FluidDexFactory::new(
-            Address::ZERO,
-            0,
-            vec![],
-            Some(FLUID_DEX_RESOLVER),
-        );
+        let factory = FluidDexFactory::new(Address::ZERO, 0, vec![], Some(FLUID_DEX_RESOLVER));
         let discovered = factory
             .discover::<alloy::network::Ethereum, _>(BlockId::latest(), provider.clone())
             .await?;
@@ -2821,7 +2861,10 @@ mod tests {
             let logs = provider.get_logs(&filter).await?;
 
             if logs.is_empty() {
-                println!("No swap events for {} in last 10000 blocks, skipping", label);
+                println!(
+                    "No swap events for {} in last 10000 blocks, skipping",
+                    label
+                );
                 continue;
             }
 
@@ -2884,20 +2927,20 @@ mod tests {
                     )
                     .await?;
 
-                let amount_out_sim =
-                    match test_pool.simulate_swap(token_in, token_out, *amount_in) {
-                        Ok(out) => out,
-                        Err(e) => {
-                            println!(
-                                "    Test {}: Sim failed for amount {}: {:?}",
-                                idx + 1,
-                                amount_in,
-                                e
-                            );
-                            all_passed = false;
-                            continue;
-                        }
-                    };
+                let amount_out_sim = match test_pool.simulate_swap(token_in, token_out, *amount_in)
+                {
+                    Ok(out) => out,
+                    Err(e) => {
+                        println!(
+                            "    Test {}: Sim failed for amount {}: {:?}",
+                            idx + 1,
+                            amount_in,
+                            e
+                        );
+                        all_passed = false;
+                        continue;
+                    }
+                };
 
                 let expected_out = if *amount_in == base_amount {
                     actual_amount_out
@@ -2948,7 +2991,11 @@ mod tests {
                 "\n  {} pool summary: Max deviation = {} bps, Overall = {}",
                 label,
                 max_deviation_bps,
-                if all_passed { "✅ PASSED" } else { "❌ FAILED" }
+                if all_passed {
+                    "✅ PASSED"
+                } else {
+                    "❌ FAILED"
+                }
             );
 
             if label == "wstETH/ETH" {
@@ -2961,7 +3008,6 @@ mod tests {
 
         Ok(())
     }
-
 }
 
 #[cfg(test)]

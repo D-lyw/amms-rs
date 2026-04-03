@@ -35,8 +35,7 @@ async fn test_base_balancer_v3_init() -> eyre::Result<()> {
 
     let vault_address = Address::from_str("0xbA1333333333a1BA1108E8412f11850A5C319bA9")?;
 
-    let pool_address =
-        Address::from_str("0x4126D6C3c675F27a92Ee031E5670B7EAC868887f")?;
+    let pool_address = Address::from_str("0x4126D6C3c675F27a92Ee031E5670B7EAC868887f")?;
 
     let code = provider.get_code_at(pool_address).await?;
     if code.is_empty() {
@@ -44,11 +43,7 @@ async fn test_base_balancer_v3_init() -> eyre::Result<()> {
         return Ok(());
     }
 
-    let mut pool = BalancerV3Pool::new(
-        pool_address,
-        vault_address,
-        BalancerV3PoolType::Weighted,
-    );
+    let mut pool = BalancerV3Pool::new(pool_address, vault_address, BalancerV3PoolType::Weighted);
 
     pool = pool.init(block_id, provider.clone()).await?;
 
@@ -97,8 +92,7 @@ async fn test_base_balancer_v3_stable_pool() -> eyre::Result<()> {
 
     let vault_address = Address::from_str("0xbA1333333333a1BA1108E8412f11850A5C319bA9")?;
 
-    let pool_address =
-        Address::from_str("0x9B4efaA492923435E8Cbf3A7c5230590866010a7")?;
+    let pool_address = Address::from_str("0x9B4efaA492923435E8Cbf3A7c5230590866010a7")?;
 
     let code = provider.get_code_at(pool_address).await?;
     if code.is_empty() {
@@ -106,11 +100,7 @@ async fn test_base_balancer_v3_stable_pool() -> eyre::Result<()> {
         return Ok(());
     }
 
-    let mut pool = BalancerV3Pool::new(
-        pool_address,
-        vault_address,
-        BalancerV3PoolType::Stable,
-    );
+    let mut pool = BalancerV3Pool::new(pool_address, vault_address, BalancerV3PoolType::Stable);
 
     pool = pool.init(block_id, provider.clone()).await?;
 

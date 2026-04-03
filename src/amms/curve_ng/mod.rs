@@ -381,15 +381,15 @@ impl AutomatedMarketMaker for CurveNGPool {
     /// Curve NG is deployed on multiple EVM-compatible chains
     fn supported_chains(&self) -> Option<Vec<u64>> {
         Some(vec![
-            1,      // Ethereum
-            42161,  // Arbitrum
-            137,    // Polygon
-            10,     // Optimism
-            8453,   // Base
-            56,     // BSC
-            43114,  // Avalanche
-            100,    // Gnosis
-            42220,  // Celo
+            1,     // Ethereum
+            42161, // Arbitrum
+            137,   // Polygon
+            10,    // Optimism
+            8453,  // Base
+            56,    // BSC
+            43114, // Avalanche
+            100,   // Gnosis
+            42220, // Celo
         ])
     }
 
@@ -1272,8 +1272,7 @@ impl CurveNGPool {
                     .map_err(|e| AMMError::Msg(e.into()))?
             }
         } else {
-            math::cryptoswap::newton_d(amp, gamma, &xp)
-                .map_err(|e| AMMError::Msg(e.into()))?
+            math::cryptoswap::newton_d(amp, gamma, &xp).map_err(|e| AMMError::Msg(e.into()))?
         };
 
         // 链上安全检查: assert _D > 10**17 - 1 and _D < 10**15 * 10**18 + 1
@@ -1325,7 +1324,9 @@ impl CurveNGPool {
         // dy_scaled = xp[j] - y - 1
         let dy_scaled = xp[j]
             .checked_sub(y)
-            .ok_or(AMMError::Msg("New y is larger than old y (slippage?)".into()))?
+            .ok_or(AMMError::Msg(
+                "New y is larger than old y (slippage?)".into(),
+            ))?
             .checked_sub(U256::from(1u8))
             .ok_or(AMMError::Msg("Underflow in dy_scaled - 1".into()))?;
 

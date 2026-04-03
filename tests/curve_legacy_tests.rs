@@ -24,7 +24,8 @@ sol! {
 
 #[tokio::test]
 async fn test_curve_legacy_3pool_simulation() -> Result<()> {
-    let rpc_url = env::var("ETHEREUM_PROVIDER").unwrap_or("https://ethereum-rpc.publicnode.com".to_string());
+    let rpc_url =
+        env::var("ETHEREUM_PROVIDER").unwrap_or("https://ethereum-rpc.publicnode.com".to_string());
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
 
     // 3pool Address (DAI/USDC/USDT)
@@ -195,17 +196,14 @@ async fn test_curve_legacy_3pool_exact_out() -> Result<()> {
     let usdc_idx = 1;
 
     let target_outs = vec![
-        U256::from(100) * U256::from(10).pow(U256::from(6)),   // 100 USDC
-        U256::from(1000) * U256::from(10).pow(U256::from(6)),  // 1000 USDC
+        U256::from(100) * U256::from(10).pow(U256::from(6)), // 100 USDC
+        U256::from(1000) * U256::from(10).pow(U256::from(6)), // 1000 USDC
         U256::from(10000) * U256::from(10).pow(U256::from(6)), // 10k USDC
     ];
 
     for target_out in target_outs {
-        let amount_in = pool.simulate_swap_exact_out(
-            pool.coins[dai_idx],
-            pool.coins[usdc_idx],
-            target_out,
-        )?;
+        let amount_in =
+            pool.simulate_swap_exact_out(pool.coins[dai_idx], pool.coins[usdc_idx], target_out)?;
 
         // Verify: use calculated amount_in to do exact-in, should get >= target_out
         let actual_out =
@@ -262,9 +260,9 @@ async fn test_curve_legacy_tricrypto2_exact_out() -> Result<()> {
             0,
             1,
             vec![
-                U256::from(100000),    // 100000 satoshi ~ 0.001 BTC
-                U256::from(1000000),   // 0.01 BTC
-                U256::from(10000000),  // 0.1 BTC
+                U256::from(100000),   // 100000 satoshi ~ 0.001 BTC
+                U256::from(1000000),  // 0.01 BTC
+                U256::from(10000000), // 0.1 BTC
             ],
         ),
         // WBTC (1) -> USDT (0): target USDT output
@@ -272,7 +270,7 @@ async fn test_curve_legacy_tricrypto2_exact_out() -> Result<()> {
             1,
             0,
             vec![
-                U256::from(1000) * U256::from(10).pow(U256::from(6)),  // 1000 USDT
+                U256::from(1000) * U256::from(10).pow(U256::from(6)), // 1000 USDT
                 U256::from(10000) * U256::from(10).pow(U256::from(6)), // 10k USDT
             ],
         ),
@@ -281,7 +279,7 @@ async fn test_curve_legacy_tricrypto2_exact_out() -> Result<()> {
             2,
             0,
             vec![
-                U256::from(1000) * U256::from(10).pow(U256::from(6)),  // 1000 USDT
+                U256::from(1000) * U256::from(10).pow(U256::from(6)), // 1000 USDT
             ],
         ),
     ];

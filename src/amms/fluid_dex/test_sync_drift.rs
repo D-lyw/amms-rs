@@ -1,8 +1,9 @@
-use crate::amms::amm::AutomatedMarketMaker;
 use super::{
     decode_liquidity_utilization, decode_price_from_dex_variables, mask, DexReservesResolver,
-    FluidDexPool, FluidDexT1, FluidLiquidity, LogOperate, FLUID_DEX_RESOLVER, FLUID_LIQUIDITY_LAYER,
+    FluidDexPool, FluidDexT1, FluidLiquidity, LogOperate, FLUID_DEX_RESOLVER,
+    FLUID_LIQUIDITY_LAYER,
 };
+use crate::amms::amm::AutomatedMarketMaker;
 use alloy::{
     eips::BlockId,
     network::Ethereum,
@@ -23,10 +24,7 @@ async fn fetch_pool_events<P: Provider + Clone>(
     from_block: u64,
     to_block: u64,
 ) -> Result<Vec<Log>> {
-    let event_sigs = vec![
-        FluidDexT1::Swap::SIGNATURE_HASH,
-        LogOperate::SIGNATURE_HASH,
-    ];
+    let event_sigs = vec![FluidDexT1::Swap::SIGNATURE_HASH, LogOperate::SIGNATURE_HASH];
 
     let filter = Filter::new()
         .address(vec![pool_address, FLUID_LIQUIDITY_LAYER])
@@ -45,14 +43,18 @@ async fn fetch_onchain_state<P: Provider + Clone>(
     block: BlockId,
 ) -> Result<(U256, U256, U256, U256)> {
     let resolver = DexReservesResolver::new(resolver_address, provider.clone());
-    let res = resolver.getPoolReservesAdjusted(pool_address).block(block).call().await?;
+    let res = resolver
+        .getPoolReservesAdjusted(pool_address)
+        .block(block)
+        .call()
+        .await?;
 
     let real_0 = res.collateralReserves.token0RealReserves + res.debtReserves.token0RealReserves;
     let real_1 = res.collateralReserves.token1RealReserves + res.debtReserves.token1RealReserves;
-    let imag_0 = res.collateralReserves.token0ImaginaryReserves
-        + res.debtReserves.token0ImaginaryReserves;
-    let imag_1 = res.collateralReserves.token1ImaginaryReserves
-        + res.debtReserves.token1ImaginaryReserves;
+    let imag_0 =
+        res.collateralReserves.token0ImaginaryReserves + res.debtReserves.token0ImaginaryReserves;
+    let imag_1 =
+        res.collateralReserves.token1ImaginaryReserves + res.debtReserves.token1ImaginaryReserves;
 
     Ok((real_0, real_1, imag_0, imag_1))
 }
@@ -109,7 +111,11 @@ async fn refresh_pool_from_resolver<P: Provider + Clone>(
     block: BlockId,
 ) -> Result<()> {
     let resolver = DexReservesResolver::new(resolver_address, provider.clone());
-    let pr = resolver.getPoolReservesAdjusted(pool.address).block(block).call().await?;
+    let pr = resolver
+        .getPoolReservesAdjusted(pool.address)
+        .block(block)
+        .call()
+        .await?;
 
     pool.center_price_1e27 = pr.centerPrice;
 
@@ -214,7 +220,11 @@ async fn refresh_pool_from_resolver<P: Provider + Clone>(
             pool.last_synced_block_timestamp,
         )
         .await;
-    pool.compute_ranges_from_dex(dex_variables, dex_variables2, pool.last_synced_block_timestamp);
+    pool.compute_ranges_from_dex(
+        dex_variables,
+        dex_variables2,
+        pool.last_synced_block_timestamp,
+    );
 
     if !pool.liquidity_address.is_zero() {
         let liquidity = FluidLiquidity::new(pool.liquidity_address, provider.clone());
@@ -255,7 +265,9 @@ async fn run_sync_drift_test(pool_address: Address, label: &str) -> Result<()> {
     };
 
     let resolver_address = FLUID_DEX_RESOLVER;
-    let provider = Arc::new(alloy::providers::ProviderBuilder::new().connect_http(rpc_endpoint.parse().unwrap()));
+    let provider = Arc::new(
+        alloy::providers::ProviderBuilder::new().connect_http(rpc_endpoint.parse().unwrap()),
+    );
 
     let current_block = provider.get_block_number().await?;
     println!("[{label}] Current block: {current_block}");
@@ -288,9 +300,13 @@ async fn run_sync_drift_test(pool_address: Address, label: &str) -> Result<()> {
         .await?;
     pool.set_last_synced_block(start_block);
 
-    let (onchain_real_0, onchain_real_1, onchain_imag_0, onchain_imag_1) =
-        fetch_onchain_state(&*provider, pool_address, resolver_address, BlockId::from(start_block))
-            .await?;
+    let (onchain_real_0, onchain_real_1, onchain_imag_0, onchain_imag_1) = fetch_onchain_state(
+        &*provider,
+        pool_address,
+        resolver_address,
+        BlockId::from(start_block),
+    )
+    .await?;
 
     assert_eq!(
         pool.token0_real_reserves_1e12, onchain_real_0,
@@ -309,7 +325,10 @@ async fn run_sync_drift_test(pool_address: Address, label: &str) -> Result<()> {
         "[{label}] Initial token1_imag_reserves mismatch!"
     );
 
-    println!("[{label}] ✅ Initial state verified at block {}", start_block);
+    println!(
+        "[{label}] ✅ Initial state verified at block {}",
+        start_block
+    );
 
     let mut events =
         fetch_pool_events(&*provider, pool_address, start_block + 1, current_block).await?;
@@ -358,9 +377,11 @@ async fn run_sync_drift_test(pool_address: Address, label: &str) -> Result<()> {
 
         if block_num >= last_checked_block + check_interval {
             let check_block = BlockId::from(block_num);
-            let _ = refresh_pool_from_resolver(&mut pool, &*provider, resolver_address, check_block)
-                .await;
-            match fetch_onchain_state(&*provider, pool_address, resolver_address, check_block).await {
+            let _ =
+                refresh_pool_from_resolver(&mut pool, &*provider, resolver_address, check_block)
+                    .await;
+            match fetch_onchain_state(&*provider, pool_address, resolver_address, check_block).await
+            {
                 Ok((oc_real_0, oc_real_1, oc_imag_0, oc_imag_1)) => {
                     total_checks += 1;
 
@@ -370,7 +391,11 @@ async fn run_sync_drift_test(pool_address: Address, label: &str) -> Result<()> {
                     let imag_1_matches = pool.token1_imag_reserves_1e12 == oc_imag_1;
 
                     let real_0_drift = if !oc_real_0.is_zero() {
-                        let local_f = pool.token0_real_reserves_1e12.to_string().parse::<f64>().unwrap_or(0.0);
+                        let local_f = pool
+                            .token0_real_reserves_1e12
+                            .to_string()
+                            .parse::<f64>()
+                            .unwrap_or(0.0);
                         let remote_f = oc_real_0.to_string().parse::<f64>().unwrap_or(1.0);
                         ((local_f - remote_f) / remote_f * 100.0).abs()
                     } else {
@@ -430,8 +455,8 @@ async fn run_sync_drift_test(pool_address: Address, label: &str) -> Result<()> {
     if let Some(last_log) = events.last() {
         let final_block = last_log.block_number.unwrap_or(current_block);
         let check_block = BlockId::from(final_block);
-        let _ = refresh_pool_from_resolver(&mut pool, &*provider, resolver_address, check_block)
-            .await;
+        let _ =
+            refresh_pool_from_resolver(&mut pool, &*provider, resolver_address, check_block).await;
         match fetch_onchain_state(&*provider, pool_address, resolver_address, check_block).await {
             Ok((oc_real_0, oc_real_1, oc_imag_0, oc_imag_1)) => {
                 total_checks += 1;
@@ -441,25 +466,41 @@ async fn run_sync_drift_test(pool_address: Address, label: &str) -> Result<()> {
                     "  token0_real: local={} vs on-chain={}  {}",
                     pool.token0_real_reserves_1e12,
                     oc_real_0,
-                    if pool.token0_real_reserves_1e12 == oc_real_0 { "✅" } else { "❌" }
+                    if pool.token0_real_reserves_1e12 == oc_real_0 {
+                        "✅"
+                    } else {
+                        "❌"
+                    }
                 );
                 println!(
                     "  token1_real: local={} vs on-chain={}  {}",
                     pool.token1_real_reserves_1e12,
                     oc_real_1,
-                    if pool.token1_real_reserves_1e12 == oc_real_1 { "✅" } else { "❌" }
+                    if pool.token1_real_reserves_1e12 == oc_real_1 {
+                        "✅"
+                    } else {
+                        "❌"
+                    }
                 );
                 println!(
                     "  token0_imag: local={} vs on-chain={}  {}",
                     pool.token0_imag_reserves_1e12,
                     oc_imag_0,
-                    if pool.token0_imag_reserves_1e12 == oc_imag_0 { "✅" } else { "❌" }
+                    if pool.token0_imag_reserves_1e12 == oc_imag_0 {
+                        "✅"
+                    } else {
+                        "❌"
+                    }
                 );
                 println!(
                     "  token1_imag: local={} vs on-chain={}  {}",
                     pool.token1_imag_reserves_1e12,
                     oc_imag_1,
-                    if pool.token1_imag_reserves_1e12 == oc_imag_1 { "✅" } else { "❌" }
+                    if pool.token1_imag_reserves_1e12 == oc_imag_1 {
+                        "✅"
+                    } else {
+                        "❌"
+                    }
                 );
 
                 assert_eq!(

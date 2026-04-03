@@ -30,13 +30,13 @@ pub fn get_vault_address(_chain_id: u64) -> Option<Address> {
 /// Returns the list of chain IDs where Balancer V3 is deployed
 pub fn get_supported_chains() -> Vec<u64> {
     vec![
-        1,      // Ethereum
-        42161,  // Arbitrum
-        8453,   // Base
-        100,    // Gnosis
-        43114,  // Avalanche
-        10,     // Optimism
-        196,    // X Layer
+        1,     // Ethereum
+        42161, // Arbitrum
+        8453,  // Base
+        100,   // Gnosis
+        43114, // Avalanche
+        10,    // Optimism
+        196,   // X Layer
     ]
 }
 
@@ -44,13 +44,13 @@ pub fn get_supported_chains() -> Vec<u64> {
 /// Ref: https://docs.balancer.fi/developer-reference/contracts/deployment-addresses/
 pub fn get_vault_explorer_address(chain_id: u64) -> Option<Address> {
     match chain_id {
-        1 => Some(address!("Fc2986feAB34713E659da84F3B1FA32c1da95832")),      // Ethereum Mainnet
+        1 => Some(address!("Fc2986feAB34713E659da84F3B1FA32c1da95832")), // Ethereum Mainnet
         42161 => Some(address!("B9d01CA61b9C181dA1051bFDd28e1097e920AB14")), // Arbitrum
-        8453 => Some(address!("aD89051bEd8d96f045E8912aE1672c6C0bF8a85E")),  // Base
-        100 => Some(address!("7f4C133e44381D05129F9B81bAD8Fa9F3345D29B")),   // Gnosis
+        8453 => Some(address!("aD89051bEd8d96f045E8912aE1672c6C0bF8a85E")), // Base
+        100 => Some(address!("7f4C133e44381D05129F9B81bAD8Fa9F3345D29B")), // Gnosis
         43114 => Some(address!("4Cb42fc3b5fb9392Ce0772C3A540E4AE4da4Ac4d")), // Avalanche
-        10 => Some(address!("EAedc32a51c510d35ebC11088fD5fF2b47aACF2E")),    // Optimism
-        196 => Some(address!("7Ba29fE8E83dd6097A7298075C4AFfdBda3121cC")),   // X Layer
+        10 => Some(address!("EAedc32a51c510d35ebC11088fD5fF2b47aACF2E")), // Optimism
+        196 => Some(address!("7Ba29fE8E83dd6097A7298075C4AFfdBda3121cC")), // X Layer
         _ => None,
     }
 }
@@ -264,11 +264,7 @@ sol!(
 );
 
 impl BalancerV3Pool {
-    pub fn new(
-        address: Address,
-        vault_address: Address,
-        pool_type: BalancerV3PoolType,
-    ) -> Self {
+    pub fn new(address: Address, vault_address: Address, pool_type: BalancerV3PoolType) -> Self {
         Self {
             address,
             last_synced_block: 0,
@@ -595,9 +591,7 @@ impl AutomatedMarketMaker for BalancerV3Pool {
         let topic0 = log.topics()[0];
 
         // Ignore ERC4626 buffer Wrap/Unwrap events emitted by the Vault
-        if topic0 == IVaultV3::Wrap::SIGNATURE_HASH
-            || topic0 == IVaultV3::Unwrap::SIGNATURE_HASH
-        {
+        if topic0 == IVaultV3::Wrap::SIGNATURE_HASH || topic0 == IVaultV3::Unwrap::SIGNATURE_HASH {
             return Ok(SyncAction::None);
         }
 
@@ -835,7 +829,8 @@ impl AutomatedMarketMaker for BalancerV3Pool {
             self.to_scaled_18_apply_rate_round_down(token_in_state.balance, token_in_state)?;
         let balance_out_scaled =
             self.to_scaled_18_apply_rate_round_down(token_out_state.balance, token_out_state)?;
-        let amount_in_scaled = self.to_scaled_18_apply_rate_round_down(amount_in, token_in_state)?;
+        let amount_in_scaled =
+            self.to_scaled_18_apply_rate_round_down(amount_in, token_in_state)?;
 
         let fee_amount_scaled = Self::fixed_mul_up(amount_in_scaled, self.swap_fee)?;
         let amount_in_after_fee_scaled = amount_in_scaled
@@ -952,10 +947,10 @@ impl AutomatedMarketMaker for BalancerV3Pool {
                     .get(token_out_state.index)
                     .ok_or(BalancerV3Error::InitializationError)?;
 
-                let balance_in_scaled =
-                    self.to_scaled_18_apply_rate_round_down(token_in_state.balance, token_in_state)?;
-                let balance_out_scaled =
-                    self.to_scaled_18_apply_rate_round_down(token_out_state.balance, token_out_state)?;
+                let balance_in_scaled = self
+                    .to_scaled_18_apply_rate_round_down(token_in_state.balance, token_in_state)?;
+                let balance_out_scaled = self
+                    .to_scaled_18_apply_rate_round_down(token_out_state.balance, token_out_state)?;
                 let rate_out_up = Self::compute_rate_round_up(token_out_state.rate);
                 let amount_out_scaled = self.to_scaled_18_apply_rate_round_up(
                     amount_out,
@@ -1290,22 +1285,14 @@ impl AutomatedMarketMaker for BalancerV3Pool {
                         rate_provider: rate_provider_addr,
                     };
 
-                    let current_live = self.to_scaled_18_apply_rate_round_down(
-                        balance_adj,
-                        &temp_state,
-                    )?;
+                    let current_live =
+                        self.to_scaled_18_apply_rate_round_down(balance_adj, &temp_state)?;
 
                     if current_live > last_live_balance {
                         let delta = current_live - last_live_balance;
-                        let fee_scaled = Self::fixed_mul_up(
-                            delta,
-                            aggregate_yield_fee_percentage,
-                        )?;
-                        let fee_raw = self.to_raw_undo_rate_round_down(
-                            fee_scaled,
-                            &temp_state,
-                            rate,
-                        )?;
+                        let fee_scaled = Self::fixed_mul_up(delta, aggregate_yield_fee_percentage)?;
+                        let fee_raw =
+                            self.to_raw_undo_rate_round_down(fee_scaled, &temp_state, rate)?;
                         if fee_raw > U256::ZERO {
                             balance_adj = balance_adj
                                 .checked_sub(fee_raw)

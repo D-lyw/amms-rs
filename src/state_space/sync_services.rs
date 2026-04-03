@@ -15,7 +15,9 @@ use crate::amms::balancer_v2::BalancerV2Pool;
 use crate::amms::balancer_v3::BalancerV3Pool;
 use crate::amms::curve_ng::{ICurveNGPool, ICurveNGStableSwap, ICurveTriCrypto, ICurveTwoCrypto};
 use crate::amms::factory::Factory;
-use crate::amms::fluid_dex::{DexReservesResolver, FluidDexT1, FluidLiquidity, TokenLimitData, FLUID_DEX_RESOLVER};
+use crate::amms::fluid_dex::{
+    DexReservesResolver, FluidDexT1, FluidLiquidity, TokenLimitData, FLUID_DEX_RESOLVER,
+};
 use crate::state_space::StateSpace;
 
 fn mask(bits: u32) -> U256 {
@@ -829,8 +831,10 @@ pub async fn start_fluid_dex_limits_sync_task<N, P>(
                     pool.utilization_limit_token0 = (dex_variables2 >> 228u32) & mask(10);
                     pool.utilization_limit_token1 = (dex_variables2 >> 238u32) & mask(10);
                     pool.older_price_1e27 = decode_price_from_dex_variables(dex_variables, 1);
-                    pool.last_stored_price_1e27 = decode_price_from_dex_variables(dex_variables, 41);
-                    pool.last_center_price_1e27 = decode_price_from_dex_variables(dex_variables, 81);
+                    pool.last_stored_price_1e27 =
+                        decode_price_from_dex_variables(dex_variables, 41);
+                    pool.last_center_price_1e27 =
+                        decode_price_from_dex_variables(dex_variables, 81);
                     pool.last_swap_timestamp = ((dex_variables >> 121u32) & mask(33)).to::<u64>();
                     pool.last_synced_block_timestamp = block_timestamp;
                     let _ = pool
@@ -845,7 +849,8 @@ pub async fn start_fluid_dex_limits_sync_task<N, P>(
                     pool.compute_ranges_from_dex(dex_variables, dex_variables2, block_timestamp);
 
                     if !pool.liquidity_address.is_zero() {
-                        let liquidity = FluidLiquidity::new(pool.liquidity_address, provider.clone());
+                        let liquidity =
+                            FluidLiquidity::new(pool.liquidity_address, provider.clone());
                         let exchange_price_token0 = liquidity
                             .readFromStorage(pool.exchange_price_token0_slot)
                             .call()
@@ -856,8 +861,10 @@ pub async fn start_fluid_dex_limits_sync_task<N, P>(
                             .call()
                             .await
                             .unwrap_or(U256::ZERO);
-                        pool.token0_utilization = decode_liquidity_utilization(exchange_price_token0);
-                        pool.token1_utilization = decode_liquidity_utilization(exchange_price_token1);
+                        pool.token0_utilization =
+                            decode_liquidity_utilization(exchange_price_token0);
+                        pool.token1_utilization =
+                            decode_liquidity_utilization(exchange_price_token1);
                     }
 
                     pool.limits_sync_time = current_time;

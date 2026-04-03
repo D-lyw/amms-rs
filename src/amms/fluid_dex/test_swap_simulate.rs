@@ -1,5 +1,5 @@
-use crate::amms::amm::AutomatedMarketMaker;
 use super::{price_diff_check, FluidDexPool, FLUID_DEX_RESOLVER};
+use crate::amms::amm::AutomatedMarketMaker;
 use alloy::{
     eips::BlockId,
     primitives::{address, Address, U256},
@@ -38,8 +38,14 @@ async fn test_fluid_dex_oseth_eth_swap_simulate() -> Result<()> {
 
     println!("\n=== Pool Info ===");
     println!("Pool Address: {:?}", pool.address);
-    println!("Token A: {:?} (decimals: {})", pool.token_a.address, pool.token_a.decimals);
-    println!("Token B: {:?} (decimals: {})", pool.token_b.address, pool.token_b.decimals);
+    println!(
+        "Token A: {:?} (decimals: {})",
+        pool.token_a.address, pool.token_a.decimals
+    );
+    println!(
+        "Token B: {:?} (decimals: {})",
+        pool.token_b.address, pool.token_b.decimals
+    );
     println!("Fee (1e6): {}", pool.fee_1e6);
     println!("Center Price (1e27): {}", pool.center_price_1e27);
     println!("\n=== Reserves (1e12) ===");
@@ -211,7 +217,7 @@ async fn test_fluid_dex_boundary_revert() -> Result<()> {
     pool.token1_real_reserves_1e12 = U256::from(1000_000_000u64);
     pool.fee_1e6 = 3000;
     pool.center_price_1e27 = U256::from(10u64).pow(U256::from(27));
-    
+
     // Set upper_range to 0 (simulates 100% range)
     pool.upper_range_1e27 = U256::ZERO;
     pool.lower_range_1e27 = U256::from(5u64) * U256::from(10u64).pow(U256::from(26)); // 0.5 price
@@ -220,7 +226,10 @@ async fn test_fluid_dex_boundary_revert() -> Result<()> {
     let result = pool.simulate_swap(pool.token_a.address, pool.token_b.address, amount_in)?;
 
     println!("Boundary test result (should be 0): {}", result);
-    assert!(result.is_zero(), "Swap should return 0 when upper_range is 0 (invalid/100% range boundary)");
+    assert!(
+        result.is_zero(),
+        "Swap should return 0 when upper_range is 0 (invalid/100% range boundary)"
+    );
 
     Ok(())
 }
@@ -259,7 +268,11 @@ fn test_pool_not_initialized_returns_zero() {
         .simulate_swap(pool.token_a.address, pool.token_b.address, amount_in)
         .expect("simulate_swap should not error");
 
-    assert_eq!(result, U256::ZERO, "Expected zero output for uninitialized pool");
+    assert_eq!(
+        result,
+        U256::ZERO,
+        "Expected zero output for uninitialized pool"
+    );
 }
 
 #[test]
@@ -296,7 +309,11 @@ fn test_amount_limits_return_zero() {
         .simulate_swap(pool.token_a.address, pool.token_b.address, amount_in)
         .expect("simulate_swap should not error");
 
-    assert_eq!(result, U256::ZERO, "Expected zero output for limit-violating amount");
+    assert_eq!(
+        result,
+        U256::ZERO,
+        "Expected zero output for limit-violating amount"
+    );
 }
 
 #[tokio::test]
@@ -322,19 +339,26 @@ async fn test_fluid_dex_dust_protection() -> eyre::Result<()> {
     pool.center_price_1e27 = U256::from(10u64).pow(U256::from(27));
     pool.upper_range_1e27 = U256::from(20u64).pow(U256::from(27));
     pool.lower_range_1e27 = U256::from(1u64).pow(U256::from(26));
-    
+
     // Amount too small (dust): 50 wei < 100 wei
     let amount_in = U256::from(50u64);
     let result = pool.simulate_swap(pool.token_a.address, pool.token_b.address, amount_in)?;
     println!("Dust test result (50 wei): {}", result);
-    assert!(result.is_zero(), "Swap should return 0 for dust amount < 100 wei");
+    assert!(
+        result.is_zero(),
+        "Swap should return 0 for dust amount < 100 wei"
+    );
 
     // Amount slightly above dust raw but below 1e6 adjusted
     // Adjusted 1e6 for 18 decimals is 1e12 wei
     let amount_in_small = U256::from(10u64).pow(U256::from(10)); // 1e10 wei
-    let result_small = pool.simulate_swap(pool.token_a.address, pool.token_b.address, amount_in_small)?;
+    let result_small =
+        pool.simulate_swap(pool.token_a.address, pool.token_b.address, amount_in_small)?;
     println!("Dust test result (1e10 wei): {}", result_small);
-    assert!(result_small.is_zero(), "Swap should return 0 for adjusted amount < 1e6");
+    assert!(
+        result_small.is_zero(),
+        "Swap should return 0 for adjusted amount < 1e6"
+    );
 
     Ok(())
 }
@@ -364,13 +388,16 @@ async fn test_fluid_dex_utilization_limit() -> eyre::Result<()> {
     pool.lower_range_1e27 = U256::from(1u64) * U256::from(10u64).pow(U256::from(25));
 
     // Set utilization limit to 10% (100 * 10 = 1000 in comparison)
-    pool.utilization_limit_token1 = U256::from(100u64); 
+    pool.utilization_limit_token1 = U256::from(100u64);
     pool.token1_utilization = U256::from(1001u64); // Slightly over 10% limit
-    
+
     let amount_in = U256::from(10u64).pow(U256::from(18)); // 1 T0
     let result = pool.simulate_swap(pool.token_a.address, pool.token_b.address, amount_in)?;
     println!("Utilization test result (over limit): {}", result);
-    assert!(result.is_zero(), "Swap should return 0 when utilization is over limit");
+    assert!(
+        result.is_zero(),
+        "Swap should return 0 when utilization is over limit"
+    );
 
     Ok(())
 }
@@ -380,7 +407,7 @@ async fn test_fluid_dex_oseth_eth_panic_repro() -> Result<()> {
     // reproduction of the case: 195 osETH -> ETH
     // Pool only has ~103 ETH real reserves, but swap wants ~207 ETH.
     // This should result in an error or 0 instead of success.
-    
+
     let mut pool = FluidDexPool::default();
     pool.token_a = crate::amms::Token {
         address: ETH_ADDRESS,
@@ -394,15 +421,15 @@ async fn test_fluid_dex_oseth_eth_panic_repro() -> Result<()> {
         symbol: "osETH".to_string(),
         chain_id: 1,
     };
-    
+
     // Set reserves from screenshot (1e12 scale)
     pool.token0_real_reserves_1e12 = U256::from(103_760_000_000u64); // 103.76 ETH
     pool.token1_real_reserves_1e12 = U256::from(5_641_400_000_000u128); // 5641.4 osETH
-    
+
     // Set imaginary reserves large enough to allow calculation but real reserves will hit limit
-    pool.token0_imag_reserves_1e12 = U256::from(10_000_000_000_000u128); 
+    pool.token0_imag_reserves_1e12 = U256::from(10_000_000_000_000u128);
     pool.token1_imag_reserves_1e12 = U256::from(10_000_000_000_000u128);
-    
+
     pool.fee_1e6 = 100; // 0.01%
     pool.center_price_1e27 = U256::from(936_839_000_000_000_000_000_000_000u128); // 0.936839
     pool.upper_range_1e27 = U256::from(938_247_000_000_000_000_000_000_000u128);
@@ -410,19 +437,22 @@ async fn test_fluid_dex_oseth_eth_panic_repro() -> Result<()> {
 
     // Swap 195 osETH -> ETH
     let amount_in = U256::from(195u64) * U256::from(10u64).pow(U256::from(18u64));
-    
+
     println!("\n=== osETH/ETH Panic Repro ===");
     println!("Amount In: 195 osETH");
     println!("ETH Real Reserves: 103.76");
-    
+
     // This should return Err(ArithmeticError) with our new fix
     let result = pool.simulate_swap(OSETH_TOKEN, ETH_ADDRESS, amount_in);
-    
+
     match result {
         Ok(out) => {
             println!("Simulated Amount Out: {} ETH", out);
-            assert!(out.is_zero(), "Should return 0 or Err if output > real reserves");
-        },
+            assert!(
+                out.is_zero(),
+                "Should return 0 or Err if output > real reserves"
+            );
+        }
         Err(e) => {
             println!("Simulated Swap failed as expected: {:?}", e);
             // This is the desired behavior for 100% parity with contract panic
@@ -434,10 +464,10 @@ async fn test_fluid_dex_oseth_eth_panic_repro() -> Result<()> {
 
 #[tokio::test]
 async fn test_reproduce_0xc065_panic() -> Result<()> {
-    use std::str::FromStr;
     use crate::amms::fluid_dex::TokenLimitData;
+    use std::str::FromStr;
     let mut pool = FluidDexPool::default();
-    
+
     let oseth = address!("f1C9acDc66974dFB6dEcB12aA385b9cD01190E38");
     let eth = address!("EeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE");
 
@@ -459,9 +489,9 @@ async fn test_reproduce_0xc065_panic() -> Result<()> {
     pool.col_token1_real_1e12 = U256::from(1000_000_000_000u128);
     pool.debt_token0_real_1e12 = U256::from(1000_000_000_000u128);
     pool.debt_token1_real_1e12 = U256::from(1000_000_000_000u128);
-    
+
     // Imaginary reserves must be non-zero to enable pool
-    pool.col_token0_imag_1e12 = U256::from(10_000_000_000_000u128); 
+    pool.col_token0_imag_1e12 = U256::from(10_000_000_000_000u128);
     pool.col_token1_imag_1e12 = U256::from(10_000_000_000_000u128);
     pool.debt_token0_imag_1e12 = U256::from(10_000_000_000_000u128);
     pool.debt_token1_imag_1e12 = U256::from(10_000_000_000_000u128);
@@ -476,13 +506,13 @@ async fn test_reproduce_0xc065_panic() -> Result<()> {
     pool.borrowable_token1 = high_limit.clone();
     pool.withdrawable_token0 = high_limit.clone();
     pool.withdrawable_token1 = high_limit.clone();
-    
+
     // Unhealthy debt: 5000 osETH debt vs 1000 ETH real
     // ry * 1e27 - dx * pb => 1000 * 1e27 - 5000 * 0.93 * 1e27 < 0
     pool.is_smart_debt_enabled = true;
-    pool.debt0_1e12 = U256::from(0u64); 
+    pool.debt0_1e12 = U256::from(0u64);
     pool.debt1_1e12 = U256::from(5000_000_000_000u128); // 5000 osETH debt
-    
+
     pool.is_smart_collateral_enabled = true;
     pool.fee_1e6 = 100;
     pool.center_price_1e27 = U256::from_str("936839303419921804869391716").unwrap(); // ~0.93
@@ -490,14 +520,17 @@ async fn test_reproduce_0xc065_panic() -> Result<()> {
     pool.lower_range_1e27 = U256::from_str("900000000000000000000000000").unwrap();
 
     let amount_in = U256::from(1u64) * U256::from(10u64).pow(U256::from(18u64));
-    
+
     println!("\n=== Reproduction: Debt Health Check (1000 ETH, 5000 osETH Debt) ===");
     let result = pool.simulate_swap(oseth, eth, amount_in);
 
     match result {
         Ok(out) => {
-            println!("SIMULATION BUG: Returned {} ETH (Should have failed/returned 0)", out);
-        },
+            println!(
+                "SIMULATION BUG: Returned {} ETH (Should have failed/returned 0)",
+                out
+            );
+        }
         Err(e) => {
             println!("✅ Simulation correctly caught panic state: {:?}", e);
         }
@@ -523,8 +556,13 @@ async fn test_fluid_dex_exact_out_zero_amount() -> Result<()> {
     };
 
     // Zero amount_out should return 0
-    let result = pool.simulate_swap_exact_out(pool.token_a.address, pool.token_b.address, U256::ZERO)?;
-    assert_eq!(result, U256::ZERO, "Zero amount_out should return zero input");
+    let result =
+        pool.simulate_swap_exact_out(pool.token_a.address, pool.token_b.address, U256::ZERO)?;
+    assert_eq!(
+        result,
+        U256::ZERO,
+        "Zero amount_out should return zero input"
+    );
 
     println!("✅ Exact-out zero amount test PASSED");
     Ok(())
@@ -584,7 +622,10 @@ async fn test_fluid_dex_exact_out_roundtrip() -> Result<()> {
 
     // Verify: simulate_swap(exact_in) should be >= amount_out
     let verify_out = pool.simulate_swap(OSETH_TOKEN, ETH_ADDRESS, exact_in)?;
-    println!("Verification: simulate_swap(exact_in) = {} wei ETH", verify_out);
+    println!(
+        "Verification: simulate_swap(exact_in) = {} wei ETH",
+        verify_out
+    );
 
     assert!(
         verify_out >= amount_out,
@@ -597,7 +638,10 @@ async fn test_fluid_dex_exact_out_roundtrip() -> Result<()> {
     if exact_in > U256::ZERO {
         let smaller_in = exact_in - U256::from(1u8);
         let smaller_out = pool.simulate_swap(OSETH_TOKEN, ETH_ADDRESS, smaller_in)?;
-        println!("Verification: simulate_swap(exact_in - 1) = {} wei ETH", smaller_out);
+        println!(
+            "Verification: simulate_swap(exact_in - 1) = {} wei ETH",
+            smaller_out
+        );
         assert!(
             smaller_out < amount_out,
             "simulate_swap(exact_in - 1) should be < amount_out. Got {}, expected < {}",
@@ -613,7 +657,10 @@ async fn test_fluid_dex_exact_out_roundtrip() -> Result<()> {
         amount_in - exact_in
     };
     let diff_pct = diff.as_limbs()[0] as f64 / amount_in.as_limbs()[0] as f64 * 100.0;
-    println!("Difference from original input: {} wei ({:.4}%)", diff, diff_pct);
+    println!(
+        "Difference from original input: {} wei ({:.4}%)",
+        diff, diff_pct
+    );
 
     // Allow some tolerance due to binary search precision
     assert!(
@@ -666,7 +713,10 @@ async fn test_fluid_dex_exact_out_reverse_direction() -> Result<()> {
 
     // Verify
     let verify_out = pool.simulate_swap(ETH_ADDRESS, OSETH_TOKEN, exact_in)?;
-    println!("Verification: simulate_swap(exact_in) = {} wei osETH", verify_out);
+    println!(
+        "Verification: simulate_swap(exact_in) = {} wei osETH",
+        verify_out
+    );
 
     assert!(
         verify_out >= amount_out,

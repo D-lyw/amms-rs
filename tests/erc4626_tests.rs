@@ -3,15 +3,13 @@
 //! These tests verify the exact-out simulation logic for ERC4626 vaults.
 
 use alloy::primitives::{Address, U256};
-use amms::amms::{
-    amm::AutomatedMarketMaker,
-    erc_4626::ERC4626Vault,
-};
+use amms::amms::{amm::AutomatedMarketMaker, erc_4626::ERC4626Vault};
 
 // Test vault addresses
 const SDAI_VAULT: Address = alloy::primitives::address!("83F20F44975D03b1b09e64809B757c47f942BEeA");
 const DAI_TOKEN: Address = alloy::primitives::address!("6B175474E89094C44Da98b954EedeAC495271d0F");
-const ASSET_TOKEN: Address = alloy::primitives::address!("1111111111111111111111111111111111111111");
+const ASSET_TOKEN: Address =
+    alloy::primitives::address!("1111111111111111111111111111111111111111");
 
 /// Create a test vault with specified parameters
 fn create_test_vault(
@@ -50,8 +48,8 @@ fn test_simulate_swap_exact_out_zero_amount() {
         ASSET_TOKEN,
         U256::from(1000000000000000000000u128), // 1000 shares
         U256::from(1000000000000000000000u128), // 1000 assets
-        0,  // 0% deposit fee
-        0,  // 0% withdraw fee
+        0,                                      // 0% deposit fee
+        0,                                      // 0% withdraw fee
         18,
         18,
     );
@@ -89,8 +87,8 @@ fn test_simulate_swap_exact_out_withdraw_no_fee() {
         ASSET_TOKEN,
         U256::from(1000000000000000000000u128), // 1000 shares
         U256::from(1000000000000000000000u128), // 1000 assets
-        0,  // 0% deposit fee
-        0,  // 0% withdraw fee
+        0,                                      // 0% deposit fee
+        0,                                      // 0% withdraw fee
         18,
         18,
     );
@@ -104,7 +102,10 @@ fn test_simulate_swap_exact_out_withdraw_no_fee() {
 
     // With 1:1 ratio and no fee, should need ~100 shares
     // Due to ceiling division, might be slightly more
-    println!("Withdraw: need {} shares to get {} assets", amount_in, amount_out);
+    println!(
+        "Withdraw: need {} shares to get {} assets",
+        amount_in, amount_out
+    );
     assert!(amount_in >= U256::from(100000000000000000000u128));
     // Allow larger margin due to ceiling division in exact-out formula
     assert!(amount_in < U256::from(150000000000000000000u128));
@@ -133,7 +134,10 @@ fn test_simulate_swap_exact_out_deposit_no_fee() {
     let amount_in = result.unwrap();
 
     // With 1:1 ratio and no fee, should need ~100 assets
-    println!("Deposit: need {} assets to get {} shares", amount_in, amount_out);
+    println!(
+        "Deposit: need {} assets to get {} shares",
+        amount_in, amount_out
+    );
     assert!(amount_in >= U256::from(100000000000000000000u128));
     // Allow larger margin due to ceiling division in exact-out formula
     assert!(amount_in < U256::from(150000000000000000000u128));
@@ -147,8 +151,8 @@ fn test_simulate_swap_exact_out_withdraw_with_fee() {
         ASSET_TOKEN,
         U256::from(1000000000000000000000u128), // 1000 shares
         U256::from(1000000000000000000000u128), // 1000 assets
-        0,    // 0% deposit fee
-        100,  // 1% withdraw fee (100 basis points)
+        0,                                      // 0% deposit fee
+        100,                                    // 1% withdraw fee (100 basis points)
         18,
         18,
     );
@@ -161,7 +165,10 @@ fn test_simulate_swap_exact_out_withdraw_with_fee() {
     let amount_in = result.unwrap();
 
     // With 1% fee, need more shares than 1:1
-    println!("Withdraw with fee: need {} shares to get {} assets", amount_in, amount_out);
+    println!(
+        "Withdraw with fee: need {} shares to get {} assets",
+        amount_in, amount_out
+    );
     assert!(amount_in > U256::from(100000000000000000000u128)); // > 100 shares
 }
 
@@ -174,8 +181,8 @@ fn test_simulate_swap_exact_out_deposit_with_fee() {
         asset_token,
         U256::from(1000000000000000000000u128), // 1000 shares
         U256::from(1000000000000000000000u128), // 1000 assets
-        100, // 1% deposit fee
-        0,   // 0% withdraw fee
+        100,                                    // 1% deposit fee
+        0,                                      // 0% withdraw fee
         18,
         18,
     );
@@ -188,7 +195,10 @@ fn test_simulate_swap_exact_out_deposit_with_fee() {
     let amount_in = result.unwrap();
 
     // With 1% fee, need more assets than 1:1
-    println!("Deposit with fee: need {} assets to get {} shares", amount_in, amount_out);
+    println!(
+        "Deposit with fee: need {} assets to get {} shares",
+        amount_in, amount_out
+    );
     assert!(amount_in > U256::from(100000000000000000000u128)); // > 100 assets
 }
 
@@ -200,16 +210,16 @@ fn test_simulate_swap_exact_out_reverse_verify() {
         ASSET_TOKEN,
         U256::from(10000000000000000000000u128), // 10000 shares
         U256::from(10000000000000000000000u128), // 10000 assets
-        50,  // 0.5% deposit fee
-        50,  // 0.5% withdraw fee
+        50,                                      // 0.5% deposit fee
+        50,                                      // 0.5% withdraw fee
         18,
         18,
     );
 
     let test_amounts = [
-        U256::from(100000000000000000000u128),   // 100
-        U256::from(500000000000000000000u128),   // 500
-        U256::from(1000000000000000000000u128),  // 1000
+        U256::from(100000000000000000000u128),  // 100
+        U256::from(500000000000000000000u128),  // 500
+        U256::from(1000000000000000000000u128), // 1000
     ];
 
     for amount_out in test_amounts {
@@ -244,7 +254,7 @@ fn test_simulate_swap_exact_out_different_decimals() {
         SDAI_VAULT,
         ASSET_TOKEN,
         U256::from(1000000000000000000000000u128), // 1M shares (18 decimals)
-        U256::from(1000000000u128),                 // 1000 USDC (6 decimals)
+        U256::from(1000000000u128),                // 1000 USDC (6 decimals)
         0,
         0,
         18,
@@ -258,7 +268,10 @@ fn test_simulate_swap_exact_out_different_decimals() {
     assert!(result.is_ok());
     let amount_in = result.unwrap();
 
-    println!("Different decimals: need {} shares to get {} USDC", amount_in, amount_out);
+    println!(
+        "Different decimals: need {} shares to get {} USDC",
+        amount_in, amount_out
+    );
     assert!(amount_in > U256::ZERO);
 }
 
@@ -271,8 +284,8 @@ fn test_simulate_swap_exact_out_round_trip() {
         asset_token,
         U256::from(10000000000000000000000u128),
         U256::from(10000000000000000000000u128),
-        30,  // 0.3% deposit fee
-        30,  // 0.3% withdraw fee
+        30, // 0.3% deposit fee
+        30, // 0.3% withdraw fee
         18,
         18,
     );
@@ -281,15 +294,29 @@ fn test_simulate_swap_exact_out_round_trip() {
     let target_out = U256::from(1000000000000000000000u128); // 100
 
     // Direction 1: Withdraw (vault -> asset)
-    let exact_in_1 = vault.simulate_swap_exact_out(SDAI_VAULT, asset_token, target_out).unwrap();
-    let verify_out_1 = vault.simulate_swap(SDAI_VAULT, asset_token, exact_in_1).unwrap();
+    let exact_in_1 = vault
+        .simulate_swap_exact_out(SDAI_VAULT, asset_token, target_out)
+        .unwrap();
+    let verify_out_1 = vault
+        .simulate_swap(SDAI_VAULT, asset_token, exact_in_1)
+        .unwrap();
     assert!(verify_out_1 >= target_out, "Withdraw round-trip failed");
 
     // Direction 2: Deposit (asset -> vault)
-    let exact_in_2 = vault.simulate_swap_exact_out(asset_token, SDAI_VAULT, target_out).unwrap();
-    let verify_out_2 = vault.simulate_swap(asset_token, SDAI_VAULT, exact_in_2).unwrap();
+    let exact_in_2 = vault
+        .simulate_swap_exact_out(asset_token, SDAI_VAULT, target_out)
+        .unwrap();
+    let verify_out_2 = vault
+        .simulate_swap(asset_token, SDAI_VAULT, exact_in_2)
+        .unwrap();
     assert!(verify_out_2 >= target_out, "Deposit round-trip failed");
 
-    println!("Withdraw: target={}, in={}, verify={}", target_out, exact_in_1, verify_out_1);
-    println!("Deposit: target={}, in={}, verify={}", target_out, exact_in_2, verify_out_2);
+    println!(
+        "Withdraw: target={}, in={}, verify={}",
+        target_out, exact_in_1, verify_out_1
+    );
+    println!(
+        "Deposit: target={}, in={}, verify={}",
+        target_out, exact_in_2, verify_out_2
+    );
 }

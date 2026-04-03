@@ -71,11 +71,7 @@ async fn run_swap_test(
         return Ok(());
     }
 
-    let mut pool = BalancerV3Pool::new(
-        pool_address,
-        vault_address,
-        pool_type,
-    );
+    let mut pool = BalancerV3Pool::new(pool_address, vault_address, pool_type);
     pool = pool.init(block_id, provider.clone()).await?;
 
     assert_eq!(pool.pool_type, pool_type);
@@ -427,7 +423,10 @@ where
                 }
                 Err(e) => {
                     let msg = e.to_string();
-                    if msg.contains("MAX_IN_RATIO") || msg.contains("MAX_OUT_RATIO") || msg.contains("Math Error") {
+                    if msg.contains("MAX_IN_RATIO")
+                        || msg.contains("MAX_OUT_RATIO")
+                        || msg.contains("Math Error")
+                    {
                         attempt_out = std::cmp::max(attempt_out / U256::from(2u8), U256::from(1u8));
                         if attempts >= 12 {
                             return Err(eyre::eyre!(
@@ -870,11 +869,26 @@ async fn test_balancer_v3_weighted_exact_in_pool_index_v3() -> eyre::Result<()> 
     let router_address = Address::from_str("0xAE563E3f8219521950555F5962419C8919758Ea2")?;
 
     let pools = vec![
-        ("0x6687b8d041a178ef7b865b60dfce39ebb0700e1b", "Weighted v3 8-token (weight 0.86 core)"),
-        ("0x6378c977cc421f71dfff5aa72b1567d1082ad00d", "Weighted v3 8-token (ALCX/USDC mix)"),
-        ("0xb1f62fc950e30a64a5032bbd8619a70b2c2b27c6", "Weighted v3 7-token (PEPE core)"),
-        ("0xc3b10d061c1e172883135532f1dca99348544959", "Weighted v3 8-token (USDC core)"),
-        ("0xb96008d1d926a6129bd91a12c924bd49b79d7bf5", "Weighted v3 3-token (USDC/USDT/PEPE)"),
+        (
+            "0x6687b8d041a178ef7b865b60dfce39ebb0700e1b",
+            "Weighted v3 8-token (weight 0.86 core)",
+        ),
+        (
+            "0x6378c977cc421f71dfff5aa72b1567d1082ad00d",
+            "Weighted v3 8-token (ALCX/USDC mix)",
+        ),
+        (
+            "0xb1f62fc950e30a64a5032bbd8619a70b2c2b27c6",
+            "Weighted v3 7-token (PEPE core)",
+        ),
+        (
+            "0xc3b10d061c1e172883135532f1dca99348544959",
+            "Weighted v3 8-token (USDC core)",
+        ),
+        (
+            "0xb96008d1d926a6129bd91a12c924bd49b79d7bf5",
+            "Weighted v3 3-token (USDC/USDT/PEPE)",
+        ),
     ];
 
     for (addr, label) in pools {
@@ -935,11 +949,26 @@ async fn test_balancer_v3_weighted_exact_out_pool_index_v3() -> eyre::Result<()>
     let router_address = Address::from_str("0xAE563E3f8219521950555F5962419C8919758Ea2")?;
 
     let pools = vec![
-        ("0x6687b8d041a178ef7b865b60dfce39ebb0700e1b", "Weighted v3 8-token (weight 0.86 core)"),
-        ("0x6378c977cc421f71dfff5aa72b1567d1082ad00d", "Weighted v3 8-token (ALCX/USDC mix)"),
-        ("0xb1f62fc950e30a64a5032bbd8619a70b2c2b27c6", "Weighted v3 7-token (PEPE core)"),
-        ("0xc3b10d061c1e172883135532f1dca99348544959", "Weighted v3 8-token (USDC core)"),
-        ("0xb96008d1d926a6129bd91a12c924bd49b79d7bf5", "Weighted v3 3-token (USDC/USDT/PEPE)"),
+        (
+            "0x6687b8d041a178ef7b865b60dfce39ebb0700e1b",
+            "Weighted v3 8-token (weight 0.86 core)",
+        ),
+        (
+            "0x6378c977cc421f71dfff5aa72b1567d1082ad00d",
+            "Weighted v3 8-token (ALCX/USDC mix)",
+        ),
+        (
+            "0xb1f62fc950e30a64a5032bbd8619a70b2c2b27c6",
+            "Weighted v3 7-token (PEPE core)",
+        ),
+        (
+            "0xc3b10d061c1e172883135532f1dca99348544959",
+            "Weighted v3 8-token (USDC core)",
+        ),
+        (
+            "0xb96008d1d926a6129bd91a12c924bd49b79d7bf5",
+            "Weighted v3 3-token (USDC/USDT/PEPE)",
+        ),
     ];
 
     for (addr, label) in pools {
@@ -985,33 +1014,23 @@ async fn test_balancer_v3_weighted_exact_out_pool_index_v3() -> eyre::Result<()>
 #[tokio::test]
 async fn test_balancer_v3_stable_exact_in_pool_index_v3() -> eyre::Result<()> {
     let pools = vec![
-        ("0x1ea5870f7c037930ce1d5d8d9317c670e89e13e3", "Stable v3 wstETH/rETH"),
-        ("0x57c23c58b1d8c3292c15becf07c62c5c52457a42", "Stable v3 wstETH/pyUSD"),
+        (
+            "0x1ea5870f7c037930ce1d5d8d9317c670e89e13e3",
+            "Stable v3 wstETH/rETH",
+        ),
+        (
+            "0x57c23c58b1d8c3292c15becf07c62c5c52457a42",
+            "Stable v3 wstETH/pyUSD",
+        ),
     ];
 
     for (addr, label) in pools {
         let pool = Address::from_str(addr)?;
         let desc_0_1 = format!("PoolIndex Stable exact-in {label} 0->1");
-        run_swap_test(
-            pool,
-            BalancerV3PoolType::Stable,
-            0,
-            1,
-            1.0,
-            &desc_0_1,
-        )
-        .await?;
+        run_swap_test(pool, BalancerV3PoolType::Stable, 0, 1, 1.0, &desc_0_1).await?;
 
         let desc_1_0 = format!("PoolIndex Stable exact-in {label} 1->0");
-        run_swap_test(
-            pool,
-            BalancerV3PoolType::Stable,
-            1,
-            0,
-            1.0,
-            &desc_1_0,
-        )
-        .await?;
+        run_swap_test(pool, BalancerV3PoolType::Stable, 1, 0, 1.0, &desc_1_0).await?;
     }
 
     Ok(())
@@ -1020,33 +1039,23 @@ async fn test_balancer_v3_stable_exact_in_pool_index_v3() -> eyre::Result<()> {
 #[tokio::test]
 async fn test_balancer_v3_stable_exact_out_pool_index_v3() -> eyre::Result<()> {
     let pools = vec![
-        ("0x1ea5870f7c037930ce1d5d8d9317c670e89e13e3", "Stable v3 wstETH/rETH"),
-        ("0x57c23c58b1d8c3292c15becf07c62c5c52457a42", "Stable v3 wstETH/pyUSD"),
+        (
+            "0x1ea5870f7c037930ce1d5d8d9317c670e89e13e3",
+            "Stable v3 wstETH/rETH",
+        ),
+        (
+            "0x57c23c58b1d8c3292c15becf07c62c5c52457a42",
+            "Stable v3 wstETH/pyUSD",
+        ),
     ];
 
     for (addr, label) in pools {
         let pool = Address::from_str(addr)?;
         let desc_0_1 = format!("PoolIndex Stable exact-out {label} 0->1");
-        run_swap_exact_out_test(
-            pool,
-            BalancerV3PoolType::Stable,
-            0,
-            1,
-            1.0,
-            &desc_0_1,
-        )
-        .await?;
+        run_swap_exact_out_test(pool, BalancerV3PoolType::Stable, 0, 1, 1.0, &desc_0_1).await?;
 
         let desc_1_0 = format!("PoolIndex Stable exact-out {label} 1->0");
-        run_swap_exact_out_test(
-            pool,
-            BalancerV3PoolType::Stable,
-            1,
-            0,
-            1.0,
-            &desc_1_0,
-        )
-        .await?;
+        run_swap_exact_out_test(pool, BalancerV3PoolType::Stable, 1, 0, 1.0, &desc_1_0).await?;
     }
 
     Ok(())
@@ -1140,17 +1149,13 @@ async fn test_calculate_price() -> eyre::Result<()> {
     let pool_address = Address::from_str("0xB1F62fc950E30A64a5032bBD8619A70B2c2B27C6")?;
     let vault_address = Address::from_str("0xbA1333333333a1BA1108E8412f11850A5C319bA9")?;
 
-    let mut pool = BalancerV3Pool::new(
-        pool_address,
-        vault_address,
-        BalancerV3PoolType::Weighted,
-    );
+    let mut pool = BalancerV3Pool::new(pool_address, vault_address, BalancerV3PoolType::Weighted);
 
     pool = pool.init(BlockId::latest(), provider.clone()).await?;
 
     // Use UNI and another token from the pool
     let uni = Address::from_str("0x1f9840a85d5af5bf1d1762f925bdaddc4201f984")?;
-    let other = Address::from_str("0xbe1936a67f503e0eaf2434b0cf9f4e3d7100008a")?; 
+    let other = Address::from_str("0xbe1936a67f503e0eaf2434b0cf9f4e3d7100008a")?;
 
     let price_uni = pool.calculate_price(uni, other)?;
     let price_other = pool.calculate_price(other, uni)?;

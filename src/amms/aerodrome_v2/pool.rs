@@ -26,13 +26,13 @@ use tokio::time::{sleep, Duration};
 
 use crate::amms::{
     amm::{AutomatedMarketMaker, SyncAction, AMM},
-    consts::{MPFR_T_PRECISION, MIN_POOL_RESERVE},
+    consts::{MIN_POOL_RESERVE, MPFR_T_PRECISION},
     error::AMMError,
     factory::{AutomatedMarketMakerFactory, DiscoverySync},
     Token,
 };
-use rug::Float;
 use rug::ops::Pow;
+use rug::Float;
 
 // Import batch contract ABI
 sol!(
@@ -147,7 +147,12 @@ impl AerodromeV2Pool {
     /// amountIn -= (amountIn * fee) / 10000;
     /// return (amountIn * reserveB) / (reserveA + amountIn);
     /// ```
-    pub fn get_amount_out_volatile(&self, amount_in: U256, reserve_in: U256, reserve_out: U256) -> U256 {
+    pub fn get_amount_out_volatile(
+        &self,
+        amount_in: U256,
+        reserve_in: U256,
+        reserve_out: U256,
+    ) -> U256 {
         if amount_in.is_zero() || reserve_in.is_zero() || reserve_out.is_zero() {
             return U256::ZERO;
         }
@@ -165,7 +170,12 @@ impl AerodromeV2Pool {
 
     /// Calculates the amount received for stable pools using the same integer
     /// arithmetic as Aerodrome Pool.sol.
-    pub fn get_amount_out_stable(&self, amount_in: U256, reserve_in: U256, reserve_out: U256) -> U256 {
+    pub fn get_amount_out_stable(
+        &self,
+        amount_in: U256,
+        reserve_in: U256,
+        reserve_out: U256,
+    ) -> U256 {
         let decimals_in = Self::decimals_scale(self.token_a.decimals);
         let decimals_out = Self::decimals_scale(self.token_b.decimals);
         self.get_amount_out_stable_with_decimals(
@@ -243,7 +253,12 @@ impl AerodromeV2Pool {
         let y_squared = y_norm * y_norm / precision;
         let b = x_squared + y_squared;
 
-        tracing::trace!("k_stable: x_squared={}, y_squared={}, b={}", x_squared, y_squared, b);
+        tracing::trace!(
+            "k_stable: x_squared={}, y_squared={}, b={}",
+            x_squared,
+            y_squared,
+            b
+        );
 
         // K = (_a * _b) / 1e18 = (x³y + y³x) / 10³⁶
         let ab = a * b;
@@ -365,10 +380,14 @@ impl AerodromeV2Pool {
 
         let y_squared = y.checked_mul(y).map_or(U256::MAX, |s| s / precision);
         let term1 = U256::from(3u64) * x0;
-        let term1 = term1.checked_mul(y_squared).map_or(U256::MAX, |t| t / precision);
+        let term1 = term1
+            .checked_mul(y_squared)
+            .map_or(U256::MAX, |t| t / precision);
 
         let x0_squared = x0.checked_mul(x0).map_or(U256::MAX, |s| s / precision);
-        let term2 = x0_squared.checked_mul(x0).map_or(U256::MAX, |t| t / precision);
+        let term2 = x0_squared
+            .checked_mul(x0)
+            .map_or(U256::MAX, |t| t / precision);
 
         term1.saturating_add(term2)
     }
@@ -533,7 +552,11 @@ impl AerodromeV2Pool {
     fn ceil_div_u256(numerator: U256, denominator: U256) -> U256 {
         let q = numerator / denominator;
         let r = numerator % denominator;
-        if r.is_zero() { q } else { q + U256::from(1u8) }
+        if r.is_zero() {
+            q
+        } else {
+            q + U256::from(1u8)
+        }
     }
 
     /// Generate calldata for a swap operation on this pool.
@@ -835,7 +858,9 @@ impl AutomatedMarketMaker for AerodromeV2Pool {
             return Err(AMMError::TokenNotFound(quote_token));
         }
         if base_token == quote_token {
-            return Err(AMMError::Msg("base and quote tokens are the same".to_string()));
+            return Err(AMMError::Msg(
+                "base and quote tokens are the same".to_string(),
+            ));
         }
 
         let price = if base_is_a {
@@ -883,8 +908,16 @@ impl AutomatedMarketMaker for AerodromeV2Pool {
         self.stable = metadata.st;
 
         // Fetch tokens (use block_number for token queries too)
-        self.token_a = Token::new(pool.token0().call().block(block_number).await?, provider.clone()).await?;
-        self.token_b = Token::new(pool.token1().call().block(block_number).await?, provider.clone()).await?;
+        self.token_a = Token::new(
+            pool.token0().call().block(block_number).await?,
+            provider.clone(),
+        )
+        .await?;
+        self.token_b = Token::new(
+            pool.token1().call().block(block_number).await?,
+            provider.clone(),
+        )
+        .await?;
 
         // Fetch reserves at the specified block
         let reserves = pool.getReserves().call().block(block_number).await?;
@@ -1032,9 +1065,7 @@ impl DiscoverySync for AerodromeV2Factory {
         N: alloy::network::Network,
         P: Provider<N> + Clone,
     {
-        async move {
-            Self::sync_all_pools(amms, to_block, provider).await
-        }
+        async move { Self::sync_all_pools(amms, to_block, provider).await }
     }
 }
 
@@ -1064,20 +1095,21 @@ impl AerodromeV2Factory {
             let provider = provider.clone();
 
             futures.push(async move {
-                let result = IGetAerodromeV2PoolDataBatchRequestInstance::deploy_builder(provider, group.clone())
-                    .call_raw()
-                    .block(block_number)
-                    .await?;
+                let result = IGetAerodromeV2PoolDataBatchRequestInstance::deploy_builder(
+                    provider,
+                    group.clone(),
+                )
+                .call_raw()
+                .block(block_number)
+                .await?;
 
                 Ok::<(Vec<Address>, alloy::primitives::Bytes), AMMError>((group, result))
             });
             sleep(Duration::from_millis(500)).await;
         }
 
-        let mut amms_map: HashMap<Address, AMM> = amms
-            .into_iter()
-            .map(|amm| (amm.address(), amm))
-            .collect();
+        let mut amms_map: HashMap<Address, AMM> =
+            amms.into_iter().map(|amm| (amm.address(), amm)).collect();
 
         while let Some(res) = futures.next().await {
             let (group, return_data) = match res {
@@ -1099,19 +1131,22 @@ impl AerodromeV2Factory {
                 "Raw batch return data"
             );
 
-            let return_data = match <Vec<(Address, Address, u128, u128, u32, u32, bool)> as SolValue>::abi_decode(&return_data) {
-                Ok(data) => data,
-                Err(e) => {
-                    tracing::warn!(
-                        target = "amms::aerodrome_v2::init_batch",
-                        error = ?e,
-                        return_data_len = return_data.len(),
-                        pools = ?group,
-                        "Failed to decode batch return data, skipping batch"
-                    );
-                    continue;
-                }
-            };
+            let return_data =
+                match <Vec<(Address, Address, u128, u128, u32, u32, bool)> as SolValue>::abi_decode(
+                    &return_data,
+                ) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        tracing::warn!(
+                            target = "amms::aerodrome_v2::init_batch",
+                            error = ?e,
+                            return_data_len = return_data.len(),
+                            pools = ?group,
+                            "Failed to decode batch return data, skipping batch"
+                        );
+                        continue;
+                    }
+                };
 
             for (pool_data, pool_address) in return_data.iter().zip(group.iter()) {
                 if pool_data.0.is_zero() {
@@ -1128,7 +1163,8 @@ impl AerodromeV2Factory {
                         continue;
                     };
 
-                    let (token_a, token_b, reserve_0, reserve_1, decimals_a, decimals_b, stable) = pool_data;
+                    let (token_a, token_b, reserve_0, reserve_1, decimals_a, decimals_b, stable) =
+                        pool_data;
 
                     let decimals_a = *decimals_a as u8;
                     let decimals_b = *decimals_b as u8;
@@ -1153,7 +1189,8 @@ impl AerodromeV2Factory {
                         pool.fee = 3000;
                     }
 
-                    if let Ok(p) = pool.calculate_price(pool.token_a.address, pool.token_b.address) {
+                    if let Ok(p) = pool.calculate_price(pool.token_a.address, pool.token_b.address)
+                    {
                         pool.token_a_price = p;
                         pool.token_b_price = if p != 0.0 { 1.0 / p } else { 0.0 };
                     }
@@ -1225,20 +1262,21 @@ impl AerodromeV2Factory {
             let provider = provider.clone();
 
             futures.push(async move {
-                let result = IGetAerodromeV2PoolDataBatchRequestInstance::deploy_builder(provider, group.clone())
-                    .call_raw()
-                    .block(block_number)
-                    .await?;
+                let result = IGetAerodromeV2PoolDataBatchRequestInstance::deploy_builder(
+                    provider,
+                    group.clone(),
+                )
+                .call_raw()
+                .block(block_number)
+                .await?;
 
                 Ok::<(Vec<Address>, alloy::primitives::Bytes), AMMError>((group, result))
             });
             sleep(Duration::from_millis(500)).await;
         }
 
-        let mut amms_map: HashMap<Address, AMM> = amms
-            .into_iter()
-            .map(|amm| (amm.address(), amm))
-            .collect();
+        let mut amms_map: HashMap<Address, AMM> =
+            amms.into_iter().map(|amm| (amm.address(), amm)).collect();
 
         while let Some(res) = futures.next().await {
             let (group, return_data) = match res {
@@ -1253,19 +1291,22 @@ impl AerodromeV2Factory {
                 }
             };
 
-            let return_data = match <Vec<(Address, Address, u128, u128, u32, u32, bool)> as SolValue>::abi_decode(&return_data) {
-                Ok(data) => data,
-                Err(e) => {
-                    tracing::warn!(
-                        target = "amms::aerodrome_v2::sync_all_pools",
-                        error = ?e,
-                        return_data_len = return_data.len(),
-                        pools = ?group,
-                        "Failed to decode batch return data, skipping batch"
-                    );
-                    continue;
-                }
-            };
+            let return_data =
+                match <Vec<(Address, Address, u128, u128, u32, u32, bool)> as SolValue>::abi_decode(
+                    &return_data,
+                ) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        tracing::warn!(
+                            target = "amms::aerodrome_v2::sync_all_pools",
+                            error = ?e,
+                            return_data_len = return_data.len(),
+                            pools = ?group,
+                            "Failed to decode batch return data, skipping batch"
+                        );
+                        continue;
+                    }
+                };
 
             for (pool_data, pool_address) in return_data.iter().zip(group.iter()) {
                 if pool_data.0.is_zero() {
@@ -1283,7 +1324,8 @@ impl AerodromeV2Factory {
                     pool.reserve_1 = *reserve_1;
                     pool.stable = *stable;
 
-                    if let Ok(p) = pool.calculate_price(pool.token_a.address, pool.token_b.address) {
+                    if let Ok(p) = pool.calculate_price(pool.token_a.address, pool.token_b.address)
+                    {
                         pool.token_a_price = p;
                         pool.token_b_price = if p != 0.0 { 1.0 / p } else { 0.0 };
                     }
@@ -1319,11 +1361,8 @@ mod tests_exact_out {
         assert!(out_with_in >= target_out);
 
         if amount_in > U256::ZERO {
-            let out_with_less = pool.get_amount_out_volatile(
-                amount_in - U256::from(1u8),
-                reserve_in,
-                reserve_out,
-            );
+            let out_with_less =
+                pool.get_amount_out_volatile(amount_in - U256::from(1u8), reserve_in, reserve_out);
             assert!(out_with_less < target_out);
         }
     }
@@ -1333,8 +1372,14 @@ mod tests_exact_out {
         let pool = AerodromeV2Pool {
             fee: 5, // 0.05% stable
             stable: true,
-            token_a: Token::new_with_decimals(address!("4200000000000000000000000000000000000006"), 18),
-            token_b: Token::new_with_decimals(address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"), 6),
+            token_a: Token::new_with_decimals(
+                address!("4200000000000000000000000000000000000006"),
+                18,
+            ),
+            token_b: Token::new_with_decimals(
+                address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"),
+                6,
+            ),
             ..Default::default()
         };
 

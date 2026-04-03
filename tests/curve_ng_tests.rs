@@ -159,8 +159,7 @@ async fn test_ng_stableswap_simulation() -> Result<()> {
         for (i, j) in pairs {
             let amounts = sample_amounts(pool.balances[i], pool.decimals[i]);
             for amount_in in amounts {
-                let amount_out_sim =
-                    pool.simulate_swap(pool.coins[i], pool.coins[j], amount_in)?;
+                let amount_out_sim = pool.simulate_swap(pool.coins[i], pool.coins[j], amount_in)?;
 
                 let amount_out_chain = contract
                     .get_dy(i as i128, j as i128, amount_in)
@@ -304,8 +303,7 @@ async fn test_ng_twocrypto_simulation() -> Result<()> {
         for (i, j) in pairs {
             let amounts = sample_amounts(pool.balances[i], pool.decimals[i]);
             for amount_in in amounts {
-                let amount_out_sim =
-                    pool.simulate_swap(pool.coins[i], pool.coins[j], amount_in)?;
+                let amount_out_sim = pool.simulate_swap(pool.coins[i], pool.coins[j], amount_in)?;
 
                 let amount_out_chain = contract
                     .get_dy(U256::from(i), U256::from(j), amount_in)
@@ -386,8 +384,7 @@ async fn test_ng_tricrypto_simulation() -> Result<()> {
         for (i, j) in pairs {
             let amounts = sample_amounts(pool.balances[i], pool.decimals[i]);
             for amount_in in amounts {
-                let amount_out_sim =
-                    pool.simulate_swap(pool.coins[i], pool.coins[j], amount_in)?;
+                let amount_out_sim = pool.simulate_swap(pool.coins[i], pool.coins[j], amount_in)?;
 
                 let amount_out_chain = contract
                     .get_dy(U256::from(i), U256::from(j), amount_in)
@@ -469,7 +466,11 @@ async fn test_ng_twocrypto_exact_out_simulation() -> Result<()> {
             }
         };
         let local_dx = pool.simulate_swap_exact_out(pool.coins[0], pool.coins[1], target_out)?;
-        let hi = if local_dx > amount_in { local_dx } else { amount_in };
+        let hi = if local_dx > amount_in {
+            local_dx
+        } else {
+            amount_in
+        };
         let contract_for_search = contract.clone();
         let onchain_dx = find_min_dx_onchain(
             move |dx| {
@@ -576,7 +577,11 @@ async fn test_ng_tricrypto_exact_out_simulation() -> Result<()> {
             }
         };
         let local_dx = pool.simulate_swap_exact_out(pool.coins[2], pool.coins[0], target_out)?;
-        let hi = if local_dx > amount_in { local_dx } else { amount_in };
+        let hi = if local_dx > amount_in {
+            local_dx
+        } else {
+            amount_in
+        };
         let contract_for_search = contract.clone();
         let onchain_dx = find_min_dx_onchain(
             move |dx| {

@@ -193,7 +193,9 @@ impl AutomatedMarketMaker for EkuboPool {
         };
 
         // Efficient O(1) best-case check for any tick containing enough liquidity
-        self.ticks.values().any(|info| info.liquidity_gross >= l_thresh)
+        self.ticks
+            .values()
+            .any(|info| info.liquidity_gross >= l_thresh)
     }
 
     fn decimals(&self, token: Address) -> u8 {

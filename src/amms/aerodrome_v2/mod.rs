@@ -19,4 +19,4 @@ mod test_sync_drift;
 
 // Re-export main types
 pub use factory::AerodromeV2FactoryConfig;
-pub use pool::{AerodromeV2Factory, AerodromeV2Pool, IAerodromeV2Pool, IAerodromeV2Factory};
+pub use pool::{AerodromeV2Factory, AerodromeV2Pool, IAerodromeV2Factory, IAerodromeV2Pool};

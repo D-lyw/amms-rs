@@ -189,7 +189,11 @@ mod tests {
                         break;
                     }
                     Err(e) => {
-                        println!("⚠️ fee event fetch error (retry {}/5): {:?}", retries + 1, e);
+                        println!(
+                            "⚠️ fee event fetch error (retry {}/5): {:?}",
+                            retries + 1,
+                            e
+                        );
                         retries += 1;
                         tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
                     }
@@ -307,14 +311,22 @@ mod tests {
         );
 
         // Verify fee is fetched from chain (not default)
-        let onchain_fee = fetch_onchain_fee(&*provider, pool_address, BlockId::from(current_block)).await?;
+        let onchain_fee =
+            fetch_onchain_fee(&*provider, pool_address, BlockId::from(current_block)).await?;
         println!(
             "  Fee verification: local={} vs onchain={} {}",
             pool.fee,
             onchain_fee,
-            if pool.fee == onchain_fee { "✅" } else { "❌" }
+            if pool.fee == onchain_fee {
+                "✅"
+            } else {
+                "❌"
+            }
         );
-        assert_eq!(pool.fee, onchain_fee, "[{label}] Fee mismatch - not using on-chain value!");
+        assert_eq!(
+            pool.fee, onchain_fee,
+            "[{label}] Fee mismatch - not using on-chain value!"
+        );
 
         // Step 2: Simulate swaps in both directions with different amounts
         let test_amounts = vec![
@@ -472,7 +484,8 @@ mod tests {
         assert_eq!(pool.tick, onchain_tick, "[{label}] Initial tick mismatch!");
 
         // Verify initial fee matches on-chain
-        let onchain_fee = fetch_onchain_fee(&*provider, pool_address, BlockId::from(start_block)).await?;
+        let onchain_fee =
+            fetch_onchain_fee(&*provider, pool_address, BlockId::from(start_block)).await?;
         assert_eq!(pool.fee, onchain_fee, "[{label}] Initial fee mismatch!");
         println!("[{label}] ✅ Initial state (including fee) matches on-chain");
 
@@ -745,8 +758,18 @@ mod tests {
         );
 
         let test_directions = vec![
-            (pool.token_a.address, pool.token_b.address, pool.token_b.decimals, "A->B"),
-            (pool.token_b.address, pool.token_a.address, pool.token_a.decimals, "B->A"),
+            (
+                pool.token_a.address,
+                pool.token_b.address,
+                pool.token_b.decimals,
+                "A->B",
+            ),
+            (
+                pool.token_b.address,
+                pool.token_a.address,
+                pool.token_a.decimals,
+                "B->A",
+            ),
         ];
 
         for (token_in, token_out, out_decimals, dir) in test_directions {
@@ -856,11 +879,19 @@ mod tests {
             start_block, current_block
         );
 
-        let fee_events =
-            fetch_fee_events(&*provider, fee_module_address, pool_address, start_block, current_block)
-                .await?;
+        let fee_events = fetch_fee_events(
+            &*provider,
+            fee_module_address,
+            pool_address,
+            start_block,
+            current_block,
+        )
+        .await?;
 
-        println!("[{label}] Found {} fee change events for this pool", fee_events.len());
+        println!(
+            "[{label}] Found {} fee change events for this pool",
+            fee_events.len()
+        );
 
         // Display found events
         for log in &fee_events {

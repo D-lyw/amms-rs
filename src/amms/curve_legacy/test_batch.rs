@@ -285,7 +285,10 @@ mod tests {
             } else {
                 CurveLegacyPoolType::StableSwap
             };
-            amms.push(AMM::CurveLegacyPool(CurveLegacyPool::new(*pool_address, p_type)));
+            amms.push(AMM::CurveLegacyPool(CurveLegacyPool::new(
+                *pool_address,
+                p_type,
+            )));
         }
 
         println!("Testing batch init with {} pools...", amms.len());

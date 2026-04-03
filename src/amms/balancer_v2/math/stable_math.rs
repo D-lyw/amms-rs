@@ -9,7 +9,11 @@ const AMP_PRECISION: u64 = 1000;
 const MAX_STABLE_ITERATIONS: usize = 255;
 
 fn abs_diff(a: U256, b: U256) -> U256 {
-    if a >= b { a - b } else { b - a }
+    if a >= b {
+        a - b
+    } else {
+        b - a
+    }
 }
 
 fn div_down(a: U256, b: U256) -> Result<U256, BalancerV2Error> {
@@ -74,7 +78,9 @@ fn calculate_invariant_u256(amp: U256, balances: &[U256]) -> Result<U256, Balanc
 
         let term1 = mul_div_down(amp_times_total, sum, amp_precision)?;
         let term2 = p_d.checked_mul(n).ok_or(BalancerV2Error::MulOverflow)?;
-        let numerator_base = term1.checked_add(term2).ok_or(BalancerV2Error::AddOverflow)?;
+        let numerator_base = term1
+            .checked_add(term2)
+            .ok_or(BalancerV2Error::AddOverflow)?;
         let numerator = numerator_base
             .checked_mul(invariant)
             .ok_or(BalancerV2Error::MulOverflow)?;
@@ -126,9 +132,13 @@ fn get_token_balance_given_invariant_and_all_other_balances_u256(
         let pd_mul_b = p_d
             .checked_mul(*balance)
             .ok_or(BalancerV2Error::MulOverflow)?;
-        let pd_mul_bn = pd_mul_b.checked_mul(n).ok_or(BalancerV2Error::MulOverflow)?;
+        let pd_mul_bn = pd_mul_b
+            .checked_mul(n)
+            .ok_or(BalancerV2Error::MulOverflow)?;
         p_d = div_down(pd_mul_bn, invariant)?;
-        sum = sum.checked_add(*balance).ok_or(BalancerV2Error::AddOverflow)?;
+        sum = sum
+            .checked_add(*balance)
+            .ok_or(BalancerV2Error::AddOverflow)?;
     }
     sum = sum
         .checked_sub(balances[token_index])
@@ -155,7 +165,9 @@ fn get_token_balance_given_invariant_and_all_other_balances_u256(
     let b_term = div_down(invariant, amp_times_total)?
         .checked_mul(amp_precision)
         .ok_or(BalancerV2Error::MulOverflow)?;
-    let b = sum.checked_add(b_term).ok_or(BalancerV2Error::AddOverflow)?;
+    let b = sum
+        .checked_add(b_term)
+        .ok_or(BalancerV2Error::AddOverflow)?;
 
     // Newton iteration for token balance
     let mut token_balance = div_up(
@@ -321,8 +333,9 @@ mod tests {
         );
 
         if amount_in > U256::ZERO {
-            let out_less = calculate_out_given_in(amp, &balances, 0, 1, amount_in - U256::from(1u8))
-                .expect("stable out_given_in should work");
+            let out_less =
+                calculate_out_given_in(amp, &balances, 0, 1, amount_in - U256::from(1u8))
+                    .expect("stable out_given_in should work");
             assert!(out_less <= out);
         }
     }

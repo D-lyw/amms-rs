@@ -118,7 +118,11 @@ impl SushiV2Pool {
     fn ceil_div_u256(numerator: U256, denominator: U256) -> U256 {
         let q = numerator / denominator;
         let r = numerator % denominator;
-        if r.is_zero() { q } else { q + U256::from(1u8) }
+        if r.is_zero() {
+            q
+        } else {
+            q + U256::from(1u8)
+        }
     }
 
     pub fn calculate_price_64_x_64(&self, base_token: Address) -> Result<u128, AMMError> {

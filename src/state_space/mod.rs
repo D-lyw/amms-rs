@@ -10,7 +10,10 @@ use crate::amms::amm::{SyncAction, AMM};
 use crate::amms::error::AMMError;
 use crate::amms::factory::Factory;
 use crate::amms::fluid_dex::get_liquidity_layer;
-use crate::amms::{balancer_v2, balancer_v3, ekubo};
+use crate::amms::{
+    aerodrome_slipstream::{ICustomFeeModule, BASE_SLIPSTREAM_FACTORY},
+    balancer_v2, balancer_v3, ekubo,
+};
 use crate::state_space::hooks::HookHandle;
 use crate::state_space::hooks::HookRegistry;
 use crate::state_space::hooks::SnapshotConfig;
@@ -18,11 +21,14 @@ use crate::state_space::hooks::StateHook;
 
 use alloy::consensus::BlockHeader;
 use alloy::eips::BlockId;
+use alloy::network::primitives::HeaderResponse;
 use alloy::network::Network;
 
-use alloy::primitives::{Address, FixedBytes};
+use alloy::primitives::{Address, Bloom, BloomInput, FixedBytes};
 use alloy::providers::Provider;
 use alloy::rpc::types::{eth::Log, Block, Filter, FilterSet};
+use alloy::sol;
+use alloy::sol_types::SolEvent;
 use async_stream::stream;
 use cache::StateChange;
 use cache::StateChangeCache;
@@ -57,6 +63,48 @@ pub struct StateSpaceManager<N, P> {
     phantom: PhantomData<N>,
 }
 
+const LOG_ADDRESS_CHUNK_SIZE: usize = 200;
+const BASE_CHAIN_ID: u64 = 8453;
+const ARBITRUM_CHAIN_ID: u64 = 42161;
+const ETHEREUM_MAINNET_CHAIN_ID: u64 = 1;
+
+sol! {
+    #[derive(Debug)]
+    #[sol(rpc)]
+    interface ICLFactoryReader {
+        function swapFeeModule() external view returns (address);
+    }
+}
+
+#[derive(Clone, Debug)]
+enum QueryMode {
+    TopicFiltered(Vec<FixedBytes<32>>),
+    AddressOnly,
+}
+
+#[derive(Clone, Debug)]
+struct LogQueryChunk {
+    addresses: Vec<Address>,
+    mode: QueryMode,
+}
+
+impl LogQueryChunk {
+    fn filter(&self, from_block: u64, to_block: u64) -> Filter {
+        let mut filter = Filter::new()
+            .address(self.addresses.clone())
+            .from_block(from_block)
+            .to_block(to_block);
+
+        if let QueryMode::TopicFiltered(topics) = &self.mode {
+            if !topics.is_empty() {
+                filter = filter.event_signature(topics.clone());
+            }
+        }
+
+        filter
+    }
+}
+
 impl<N, P> StateSpaceManager<N, P> {
     /// Registers a hook to be called on every state change.
     pub async fn register_hook(&self, hook: StateHook<Vec<Address>>) -> HookHandle<Vec<Address>> {
@@ -65,10 +113,7 @@ impl<N, P> StateSpaceManager<N, P> {
 
     /// Subscribes to AMM state changes via newHeads + eth_getLogs pull mode.
     ///
-    /// This approach uses block headers as triggers and pulls complete logs for each block,
-    /// ensuring atomic block-level data completeness (no partial batch issues).
-    ///
-    /// Flow: newHeads(N) → eth_getLogs(block=N) → sync → yield affected
+    /// Flow: newHeads(N) -> logsBloom prefilter -> eth_getLogs(block=N) -> sync
     pub async fn subscribe(
         &self,
     ) -> Result<
@@ -84,78 +129,18 @@ impl<N, P> StateSpaceManager<N, P> {
         let state = self.state.clone();
         let hooks = self.hooks.clone();
 
-        // Build address list for log filtering
-        // V2/V3: pool address
-        // V4/Infinity: manager address
-        // FluidDex: pool address + liquidity layer
-        let guard = state.read().await;
-        let chain_id = guard.chain_id;
-        let mut unique_addresses = HashSet::new();
-
-        for (_, amm) in guard.state.iter() {
-            match amm {
-                AMM::UniswapV4Pool(p) => {
-                    unique_addresses.insert(p.manager_address);
-                }
-                AMM::PancakeInfinityPool(p) => {
-                    unique_addresses.insert(p.manager_address);
-                }
-                AMM::FluidDexPool(p) => {
-                    unique_addresses.insert(p.address);
-                    if let Some(addr) = get_liquidity_layer(chain_id) {
-                        unique_addresses.insert(addr);
-                    }
-                }
-                AMM::BalancerV2Pool(p) => {
-                    // Balancer V2 events are emitted from Vault, not pool
-                    if let Some(vault) = balancer_v2::get_vault_address(chain_id) {
-                        unique_addresses.insert(vault);
-                    } else {
-                        unique_addresses.insert(p.vault_address);
-                    }
-                }
-                AMM::BalancerV3Pool(p) => {
-                    // Balancer V3 events are emitted from Vault, not pool
-                    if let Some(vault) = balancer_v3::get_vault_address(chain_id) {
-                        unique_addresses.insert(vault);
-                    } else {
-                        unique_addresses.insert(p.vault_address);
-                    }
-                }
-                AMM::EkuboPool(_) => {
-                    // Ekubo V2 uses Log0 events emitted from Core, not pool
-                    // We only subscribe to Core if we are on the supported chain
-                    if let Some(core) = ekubo::get_core_address(chain_id) {
-                        unique_addresses.insert(core);
-                    }
-                }
-                _ => {
-                    unique_addresses.insert(amm.address());
-                }
-            }
-        }
-        drop(guard);
-
-        let all_addresses: Vec<Address> = unique_addresses.into_iter().collect();
-
-        // Chunk addresses to avoid RPC limits (typically 100-500 addresses per call)
-        let chunk_size = 200;
-        let chunks: Vec<Vec<Address>> = all_addresses
-            .chunks(chunk_size)
-            .map(|c| c.to_vec())
-            .collect();
+        let chain_id = { state.read().await.chain_id };
+        let query_chunks = Self::build_query_chunks(&provider, &state, chain_id).await;
 
         info!(
-            "Starting newHeads + getLogs sync for {} addresses ({} chunks)",
-            all_addresses.len(),
-            chunks.len()
+            "Starting newHeads + logsBloom + getLogs sync ({} query chunks)",
+            query_chunks.len()
         );
 
         Ok(Box::pin(stream! {
             let mut last_hash: Option<FixedBytes<32>> = None;
 
             loop {
-                // 1. Subscribe to newHeads
                 let mut heads_stream = match provider.subscribe_blocks().await {
                     Ok(sub) => sub.into_stream(),
                     Err(e) => {
@@ -167,106 +152,142 @@ impl<N, P> StateSpaceManager<N, P> {
 
                 info!("Subscribed to newHeads");
 
-                // 2. Backfill missed blocks
                 let current_synced = latest_block.load(Ordering::Relaxed);
                 if let Ok(chain_head) = provider.get_block_number().await {
                     if chain_head > current_synced && current_synced > 0 {
-                        info!("Backfilling blocks {} to {}", current_synced + 1, chain_head);
-                        for block_num in (current_synced + 1)..=chain_head {
-                            match Self::fetch_and_sync_block(
-                                &provider, &state, &hooks, &chunks, block_num, &latest_block
-                            ).await {
-                                Ok((affected, hash)) => {
-                                    if let Some(h) = hash {
-                                        last_hash = Some(h);
-                                    }
+                        match Self::backfill_range(
+                            &provider,
+                            &state,
+                            &hooks,
+                            &query_chunks,
+                            current_synced + 1,
+                            chain_head,
+                            &latest_block,
+                            chain_id,
+                        )
+                        .await
+                        {
+                            Ok(results) => {
+                                for affected in results {
                                     if !affected.is_empty() {
                                         yield Ok(affected);
                                     }
                                 }
-                                Err(e) => error!("Backfill block {} failed: {}", block_num, e),
+                            }
+                            Err(e) => {
+                                error!("Initial backfill failed: {}", e);
                             }
                         }
                     }
                 }
 
-                // 3. Main loop: process new blocks
                 loop {
                     match tokio::time::timeout(Duration::from_secs(60), heads_stream.next()).await {
                         Ok(Some(new_head)) => {
-                            let block_num = new_head.header_info().number;
+                            let block_num = new_head.number();
+                            let block_hash = new_head.hash();
+                            let parent_hash = new_head.parent_hash();
+                            let logs_bloom = new_head.logs_bloom();
 
-                            // Fetch canonical block to get hash and verify availability
-                            let block_hash = match provider.get_block(block_num.into()).await {
-                                Ok(Some(block)) => block.header.hash,
-                                Ok(None) => {
-                                    warn!("Received newHead {}, but get_block returned None", block_num);
-                                    continue;
-                                }
-                                Err(e) => {
-                                    error!("Failed to fetch block {}: {}", block_num, e);
-                                    continue;
-                                }
-                            };
-
-                            // block_hash is FixedBytes<32> (based on compiler error), so use directly
                             let last_processed = latest_block.load(Ordering::Relaxed);
 
-                            // Reorg / Duplicate check
                             if block_num < last_processed {
-                                // Old block, ignore
                                 continue;
-                            } else if block_num == last_processed {
-                                // Same height: check hash for reorg
+                            }
+
+                            if block_num == last_processed {
                                 if let Some(last) = last_hash {
                                     if last == block_hash {
-                                        // Duplicate, ignore
                                         continue;
-                                    } else {
-                                        warn!("Reorg detected at height {}: {} -> {}", block_num, last, block_hash);
-                                        // Process new hash
                                     }
                                 }
                             } else {
-                                // block_num > last_processed
-                                // Check for gap
                                 if block_num > last_processed + 1 {
-                                     // Fill gap
-                                     // Fill gap
-                                     let mut backfill_success = true;
-                                     for bn in (last_processed + 1)..block_num {
-                                        match Self::fetch_and_sync_block(
-                                            &provider, &state, &hooks, &chunks, bn, &latest_block
-                                        ).await {
-                                            Ok((affected, hash)) => {
-                                                if let Some(h) = hash {
-                                                    last_hash = Some(h);
-                                                }
+                                    match Self::backfill_range(
+                                        &provider,
+                                        &state,
+                                        &hooks,
+                                        &query_chunks,
+                                        last_processed + 1,
+                                        block_num - 1,
+                                        &latest_block,
+                                        chain_id,
+                                    )
+                                    .await
+                                    {
+                                        Ok(results) => {
+                                            for affected in results {
                                                 if !affected.is_empty() {
                                                     yield Ok(affected);
                                                 }
                                             }
+                                        }
+                                        Err(e) => {
+                                            error!(
+                                                "Gap backfill {}..{} failed: {}",
+                                                last_processed + 1,
+                                                block_num - 1,
+                                                e
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                } else if let Some(last) = last_hash {
+                                    if parent_hash != last {
+                                        warn!(
+                                            "Parent hash mismatch at block {} (expected parent {}, got {})",
+                                            block_num,
+                                            last,
+                                            parent_hash
+                                        );
+
+                                        match provider.get_block(block_num.into()).await {
+                                            Ok(Some(block)) => {
+                                                if block.header.parent_hash != last {
+                                                    warn!(
+                                                        "Canonical parent mismatch confirmed at block {}",
+                                                        block_num
+                                                    );
+                                                }
+                                            }
+                                            Ok(None) => {
+                                                warn!("Fallback get_block returned None for block {}", block_num);
+                                            }
                                             Err(e) => {
-                                                error!("Fill block {} failed: {}. Aborting batch to maintain state integrity.", bn, e);
-                                                backfill_success = false;
-                                                break;
+                                                warn!("Fallback get_block failed for block {}: {}", block_num, e);
                                             }
                                         }
-                                     }
-
-                                     if !backfill_success {
-                                         warn!("Backfill failed. Skipping head {} to retry on next tick.", block_num);
-                                         continue;
-                                     }
+                                    }
                                 }
                             }
 
-                            // Process current block (New or Reorg)
-                            match Self::fetch_and_sync_block(
-                                &provider, &state, &hooks, &chunks, block_num, &latest_block
-                            ).await {
-                                Ok((affected, _)) => {
-                                    // Use the authoritative header hash for tracking
+                            let all_logs = match Self::collect_logs_for_chunks(
+                                &provider,
+                                &query_chunks,
+                                block_num,
+                                block_num,
+                                Some(&logs_bloom),
+                            )
+                            .await
+                            {
+                                Ok(logs) => logs,
+                                Err(e) => {
+                                    error!("get_logs failed for block {}: {}", block_num, e);
+                                    continue;
+                                }
+                            };
+
+                            match Self::apply_logs_for_block(
+                                &provider,
+                                &state,
+                                &hooks,
+                                block_num,
+                                all_logs,
+                                &latest_block,
+                            )
+                            .await
+                            {
+                                Ok(affected) => {
                                     last_hash = Some(block_hash);
                                     if !affected.is_empty() {
                                         yield Ok(affected);
@@ -288,15 +309,12 @@ impl<N, P> StateSpaceManager<N, P> {
                     }
                 }
 
-                // 4. Reconnection
                 warn!("Reconnecting in 2s...");
                 sleep(Duration::from_secs(2)).await;
             }
         }))
     }
 
-    /// Fetches all logs for a specific block and syncs to state
-    /// Returns (affected_addresses, block_hash_if_logs_found)
     async fn execute_batch_tasks<F, Fut>(
         state: &Arc<RwLock<StateSpace>>,
         amms: Vec<AMM>,
@@ -337,55 +355,34 @@ impl<N, P> StateSpaceManager<N, P> {
         affected
     }
 
-    /// Fetches all logs for a specific block and syncs to state
-    /// Returns (affected_addresses, block_hash_if_logs_found)
-    async fn fetch_and_sync_block(
+    async fn apply_logs_for_block(
         provider: &P,
         state: &Arc<RwLock<StateSpace>>,
         hooks: &HookRegistry<Vec<Address>>,
-        chunks: &[Vec<Address>],
         block_num: u64,
+        mut logs: Vec<Log>,
         latest_block: &Arc<AtomicU64>,
-    ) -> Result<(Vec<Address>, Option<FixedBytes<32>>), StateSpaceError>
+    ) -> Result<Vec<Address>, StateSpaceError>
     where
         P: Provider<N> + Clone,
         N: Network,
     {
-        let mut all_logs: Vec<Log> = Vec::new();
-
-        // Fetch logs in chunks to avoid RPC address limits
-        for addresses in chunks {
-            let filter = Filter::new()
-                .address(addresses.clone())
-                .from_block(block_num)
-                .to_block(block_num);
-
-            match provider.get_logs(&filter).await {
-                Ok(logs) => all_logs.extend(logs),
-                Err(e) => {
-                    error!("get_logs failed for block {}: {}", block_num, e);
-                    return Err(e.into());
-                }
-            }
-        }
-
-        // Update latest_block first
         latest_block.store(block_num, Ordering::Relaxed);
 
-        if all_logs.is_empty() {
-            return Ok((vec![], None));
+        if logs.is_empty() {
+            return Ok(vec![]);
         }
 
-        // Capture hash from first log (all logs in this batch are from block_num)
-        let block_hash = all_logs.first().and_then(|l| l.block_hash);
+        logs.sort_by_key(|log| {
+            (
+                log.block_number.unwrap_or_default(),
+                log.transaction_index.unwrap_or_default(),
+                log.log_index.unwrap_or_default(),
+            )
+        });
 
-        // Sort by log_index to ensure correct order
-        all_logs.sort_by_key(|log| log.log_index.unwrap_or(0));
+        let (affected, needs_resync, needs_async_update) = state.write().await.sync(&logs)?;
 
-        // Sync to state
-        let (affected, needs_resync, needs_async_update) = state.write().await.sync(&all_logs)?;
-
-        // Handle Re-syncs
         let amms_to_resync: Vec<AMM> = {
             let guard = state.read().await;
             needs_resync
@@ -407,7 +404,6 @@ impl<N, P> StateSpaceManager<N, P> {
             .await;
         }
 
-        // Handle Async Updates
         let amms_to_update: Vec<AMM> = {
             let guard = state.read().await;
             needs_async_update
@@ -434,7 +430,289 @@ impl<N, P> StateSpaceManager<N, P> {
             hooks.notify(&affected).await;
         }
 
-        Ok((affected, block_hash))
+        Ok(affected)
+    }
+
+    async fn collect_logs_for_chunks(
+        provider: &P,
+        chunks: &[LogQueryChunk],
+        from_block: u64,
+        to_block: u64,
+        bloom: Option<&Bloom>,
+    ) -> Result<Vec<Log>, StateSpaceError>
+    where
+        P: Provider<N> + Clone,
+        N: Network,
+    {
+        let mut all_logs = Vec::new();
+
+        for chunk in chunks {
+            if let Some(block_bloom) = bloom {
+                if !Self::bloom_maybe_has_relevant_logs(block_bloom, chunk) {
+                    continue;
+                }
+            }
+
+            let filter = chunk.filter(from_block, to_block);
+            let logs = provider
+                .get_logs(&filter)
+                .await
+                .map_err(StateSpaceError::from)?;
+            all_logs.extend(logs);
+        }
+
+        Ok(all_logs)
+    }
+
+    async fn backfill_range(
+        provider: &P,
+        state: &Arc<RwLock<StateSpace>>,
+        hooks: &HookRegistry<Vec<Address>>,
+        chunks: &[LogQueryChunk],
+        from_block: u64,
+        to_block: u64,
+        latest_block: &Arc<AtomicU64>,
+        chain_id: u64,
+    ) -> Result<Vec<Vec<Address>>, StateSpaceError>
+    where
+        P: Provider<N> + Clone,
+        N: Network,
+    {
+        if from_block > to_block {
+            return Ok(vec![]);
+        }
+
+        let mut results = Vec::new();
+        let mut start = from_block;
+        let window = Self::backfill_window_size(chain_id);
+
+        while start <= to_block {
+            let mut end = (start + window - 1).min(to_block);
+
+            loop {
+                let logs_res =
+                    Self::collect_logs_for_chunks(provider, chunks, start, end, None).await;
+
+                match logs_res {
+                    Ok(mut logs) => {
+                        logs.sort_by_key(|log| {
+                            (
+                                log.block_number.unwrap_or_default(),
+                                log.transaction_index.unwrap_or_default(),
+                                log.log_index.unwrap_or_default(),
+                            )
+                        });
+
+                        let mut by_block: HashMap<u64, Vec<Log>> = HashMap::new();
+                        for log in logs {
+                            if let Some(bn) = log.block_number {
+                                by_block.entry(bn).or_default().push(log);
+                            }
+                        }
+
+                        for block_num in start..=end {
+                            let block_logs = by_block.remove(&block_num).unwrap_or_default();
+                            let affected = Self::apply_logs_for_block(
+                                provider,
+                                state,
+                                hooks,
+                                block_num,
+                                block_logs,
+                                latest_block,
+                            )
+                            .await?;
+
+                            if !affected.is_empty() {
+                                results.push(affected);
+                            }
+                        }
+
+                        start = end + 1;
+                        break;
+                    }
+                    Err(e) => {
+                        if start == end {
+                            return Err(e);
+                        }
+
+                        end = start + ((end - start) / 2);
+                        warn!(
+                            "Backfill window {}..{} failed, shrinking window",
+                            start, end
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    async fn build_query_chunks(
+        provider: &P,
+        state: &Arc<RwLock<StateSpace>>,
+        chain_id: u64,
+    ) -> Vec<LogQueryChunk>
+    where
+        P: Provider<N> + Clone,
+        N: Network,
+    {
+        let guard = state.read().await;
+
+        let mut topic_addresses = HashSet::new();
+        let mut address_only_addresses = HashSet::new();
+        let mut topic_signatures: HashSet<FixedBytes<32>> = HashSet::new();
+        let mut has_slipstream_pool = false;
+
+        for amm in guard.state.values() {
+            let sync_events = amm.sync_events();
+            let has_events = !sync_events.is_empty();
+
+            if has_events {
+                for event in sync_events {
+                    topic_signatures.insert(event);
+                }
+            }
+
+            match amm {
+                AMM::UniswapV4Pool(p) => {
+                    if has_events {
+                        topic_addresses.insert(p.manager_address);
+                    }
+                }
+                AMM::PancakeInfinityPool(p) => {
+                    if has_events {
+                        topic_addresses.insert(p.manager_address);
+                    }
+                }
+                AMM::FluidDexPool(p) => {
+                    if has_events {
+                        topic_addresses.insert(p.address);
+                    }
+                    if let Some(addr) = get_liquidity_layer(chain_id) {
+                        topic_addresses.insert(addr);
+                    }
+                }
+                AMM::BalancerV2Pool(p) => {
+                    if has_events {
+                        if let Some(vault) = balancer_v2::get_vault_address(chain_id) {
+                            topic_addresses.insert(vault);
+                        } else {
+                            topic_addresses.insert(p.vault_address);
+                        }
+                    }
+                }
+                AMM::BalancerV3Pool(p) => {
+                    if has_events {
+                        if let Some(vault) = balancer_v3::get_vault_address(chain_id) {
+                            topic_addresses.insert(vault);
+                        } else {
+                            topic_addresses.insert(p.vault_address);
+                        }
+                    }
+                }
+                AMM::EkuboPool(_) => {
+                    if let Some(core) = ekubo::get_core_address(chain_id) {
+                        address_only_addresses.insert(core);
+                    }
+                }
+                AMM::AerodromeSlipstreamPool(_) => {
+                    has_slipstream_pool = true;
+                    if has_events {
+                        topic_addresses.insert(amm.address());
+                    }
+                }
+                _ => {
+                    if has_events {
+                        topic_addresses.insert(amm.address());
+                    }
+                }
+            }
+        }
+
+        drop(guard);
+
+        if has_slipstream_pool && chain_id == BASE_CHAIN_ID {
+            if let Some(fee_module) = Self::resolve_slipstream_fee_module(provider).await {
+                topic_addresses.insert(fee_module);
+                topic_signatures.insert(ICustomFeeModule::CustomFeeSet::SIGNATURE_HASH);
+            }
+        }
+
+        let mut chunks = Vec::new();
+
+        if !topic_addresses.is_empty() && !topic_signatures.is_empty() {
+            let mut topic_addresses: Vec<Address> = topic_addresses.into_iter().collect();
+            topic_addresses.sort();
+
+            let mut topic_signatures: Vec<FixedBytes<32>> = topic_signatures.into_iter().collect();
+            topic_signatures.sort();
+
+            for addresses in topic_addresses.chunks(LOG_ADDRESS_CHUNK_SIZE) {
+                chunks.push(LogQueryChunk {
+                    addresses: addresses.to_vec(),
+                    mode: QueryMode::TopicFiltered(topic_signatures.clone()),
+                });
+            }
+        }
+
+        if !address_only_addresses.is_empty() {
+            let mut address_only_addresses: Vec<Address> =
+                address_only_addresses.into_iter().collect();
+            address_only_addresses.sort();
+
+            for addresses in address_only_addresses.chunks(LOG_ADDRESS_CHUNK_SIZE) {
+                chunks.push(LogQueryChunk {
+                    addresses: addresses.to_vec(),
+                    mode: QueryMode::AddressOnly,
+                });
+            }
+        }
+
+        chunks
+    }
+
+    async fn resolve_slipstream_fee_module(provider: &P) -> Option<Address>
+    where
+        P: Provider<N> + Clone,
+        N: Network,
+    {
+        let factory = ICLFactoryReader::new(BASE_SLIPSTREAM_FACTORY, provider.clone());
+        match factory.swapFeeModule().call().await {
+            Ok(addr) if addr != Address::ZERO => Some(addr),
+            Ok(_) => None,
+            Err(e) => {
+                warn!("Failed to fetch Slipstream FeeModule address: {}", e);
+                None
+            }
+        }
+    }
+
+    fn bloom_maybe_has_relevant_logs(bloom: &Bloom, chunk: &LogQueryChunk) -> bool {
+        let address_hit = chunk
+            .addresses
+            .iter()
+            .any(|addr| bloom.contains_input(BloomInput::Raw(addr.as_slice())));
+
+        if !address_hit {
+            return false;
+        }
+
+        match &chunk.mode {
+            QueryMode::AddressOnly => true,
+            QueryMode::TopicFiltered(topics) => topics
+                .iter()
+                .any(|topic| bloom.contains_input(BloomInput::Raw(topic.as_slice()))),
+        }
+    }
+
+    fn backfill_window_size(chain_id: u64) -> u64 {
+        match chain_id {
+            ARBITRUM_CHAIN_ID => 200,
+            BASE_CHAIN_ID => 100,
+            ETHEREUM_MAINNET_CHAIN_ID => 50,
+            _ => 50,
+        }
     }
 }
 
@@ -807,6 +1085,22 @@ impl StateSpace {
         self.state.get_mut(address)
     }
 
+    fn resolve_slipstream_fee_event_pool(&self, topics: &[FixedBytes<32>]) -> Option<Address> {
+        if topics.len() < 2 {
+            return None;
+        }
+
+        if topics[0] != ICustomFeeModule::CustomFeeSet::SIGNATURE_HASH {
+            return None;
+        }
+
+        let pool_address = Address::from_word(topics[1]);
+        match self.state.get(&pool_address) {
+            Some(AMM::AerodromeSlipstreamPool(_)) => Some(pool_address),
+            _ => None,
+        }
+    }
+
     pub fn sync(
         &mut self,
         logs: &[Log],
@@ -882,6 +1176,10 @@ impl StateSpace {
                     } else {
                         None
                     }
+                } else if let Some(pool_address) =
+                    self.resolve_slipstream_fee_event_pool(log.topics())
+                {
+                    Some(pool_address)
                 } else {
                     let pool_id = log.topics()[1];
                     let virtual_address = Address::from_slice(&pool_id.as_slice()[0..20]);
@@ -979,6 +1277,102 @@ impl From<StateSpace> for SerializableStateSpace {
             latest_block: ss.latest_block.load(Ordering::Relaxed),
             cache: (ss.cache.cache.into_iter().collect(), ss.cache.oldest_block),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::primitives::{address, FixedBytes};
+
+    #[test]
+    fn bloom_prefilter_address_only_matches() {
+        let address = address!("1111111111111111111111111111111111111111");
+        let mut bloom = Bloom::ZERO;
+        bloom.accrue(BloomInput::Raw(address.as_slice()));
+
+        let chunk = LogQueryChunk {
+            addresses: vec![address],
+            mode: QueryMode::AddressOnly,
+        };
+
+        assert!(StateSpaceManager::<(), ()>::bloom_maybe_has_relevant_logs(
+            &bloom, &chunk
+        ));
+    }
+
+    #[test]
+    fn bloom_prefilter_topic_filtered_requires_topic_hit() {
+        let address = address!("2222222222222222222222222222222222222222");
+        let hit_topic = FixedBytes::<32>::from([0x11u8; 32]);
+        let miss_topic = FixedBytes::<32>::from([0x22u8; 32]);
+
+        let mut bloom = Bloom::ZERO;
+        bloom.accrue(BloomInput::Raw(address.as_slice()));
+        bloom.accrue(BloomInput::Raw(hit_topic.as_slice()));
+
+        let hit_chunk = LogQueryChunk {
+            addresses: vec![address],
+            mode: QueryMode::TopicFiltered(vec![hit_topic]),
+        };
+
+        let miss_chunk = LogQueryChunk {
+            addresses: vec![address],
+            mode: QueryMode::TopicFiltered(vec![miss_topic]),
+        };
+
+        assert!(StateSpaceManager::<(), ()>::bloom_maybe_has_relevant_logs(
+            &bloom, &hit_chunk
+        ));
+        assert!(!StateSpaceManager::<(), ()>::bloom_maybe_has_relevant_logs(
+            &bloom,
+            &miss_chunk
+        ));
+    }
+
+    #[test]
+    fn backfill_window_size_is_chain_specific() {
+        assert_eq!(
+            StateSpaceManager::<(), ()>::backfill_window_size(42161),
+            200
+        );
+        assert_eq!(StateSpaceManager::<(), ()>::backfill_window_size(8453), 100);
+        assert_eq!(StateSpaceManager::<(), ()>::backfill_window_size(1), 50);
+        assert_eq!(StateSpaceManager::<(), ()>::backfill_window_size(10), 50);
+    }
+
+    #[test]
+    fn slipstream_custom_fee_event_routes_to_pool_topic1() {
+        let pool_address = address!("b2cc224c1c9fee385f8ad6a55b4d94e92359dc59");
+        let mut state = StateSpace::default();
+        state.state.insert(
+            pool_address,
+            AMM::AerodromeSlipstreamPool(
+                crate::amms::aerodrome_slipstream::AerodromeSlipstreamPool::new(pool_address),
+            ),
+        );
+
+        let topics = vec![
+            ICustomFeeModule::CustomFeeSet::SIGNATURE_HASH,
+            pool_address.into_word(),
+        ];
+
+        assert_eq!(
+            state.resolve_slipstream_fee_event_pool(&topics),
+            Some(pool_address)
+        );
+    }
+
+    #[test]
+    fn slipstream_custom_fee_event_ignores_unknown_pool() {
+        let pool_address = address!("b2cc224c1c9fee385f8ad6a55b4d94e92359dc59");
+        let state = StateSpace::default();
+        let topics = vec![
+            ICustomFeeModule::CustomFeeSet::SIGNATURE_HASH,
+            pool_address.into_word(),
+        ];
+
+        assert_eq!(state.resolve_slipstream_fee_event_pool(&topics), None);
     }
 }
 

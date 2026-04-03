@@ -662,8 +662,12 @@ mod tests {
     #[test]
     fn test_dai_usds_simulation() {
         let mut converter = SkyConverter::new_dai_usds(addresses::DAI_USDS);
-        converter.token_0 = "0x6B175474E89094C44Da98b954EedeAC495271d0F".parse().unwrap(); // DAI
-        converter.token_1 = "0xdC035Df69075f5b12d8F7Bbd66d0Df2C27eaB2CE".parse().unwrap(); // USDS
+        converter.token_0 = "0x6B175474E89094C44Da98b954EedeAC495271d0F"
+            .parse()
+            .unwrap(); // DAI
+        converter.token_1 = "0xdC035Df69075f5b12d8F7Bbd66d0Df2C27eaB2CE"
+            .parse()
+            .unwrap(); // USDS
         converter.token_0_decimals = 18;
         converter.token_1_decimals = 18;
 
@@ -678,8 +682,12 @@ mod tests {
     #[test]
     fn test_lite_psm_simulation() {
         let mut converter = SkyConverter::new_lite_psm(addresses::LITE_PSM);
-        converter.token_0 = "0x6B175474E89094C44Da98b954EedeAC495271d0F".parse().unwrap(); // DAI
-        converter.token_1 = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".parse().unwrap(); // USDC
+        converter.token_0 = "0x6B175474E89094C44Da98b954EedeAC495271d0F"
+            .parse()
+            .unwrap(); // DAI
+        converter.token_1 = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+            .parse()
+            .unwrap(); // USDC
         converter.token_0_decimals = 18;
         converter.token_1_decimals = 6;
         converter.to18_conversion_factor = 1_000_000_000_000; // 10^12

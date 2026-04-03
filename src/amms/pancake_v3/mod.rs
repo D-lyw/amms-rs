@@ -329,14 +329,14 @@ impl AutomatedMarketMaker for PancakeV3Pool {
     /// PancakeSwap V3 is deployed on multiple EVM-compatible chains
     fn supported_chains(&self) -> Option<Vec<u64>> {
         Some(vec![
-            56,     // BNB Chain (Main)
-            1,      // Ethereum
-            137,    // Polygon
-            8453,   // Base
-            42161,  // Arbitrum
-            10,     // Optimism
-            43114,  // Avalanche
-            1101,   // Polygon zkEVM
+            56,    // BNB Chain (Main)
+            1,     // Ethereum
+            137,   // Polygon
+            8453,  // Base
+            42161, // Arbitrum
+            10,    // Optimism
+            43114, // Avalanche
+            1101,  // Polygon zkEVM
         ])
     }
 
@@ -1493,8 +1493,7 @@ impl PancakeV3Factory {
                     let (pools_addrs, return_data) = res?;
                     let return_data = <Vec<Vec<U256>> as SolValue>::abi_decode(&return_data)?;
 
-                    for (tick_bitmaps, pool_address) in return_data.iter().zip(pools_addrs.iter())
-                    {
+                    for (tick_bitmaps, pool_address) in return_data.iter().zip(pools_addrs.iter()) {
                         let Some(pool_idx) = pool_index.get(pool_address).copied() else {
                             continue;
                         };

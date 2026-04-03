@@ -1,2 +1,2 @@
-pub mod stableswap;
 pub mod cryptoswap;
+pub mod stableswap;

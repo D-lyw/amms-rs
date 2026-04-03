@@ -479,8 +479,8 @@ impl AutomatedMarketMaker for UniswapV4Pool {
             sqrt_price_x_96: self.sqrt_price, // Active price on the pool
             amount_calculated: I256::ZERO,    // Amount of token_in that has been calculated
             amount_specified_remaining: I256::ZERO - I256::from_raw(amount_out), // Negative for exact-out
-            tick: self.tick,                  // Current i24 tick of the pool
-            liquidity: self.liquidity,        // Current available liquidity in the tick range
+            tick: self.tick,           // Current i24 tick of the pool
+            liquidity: self.liquidity, // Current available liquidity in the tick range
         };
 
         while current_state.amount_specified_remaining != I256::ZERO
@@ -661,7 +661,9 @@ impl AutomatedMarketMaker for UniswapV4Pool {
         };
 
         // Efficient O(1) best-case check for any tick containing enough liquidity
-        self.ticks.values().any(|info| info.liquidity_gross >= l_thresh)
+        self.ticks
+            .values()
+            .any(|info| info.liquidity_gross >= l_thresh)
     }
 
     fn decimals(&self, token: Address) -> u8 {
@@ -1742,14 +1744,19 @@ mod test {
                 "exact_out: want {} ETH, computed amount_in {} USDC, actual_out {} ETH",
                 amount_out, amount_in, actual_out
             );
-            assert!(actual_out >= amount_out, "actual_out {} < amount_out {}", actual_out, amount_out);
+            assert!(
+                actual_out >= amount_out,
+                "actual_out {} < amount_out {}",
+                actual_out,
+                amount_out
+            );
         }
 
         // Exact out: ETH -> USDC (want USDC out)
         // To get USDC out, swap ETH in: base_token = ETH (token_a)
         let exact_outs_usdc = [
-            U256::from(1_000_000u64),      // 1 USDC
-            U256::from(100_000_000u64),    // 100 USDC
+            U256::from(1_000_000u64),         // 1 USDC
+            U256::from(100_000_000u64),       // 100 USDC
             U256::from(1_000_000_000_000u64), // 1,000,000 USDC
         ];
 
@@ -1766,7 +1773,12 @@ mod test {
                 "exact_out: want {} USDC, computed amount_in {} ETH, actual_out {} USDC",
                 amount_out, amount_in, actual_out
             );
-            assert!(actual_out >= amount_out, "actual_out {} < amount_out {}", actual_out, amount_out);
+            assert!(
+                actual_out >= amount_out,
+                "actual_out {} < amount_out {}",
+                actual_out,
+                amount_out
+            );
         }
 
         Ok(())
@@ -1833,8 +1845,8 @@ mod test {
         // Exact out: ETH -> USDC (want USDC out)
         // base_token = ETH (token_a) for ETH input
         let exact_outs_usdc = [
-            U256::from(1_000_000u64),      // 1 USDC
-            U256::from(100_000_000u64),    // 100 USDC
+            U256::from(1_000_000u64),         // 1 USDC
+            U256::from(100_000_000u64),       // 100 USDC
             U256::from(1_000_000_000_000u64), // 1,000,000 USDC
         ];
 
@@ -1850,7 +1862,12 @@ mod test {
                 "exact_out: want {} USDC, computed amount_in {} ETH, actual_out {} USDC",
                 amount_out, amount_in, actual_out
             );
-            assert!(actual_out >= amount_out, "actual_out {} < amount_out {}", actual_out, amount_out);
+            assert!(
+                actual_out >= amount_out,
+                "actual_out {} < amount_out {}",
+                actual_out,
+                amount_out
+            );
         }
 
         // Exact out: USDC -> ETH (want ETH out)
@@ -1873,7 +1890,12 @@ mod test {
                 "exact_out: want {} ETH, computed amount_in {} USDC, actual_out {} ETH",
                 amount_out, amount_in, actual_out
             );
-            assert!(actual_out >= amount_out, "actual_out {} < amount_out {}", actual_out, amount_out);
+            assert!(
+                actual_out >= amount_out,
+                "actual_out {} < amount_out {}",
+                actual_out,
+                amount_out
+            );
         }
 
         Ok(())
@@ -1909,7 +1931,8 @@ mod test {
             .await?;
 
         // Zero amount should return zero
-        let amount_in = pool.simulate_swap_exact_out(pool.token_a.address, Address::ZERO, U256::ZERO)?;
+        let amount_in =
+            pool.simulate_swap_exact_out(pool.token_a.address, Address::ZERO, U256::ZERO)?;
         assert!(amount_in.is_zero());
 
         Ok(())
@@ -1947,7 +1970,10 @@ mod test {
         // Request an absurdly large exact-out amount to force exhaustion
         let huge_out = U256::from(10u8).pow(U256::from(36u8));
         let res = pool.simulate_swap_exact_out(pool.token_a.address, Address::ZERO, huge_out);
-        assert!(res.is_err(), "Should fail with insufficient liquidity error");
+        assert!(
+            res.is_err(),
+            "Should fail with insufficient liquidity error"
+        );
 
         Ok(())
     }
@@ -1986,7 +2012,8 @@ mod test {
         let original_amount_in = U256::from(1_000_000_000_000_000_000u128); // 1 ETH
 
         // Step 1: exact_in to get amount_out
-        let amount_out = pool.simulate_swap(pool.token_a.address, Address::ZERO, original_amount_in)?;
+        let amount_out =
+            pool.simulate_swap(pool.token_a.address, Address::ZERO, original_amount_in)?;
 
         // Step 2: exact_out to get back amount_in
         let round_trip_amount_in = pool.simulate_swap_exact_out(
@@ -2108,8 +2135,8 @@ mod test {
         // Exact out: ETH -> USDC (want USDC out)
         // base_token = ETH (token_a), zeroForOne = true
         let exact_outs_usdc = [
-            U256::from(1_000_000u64),      // 1 USDC
-            U256::from(100_000_000u64),    // 100 USDC
+            U256::from(1_000_000u64),         // 1 USDC
+            U256::from(100_000_000u64),       // 100 USDC
             U256::from(1_000_000_000_000u64), // 1,000,000 USDC
         ];
 
@@ -2228,8 +2255,8 @@ mod test {
         // Exact out: ETH -> USDC (want USDC out)
         // base_token = ETH (token_a), zeroForOne = true
         let exact_outs_usdc = [
-            U256::from(1_000_000u64),      // 1 USDC
-            U256::from(100_000_000u64),    // 100 USDC
+            U256::from(1_000_000u64),         // 1 USDC
+            U256::from(100_000_000u64),       // 100 USDC
             U256::from(1_000_000_000_000u64), // 1,000,000 USDC
         ];
 

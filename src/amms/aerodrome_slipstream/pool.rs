@@ -19,7 +19,7 @@
 use alloy::{
     eips::BlockId,
     network::Network,
-    primitives::{Address, Bytes, Signed, I256, U256},
+    primitives::{address, Address, Bytes, Signed, I256, U256},
     providers::Provider,
     rpc::types::Log,
     sol,
@@ -37,15 +37,14 @@ use crate::amms::{
     consts::{MIN_V3_LIQUIDITY, MPFR_T_PRECISION, U256_1},
     error::AMMError,
     factory::{AutomatedMarketMakerFactory, DiscoverySync},
-    uniswap_v3::{
-        tick_to_word, GetUniswapV3PoolTickBitmapBatchRequest,
-        UniswapV3Factory,
-    },
+    uniswap_v3::{tick_to_word, GetUniswapV3PoolTickBitmapBatchRequest, UniswapV3Factory},
     Token,
 };
 use rug::ops::Pow;
 use rug::Float;
 use uniswap_v3_math::tick_math::{MAX_SQRT_RATIO, MAX_TICK, MIN_SQRT_RATIO, MIN_TICK};
+
+pub const BASE_SLIPSTREAM_FACTORY: Address = address!("5e7BB104d84c7CB9B682AaC2F3d509f5F406809A");
 
 sol! {
     #[derive(Debug, PartialEq, Eq)]
@@ -103,6 +102,8 @@ sol! {
     #[derive(Debug)]
     #[sol(rpc)]
     contract ICLPoolFactory {
+        function swapFeeModule() external view returns (address);
+
         event PoolCreated(
             address indexed token0,
             address indexed token1,
@@ -1575,10 +1576,12 @@ impl AerodromeSlipstreamFactory {
             futures.push(Box::pin(async move {
                 Ok::<(Vec<TickDataInfo>, Bytes), AMMError>((
                     calldata_clone,
-                    GetAerodromeSlipstreamPoolTickDataBatchRequest::deploy_builder(provider, calldata)
-                        .call_raw()
-                        .block(block_number)
-                        .await?,
+                    GetAerodromeSlipstreamPoolTickDataBatchRequest::deploy_builder(
+                        provider, calldata,
+                    )
+                    .call_raw()
+                    .block(block_number)
+                    .await?,
                 ))
             }));
 
@@ -1595,18 +1598,19 @@ impl AerodromeSlipstreamFactory {
                             continue;
                         }
                     };
-                    let return_data = match <Vec<Vec<(u128, i128)>> as SolValue>::abi_decode(&return_data) {
-                        Ok(data) => data,
-                        Err(e) => {
-                            tracing::warn!(
-                                target = "amms::aerodrome_slipstream::sync_tick_data",
-                                error = ?e,
-                                return_data_len = return_data.len(),
-                                "Failed to decode tick data, skipping batch"
-                            );
-                            continue;
-                        }
-                    };
+                    let return_data =
+                        match <Vec<Vec<(u128, i128)>> as SolValue>::abi_decode(&return_data) {
+                            Ok(data) => data,
+                            Err(e) => {
+                                tracing::warn!(
+                                    target = "amms::aerodrome_slipstream::sync_tick_data",
+                                    error = ?e,
+                                    return_data_len = return_data.len(),
+                                    "Failed to decode tick data, skipping batch"
+                                );
+                                continue;
+                            }
+                        };
 
                     for (tick_results, tick_info_item) in return_data.iter().zip(tick_info.iter()) {
                         let Some(pool_idx) = pool_index.get(&tick_info_item.pool).copied() else {
@@ -1725,18 +1729,19 @@ impl AerodromeSlipstreamFactory {
                     continue;
                 }
             };
-            let static_data = match <Vec<(Address, Address, i32, u32)> as SolValue>::abi_decode(&return_data) {
-                Ok(data) => data,
-                Err(e) => {
-                    tracing::warn!(
-                        target = "amms::aerodrome_slipstream::init_batch",
-                        error = ?e,
-                        return_data_len = return_data.len(),
-                        "Failed to decode static data, skipping batch"
-                    );
-                    continue;
-                }
-            };
+            let static_data =
+                match <Vec<(Address, Address, i32, u32)> as SolValue>::abi_decode(&return_data) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        tracing::warn!(
+                            target = "amms::aerodrome_slipstream::init_batch",
+                            error = ?e,
+                            return_data_len = return_data.len(),
+                            "Failed to decode static data, skipping batch"
+                        );
+                        continue;
+                    }
+                };
 
             let addr_to_data: HashMap<Address, (Address, Address, i32, u32)> =
                 addresses.into_iter().zip(static_data.into_iter()).collect();
@@ -1763,20 +1768,18 @@ impl AerodromeSlipstreamFactory {
             .map_err(AMMError::from)?;
         sleep(Duration::from_millis(500)).await;
 
-        let (valid_amms, invalid_amms): (Vec<_>, Vec<_>) = amms
-            .into_iter()
-            .partition(|amm| {
-                if let AMM::AerodromeSlipstreamPool(pool) = amm {
-                    pool.liquidity > 0
-                        && pool.tick_spacing != 0
-                        && !pool.token_a.address.is_zero()
-                        && !pool.token_b.address.is_zero()
-                        && pool.token_a.decimals > 0
-                        && pool.token_b.decimals > 0
-                } else {
-                    false
-                }
-            });
+        let (valid_amms, invalid_amms): (Vec<_>, Vec<_>) = amms.into_iter().partition(|amm| {
+            if let AMM::AerodromeSlipstreamPool(pool) = amm {
+                pool.liquidity > 0
+                    && pool.tick_spacing != 0
+                    && !pool.token_a.address.is_zero()
+                    && !pool.token_b.address.is_zero()
+                    && pool.token_a.decimals > 0
+                    && pool.token_b.decimals > 0
+            } else {
+                false
+            }
+        });
 
         if !invalid_amms.is_empty() {
             for amm in &invalid_amms {

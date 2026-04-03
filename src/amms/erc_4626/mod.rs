@@ -239,10 +239,20 @@ impl AutomatedMarketMaker for ERC4626Vault {
 
         if self.vault_token == base_token {
             // Withdraw: vault_token -> asset_token
-            self.get_amount_in(amount_out, self.vault_reserve, self.asset_reserve, self.withdraw_fee)
+            self.get_amount_in(
+                amount_out,
+                self.vault_reserve,
+                self.asset_reserve,
+                self.withdraw_fee,
+            )
         } else {
             // Deposit: asset_token -> vault_token
-            self.get_amount_in(amount_out, self.asset_reserve, self.vault_reserve, self.deposit_fee)
+            self.get_amount_in(
+                amount_out,
+                self.asset_reserve,
+                self.vault_reserve,
+                self.deposit_fee,
+            )
         }
     }
 
@@ -373,23 +383,26 @@ impl ERC4626Vault {
                     U256,
                 )> as SolValue>::abi_decode(&res)?;
 
-                Ok::<(
-                    Vec<Address>,
-                    Vec<(
-                        Address,
-                        u16,
-                        Address,
-                        u16,
-                        U256,
-                        U256,
-                        U256,
-                        U256,
-                        U256,
-                        U256,
-                        U256,
-                        U256,
-                    )>,
-                ), AMMError>((group, return_data))
+                Ok::<
+                    (
+                        Vec<Address>,
+                        Vec<(
+                            Address,
+                            u16,
+                            Address,
+                            u16,
+                            U256,
+                            U256,
+                            U256,
+                            U256,
+                            U256,
+                            U256,
+                            U256,
+                            U256,
+                        )>,
+                    ),
+                    AMMError,
+                >((group, return_data))
             });
         }
 
@@ -642,6 +655,6 @@ impl ERC4626Vault {
 }
 
 #[cfg(test)]
-mod test_price;
-#[cfg(test)]
 mod test_batch;
+#[cfg(test)]
+mod test_price;

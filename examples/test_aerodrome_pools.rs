@@ -8,9 +8,7 @@ use alloy::{
 };
 use amms::{
     amms::{
-        aerodrome_slipstream::AerodromeSlipstreamPool,
-        aerodrome_v2::AerodromeV2Pool,
-        amm::AMM,
+        aerodrome_slipstream::AerodromeSlipstreamPool, aerodrome_v2::AerodromeV2Pool, amm::AMM,
     },
     state_space::StateSpaceBuilder,
 };

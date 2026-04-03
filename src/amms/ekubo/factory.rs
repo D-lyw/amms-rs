@@ -213,7 +213,7 @@ impl EkuboFactory {
 
         // Step 1: Parallel fetch core state and initialize tokens
         let mut tasks = Vec::new();
-        
+
         for &idx in &ekubo_indices {
             if let AMM::EkuboPool(p) = &pools[idx] {
                 let mut new_pool = EkuboPool::new(p.address, p.pool_key.clone());
@@ -223,11 +223,11 @@ impl EkuboFactory {
                 tasks.push(async move {
                     // Fetch core state (sqrt_price, tick, liquidity) using poolPrice() correctly
                     new_pool = new_pool.fetch_core_state(block, provider.clone()).await?;
-                    
+
                     // Initialize tokens (already done inside fetch_core_state? Yes, let's check pool.rs)
                     // pool.rs fetch_core_state calls Token::new(). So we don't need to do it here manually!
                     // This simplifies the logic significantly.
-                    
+
                     Ok::<(usize, EkuboPool), AMMError>((idx, new_pool))
                 });
             }
@@ -248,7 +248,6 @@ impl EkuboFactory {
                 }
             }
         }
-
 
         // Step 3: Batch sync tick bitmaps and data (Chunked)
         const CHUNK_SIZE: usize = 2;

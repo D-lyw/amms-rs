@@ -1,7 +1,16 @@
 #[cfg(test)]
 mod tests {
-    use crate::amms::{amm::{AMM, AutomatedMarketMaker}, erc_4626::ERC4626Vault};
-    use alloy::{eips::BlockId, primitives::address, providers::ProviderBuilder, rpc::client::ClientBuilder, transports::layers::{RetryBackoffLayer, ThrottleLayer}};
+    use crate::amms::{
+        amm::{AutomatedMarketMaker, AMM},
+        erc_4626::ERC4626Vault,
+    };
+    use alloy::{
+        eips::BlockId,
+        primitives::address,
+        providers::ProviderBuilder,
+        rpc::client::ClientBuilder,
+        transports::layers::{RetryBackoffLayer, ThrottleLayer},
+    };
     use eyre::Result;
 
     #[tokio::test]
@@ -9,7 +18,7 @@ mod tests {
     async fn test_init_batch() -> Result<()> {
         dotenv::dotenv().ok();
         let rpc_endpoint = std::env::var("ETHEREUM_PROVIDER")?;
-        
+
         let client = ClientBuilder::default()
             .layer(ThrottleLayer::new(100))
             .layer(RetryBackoffLayer::new(5, 100, 300))
@@ -26,12 +35,16 @@ mod tests {
 
         let block_number = BlockId::from(20000000);
 
-        let initialized_vaults = ERC4626Vault::init_batch::<_, _>(vaults, block_number, provider).await?;
+        let initialized_vaults =
+            ERC4626Vault::init_batch::<_, _>(vaults, block_number, provider).await?;
 
         assert_eq!(initialized_vaults.len(), 1);
 
         // Check sDAI
-        let sdai = initialized_vaults.iter().find(|v| v.address() == sdai_address).unwrap();
+        let sdai = initialized_vaults
+            .iter()
+            .find(|v| v.address() == sdai_address)
+            .unwrap();
         if let AMM::ERC4626Vault(v) = sdai {
             assert!(v.vault_reserve > alloy::primitives::U256::ZERO);
             assert!(v.asset_reserve > alloy::primitives::U256::ZERO);
@@ -44,22 +57,22 @@ mod tests {
         } else {
             panic!("Wrong type for sDAI");
         }
-/*
-        // Check wstETH
-        let wsteth = initialized_vaults.iter().find(|v| v.address() == wsteth_address).unwrap();
-        if let AMM::ERC4626Vault(v) = wsteth {
-            assert!(v.vault_reserve > alloy::primitives::U256::ZERO);
-            assert!(v.asset_reserve > alloy::primitives::U256::ZERO);
-            assert_eq!(v.vault_token_decimals, 18);
-            // wstETH is 18, stETH is 18.
-            
-            println!("wstETH Price: {}", v.vault_token_price);
-            // wstETH price in stETH should be > 1.0
-            assert!(v.vault_token_price > 1.0);
-        } else {
-            panic!("Wrong type for wstETH");
-        }
-*/
+        /*
+                // Check wstETH
+                let wsteth = initialized_vaults.iter().find(|v| v.address() == wsteth_address).unwrap();
+                if let AMM::ERC4626Vault(v) = wsteth {
+                    assert!(v.vault_reserve > alloy::primitives::U256::ZERO);
+                    assert!(v.asset_reserve > alloy::primitives::U256::ZERO);
+                    assert_eq!(v.vault_token_decimals, 18);
+                    // wstETH is 18, stETH is 18.
+
+                    println!("wstETH Price: {}", v.vault_token_price);
+                    // wstETH price in stETH should be > 1.0
+                    assert!(v.vault_token_price > 1.0);
+                } else {
+                    panic!("Wrong type for wstETH");
+                }
+        */
 
         Ok(())
     }

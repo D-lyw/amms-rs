@@ -8,7 +8,7 @@ use alloy::{
     transports::layers::{RetryBackoffLayer, ThrottleLayer},
 };
 use amms::amms::{
-    amm::{AMM, AutomatedMarketMaker},
+    amm::{AutomatedMarketMaker, AMM},
     balancer_v3::{BalancerV3Factory, BalancerV3Pool, BalancerV3PoolType},
 };
 
@@ -36,22 +36,26 @@ async fn main() -> eyre::Result<()> {
             address!("b97459fe72708603d822f4edf24bff8ecc07d8f6"),
             BASE_VAULT_ADDRESS,
             BalancerV3PoolType::Weighted,
-        ).into(),
+        )
+        .into(),
         BalancerV3Pool::new(
             address!("608de85fff36132e1f6212b4550801f246609bbf"),
             BASE_VAULT_ADDRESS,
             BalancerV3PoolType::Weighted,
-        ).into(),
+        )
+        .into(),
         BalancerV3Pool::new(
             address!("f09e25b0f5974ec9caf26df4c2f57f4152e46069"),
             BASE_VAULT_ADDRESS,
             BalancerV3PoolType::Stable,
-        ).into(),
+        )
+        .into(),
         BalancerV3Pool::new(
             address!("aae5d575b730c6ce28af137490f3cfc96797d07f"),
             BASE_VAULT_ADDRESS,
             BalancerV3PoolType::Weighted,
-        ).into(),
+        )
+        .into(),
     ];
 
     tracing::info!(
@@ -84,7 +88,10 @@ async fn main() -> eyre::Result<()> {
             tracing::info!("========== SYNC RESULT ==========");
             tracing::info!("Total requested: {}", balancer_v3_pools.len());
             tracing::info!("Successfully synced: {}", synced_amms.len());
-            tracing::info!("Failed/Skipped: {}", balancer_v3_pools.len() - synced_amms.len());
+            tracing::info!(
+                "Failed/Skipped: {}",
+                balancer_v3_pools.len() - synced_amms.len()
+            );
 
             for amm in &synced_amms {
                 if let AMM::BalancerV3Pool(pool) = amm {
@@ -114,13 +121,24 @@ async fn main() -> eyre::Result<()> {
                 tracing::error!("Caused by: {}", source);
             }
 
-            tracing::info!("Trying individual pool initialization to identify the problematic pool...");
+            tracing::info!(
+                "Trying individual pool initialization to identify the problematic pool..."
+            );
 
             for (i, amm) in balancer_v3_pools.iter().enumerate() {
                 if let AMM::BalancerV3Pool(pool) = amm {
-                    tracing::info!("--- Testing pool {}/{}: {} ---", i + 1, balancer_v3_pools.len(), pool.address);
+                    tracing::info!(
+                        "--- Testing pool {}/{}: {} ---",
+                        i + 1,
+                        balancer_v3_pools.len(),
+                        pool.address
+                    );
 
-                    match pool.clone().init::<_, _>(BlockId::from(block), provider.clone()).await {
+                    match pool
+                        .clone()
+                        .init::<_, _>(BlockId::from(block), provider.clone())
+                        .await
+                    {
                         Ok(synced_pool) => {
                             tracing::info!(
                                 "[OK] {} | type: {:?} | token_count: {} | swap_fee: {:?}",
@@ -139,11 +157,7 @@ async fn main() -> eyre::Result<()> {
                             }
                         }
                         Err(e) => {
-                            tracing::error!(
-                                "[FAILED] {} | Error: {}",
-                                pool.address,
-                                e
-                            );
+                            tracing::error!("[FAILED] {} | Error: {}", pool.address, e);
                         }
                     }
 

@@ -19,10 +19,7 @@ mod tests {
         sol_types::SolEvent,
     };
 
-    use crate::amms::{
-        aerodrome_v2::AerodromeV2Pool,
-        amm::AutomatedMarketMaker,
-    };
+    use crate::amms::{aerodrome_v2::AerodromeV2Pool, amm::AutomatedMarketMaker};
 
     // ============================================================================
     // Contract Interfaces
@@ -69,7 +66,9 @@ mod tests {
                 return Err(eyre::eyre!("BASE_PROVIDER not set"));
             }
         };
-        Ok(Arc::new(ProviderBuilder::new().connect_http(rpc_endpoint.parse()?)))
+        Ok(Arc::new(
+            ProviderBuilder::new().connect_http(rpc_endpoint.parse()?),
+        ))
     }
 
     /// Helper: fetch all Aerodrome V2 pool events in a block range
@@ -137,7 +136,10 @@ mod tests {
     ) -> eyre::Result<(u128, u128)> {
         let pool_contract = IAerodromeV2PoolOnchain::new(pool_address, provider.clone());
         let reserves = pool_contract.getReserves().block(block).call().await?;
-        Ok((reserves.reserve0.to::<u128>(), reserves.reserve1.to::<u128>()))
+        Ok((
+            reserves.reserve0.to::<u128>(),
+            reserves.reserve1.to::<u128>(),
+        ))
     }
 
     async fn find_onchain_amount_in_for_exact_out<P: Provider + Clone>(
@@ -222,15 +224,22 @@ mod tests {
 
         println!("\n[{label}] ========== SWAP SIMULATION TEST ==========");
         println!("Pool address: {:?}", pool_address);
-        println!("Token A: {:?} (decimals: {})", pool.token_a.address, pool.token_a.decimals);
-        println!("Token B: {:?} (decimals: {})", pool.token_b.address, pool.token_b.decimals);
+        println!(
+            "Token A: {:?} (decimals: {})",
+            pool.token_a.address, pool.token_a.decimals
+        );
+        println!(
+            "Token B: {:?} (decimals: {})",
+            pool.token_b.address, pool.token_b.decimals
+        );
         println!("Reserve 0: {}", pool.reserve_0);
         println!("Reserve 1: {}", pool.reserve_1);
         println!("Stable: {}", pool.stable);
 
         // Verify pool type
         assert_eq!(
-            pool.stable, is_stable,
+            pool.stable,
+            is_stable,
             "[{label}] Expected {} pool but got {}",
             if is_stable { "stable" } else { "volatile" },
             if pool.stable { "stable" } else { "volatile" }
@@ -262,20 +271,28 @@ mod tests {
             println!("Amount in: {}", amount_in);
 
             // Simulate swap locally
-            let simulated = match pool.simulate_swap(pool.token_a.address, pool.token_b.address, *amount_in) {
-                Ok(amount) => amount,
-                Err(e) => {
-                    println!("[{label}] Skip: Local simulation error: {:?}", e);
-                    continue;
-                }
-            };
+            let simulated =
+                match pool.simulate_swap(pool.token_a.address, pool.token_b.address, *amount_in) {
+                    Ok(amount) => amount,
+                    Err(e) => {
+                        println!("[{label}] Skip: Local simulation error: {:?}", e);
+                        continue;
+                    }
+                };
 
             // Get on-chain result
-            let onchain_result = match onchain_pool.getAmountOut(*amount_in, pool.token_a.address).call().await {
+            let onchain_result = match onchain_pool
+                .getAmountOut(*amount_in, pool.token_a.address)
+                .call()
+                .await
+            {
                 Ok(result) => result,
                 Err(e) => {
                     let err_str = e.to_string();
-                    if err_str.contains("rate limit") || err_str.contains("429") || err_str.contains("-32016") {
+                    if err_str.contains("rate limit")
+                        || err_str.contains("429")
+                        || err_str.contains("-32016")
+                    {
                         println!("[{label}] ⚠️ Rate limited, skipping on-chain comparison");
                         println!("[{label}] Local simulation: {}", simulated);
                         continue;
@@ -302,7 +319,11 @@ mod tests {
             let diff_ratio = diff.to_string().parse::<f64>().unwrap()
                 / onchain_result.to_string().parse::<f64>().unwrap();
 
-            println!("[{label}] Difference: {} ({:.4}%)", diff, diff_ratio * 100.0);
+            println!(
+                "[{label}] Difference: {} ({:.4}%)",
+                diff,
+                diff_ratio * 100.0
+            );
 
             assert!(
                 diff_ratio < tolerance,
@@ -356,14 +377,22 @@ mod tests {
 
         println!("\n[ReverseSwap] Testing Token B -> Token A: {}", amount_in);
 
-        let simulated = pool.simulate_swap(pool.token_b.address, pool.token_a.address, amount_in)?;
+        let simulated =
+            pool.simulate_swap(pool.token_b.address, pool.token_a.address, amount_in)?;
         println!("[ReverseSwap] Local simulated: {}", simulated);
 
-        let onchain_result = match onchain_pool.getAmountOut(amount_in, pool.token_b.address).call().await {
+        let onchain_result = match onchain_pool
+            .getAmountOut(amount_in, pool.token_b.address)
+            .call()
+            .await
+        {
             Ok(result) => result,
             Err(e) => {
                 let err_str = e.to_string();
-                if err_str.contains("rate limit") || err_str.contains("429") || err_str.contains("-32016") {
+                if err_str.contains("rate limit")
+                    || err_str.contains("429")
+                    || err_str.contains("-32016")
+                {
                     println!("[ReverseSwap] ⚠️ Rate limited, test passed (local only)");
                     println!("[ReverseSwap] ✅ REVERSE SWAP TEST PASSED (local only)");
                     return Ok(());
@@ -385,7 +414,11 @@ mod tests {
                 / onchain_result.to_string().parse::<f64>().unwrap();
 
             println!("[ReverseSwap] Difference: {:.4}%", diff_ratio * 100.0);
-            assert!(diff_ratio < 0.005, "[ReverseSwap] Diff ratio too high: {:.4}%", diff_ratio * 100.0);
+            assert!(
+                diff_ratio < 0.005,
+                "[ReverseSwap] Diff ratio too high: {:.4}%",
+                diff_ratio * 100.0
+            );
         }
 
         println!("\n[ReverseSwap] ✅ REVERSE SWAP TEST PASSED");
@@ -437,8 +470,11 @@ mod tests {
         );
 
         for target_out in targets {
-            let local_in =
-                pool.simulate_swap_exact_out(pool.token_a.address, pool.token_b.address, target_out)?;
+            let local_in = pool.simulate_swap_exact_out(
+                pool.token_a.address,
+                pool.token_b.address,
+                target_out,
+            )?;
             let chain_in = find_onchain_amount_in_for_exact_out(
                 &onchain_pool,
                 pool.token_a.address,
@@ -514,7 +550,10 @@ mod tests {
             AerodromeV2Pool::new_volatile(pool_address)
         };
 
-        pool = match pool.init::<_, _>(BlockId::from(start_block), provider.clone()).await {
+        pool = match pool
+            .init::<_, _>(BlockId::from(start_block), provider.clone())
+            .await
+        {
             Ok(p) => p,
             Err(e) => {
                 println!("[{label}] Skipping: cannot initialize pool: {:?}", e);
@@ -533,8 +572,14 @@ mod tests {
         let (onchain_r0, onchain_r1) =
             fetch_onchain_state(&*provider, pool_address, BlockId::from(start_block)).await?;
 
-        assert_eq!(pool.reserve_0, onchain_r0, "[{label}] Initial reserve0 mismatch!");
-        assert_eq!(pool.reserve_1, onchain_r1, "[{label}] Initial reserve1 mismatch!");
+        assert_eq!(
+            pool.reserve_0, onchain_r0,
+            "[{label}] Initial reserve0 mismatch!"
+        );
+        assert_eq!(
+            pool.reserve_1, onchain_r1,
+            "[{label}] Initial reserve1 mismatch!"
+        );
         println!("[{label}] ✅ Initial state matches on-chain");
 
         // Step 2: Fetch all events in the block range
@@ -544,7 +589,8 @@ mod tests {
             current_block
         );
 
-        let mut events = fetch_pool_events(&*provider, pool_address, start_block + 1, current_block).await?;
+        let mut events =
+            fetch_pool_events(&*provider, pool_address, start_block + 1, current_block).await?;
         println!("[{label}] Found {} events", events.len());
 
         if events.is_empty() {
@@ -651,7 +697,10 @@ mod tests {
                         last_checked_block = block_num;
                     }
                     Err(e) => {
-                        println!("[{label}] ⚠️ Could not fetch on-chain state at block {}: {:?}", block_num, e);
+                        println!(
+                            "[{label}] ⚠️ Could not fetch on-chain state at block {}: {:?}",
+                            block_num, e
+                        );
                     }
                 }
             }
@@ -670,11 +719,23 @@ mod tests {
                     println!("\n[{label}] === FINAL STATE COMPARISON (block {final_block}) ===");
                     println!(
                         "  reserve0: local={} vs on-chain={}  {}",
-                        pool.reserve_0, oc_r0, if pool.reserve_0 == oc_r0 { "✅" } else { "❌" }
+                        pool.reserve_0,
+                        oc_r0,
+                        if pool.reserve_0 == oc_r0 {
+                            "✅"
+                        } else {
+                            "❌"
+                        }
                     );
                     println!(
                         "  reserve1: local={} vs on-chain={}  {}",
-                        pool.reserve_1, oc_r1, if pool.reserve_1 == oc_r1 { "✅" } else { "❌" }
+                        pool.reserve_1,
+                        oc_r1,
+                        if pool.reserve_1 == oc_r1 {
+                            "✅"
+                        } else {
+                            "❌"
+                        }
                     );
 
                     assert_eq!(pool.reserve_0, oc_r0, "[{label}] Final reserve0 mismatch!");
@@ -734,8 +795,14 @@ mod tests {
 
         println!("[Discovery] Successfully discovered and initialized pool:");
         println!("  Address: {:?}", pool.address);
-        println!("  Token A: {:?} (decimals: {})", pool.token_a.address, pool.token_a.decimals);
-        println!("  Token B: {:?} (decimals: {})", pool.token_b.address, pool.token_b.decimals);
+        println!(
+            "  Token A: {:?} (decimals: {})",
+            pool.token_a.address, pool.token_a.decimals
+        );
+        println!(
+            "  Token B: {:?} (decimals: {})",
+            pool.token_b.address, pool.token_b.decimals
+        );
         println!("  Stable: {}", pool.stable);
 
         assert!(!pool.stable, "[Discovery] Expected volatile pool");

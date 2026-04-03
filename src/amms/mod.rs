@@ -9,9 +9,9 @@ use error::{AMMError, BatchContractError};
 use futures::{stream::FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 
-pub mod amm;
-pub mod aerodrome_v2;
 pub mod aerodrome_slipstream;
+pub mod aerodrome_v2;
+pub mod amm;
 pub mod balancer_v2;
 pub mod balancer_v3;
 pub mod consts;

@@ -7,10 +7,7 @@ use alloy::{
     transports::layers::{RetryBackoffLayer, ThrottleLayer},
 };
 use amms::{
-    amms::{
-        amm::AMM,
-        pancake_v3::PancakeV3Pool,
-    },
+    amms::{amm::AMM, pancake_v3::PancakeV3Pool},
     state_space::StateSpaceBuilder,
 };
 
@@ -51,11 +48,7 @@ async fn main() -> eyre::Result<()> {
 
     for (i, amm) in pancake_v3_pools.iter().enumerate() {
         if let AMM::PancakeV3Pool(pool) = amm {
-            tracing::info!(
-                "[{}] Pool address: {}",
-                i + 1,
-                pool.address
-            );
+            tracing::info!("[{}] Pool address: {}", i + 1, pool.address);
         }
     }
 

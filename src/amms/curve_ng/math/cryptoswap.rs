@@ -509,9 +509,7 @@ pub fn twocrypto_fee(
         .ok_or("overflow")?;
 
     // fee = (mid_fee * B + out_fee * (1e18 - B)) / 1e18
-    let out_component = out_fee
-        .checked_mul(precision - b)
-        .ok_or("overflow")?;
+    let out_component = out_fee.checked_mul(precision - b).ok_or("overflow")?;
     let fee = mid_fee
         .checked_mul(b)
         .and_then(|v| v.checked_add(out_component))
@@ -656,7 +654,11 @@ pub fn isqrt(x: U256) -> U256 {
 // =============================================================================
 
 fn abs_i256(x: I256) -> I256 {
-    if x < I256::ZERO { -x } else { x }
+    if x < I256::ZERO {
+        -x
+    } else {
+        x
+    }
 }
 
 fn i256_from_u256(u: U256) -> Result<I256, &'static str> {
@@ -685,10 +687,7 @@ fn twocrypto_newton_y_internal(
     }
 
     let n = U256::from(N_COINS_2);
-    let mut y = d
-        .checked_mul(d)
-        .ok_or("twocrypto_newton_y: d^2 overflow")?
-        / (x_j * n * n);
+    let mut y = d.checked_mul(d).ok_or("twocrypto_newton_y: d^2 overflow")? / (x_j * n * n);
 
     let k0_i = (U256::from(WAD) * n) * x_j / d;
     let lim_mul_min = U256::from(10).pow(U256::from(36)) / lim_mul;
@@ -697,7 +696,10 @@ fn twocrypto_newton_y_internal(
     }
 
     let convergence_limit = std::cmp::max(
-        std::cmp::max(x_j / U256::from(10).pow(U256::from(14)), d / U256::from(10).pow(U256::from(14))),
+        std::cmp::max(
+            x_j / U256::from(10).pow(U256::from(14)),
+            d / U256::from(10).pow(U256::from(14)),
+        ),
         U256::from(100u64),
     );
 
@@ -869,7 +871,11 @@ pub fn twocrypto_get_y(
         let t1 = abs_i256(delta0);
         let t2 = abs_i256(delta1);
         let t = if t1 < t2 { t1 } else { t2 };
-        if t < a { t } else { a }
+        if t < a {
+            t
+        } else {
+            a
+        }
     };
 
     let divider = if threshold > i256_from_u256(U256::from(10).pow(U256::from(48)))? {
@@ -943,12 +949,12 @@ pub fn twocrypto_get_y(
     // 关键: 先转换为 uint256 再除以 2，而不是在 int256 中除法
     let second_cbrt = if delta1 > I256::ZERO {
         let sum_u = U256::try_from(delta1 + sqrt_val).map_err(|_| "cbrt arg overflow")?;
-        let arg_u = sum_u / U256::from(2u64);  // 在 uint256 中除法
+        let arg_u = sum_u / U256::from(2u64); // 在 uint256 中除法
         I256::try_from(cbrt(arg_u)).map_err(|_| "second cbrt overflow")?
     } else {
         // Vyper: -convert(self._cbrt(unsafe_div(convert(unsafe_sub(sqrt_val, delta1), uint256), 2)), int256)
         let diff_u = U256::try_from(sqrt_val - delta1).map_err(|_| "cbrt arg overflow")?;
-        let arg_u = diff_u / U256::from(2u64);  // 在 uint256 中除法
+        let arg_u = diff_u / U256::from(2u64); // 在 uint256 中除法
         -I256::try_from(cbrt(arg_u)).map_err(|_| "second cbrt overflow")?
     };
 
@@ -957,7 +963,9 @@ pub fn twocrypto_get_y(
     // 注意: second_cbrt 可能是负数，导致中间结果为负数，除以 i_wad 需要 floor_div
     let b_cbrt_sq = b_cbrt.checked_mul(b_cbrt).ok_or("c1 overflow")?;
     let b_cbrt_sq_div_wad = floor_div(b_cbrt_sq, i_wad)?;
-    let mul_second_cbrt = b_cbrt_sq_div_wad.checked_mul(second_cbrt).ok_or("c1 overflow")?;
+    let mul_second_cbrt = b_cbrt_sq_div_wad
+        .checked_mul(second_cbrt)
+        .ok_or("c1 overflow")?;
     let c1 = floor_div(mul_second_cbrt, i_wad)?;
 
     // Vyper: root = (10**18*C1 - 10**18*b - 10**18*b//C1*delta0) // (3*a)
@@ -1052,10 +1060,12 @@ pub fn twocrypto_newton_d(
             g1k0i = k0 - g1k0i + U256::from(1u64);
         }
 
-        let mul1 = U256::from(WAD) * d / gamma * g1k0i / gamma * g1k0i * U256::from(A_MULTIPLIER) / ann;
+        let mul1 =
+            U256::from(WAD) * d / gamma * g1k0i / gamma * g1k0i * U256::from(A_MULTIPLIER) / ann;
         let mul2 = (U256::from(2u64) * U256::from(WAD) * U256::from(N_COINS_2)) * k0 / g1k0i;
 
-        let neg_fprime = (s + s * mul2 / U256::from(WAD)) + mul1 * U256::from(N_COINS_2) / k0 - mul2 * d / U256::from(WAD);
+        let neg_fprime = (s + s * mul2 / U256::from(WAD)) + mul1 * U256::from(N_COINS_2) / k0
+            - mul2 * d / U256::from(WAD);
 
         let d_plus = d * (neg_fprime + s) / neg_fprime;
         let mut d_minus = d * d / neg_fprime;
@@ -1072,11 +1082,15 @@ pub fn twocrypto_newton_d(
         };
 
         let diff = if d > d_prev { d - d_prev } else { d_prev - d };
-        if diff * U256::from(10).pow(U256::from(14)) < std::cmp::max(U256::from(10).pow(U256::from(16)), d) {
+        if diff * U256::from(10).pow(U256::from(14))
+            < std::cmp::max(U256::from(10).pow(U256::from(16)), d)
+        {
             for _x in x {
                 let frac = _x * U256::from(WAD) / d;
-                let min_frac = U256::from(10).pow(U256::from(16)) / U256::from(N_COINS_2) - U256::from(1u64);
-                let max_frac = U256::from(10).pow(U256::from(20)) / U256::from(N_COINS_2) + U256::from(1u64);
+                let min_frac =
+                    U256::from(10).pow(U256::from(16)) / U256::from(N_COINS_2) - U256::from(1u64);
+                let max_frac =
+                    U256::from(10).pow(U256::from(20)) / U256::from(N_COINS_2) + U256::from(1u64);
                 if frac <= min_frac || frac >= max_frac {
                     return Err("unsafe values x[i]");
                 }

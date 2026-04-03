@@ -5,8 +5,8 @@ mod tests {
     use crate::amms::{
         amm::AutomatedMarketMaker,
         pancake_v3::{
-            IQuoterV2, IQuoterV2::IQuoterV2Instance, IPancakeV3FactoryExt::IPancakeV3FactoryExtInstance,
-            PancakeV3Pool,
+            IPancakeV3FactoryExt::IPancakeV3FactoryExtInstance, IQuoterV2,
+            IQuoterV2::IQuoterV2Instance, PancakeV3Pool,
         },
     };
     use alloy::{
@@ -30,7 +30,10 @@ mod tests {
         fees: &[u32],
     ) -> eyre::Result<(Address, u32)> {
         for &fee in fees {
-            let addr = factory.getPool(token_a, token_b, U24::from(fee)).call().await?;
+            let addr = factory
+                .getPool(token_a, token_b, U24::from(fee))
+                .call()
+                .await?;
             if !addr.is_zero() {
                 return Ok((addr, fee));
             }
@@ -46,14 +49,17 @@ mod tests {
 
         let factory = IPancakeV3FactoryExtInstance::new(PANCAKE_V3_FACTORY_ETH, provider.clone());
 
-        let (pool_addr, fee) = find_pool(&factory, USDC_ETH, USDT_ETH, &[100, 500, 2500, 10000]).await?;
+        let (pool_addr, fee) =
+            find_pool(&factory, USDC_ETH, USDT_ETH, &[100, 500, 2500, 10000]).await?;
         if pool_addr.is_zero() {
             println!("Pool not found, skipping test");
             return Ok(());
         }
 
         let block = BlockId::from(provider.get_block_number().await?);
-        let pool = PancakeV3Pool::new(pool_addr).init::<_, _>(block, provider.clone()).await?;
+        let pool = PancakeV3Pool::new(pool_addr)
+            .init::<_, _>(block, provider.clone())
+            .await?;
 
         let quoter = IQuoterV2Instance::new(PANCAKE_V3_QUOTER_ETH, provider.clone());
 
@@ -80,9 +86,16 @@ mod tests {
                 fee: U24::from(fee),
                 sqrtPriceLimitX96: U160::ZERO,
             };
-            let quoted = quoter.quoteExactInputSingle(params).block(block).call().await?;
+            let quoted = quoter
+                .quoteExactInputSingle(params)
+                .block(block)
+                .call()
+                .await?;
 
-            println!("Amount in: {}, Simulated: {}, Quoted: {}", amount_in, simulated, quoted.amountOut);
+            println!(
+                "Amount in: {}, Simulated: {}, Quoted: {}",
+                amount_in, simulated, quoted.amountOut
+            );
 
             assert_eq!(
                 simulated, quoted.amountOut,
@@ -109,7 +122,9 @@ mod tests {
         }
 
         let block = BlockId::from(provider.get_block_number().await?);
-        let pool = PancakeV3Pool::new(pool_addr).init::<_, _>(block, provider.clone()).await?;
+        let pool = PancakeV3Pool::new(pool_addr)
+            .init::<_, _>(block, provider.clone())
+            .await?;
 
         let quoter = IQuoterV2Instance::new(PANCAKE_V3_QUOTER_ETH, provider.clone());
 
@@ -134,9 +149,16 @@ mod tests {
                 fee: U24::from(fee),
                 sqrtPriceLimitX96: U160::ZERO,
             };
-            let quoted = quoter.quoteExactInputSingle(params).block(block).call().await?;
+            let quoted = quoter
+                .quoteExactInputSingle(params)
+                .block(block)
+                .call()
+                .await?;
 
-            println!("Amount in: {}, Simulated: {}, Quoted: {}", amount_in, simulated, quoted.amountOut);
+            println!(
+                "Amount in: {}, Simulated: {}, Quoted: {}",
+                amount_in, simulated, quoted.amountOut
+            );
 
             assert_eq!(
                 simulated, quoted.amountOut,
@@ -163,7 +185,9 @@ mod tests {
         }
 
         let block = BlockId::from(provider.get_block_number().await?);
-        let pool = PancakeV3Pool::new(pool_addr).init::<_, _>(block, provider.clone()).await?;
+        let pool = PancakeV3Pool::new(pool_addr)
+            .init::<_, _>(block, provider.clone())
+            .await?;
 
         let quoter = IQuoterV2Instance::new(PANCAKE_V3_QUOTER_ETH, provider.clone());
 
@@ -189,9 +213,16 @@ mod tests {
                 fee: U24::from(fee),
                 sqrtPriceLimitX96: U160::ZERO,
             };
-            let quoted = quoter.quoteExactInputSingle(params).block(block).call().await?;
+            let quoted = quoter
+                .quoteExactInputSingle(params)
+                .block(block)
+                .call()
+                .await?;
 
-            println!("Amount in: {}, Simulated: {}, Quoted: {}", amount_in, simulated, quoted.amountOut);
+            println!(
+                "Amount in: {}, Simulated: {}, Quoted: {}",
+                amount_in, simulated, quoted.amountOut
+            );
 
             assert_eq!(
                 simulated, quoted.amountOut,
@@ -218,7 +249,9 @@ mod tests {
         }
 
         let block = BlockId::from(provider.get_block_number().await?);
-        let pool = PancakeV3Pool::new(pool_addr).init::<_, _>(block, provider.clone()).await?;
+        let pool = PancakeV3Pool::new(pool_addr)
+            .init::<_, _>(block, provider.clone())
+            .await?;
 
         let quoter = IQuoterV2Instance::new(PANCAKE_V3_QUOTER_ETH, provider.clone());
 
@@ -242,9 +275,16 @@ mod tests {
                 fee: U24::from(fee),
                 sqrtPriceLimitX96: U160::ZERO,
             };
-            let quoted = quoter.quoteExactInputSingle(params).block(block).call().await?;
+            let quoted = quoter
+                .quoteExactInputSingle(params)
+                .block(block)
+                .call()
+                .await?;
 
-            println!("WETH->USDT: in={}, out_sim={}, out_quote={}", amount_in, simulated, quoted.amountOut);
+            println!(
+                "WETH->USDT: in={}, out_sim={}, out_quote={}",
+                amount_in, simulated, quoted.amountOut
+            );
             assert_eq!(simulated, quoted.amountOut);
         }
 
@@ -265,9 +305,16 @@ mod tests {
                 fee: U24::from(fee),
                 sqrtPriceLimitX96: U160::ZERO,
             };
-            let quoted = quoter.quoteExactInputSingle(params).block(block).call().await?;
+            let quoted = quoter
+                .quoteExactInputSingle(params)
+                .block(block)
+                .call()
+                .await?;
 
-            println!("USDT->WETH: in={}, out_sim={}, out_quote={}", amount_in, simulated, quoted.amountOut);
+            println!(
+                "USDT->WETH: in={}, out_sim={}, out_quote={}",
+                amount_in, simulated, quoted.amountOut
+            );
             assert_eq!(simulated, quoted.amountOut);
         }
 
@@ -289,7 +336,9 @@ mod tests {
         }
 
         let block = BlockId::from(19000000u64);
-        let pool = PancakeV3Pool::new(pool_addr).init::<_, _>(block, provider.clone()).await?;
+        let pool = PancakeV3Pool::new(pool_addr)
+            .init::<_, _>(block, provider.clone())
+            .await?;
 
         let price_weth_usdt = pool.calculate_price(WETH_ETH, USDT_ETH)?;
         println!("WETH price in USDT: {}", price_weth_usdt);

@@ -687,7 +687,7 @@ impl AutomatedMarketMaker for UniswapV3Pool {
             sqrt_price_x_96: self.sqrt_price, // Active price on the pool
             amount_calculated: I256::ZERO,    // Amount of token_in that has been calculated
             amount_specified_remaining: I256::ZERO - I256::from_raw(amount_out), // Remaining token_out
-            tick: self.tick,                                       // Current i24 tick of the pool
+            tick: self.tick,           // Current i24 tick of the pool
             liquidity: self.liquidity, // Current available liquidity in the tick range
         };
 

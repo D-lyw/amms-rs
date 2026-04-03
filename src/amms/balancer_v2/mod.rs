@@ -25,15 +25,15 @@ pub fn get_vault_address(_chain_id: u64) -> Option<Address> {
 /// Returns the list of chain IDs where Balancer V2 is deployed
 pub fn get_supported_chains() -> Vec<u64> {
     vec![
-        1,      // Ethereum
-        137,    // Polygon
-        42161,  // Arbitrum
-        10,     // Optimism
-        8453,   // Base
-        43114,  // Avalanche
-        100,    // Gnosis
-        56,     // BSC
-        250,    // Fantom (deprecated but historical data exists)
+        1,     // Ethereum
+        137,   // Polygon
+        42161, // Arbitrum
+        10,    // Optimism
+        8453,  // Base
+        43114, // Avalanche
+        100,   // Gnosis
+        56,    // BSC
+        250,   // Fantom (deprecated but historical data exists)
     ]
 }
 
@@ -229,7 +229,9 @@ impl BalancerV2Pool {
         let mut out_hi = self.simulate_swap(base_token, quote_token, hi)?;
         let mut expand_iters = 0u16;
         while out_hi < amount_out {
-            hi = hi.checked_mul(U256::from(2u8)).ok_or(AMMError::ArithmeticError)?;
+            hi = hi
+                .checked_mul(U256::from(2u8))
+                .ok_or(AMMError::ArithmeticError)?;
             out_hi = self.simulate_swap(base_token, quote_token, hi)?;
             expand_iters = expand_iters.saturating_add(1);
             if expand_iters > 256 {
@@ -261,9 +263,7 @@ impl BalancerV2Pool {
             .checked_sub(self.swap_fee)
             .ok_or(AMMError::ArithmeticError)?;
         BalancerV2Pool::ceil_div_u256(
-            amount
-                .checked_mul(BONE)
-                .ok_or(AMMError::ArithmeticError)?,
+            amount.checked_mul(BONE).ok_or(AMMError::ArithmeticError)?,
             fee_complement,
         )
     }
@@ -300,18 +300,14 @@ impl BalancerV2Pool {
         // => effective scaling factor = 10^(18-decimals) * rate.
         let dec_scale = U256::from(10).pow(U256::from(18u8.saturating_sub(state.decimals)));
         let rate = state.rate.unwrap_or(U256::from(10).pow(U256::from(18)));
-        dec_scale
-            .checked_mul(rate)
-            .ok_or(AMMError::ArithmeticError)
+        dec_scale.checked_mul(rate).ok_or(AMMError::ArithmeticError)
     }
 
     #[inline]
     fn token_scaling_factor_from_rate(state: &TokenState) -> Result<U256, AMMError> {
         let dec_scale = U256::from(10).pow(U256::from(18u8.saturating_sub(state.decimals)));
         let rate = state.rate.unwrap_or(U256::from(10).pow(U256::from(18)));
-        dec_scale
-            .checked_mul(rate)
-            .ok_or(AMMError::ArithmeticError)
+        dec_scale.checked_mul(rate).ok_or(AMMError::ArithmeticError)
     }
 
     #[inline]
@@ -335,9 +331,7 @@ impl BalancerV2Pool {
     #[inline]
     fn downscale_up(amount: U256, scaling_factor: U256) -> Result<U256, AMMError> {
         BalancerV2Pool::ceil_div_u256(
-            amount
-                .checked_mul(BONE)
-                .ok_or(AMMError::ArithmeticError)?,
+            amount.checked_mul(BONE).ok_or(AMMError::ArithmeticError)?,
             scaling_factor,
         )
     }
@@ -727,7 +721,8 @@ impl AutomatedMarketMaker for BalancerV2Pool {
                 let scaling_in = BalancerV2Pool::token_scaling_factor_from_rate(token_in_state)?;
                 let scaling_out = BalancerV2Pool::token_scaling_factor_from_rate(token_out_state)?;
 
-                let scaled_balance_in = BalancerV2Pool::upscale_down(token_in_state.balance, scaling_in)?;
+                let scaled_balance_in =
+                    BalancerV2Pool::upscale_down(token_in_state.balance, scaling_in)?;
                 let scaled_balance_out =
                     BalancerV2Pool::upscale_down(token_out_state.balance, scaling_out)?;
 
@@ -900,7 +895,8 @@ impl AutomatedMarketMaker for BalancerV2Pool {
                 let scaling_in = BalancerV2Pool::token_scaling_factor_from_rate(token_in_state)?;
                 let scaling_out = BalancerV2Pool::token_scaling_factor_from_rate(token_out_state)?;
 
-                let scaled_balance_in = BalancerV2Pool::upscale_down(token_in_state.balance, scaling_in)?;
+                let scaled_balance_in =
+                    BalancerV2Pool::upscale_down(token_in_state.balance, scaling_in)?;
                 let scaled_balance_out =
                     BalancerV2Pool::upscale_down(token_out_state.balance, scaling_out)?;
 
@@ -1264,7 +1260,11 @@ mod tests {
             .get(&token_out)
             .and_then(|t| t.rate)
             .unwrap_or(U256::from(10).pow(U256::from(18)));
-        let amp = amm.amp_state.as_ref().map(|s| s.end_value).unwrap_or(U256::ZERO);
+        let amp = amm
+            .amp_state
+            .as_ref()
+            .map(|s| s.end_value)
+            .unwrap_or(U256::ZERO);
 
         println!(
             "[exact-out][cmp] block={:?} pool={} pool_type={:?} token_in={} token_out={} target_out={} local_in={} onchain_in={} diff={} local_out_at_local_in={} local_prev_in={} local_prev_out={} local_out_at_onchain_in={} rate_in={} rate_out={} swap_fee={} amp={}",
@@ -1977,7 +1977,6 @@ mod tests {
 
         Ok(())
     }
-
 }
 
 #[cfg(test)]

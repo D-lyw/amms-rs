@@ -77,8 +77,14 @@ async fn test_pool_exact_in_out(
     let pool = FluidDexPool::new(pool_address, FLUID_DEX_RESOLVER);
     let pool = pool.init(block_id, provider.clone()).await?;
 
-    println!("Token A: {:?} (decimals: {})", pool.token_a.address, pool.token_a.decimals);
-    println!("Token B: {:?} (decimals: {})", pool.token_b.address, pool.token_b.decimals);
+    println!(
+        "Token A: {:?} (decimals: {})",
+        pool.token_a.address, pool.token_a.decimals
+    );
+    println!(
+        "Token B: {:?} (decimals: {})",
+        pool.token_b.address, pool.token_b.decimals
+    );
     println!("Fee (1e6): {}", pool.fee_1e6);
 
     // ========================================
@@ -126,23 +132,31 @@ async fn test_pool_exact_in_out(
                         if verify_out >= *target_out {
                             let diff = verify_out - *target_out;
                             let diff_pct = if *target_out > U256::ZERO {
-                                (diff * U256::from(1_000_000u64) / *target_out).to::<u64>() as f64 / 10000.0
+                                (diff * U256::from(1_000_000u64) / *target_out).to::<u64>() as f64
+                                    / 10000.0
                             } else {
                                 0.0
                             };
 
-                            println!("  Target: {} -> In: {} -> Verify: {} (error: {:.6}%) ✓",
-                                target_out, exact_in, verify_out, diff_pct);
+                            println!(
+                                "  Target: {} -> In: {} -> Verify: {} (error: {:.6}%) ✓",
+                                target_out, exact_in, verify_out, diff_pct
+                            );
 
                             exact_out_passed += 1;
                             total_error_pct += diff_pct;
                         } else {
-                            println!("  Target: {} -> In: {} -> Verify: {} (FAILED: < target)",
-                                target_out, exact_in, verify_out);
+                            println!(
+                                "  Target: {} -> In: {} -> Verify: {} (FAILED: < target)",
+                                target_out, exact_in, verify_out
+                            );
                         }
                     }
                     Err(e) => {
-                        println!("  Target: {} -> In: {} -> Verify Error: {:?}", target_out, exact_in, e);
+                        println!(
+                            "  Target: {} -> In: {} -> Verify Error: {:?}",
+                            target_out, exact_in, e
+                        );
                     }
                 }
             }
@@ -176,9 +190,9 @@ async fn test_fluid_dex_oseth_eth_exact_in() -> Result<()> {
 
     // ETH -> osETH
     let eth_amounts = vec![
-        U256::from(1u64) * U256::from(10u64).pow(U256::from(18u64)),   // 1 ETH
-        U256::from(5u64) * U256::from(10u64).pow(U256::from(18u64)),   // 5 ETH
-        U256::from(10u64) * U256::from(10u64).pow(U256::from(18u64)),  // 10 ETH
+        U256::from(1u64) * U256::from(10u64).pow(U256::from(18u64)), // 1 ETH
+        U256::from(5u64) * U256::from(10u64).pow(U256::from(18u64)), // 5 ETH
+        U256::from(10u64) * U256::from(10u64).pow(U256::from(18u64)), // 10 ETH
     ];
 
     test_pool_exact_in_out(
@@ -187,7 +201,8 @@ async fn test_fluid_dex_oseth_eth_exact_in() -> Result<()> {
         OSETH_TOKEN,
         eth_amounts,
         "osETH/ETH (ETH->osETH)",
-    ).await?;
+    )
+    .await?;
 
     Ok(())
 }
@@ -203,9 +218,9 @@ async fn test_fluid_dex_oseth_eth_exact_out() -> Result<()> {
 
     // Target osETH output, calculate required ETH input
     let target_oseth = vec![
-        U256::from(1u64) * U256::from(10u64).pow(U256::from(18u64)),   // 1 osETH
-        U256::from(5u64) * U256::from(10u64).pow(U256::from(18u64)),   // 5 osETH
-        U256::from(10u64) * U256::from(10u64).pow(U256::from(18u64)),  // 10 osETH
+        U256::from(1u64) * U256::from(10u64).pow(U256::from(18u64)), // 1 osETH
+        U256::from(5u64) * U256::from(10u64).pow(U256::from(18u64)), // 5 osETH
+        U256::from(10u64) * U256::from(10u64).pow(U256::from(18u64)), // 10 osETH
     ];
 
     test_pool_exact_in_out(
@@ -214,7 +229,8 @@ async fn test_fluid_dex_oseth_eth_exact_out() -> Result<()> {
         OSETH_TOKEN,
         target_oseth,
         "osETH/ETH (ETH->osETH exact-out)",
-    ).await?;
+    )
+    .await?;
 
     Ok(())
 }
@@ -234,9 +250,9 @@ async fn test_fluid_dex_wsteth_eth_exact_in() -> Result<()> {
 
     // ETH -> wstETH
     let eth_amounts = vec![
-        U256::from(1u64) * U256::from(10u64).pow(U256::from(18u64)),   // 1 ETH
-        U256::from(5u64) * U256::from(10u64).pow(U256::from(18u64)),   // 5 ETH
-        U256::from(10u64) * U256::from(10u64).pow(U256::from(18u64)),  // 10 ETH
+        U256::from(1u64) * U256::from(10u64).pow(U256::from(18u64)), // 1 ETH
+        U256::from(5u64) * U256::from(10u64).pow(U256::from(18u64)), // 5 ETH
+        U256::from(10u64) * U256::from(10u64).pow(U256::from(18u64)), // 10 ETH
     ];
 
     test_pool_exact_in_out(
@@ -245,7 +261,8 @@ async fn test_fluid_dex_wsteth_eth_exact_in() -> Result<()> {
         WSTETH_TOKEN,
         eth_amounts,
         "wstETH/ETH (ETH->wstETH)",
-    ).await?;
+    )
+    .await?;
 
     Ok(())
 }
@@ -261,9 +278,9 @@ async fn test_fluid_dex_wsteth_eth_exact_out() -> Result<()> {
 
     // Target wstETH output, calculate required ETH input
     let target_wsteth = vec![
-        U256::from(1u64) * U256::from(10u64).pow(U256::from(18u64)),   // 1 wstETH
-        U256::from(5u64) * U256::from(10u64).pow(U256::from(18u64)),   // 5 wstETH
-        U256::from(10u64) * U256::from(10u64).pow(U256::from(18u64)),  // 10 wstETH
+        U256::from(1u64) * U256::from(10u64).pow(U256::from(18u64)), // 1 wstETH
+        U256::from(5u64) * U256::from(10u64).pow(U256::from(18u64)), // 5 wstETH
+        U256::from(10u64) * U256::from(10u64).pow(U256::from(18u64)), // 10 wstETH
     ];
 
     test_pool_exact_in_out(
@@ -272,7 +289,8 @@ async fn test_fluid_dex_wsteth_eth_exact_out() -> Result<()> {
         WSTETH_TOKEN,
         target_wsteth,
         "wstETH/ETH (ETH->wstETH exact-out)",
-    ).await?;
+    )
+    .await?;
 
     Ok(())
 }
@@ -288,8 +306,8 @@ async fn test_fluid_dex_wsteth_eth_reverse_exact_in() -> Result<()> {
 
     // wstETH -> ETH
     let wsteth_amounts = vec![
-        U256::from(1u64) * U256::from(10u64).pow(U256::from(18u64)),   // 1 wstETH
-        U256::from(5u64) * U256::from(10u64).pow(U256::from(18u64)),   // 5 wstETH
+        U256::from(1u64) * U256::from(10u64).pow(U256::from(18u64)), // 1 wstETH
+        U256::from(5u64) * U256::from(10u64).pow(U256::from(18u64)), // 5 wstETH
     ];
 
     test_pool_exact_in_out(
@@ -298,7 +316,8 @@ async fn test_fluid_dex_wsteth_eth_reverse_exact_in() -> Result<()> {
         ETH_ADDRESS,
         wsteth_amounts,
         "wstETH/ETH (wstETH->ETH)",
-    ).await?;
+    )
+    .await?;
 
     Ok(())
 }
@@ -314,8 +333,8 @@ async fn test_fluid_dex_wsteth_eth_reverse_exact_out() -> Result<()> {
 
     // Target ETH output, calculate required wstETH input
     let target_eth = vec![
-        U256::from(500u64) * U256::from(10u64).pow(U256::from(15u64)),  // 0.5 ETH
-        U256::from(1u64) * U256::from(10u64).pow(U256::from(18u64)),    // 1 ETH
+        U256::from(500u64) * U256::from(10u64).pow(U256::from(15u64)), // 0.5 ETH
+        U256::from(1u64) * U256::from(10u64).pow(U256::from(18u64)),   // 1 ETH
     ];
 
     test_pool_exact_in_out(
@@ -324,7 +343,8 @@ async fn test_fluid_dex_wsteth_eth_reverse_exact_out() -> Result<()> {
         ETH_ADDRESS,
         target_eth,
         "wstETH/ETH (wstETH->ETH exact-out)",
-    ).await?;
+    )
+    .await?;
 
     Ok(())
 }
@@ -344,9 +364,9 @@ async fn test_fluid_dex_usdc_usdt_exact_in() -> Result<()> {
 
     // USDC -> USDT (USDC has 6 decimals)
     let usdc_amounts = vec![
-        U256::from(1000u64) * U256::from(10u64).pow(U256::from(6u64)),    // 1,000 USDC
-        U256::from(10000u64) * U256::from(10u64).pow(U256::from(6u64)),   // 10,000 USDC
-        U256::from(100000u64) * U256::from(10u64).pow(U256::from(6u64)),  // 100,000 USDC
+        U256::from(1000u64) * U256::from(10u64).pow(U256::from(6u64)), // 1,000 USDC
+        U256::from(10000u64) * U256::from(10u64).pow(U256::from(6u64)), // 10,000 USDC
+        U256::from(100000u64) * U256::from(10u64).pow(U256::from(6u64)), // 100,000 USDC
     ];
 
     test_pool_exact_in_out(
@@ -355,7 +375,8 @@ async fn test_fluid_dex_usdc_usdt_exact_in() -> Result<()> {
         USDT_TOKEN,
         usdc_amounts,
         "USDC/USDT (USDC->USDT)",
-    ).await?;
+    )
+    .await?;
 
     Ok(())
 }
@@ -371,9 +392,9 @@ async fn test_fluid_dex_usdc_usdt_exact_out() -> Result<()> {
 
     // Target USDT output (USDT has 6 decimals), calculate required USDC input
     let target_usdt = vec![
-        U256::from(1000u64) * U256::from(10u64).pow(U256::from(6u64)),    // 1,000 USDT
-        U256::from(10000u64) * U256::from(10u64).pow(U256::from(6u64)),   // 10,000 USDT
-        U256::from(100000u64) * U256::from(10u64).pow(U256::from(6u64)),  // 100,000 USDT
+        U256::from(1000u64) * U256::from(10u64).pow(U256::from(6u64)), // 1,000 USDT
+        U256::from(10000u64) * U256::from(10u64).pow(U256::from(6u64)), // 10,000 USDT
+        U256::from(100000u64) * U256::from(10u64).pow(U256::from(6u64)), // 100,000 USDT
     ];
 
     test_pool_exact_in_out(
@@ -382,7 +403,8 @@ async fn test_fluid_dex_usdc_usdt_exact_out() -> Result<()> {
         USDT_TOKEN,
         target_usdt,
         "USDC/USDT (USDC->USDT exact-out)",
-    ).await?;
+    )
+    .await?;
 
     Ok(())
 }
@@ -398,9 +420,9 @@ async fn test_fluid_dex_usdc_usdt_reverse_exact_in() -> Result<()> {
 
     // USDT -> USDC (both have 6 decimals)
     let usdt_amounts = vec![
-        U256::from(1000u64) * U256::from(10u64).pow(U256::from(6u64)),    // 1,000 USDT
-        U256::from(10000u64) * U256::from(10u64).pow(U256::from(6u64)),   // 10,000 USDT
-        U256::from(100000u64) * U256::from(10u64).pow(U256::from(6u64)),  // 100,000 USDT
+        U256::from(1000u64) * U256::from(10u64).pow(U256::from(6u64)), // 1,000 USDT
+        U256::from(10000u64) * U256::from(10u64).pow(U256::from(6u64)), // 10,000 USDT
+        U256::from(100000u64) * U256::from(10u64).pow(U256::from(6u64)), // 100,000 USDT
     ];
 
     test_pool_exact_in_out(
@@ -409,7 +431,8 @@ async fn test_fluid_dex_usdc_usdt_reverse_exact_in() -> Result<()> {
         USDC_TOKEN,
         usdt_amounts,
         "USDC/USDT (USDT->USDC)",
-    ).await?;
+    )
+    .await?;
 
     Ok(())
 }
@@ -425,9 +448,9 @@ async fn test_fluid_dex_usdc_usdt_reverse_exact_out() -> Result<()> {
 
     // Target USDC output, calculate required USDT input
     let target_usdc = vec![
-        U256::from(1000u64) * U256::from(10u64).pow(U256::from(6u64)),    // 1,000 USDC
-        U256::from(10000u64) * U256::from(10u64).pow(U256::from(6u64)),   // 10,000 USDC
-        U256::from(100000u64) * U256::from(10u64).pow(U256::from(6u64)),  // 100,000 USDC
+        U256::from(1000u64) * U256::from(10u64).pow(U256::from(6u64)), // 1,000 USDC
+        U256::from(10000u64) * U256::from(10u64).pow(U256::from(6u64)), // 10,000 USDC
+        U256::from(100000u64) * U256::from(10u64).pow(U256::from(6u64)), // 100,000 USDC
     ];
 
     test_pool_exact_in_out(
@@ -436,7 +459,8 @@ async fn test_fluid_dex_usdc_usdt_reverse_exact_out() -> Result<()> {
         USDC_TOKEN,
         target_usdc,
         "USDC/USDT (USDT->USDC exact-out)",
-    ).await?;
+    )
+    .await?;
 
     Ok(())
 }
@@ -473,15 +497,29 @@ async fn test_fluid_dex_comprehensive_summary() -> Result<()> {
         match pool.init(block_id, provider.clone()).await {
             Ok(pool) => {
                 println!("\n{} Pool:", name);
-                println!("  Token A: {:?} (decimals: {})", pool.token_a.address, pool.token_a.decimals);
-                println!("  Token B: {:?} (decimals: {})", pool.token_b.address, pool.token_b.decimals);
+                println!(
+                    "  Token A: {:?} (decimals: {})",
+                    pool.token_a.address, pool.token_a.decimals
+                );
+                println!(
+                    "  Token B: {:?} (decimals: {})",
+                    pool.token_b.address, pool.token_b.decimals
+                );
                 println!("  Fee: {} (1e6)", pool.fee_1e6);
 
                 // Quick exact-out test
                 let amount_out = U256::from(1u64) * U256::from(10u64).pow(U256::from(18u64));
-                match pool.simulate_swap_exact_out(pool.token_a.address, pool.token_b.address, amount_out) {
+                match pool.simulate_swap_exact_out(
+                    pool.token_a.address,
+                    pool.token_b.address,
+                    amount_out,
+                ) {
                     Ok(exact_in) => {
-                        match pool.simulate_swap(pool.token_a.address, pool.token_b.address, exact_in) {
+                        match pool.simulate_swap(
+                            pool.token_a.address,
+                            pool.token_b.address,
+                            exact_in,
+                        ) {
                             Ok(verify_out) => {
                                 let diff = if verify_out >= amount_out {
                                     verify_out - amount_out
@@ -489,7 +527,9 @@ async fn test_fluid_dex_comprehensive_summary() -> Result<()> {
                                     amount_out - verify_out
                                 };
                                 let diff_pct = if amount_out > U256::ZERO {
-                                    (diff * U256::from(1_000_000u64) / amount_out).to::<u64>() as f64 / 10000.0
+                                    (diff * U256::from(1_000_000u64) / amount_out).to::<u64>()
+                                        as f64
+                                        / 10000.0
                                 } else {
                                     0.0
                                 };

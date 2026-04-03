@@ -315,7 +315,11 @@ impl BalancerV2Factory {
                         };
                         let scaling_factor = if i < scaling_factors.len() {
                             let sf = scaling_factors[i];
-                            if sf.is_zero() { None } else { Some(sf) }
+                            if sf.is_zero() {
+                                None
+                            } else {
+                                Some(sf)
+                            }
                         } else {
                             None
                         };
@@ -514,7 +518,11 @@ impl BalancerV2Factory {
                         };
                         let scaling_factor = if i < scaling_factors.len() {
                             let sf = scaling_factors[i];
-                            if sf.is_zero() { None } else { Some(sf) }
+                            if sf.is_zero() {
+                                None
+                            } else {
+                                Some(sf)
+                            }
                         } else {
                             None
                         };

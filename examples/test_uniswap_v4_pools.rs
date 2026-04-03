@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use alloy::{
     primitives::{
@@ -14,7 +14,7 @@ use alloy::{
 use amms::{
     amms::{
         amm::AMM,
-        uniswap_v4::{UniswapV4Pool, IPoolManager::PoolKey},
+        uniswap_v4::{IPoolManager::PoolKey, UniswapV4Pool},
     },
     state_space::StateSpaceBuilder,
 };
