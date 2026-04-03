@@ -10,10 +10,8 @@
 
 use crate::amms::{
     amm::{AutomatedMarketMaker, SyncAction, AMM},
-    consts::U256_10000,
     error::AMMError,
     float::q64_to_float,
-    uniswap_v2::div_uu,
 };
 use alloy::{
     eips::BlockId,
@@ -27,6 +25,9 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use thiserror::Error;
 use tracing::info;
+
+const SKY_WAD_U128: u128 = 1_000_000_000_000_000_000u128;
+const DEFAULT_TO18_CONVERSION_FACTOR_U128: u128 = 1_000_000_000_000u128; // 10^12 for 18<->6
 
 sol! {
     /// Interface for DaiUsds contract (DAI ↔ USDS)
@@ -114,11 +115,13 @@ pub struct SkyConverter {
     pub token_0_decimals: u8,
     pub token_1_decimals: u8,
 
-    // Fees in basis points (0 for DaiUsds)
+    // Fees in WAD (1e18 = 100%)
     // tin: fee for token_1 → token_0 (buying token_0)
     // tout: fee for token_0 → token_1 (selling token_0)
-    pub tin: u32,
-    pub tout: u32,
+    pub tin: u128,
+    pub tout: u128,
+    // Decimal conversion factor from gem decimals to 18 decimals (typically 1e12)
+    pub to18_conversion_factor: u128,
 
     // Cached prices
     pub token_0_price: f64,
@@ -213,22 +216,16 @@ impl AutomatedMarketMaker for SkyConverter {
                 // token_0 = DAI (18 decimals), token_1 = USDC (6 decimals)
                 if base_token == self.token_0 {
                     // DAI → USDC: apply tout (sell DAI fee) + decimal conversion (18 → 6)
-                    let amount_after_fee = amount_in
-                        .checked_mul(U256::from(10000 - self.tout))
-                        .ok_or(AMMError::ArithmeticError)?
-                        / U256_10000;
+                    let amount_after_fee = Self::apply_fee_wad(amount_in, self.tout)?;
                     let amount_out = amount_after_fee
-                        .checked_div(U256::from(10u64.pow(12)))
+                        .checked_div(U256::from(self.to18_conversion_factor))
                         .ok_or(AMMError::ArithmeticError)?;
                     Ok(amount_out)
                 } else {
                     // USDC → DAI: apply tin (buy DAI fee) + decimal conversion (6 → 18)
-                    let amount_after_fee = amount_in
-                        .checked_mul(U256::from(10000 - self.tin))
-                        .ok_or(AMMError::ArithmeticError)?
-                        / U256_10000;
+                    let amount_after_fee = Self::apply_fee_wad(amount_in, self.tin)?;
                     let amount_out = amount_after_fee
-                        .checked_mul(U256::from(10u64.pow(12)))
+                        .checked_mul(U256::from(self.to18_conversion_factor))
                         .ok_or(AMMError::ArithmeticError)?;
                     Ok(amount_out)
                 }
@@ -239,22 +236,16 @@ impl AutomatedMarketMaker for SkyConverter {
                 // Internally routes through DaiUsds + LitePSM
                 if base_token == self.token_0 {
                     // USDS → USDC: 1:1 to DAI, then DAI → USDC with tout
-                    let amount_after_fee = amount_in
-                        .checked_mul(U256::from(10000 - self.tout))
-                        .ok_or(AMMError::ArithmeticError)?
-                        / U256_10000;
+                    let amount_after_fee = Self::apply_fee_wad(amount_in, self.tout)?;
                     let amount_out = amount_after_fee
-                        .checked_div(U256::from(10u64.pow(12)))
+                        .checked_div(U256::from(self.to18_conversion_factor))
                         .ok_or(AMMError::ArithmeticError)?;
                     Ok(amount_out)
                 } else {
                     // USDC → USDS: USDC → DAI with tin, then 1:1 to USDS
-                    let amount_after_fee = amount_in
-                        .checked_mul(U256::from(10000 - self.tin))
-                        .ok_or(AMMError::ArithmeticError)?
-                        / U256_10000;
+                    let amount_after_fee = Self::apply_fee_wad(amount_in, self.tin)?;
                     let amount_out = amount_after_fee
-                        .checked_mul(U256::from(10u64.pow(12)))
+                        .checked_mul(U256::from(self.to18_conversion_factor))
                         .ok_or(AMMError::ArithmeticError)?;
                     Ok(amount_out)
                 }
@@ -292,35 +283,20 @@ impl AutomatedMarketMaker for SkyConverter {
                 // Reverse the fee calculation
                 if base_token == self.token_0 {
                     // DAI → USDC: need to reverse the tout fee
-                    // amount_out = amount_in * (10000 - tout) / 10000 / 10^12
-                    // amount_in = amount_out * 10^12 * 10000 / (10000 - tout)
-                    if self.tout >= 10000 {
-                        return Err(AMMError::Msg("Fee too high".into()));
-                    }
-                    let fee_factor = 10000 - self.tout;
-                    let amount_in = amount_out
-                        .checked_mul(U256::from(10u64.pow(12)))
-                        .ok_or(AMMError::ArithmeticError)?
-                        .checked_mul(U256_10000)
-                        .ok_or(AMMError::ArithmeticError)?
-                        .checked_div(U256::from(fee_factor))
+                    // amount_out = floor(amount_after_fee / to18)
+                    // required_after_fee = amount_out * to18
+                    // amount_in = ceil(required_after_fee / (1 - tout))
+                    let required_after_fee = amount_out
+                        .checked_mul(U256::from(self.to18_conversion_factor))
                         .ok_or(AMMError::ArithmeticError)?;
-                    // Round up to ensure we get at least amount_out
-                    Ok(amount_in + U256::from(1u64))
+                    Self::reverse_apply_fee_wad(required_after_fee, self.tout)
                 } else {
                     // USDC → DAI: need to reverse the tin fee
-                    if self.tin >= 10000 {
-                        return Err(AMMError::Msg("Fee too high".into()));
-                    }
-                    let fee_factor = 10000 - self.tin;
-                    let amount_in = amount_out
-                        .checked_div(U256::from(10u64.pow(12)))
-                        .ok_or(AMMError::ArithmeticError)?
-                        .checked_mul(U256_10000)
-                        .ok_or(AMMError::ArithmeticError)?
-                        .checked_div(U256::from(fee_factor))
-                        .ok_or(AMMError::ArithmeticError)?;
-                    Ok(amount_in + U256::from(1u64))
+                    // amount_out = amount_after_fee * to18
+                    // required_after_fee = ceil(amount_out / to18)
+                    let required_after_fee =
+                        Self::ceil_div(amount_out, U256::from(self.to18_conversion_factor))?;
+                    Self::reverse_apply_fee_wad(required_after_fee, self.tin)
                 }
             }
 
@@ -328,32 +304,15 @@ impl AutomatedMarketMaker for SkyConverter {
                 // Same logic as LitePsm (just different token pair)
                 if base_token == self.token_0 {
                     // USDS → USDC
-                    if self.tout >= 10000 {
-                        return Err(AMMError::Msg("Fee too high".into()));
-                    }
-                    let fee_factor = 10000 - self.tout;
-                    let amount_in = amount_out
-                        .checked_mul(U256::from(10u64.pow(12)))
-                        .ok_or(AMMError::ArithmeticError)?
-                        .checked_mul(U256_10000)
-                        .ok_or(AMMError::ArithmeticError)?
-                        .checked_div(U256::from(fee_factor))
+                    let required_after_fee = amount_out
+                        .checked_mul(U256::from(self.to18_conversion_factor))
                         .ok_or(AMMError::ArithmeticError)?;
-                    Ok(amount_in + U256::from(1u64))
+                    Self::reverse_apply_fee_wad(required_after_fee, self.tout)
                 } else {
                     // USDC → USDS
-                    if self.tin >= 10000 {
-                        return Err(AMMError::Msg("Fee too high".into()));
-                    }
-                    let fee_factor = 10000 - self.tin;
-                    let amount_in = amount_out
-                        .checked_div(U256::from(10u64.pow(12)))
-                        .ok_or(AMMError::ArithmeticError)?
-                        .checked_mul(U256_10000)
-                        .ok_or(AMMError::ArithmeticError)?
-                        .checked_div(U256::from(fee_factor))
-                        .ok_or(AMMError::ArithmeticError)?;
-                    Ok(amount_in + U256::from(1u64))
+                    let required_after_fee =
+                        Self::ceil_div(amount_out, U256::from(self.to18_conversion_factor))?;
+                    Self::reverse_apply_fee_wad(required_after_fee, self.tin)
                 }
             }
         }
@@ -386,6 +345,7 @@ impl AutomatedMarketMaker for SkyConverter {
                 self.token_1_decimals = usds_decimals;
                 self.tin = 0;
                 self.tout = 0;
+                self.to18_conversion_factor = 1;
             }
 
             SkyConverterType::LitePsm => {
@@ -394,11 +354,17 @@ impl AutomatedMarketMaker for SkyConverter {
                 let gem = contract.gem().block(block_number).call().await?;
                 let tin = contract.tin().block(block_number).call().await?;
                 let tout = contract.tout().block(block_number).call().await?;
+                let to18 = contract
+                    .to18ConversionFactor()
+                    .block(block_number)
+                    .call()
+                    .await?;
 
                 let dai_addr: Address = dai;
                 let gem_addr: Address = gem;
                 let tin_val: U256 = tin;
                 let tout_val: U256 = tout;
+                let to18_val: U256 = to18;
 
                 // Get decimals
                 let dai_contract = IERC20::new(dai_addr, contract.provider());
@@ -413,6 +379,7 @@ impl AutomatedMarketMaker for SkyConverter {
                 self.token_1_decimals = gem_decimals;
                 self.tin = tin_val.to();
                 self.tout = tout_val.to();
+                self.to18_conversion_factor = to18_val.to();
             }
 
             SkyConverterType::LitePsmWrapper => {
@@ -421,11 +388,17 @@ impl AutomatedMarketMaker for SkyConverter {
                 let gem = contract.gem().block(block_number).call().await?;
                 let tin = contract.tin().block(block_number).call().await?;
                 let tout = contract.tout().block(block_number).call().await?;
+                let to18 = contract
+                    .to18ConversionFactor()
+                    .block(block_number)
+                    .call()
+                    .await?;
 
                 let usds_addr: Address = usds;
                 let gem_addr: Address = gem;
                 let tin_val: U256 = tin;
                 let tout_val: U256 = tout;
+                let to18_val: U256 = to18;
 
                 // Get decimals
                 let usds_contract = IERC20::new(usds_addr, contract.provider());
@@ -440,6 +413,7 @@ impl AutomatedMarketMaker for SkyConverter {
                 self.token_1_decimals = gem_decimals;
                 self.tin = tin_val.to();
                 self.tout = tout_val.to();
+                self.to18_conversion_factor = to18_val.to();
             }
         }
 
@@ -455,6 +429,7 @@ impl AutomatedMarketMaker for SkyConverter {
             token_1 = ?self.token_1,
             tin = self.tin,
             tout = self.tout,
+            to18_conversion_factor = self.to18_conversion_factor,
             "SKY converter initialized"
         );
 
@@ -465,9 +440,16 @@ impl AutomatedMarketMaker for SkyConverter {
 impl SkyConverter {
     /// Creates a new SKY converter with the given address and type
     pub fn new(address: Address, converter_type: SkyConverterType) -> Self {
+        let default_to18 = match converter_type {
+            SkyConverterType::DaiUsds => 1u128,
+            SkyConverterType::LitePsm | SkyConverterType::LitePsmWrapper => {
+                DEFAULT_TO18_CONVERSION_FACTOR_U128
+            }
+        };
         Self {
             address,
             converter_type,
+            to18_conversion_factor: default_to18,
             ..Default::default()
         }
     }
@@ -497,19 +479,25 @@ impl SkyConverter {
         // Calculate effective exchange rate
         let (effective_rate, decimal_adjustment) = if base_token == self.token_0 {
             // Selling token_0 for token_1: apply tout fee
-            // Rate = (10000 - tout) / 10000, adjusted for decimals
+            // Rate = (WAD - tout) / WAD, adjusted for decimals
+            if self.tout >= SKY_WAD_U128 {
+                return Err(AMMError::Msg("Fee too high".into()));
+            }
             let rate: U256 = if self.tout == 0 {
                 U256::from(1u64) << 64 // 1.0 in Q64
             } else {
-                (U256::from(10000 - self.tout) << 64) / U256_10000
+                ((U256::from(SKY_WAD_U128 - self.tout)) << 64) / U256::from(SKY_WAD_U128)
             };
             (rate, decimal_shift)
         } else if base_token == self.token_1 {
             // Selling token_1 for token_0: apply tin fee
+            if self.tin >= SKY_WAD_U128 {
+                return Err(AMMError::Msg("Fee too high".into()));
+            }
             let rate = if self.tin == 0 {
                 U256::from(1u64) << 64 // 1.0 in Q64
             } else {
-                (U256::from(10000 - self.tin) << 64) / U256_10000
+                ((U256::from(SKY_WAD_U128 - self.tin)) << 64) / U256::from(SKY_WAD_U128)
             };
             (rate, -decimal_shift)
         } else {
@@ -538,6 +526,46 @@ impl SkyConverter {
         };
 
         Ok(adjusted_rate.to())
+    }
+
+    fn apply_fee_wad(amount_in: U256, fee_wad: u128) -> Result<U256, AMMError> {
+        if fee_wad >= SKY_WAD_U128 {
+            return Err(AMMError::Msg("Fee too high".into()));
+        }
+        let numerator = amount_in
+            .checked_mul(U256::from(SKY_WAD_U128 - fee_wad))
+            .ok_or(AMMError::ArithmeticError)?;
+        Ok(numerator / U256::from(SKY_WAD_U128))
+    }
+
+    fn reverse_apply_fee_wad(amount_after_fee: U256, fee_wad: u128) -> Result<U256, AMMError> {
+        if fee_wad >= SKY_WAD_U128 {
+            return Err(AMMError::Msg("Fee too high".into()));
+        }
+        let numerator = amount_after_fee
+            .checked_mul(U256::from(SKY_WAD_U128))
+            .ok_or(AMMError::ArithmeticError)?;
+        let denominator = U256::from(SKY_WAD_U128 - fee_wad);
+        let mut amount_in = numerator / denominator;
+        if numerator % denominator != U256::ZERO {
+            amount_in = amount_in
+                .checked_add(U256::from(1u64))
+                .ok_or(AMMError::ArithmeticError)?;
+        }
+        Ok(amount_in)
+    }
+
+    fn ceil_div(a: U256, b: U256) -> Result<U256, AMMError> {
+        if b.is_zero() {
+            return Err(AMMError::DivisionByZero);
+        }
+        let q = a / b;
+        if a % b == U256::ZERO {
+            Ok(q)
+        } else {
+            q.checked_add(U256::from(1u64))
+                .ok_or(AMMError::ArithmeticError)
+        }
     }
 
     /// Batch initialization for multiple SKY converters
@@ -624,7 +652,7 @@ pub mod addresses {
 
     /// LitePsmWrapper: USDS ↔ USDC converter
     pub const LITE_PSM_WRAPPER: alloy::primitives::Address =
-        address!("70254BD530684CF4a6323F51098FA39AAE6130b6");
+        address!("A188EEC8F81263234dA3622A406892F3D630f98c");
 }
 
 #[cfg(test)]
@@ -654,16 +682,17 @@ mod tests {
         converter.token_1 = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".parse().unwrap(); // USDC
         converter.token_0_decimals = 18;
         converter.token_1_decimals = 6;
-        converter.tin = 10; // 0.1% fee
-        converter.tout = 10; // 0.1% fee
+        converter.to18_conversion_factor = 1_000_000_000_000; // 10^12
+        converter.tin = 1_000_000_000_000_000; // 0.1% fee in WAD
+        converter.tout = 1_000_000_000_000_000; // 0.1% fee in WAD
 
         // Test DAI → USDC
         let amount_in = U256::from(1_000_000_000_000_000_000u64); // 1 DAI (18 decimals)
         let amount_out = converter
             .simulate_swap(converter.token_0, converter.token_1, amount_in)
             .unwrap();
-        // Expected: 1 DAI * (10000 - 10) / 10000 / 10^12 = 999900 USDC (6 decimals)
-        let expected = U256::from(999900u64);
+        // Expected: 1 DAI * (10000 - 10) / 10000 / 10^12 = 999000 USDC (6 decimals)
+        let expected = U256::from(999000u64);
         assert_eq!(amount_out, expected);
 
         // Test USDC → DAI
@@ -671,8 +700,8 @@ mod tests {
         let amount_out = converter
             .simulate_swap(converter.token_1, converter.token_0, amount_in)
             .unwrap();
-        // Expected: 1 USDC * (10000 - 10) / 10000 * 10^12 = 999900000000000000 DAI (18 decimals)
-        let expected = U256::from(999900000000000000u64);
+        // Expected: 1 USDC * (10000 - 10) / 10000 * 10^12 = 999000000000000000 DAI (18 decimals)
+        let expected = U256::from(999000000000000000u64);
         assert_eq!(amount_out, expected);
     }
 

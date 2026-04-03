@@ -108,6 +108,7 @@ fn test_simulate_swap_exact_out_withdraw_no_fee() {
     assert!(amount_in >= U256::from(100000000000000000000u128));
     // Allow larger margin due to ceiling division in exact-out formula
     assert!(amount_in < U256::from(150000000000000000000u128));
+}
 
 #[test]
 fn test_simulate_swap_exact_out_deposit_no_fee() {
