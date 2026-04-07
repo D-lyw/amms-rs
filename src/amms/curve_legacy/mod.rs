@@ -78,7 +78,6 @@ sol! {
     #[sol(rpc)]
     interface ICurveLegacyCryptoSwapUpdate {
         function D() external view returns (uint256);
-        function price_scale(uint256 i) external view returns (uint256);
         function balances(uint256 i) external view returns (uint256);
     }
     #[sol(rpc)]
@@ -88,6 +87,14 @@ sol! {
     #[sol(rpc)]
     interface ICurveLegacyMetaUpdate {
         function get_virtual_price() external view returns (uint256);
+    }
+    #[sol(rpc)]
+    interface ICurveLegacyPoolPriceScaleNoArgs {
+        function price_scale() external view returns (uint256);
+    }
+    #[sol(rpc)]
+    interface ICurveLegacyPoolPriceScaleWithArgs {
+        function price_scale(uint256 i) external view returns (uint256);
     }
 }
 
@@ -1025,6 +1032,16 @@ impl AutomatedMarketMaker for CurveLegacyPool {
             interface ICurveLegacyPoolLendingInt128 {
                 function underlying_coins(int128 i) external view returns (address);
             }
+
+            #[sol(rpc)]
+            interface ICurveLegacyPoolRates {
+                function rates(int128 i) external view returns (uint256);
+            }
+
+            #[sol(rpc)]
+            interface ICurveLegacyPoolStoredRatesArray {
+                function stored_rates() external view returns (uint256[2] memory);
+            }
         }
 
         let pool = ICurveLegacyPool::new(self.address, provider.clone());
@@ -1250,33 +1267,76 @@ impl AutomatedMarketMaker for CurveLegacyPool {
             }
         }
 
-        // Some Legacy pools (Lending, Metapools, etc.) use custom rates.
-        // We try `stored_rates` first (common in older lending pools), then `rates`.
-        // If neither works, we keep the default rates (calculated from decimals).
+        // Some Legacy pools (Lending, Metapools, Factory Plain Pools, etc.) use custom rates.
+        // We try different stored_rates signatures in order of preference:
+        // 1. stored_rates() -> uint256[2] (Factory Plain Pool Vyper 0.3.7+)
+        // 2. stored_rates(uint256) -> uint256 (Lending pools)
+        // 3. rates(int128) -> uint256 (Metapools)
+        // If none works, we keep the default rates (calculated from decimals).
         let mut custom_rates = Vec::new();
-        // Try getting rate for coin 0 to see if method exists
-        if pool
-            .stored_rates(U256::ZERO)
+
+        // 1. Try stored_rates() -> uint256[2] first (Factory Plain Pools with LST)
+        let pool_stored_rates_array =
+            ICurveLegacyPoolStoredRatesArray::new(self.address, provider.clone());
+        if let Ok(rates_array) = pool_stored_rates_array
+            .stored_rates()
             .block(block_number)
             .call()
             .await
-            .is_ok()
         {
-            for i in 0..self.n_coins {
-                if let Ok(r) = pool
-                    .stored_rates(U256::from(i))
-                    .block(block_number)
-                    .call()
-                    .await
-                {
-                    custom_rates.push(r);
+            tracing::debug!(pool = ?self.address, rates = ?rates_array, "Got rates from stored_rates() array");
+            custom_rates = rates_array.into_iter().take(self.n_coins as usize).collect();
+        }
+
+        // 2. If stored_rates() array failed, try stored_rates(uint256) (Lending pools)
+        if custom_rates.is_empty() {
+            if pool
+                .stored_rates(U256::ZERO)
+                .block(block_number)
+                .call()
+                .await
+                .is_ok()
+            {
+                for i in 0..self.n_coins {
+                    if let Ok(r) = pool
+                        .stored_rates(U256::from(i))
+                        .block(block_number)
+                        .call()
+                        .await
+                    {
+                        custom_rates.push(r);
+                    }
                 }
             }
         }
 
-        // If stored_rates found, use them
+        // 3. If stored_rates failed or incomplete, try rates(int128) (Metapools)
+        if custom_rates.len() != self.n_coins as usize {
+            custom_rates.clear();
+            let pool_rates = ICurveLegacyPoolRates::new(self.address, provider.clone());
+            if pool_rates
+                .rates(0)
+                .block(block_number)
+                .call()
+                .await
+                .is_ok()
+            {
+                for i in 0..self.n_coins {
+                    if let Ok(r) = pool_rates
+                        .rates(i as i128)
+                        .block(block_number)
+                        .call()
+                        .await
+                    {
+                        custom_rates.push(r);
+                    }
+                }
+            }
+        }
+
+        // If custom rates found, use them
         if custom_rates.len() == self.n_coins as usize {
-            tracing::debug!(pool = ?self.address, "Using stored_rates for pool");
+            tracing::debug!(pool = ?self.address, rates = ?custom_rates, "Using custom rates for pool");
             self.rates = custom_rates;
         }
 
@@ -1396,21 +1456,38 @@ impl AutomatedMarketMaker for CurveLegacyPool {
             }
 
             // Fetch price_scale
-            // N coins means N-1 price scales
-            // Typically price_scale(k) where k in [0, N-2]
-            let mut scales = Vec::new();
-            for k in 0..self.n_coins.saturating_sub(1) {
-                if let Ok(ps) = pool
-                    .price_scale(U256::from(k))
-                    .block(block_number)
-                    .call()
-                    .await
-                {
-                    scales.push(ps);
-                }
+            // CryptoSwap pools have different signatures:
+            // - Two-coin pools: price_scale() returns single uint256
+            // - Three-coin pools: price_scale(uint256 i) returns price at index i
+
+            // Try price_scale() without arguments first (two-coin pools)
+            let pool_ps_no_args = ICurveLegacyPoolPriceScaleNoArgs::new(self.address, provider.clone());
+            if let Ok(ps) = pool_ps_no_args
+                .price_scale()
+                .block(block_number)
+                .call()
+                .await
+            {
+                self.price_scale = Some(vec![ps]);
+                tracing::debug!(pool = ?self.address, ps = ?ps, "Got price_scale() (no args)");
             }
-            if !scales.is_empty() {
-                self.price_scale = Some(scales);
+
+            // If price_scale() didn't work, try price_scale(uint256) (three-coin pools like Tricrypto2)
+            if self.price_scale.is_none() {
+                let mut scales = Vec::new();
+                for k in 0..self.n_coins.saturating_sub(1) {
+                    if let Ok(ps) = pool
+                        .price_scale(U256::from(k))
+                        .block(block_number)
+                        .call()
+                        .await
+                    {
+                        scales.push(ps);
+                    }
+                }
+                if !scales.is_empty() {
+                    self.price_scale = Some(scales);
+                }
             }
         }
 
@@ -1430,7 +1507,8 @@ impl AutomatedMarketMaker for CurveLegacyPool {
         // Crypto Indices
         let mut crypto_d_idx = None;
         let mut crypto_balance_indices = Vec::new();
-        let mut crypto_scale_indices = Vec::new();
+        let mut crypto_scale_no_args_idx = None;
+        let mut crypto_scale_with_args_indices = Vec::new();
 
         // Stable Indices
         let mut stable_balance_indices = Vec::new();
@@ -1465,17 +1543,28 @@ impl AutomatedMarketMaker for CurveLegacyPool {
                 crypto_balance_indices.push(calls.len() - 1);
             }
 
-            // 3. Price Scale
+            // 3. Price Scale - try both signatures
+            // First: price_scale() without arguments (two-coin pools)
+            calls.push(Call3 {
+                target: address,
+                allowFailure: true,
+                callData: ICurveLegacyPoolPriceScaleNoArgs::price_scaleCall {}
+                    .abi_encode()
+                    .into(),
+            });
+            crypto_scale_no_args_idx = Some(calls.len() - 1);
+
+            // Then: price_scale(uint256) with arguments (three-coin pools)
             let n_scales = self.n_coins.saturating_sub(1) as usize;
             for k in 0..n_scales {
                 calls.push(Call3 {
                     target: address,
                     allowFailure: true,
-                    callData: ICurveLegacyCryptoSwapUpdate::price_scaleCall { i: U256::from(k) }
+                    callData: ICurveLegacyPoolPriceScaleWithArgs::price_scaleCall { i: U256::from(k) }
                         .abi_encode()
                         .into(),
                 });
-                crypto_scale_indices.push(calls.len() - 1);
+                crypto_scale_with_args_indices.push(calls.len() - 1);
             }
         }
 
@@ -1566,21 +1655,31 @@ impl AutomatedMarketMaker for CurveLegacyPool {
                     self.balances = new_balances;
                 }
 
-                // Price Scale
-                let mut new_scales = Vec::new();
-                for &idx in &crypto_scale_indices {
-                    if let Some(res) = results.get(idx).filter(|r| r.success) {
-                        if let Ok(ps) =
-                            ICurveLegacyCryptoSwapUpdate::price_scaleCall::abi_decode_returns(
-                                &res.returnData,
-                            )
-                        {
-                            new_scales.push(ps);
+                // Price Scale - try no-args version first, then with-args version
+                // First: price_scale() without arguments (two-coin pools)
+                if let Some(idx) = crypto_scale_no_args_idx {
+                    if let Some(res) = results.get(idx).filter(|r| r.success && r.returnData.len() == 32) {
+                        if let Ok(ps) = ICurveLegacyPoolPriceScaleNoArgs::price_scaleCall::abi_decode_returns(&res.returnData) {
+                            self.price_scale = Some(vec![ps]);
+                            tracing::debug!(pool = ?self.address, ps = ?ps, "Updated price_scale (no args) from multicall");
                         }
                     }
                 }
-                if !new_scales.is_empty() {
-                    self.price_scale = Some(new_scales);
+
+                // If no-args didn't work, try with-args version (three-coin pools)
+                if self.price_scale.is_none() {
+                    let mut new_scales = Vec::new();
+                    for &idx in &crypto_scale_with_args_indices {
+                        if let Some(res) = results.get(idx).filter(|r| r.success && r.returnData.len() == 32) {
+                            if let Ok(ps) = ICurveLegacyPoolPriceScaleWithArgs::price_scaleCall::abi_decode_returns(&res.returnData) {
+                                new_scales.push(ps);
+                            }
+                        }
+                    }
+                    if !new_scales.is_empty() {
+                        tracing::debug!(pool = ?self.address, scales = ?new_scales, "Updated price_scale (with args) from multicall");
+                        self.price_scale = Some(new_scales);
+                    }
                 }
             }
 
@@ -1693,21 +1792,21 @@ impl CurveLegacyPool {
         }
     }
     /// 获取用于计算 xp 的费率
+    /// stored_rates (if available): 优先使用链上 stored_rates，适用于 Lending 池和有自定义 rate 的 Plain 池（如 LST）
     /// Plain: 10^(36-decimals)
-    /// Lending: stored_rates (if available)
     /// Meta: 10^(36-decimals) for others, but LP token uses virtual_price
     fn get_rates(&self) -> Result<Vec<U256>, AMMError> {
         let n = self.n_coins as usize;
-        let mut rates = Vec::with_capacity(n);
 
-        // 1. Lending Pool / Custom Rates
-        if self.stable_type == LegacyStableSwapType::Lending && self.rates.len() == n {
-            // Lending pools rely on stored_rates
+        // 1. 优先使用 stored_rates（如果有）
+        // 不仅是 Lending Pool，一些 Plain 池（如 ETHx/WETH）也使用 stored_rates 来表示 LST 的溢价
+        if self.rates.len() == n {
             return Ok(self.rates.clone());
         }
 
-        // 2. Metapool / Plain
+        // 2. Metapool / Plain fallback
         // For Metapool, we need to substitute the rate for the LP token with virtual_price
+        let mut rates = Vec::with_capacity(n);
         for i in 0..n {
             let mut rate = if self.decimals[i] > 18 {
                 return Err(AMMError::Msg(format!("Decimals {} > 18", self.decimals[i])));
