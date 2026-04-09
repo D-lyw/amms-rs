@@ -1,5 +1,6 @@
 use alloy::{
     network::Ethereum,
+    providers::Provider,
     primitives::{address, U256},
     providers::ProviderBuilder,
     sol,
@@ -30,19 +31,24 @@ sol! {
 }
 
 async fn setup_provider() -> Result<impl alloy::providers::Provider<Ethereum> + Clone> {
-    let rpc_url = env::var("ETHEREUM_RPC_URL").unwrap_or("https://eth.merkle.io".to_string());
+    dotenv::dotenv().ok();
+    let rpc_url = env::var("ETHEREUM_PROVIDER")
+        .or_else(|_| env::var("ETHEREUM_RPC_URL"))
+        .map_err(|_| eyre::eyre!("ETHEREUM_PROVIDER or ETHEREUM_RPC_URL must be set"))?;
     Ok(ProviderBuilder::new().connect_http(rpc_url.parse()?))
 }
 
 #[tokio::test]
 async fn test_consistency_3pool_legacy_stable() -> Result<()> {
     let provider = setup_provider().await?;
+    let block = provider.get_block_number().await?;
+    let block_id = alloy::eips::BlockId::number(block);
     let pool_addr = address!("bEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7"); // 3pool
 
     // 1. Init Local
     let mut pool = CurveLegacyPool::new(pool_addr, CurveLegacyPoolType::StableSwap);
     pool = pool
-        .init(alloy::eips::BlockId::latest(), provider.clone())
+        .init(block_id, provider.clone())
         .await?;
 
     // 2. Setup Params
@@ -60,6 +66,7 @@ async fn test_consistency_3pool_legacy_stable() -> Result<()> {
     // Use simple cast to i128
     let chain_out = contract
         .get_dy(i as i128, j as i128, amount_in)
+        .block(block_id)
         .call()
         .await?;
 
@@ -75,11 +82,13 @@ async fn test_consistency_3pool_legacy_stable() -> Result<()> {
 #[tokio::test]
 async fn test_consistency_steth_legacy_stable() -> Result<()> {
     let provider = setup_provider().await?;
+    let block = provider.get_block_number().await?;
+    let block_id = alloy::eips::BlockId::number(block);
     let pool_addr = address!("DC24316b9AE028F1497c275EB9192a3Ea0f67022"); // stETH
 
     let mut pool = CurveLegacyPool::new(pool_addr, CurveLegacyPoolType::StableSwap);
     pool = pool
-        .init(alloy::eips::BlockId::latest(), provider.clone())
+        .init(block_id, provider.clone())
         .await?;
 
     println!("stETH Coins: {:?}", pool.coins);
@@ -97,6 +106,7 @@ async fn test_consistency_steth_legacy_stable() -> Result<()> {
     let contract = ICurveStableV1::new(pool_addr, provider.clone());
     let chain_out = contract
         .get_dy(i as i128, j as i128, amount_in)
+        .block(block_id)
         .call()
         .await?;
 
@@ -112,11 +122,13 @@ async fn test_consistency_steth_legacy_stable() -> Result<()> {
 #[tokio::test]
 async fn test_consistency_tricrypto2_legacy_crypto() -> Result<()> {
     let provider = setup_provider().await?;
+    let block = provider.get_block_number().await?;
+    let block_id = alloy::eips::BlockId::number(block);
     let pool_addr = address!("D51a44d3FaE010294C616388b506AcdA1bfAAE46"); // Tricrypto2
 
     let mut pool = CurveLegacyPool::new(pool_addr, CurveLegacyPoolType::CryptoSwap);
     pool = pool
-        .init(alloy::eips::BlockId::latest(), provider.clone())
+        .init(block_id, provider.clone())
         .await?;
 
     // 验证必要参数是否已获取
@@ -138,6 +150,7 @@ async fn test_consistency_tricrypto2_legacy_crypto() -> Result<()> {
     let contract = ICurveCryptoV2::new(pool_addr, provider.clone());
     let chain_out = contract
         .get_dy(U256::from(i), U256::from(j), amount_in)
+        .block(block_id)
         .call()
         .await?;
 
@@ -159,12 +172,14 @@ async fn test_consistency_tricrypto2_legacy_crypto() -> Result<()> {
 #[tokio::test]
 async fn test_consistency_stableswap_ng() -> Result<()> {
     let provider = setup_provider().await?;
-    // stETH-ng-f (stETH/ETH) StableSwap-NG 池 (2-coin plain pool)
-    let pool_addr = address!("21e27a5e5513D6e65C4f830167390997aA84843a");
+    let block = provider.get_block_number().await?;
+    let block_id = alloy::eips::BlockId::number(block);
+    // StableSwap-NG pool (mainnet, stable and actively used in curve_ng_tests).
+    let pool_addr = address!("4dece678ceceb27446b35c672dc7d61f30bad69e");
 
     let mut pool = CurveNGPool::new(pool_addr, CurveNGPoolType::StableSwap);
     pool = pool
-        .init(alloy::eips::BlockId::latest(), provider.clone())
+        .init(block_id, provider.clone())
         .await?;
 
     println!("StableSwap-NG Pool initialized:");
@@ -192,6 +207,7 @@ async fn test_consistency_stableswap_ng() -> Result<()> {
     let contract = ICurveStableV1::new(pool_addr, provider.clone());
     let chain_out = contract
         .get_dy(i as i128, j as i128, amount_in)
+        .block(block_id)
         .call()
         .await?;
 
@@ -207,12 +223,14 @@ async fn test_consistency_stableswap_ng() -> Result<()> {
 #[tokio::test]
 async fn test_consistency_tricrypto_ng() -> Result<()> {
     let provider = setup_provider().await?;
+    let block = provider.get_block_number().await?;
+    let block_id = alloy::eips::BlockId::number(block);
     // TricryptoUSDC (factory-tricrypto-2): USDC/WBTC/WETH
     let pool_addr = address!("7F86Bf177Dd4F3494b841a37e810A34dD56c829B");
 
     let mut pool = CurveNGPool::new(pool_addr, CurveNGPoolType::TriCrypto);
     pool = pool
-        .init(alloy::eips::BlockId::latest(), provider.clone())
+        .init(block_id, provider.clone())
         .await?;
 
     println!("TriCrypto-NG Pool initialized:");
@@ -243,6 +261,7 @@ async fn test_consistency_tricrypto_ng() -> Result<()> {
     let contract = ICurveNG::new(pool_addr, provider.clone());
     let chain_out = contract
         .get_dy(U256::from(i), U256::from(j), amount_in)
+        .block(block_id)
         .call()
         .await?;
 
@@ -258,12 +277,14 @@ async fn test_consistency_tricrypto_ng() -> Result<()> {
 #[tokio::test]
 async fn test_consistency_twocrypto_ng() -> Result<()> {
     let provider = setup_provider().await?;
+    let block = provider.get_block_number().await?;
+    let block_id = alloy::eips::BlockId::number(block);
     // TwoCrypto-NG 池: UwU/WETH (factory-twocrypto-19, 已在内置测试中验证)
     let pool_addr = address!("77146B0a1d08B6844376dF6d9da99bA7F1b19e71");
 
     let mut pool = CurveNGPool::new(pool_addr, CurveNGPoolType::TwoCrypto);
     pool = pool
-        .init(alloy::eips::BlockId::latest(), provider.clone())
+        .init(block_id, provider.clone())
         .await?;
 
     println!("TwoCrypto-NG Pool initialized:");
@@ -294,6 +315,7 @@ async fn test_consistency_twocrypto_ng() -> Result<()> {
     let contract = ICurveNG::new(pool_addr, provider.clone());
     let chain_out = contract
         .get_dy(U256::from(i), U256::from(j), amount_in)
+        .block(block_id)
         .call()
         .await?;
 

@@ -92,7 +92,7 @@ async fn test_curve_legacy_all_pools_comprehensive() -> Result<()> {
         ("rETH/wstETH", address!("447ddd4960d9fdbf6af9a790560d0af76795cb08"), CurveLegacyPoolType::StableSwap),
         ("ETHx/WETH", address!("59ab5a5b5d617e478a2479b0cad80da7e2831492"), CurveLegacyPoolType::StableSwap),
         ("3pool", address!("bebc44782c7db0a1a60cb6fe97d0b483032ff1c7"), CurveLegacyPoolType::StableSwap),
-        ("TricryptoUSDT", address!("80466c64868e1ab14a1ddf27a676c3fcbe638fe5"), CurveLegacyPoolType::StableSwap),
+        ("TricryptoUSDT", address!("80466c64868e1ab14a1ddf27a676c3fcbe638fe5"), CurveLegacyPoolType::CryptoSwap),
         ("FRAX/USDC", address!("dcef968d416a41cdac0ed8702fac8128a64241a2"), CurveLegacyPoolType::StableSwap),
         ("Tricrypto2", address!("d51a44d3fae010294c616388b506acda1bfaae46"), CurveLegacyPoolType::CryptoSwap),
         ("LDO/USDC", address!("3211c6cbef1429da3d0d58494938299c92ad5860"), CurveLegacyPoolType::CryptoSwap),

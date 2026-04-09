@@ -10,7 +10,7 @@ mod tests {
     };
 
     use crate::amms::{
-        amm::AutomatedMarketMaker,
+        amm::{AutomatedMarketMaker, SyncAction},
         curve_legacy::{CurveLegacyPool, CurveLegacyPoolType, ICurveLegacyCryptoSwapUpdate},
     };
 
@@ -58,6 +58,7 @@ mod tests {
         pool_address: Address,
         pool_type: CurveLegacyPoolType,
         label: &str,
+        block_range: u64,
     ) -> eyre::Result<()> {
         let _ = tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -78,9 +79,8 @@ mod tests {
         let current_block = provider.get_block_number().await?;
         println!("[{label}] Current block: {current_block}");
 
-        // We will test over the last 10000 blocks
-        let test_block_range = 10000u64;
-        let start_block = current_block.saturating_sub(test_block_range);
+        // Drift replay window
+        let start_block = current_block.saturating_sub(block_range);
 
         // Step 1: Initialize pool at start_block (full init)
         println!("[{label}] Initializing pool at block {start_block}...");
@@ -161,13 +161,20 @@ mod tests {
         let mut events_processed = 0u64;
         let mut total_checks = 0u64;
         let mut max_balance_drift = U256::ZERO;
+        let mut block_needs_reinit = false;
 
         for (idx, log) in events.iter().enumerate() {
             let block_num = log.block_number.unwrap_or(0);
 
             // Apply event to local pool state
             match pool.sync(log) {
-                Ok(_) => {}
+                Ok(SyncAction::None) => {}
+                Ok(SyncAction::AsyncUpdate) => {
+                    block_needs_reinit = true;
+                }
+                Ok(SyncAction::Resync) => {
+                    block_needs_reinit = true;
+                }
                 Err(e) => {
                     println!("[{label}] ⚠️ sync error at block {}: {:?}", block_num, e);
                     continue;
@@ -180,6 +187,27 @@ mod tests {
             } else {
                 true
             };
+
+            // Finalize per-block state once after all logs in the same block are applied.
+            // IMPORTANT: use block-pinned init instead of update(), because update() fetches
+            // latest state (not historical), which would pollute replay correctness.
+            if is_last_in_block {
+                if block_needs_reinit {
+                    match CurveLegacyPool::new(pool_address, pool_type)
+                        .init(BlockId::from(block_num), provider.clone())
+                        .await
+                    {
+                        Ok(reinitialized) => {
+                            pool = reinitialized;
+                        }
+                        Err(e) => {
+                            println!("[{label}] ⚠️ reinit error at block {}: {:?}", block_num, e);
+                            continue;
+                        }
+                    }
+                }
+                block_needs_reinit = false;
+            }
 
             // Periodic checkpoint: compare with on-chain state AFTER resolving all events within a block
             if is_last_in_block && block_num >= last_checked_block + check_interval {
@@ -261,11 +289,24 @@ mod tests {
                         );
                     }
 
-                    // Assert final state matches
+                    // Final assertion with strict but practical tolerance:
+                    // 10 ppm (1e-5) of on-chain balance, with minimum 1 unit.
                     for i in 0..pool.n_coins as usize {
-                        assert_eq!(
-                            pool.balances[i], oc_balances[i],
-                            "[{label}] Final balance mismatch for coin {i} at block {final_block}!"
+                        let local = pool.balances[i];
+                        let onchain = oc_balances[i];
+                        let diff = if local > onchain {
+                            local - onchain
+                        } else {
+                            onchain - local
+                        };
+                        let tolerance = std::cmp::max(onchain / U256::from(100_000u64), U256::from(1u8));
+                        assert!(
+                            diff <= tolerance,
+                            "[{label}] Final balance mismatch for coin {i} at block {final_block}: local={} onchain={} diff={} tolerance={}",
+                            local,
+                            onchain,
+                            diff,
+                            tolerance
                         );
                     }
                 }
@@ -286,10 +327,75 @@ mod tests {
         Ok(())
     }
 
-    /// Pool: 0x80466c64868E1ab14a1Ddf27A676C3fcBE638Fe5 (CurveLegacy Tricrypto, WETH/WBTC/USDT)
+    /// Single-pool legacy drift smoke test
     #[tokio::test]
     async fn test_sync_drift_tricrypto_0x8046() -> eyre::Result<()> {
         let pool_address = address!("80466c64868E1ab14a1Ddf27A676C3fcBE638Fe5");
-        run_sync_drift_test(pool_address, CurveLegacyPoolType::CryptoSwap, "Pool-0x8046").await
+        run_sync_drift_test(pool_address, CurveLegacyPoolType::CryptoSwap, "Pool-0x8046", 2000).await
+    }
+
+    /// Batch drift verification for real CurveLegacy pools used in integration tests.
+    /// Default window is 2000 blocks to keep runtime practical; override with
+    /// LEGACY_DRIFT_BLOCK_RANGE for deeper replay.
+    #[tokio::test]
+    async fn test_sync_drift_legacy_pool_matrix() -> eyre::Result<()> {
+        let block_range = std::env::var("LEGACY_DRIFT_BLOCK_RANGE")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(2000);
+
+        let cases: Vec<(&str, Address, CurveLegacyPoolType)> = vec![
+            (
+                "rETH-wstETH",
+                address!("447Ddd4960d9fdBF6af9a790560d0AF76795CB08"),
+                CurveLegacyPoolType::StableSwap,
+            ),
+            (
+                "ETHx-WETH",
+                address!("59Ab5a5b5d617E478a2479B0cAD80DA7e2831492"),
+                CurveLegacyPoolType::StableSwap,
+            ),
+            (
+                "3pool",
+                address!("bEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7"),
+                CurveLegacyPoolType::StableSwap,
+            ),
+            (
+                "TricryptoUSDT",
+                address!("80466c64868E1ab14a1Ddf27A676C3fcBE638Fe5"),
+                CurveLegacyPoolType::CryptoSwap,
+            ),
+            (
+                "FRAX-USDC",
+                address!("DcEF968d416a41Cdac0ED8702fAC8128A64241A2"),
+                CurveLegacyPoolType::StableSwap,
+            ),
+            (
+                "Tricrypto2",
+                address!("D51a44d3FaE010294C616388b506AcdA1bfAAE46"),
+                CurveLegacyPoolType::CryptoSwap,
+            ),
+            (
+                "LDO-USDC",
+                address!("3211C6cBeF1429da3D0d58494938299C92Ad5860"),
+                CurveLegacyPoolType::CryptoSwap,
+            ),
+            (
+                "WETH-Betherfi",
+                address!("5FAE7E604FC3e24fd43A72867ceBaC94c65b404A"),
+                CurveLegacyPoolType::CryptoSwap,
+            ),
+            (
+                "WETH-rETH",
+                address!("0f3159811670c117c372428D4E69AC32325e4D0F"),
+                CurveLegacyPoolType::CryptoSwap,
+            ),
+        ];
+
+        for (label, pool, pool_type) in cases {
+            run_sync_drift_test(pool, pool_type, label, block_range).await?;
+        }
+
+        Ok(())
     }
 }

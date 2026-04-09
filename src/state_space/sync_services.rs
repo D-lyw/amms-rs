@@ -571,28 +571,35 @@ pub async fn start_curve_rate_sync_task<N, P>(
                     }
                 } else {
                     // --- Curve Legacy Strategy ---
-                    // Legacy CryptoSwap usually follows TriCrypto logic (index-based)
-                    let contract = ICurveTriCrypto::new(addr, provider.clone());
-                    let mut scales = Vec::new();
-                    let mut success = true;
-                    // n_coins=3 implies 2 price scales (0 and 1)
-                    for i in 0..(n_coins - 1) {
-                        match contract
-                            .price_scale(alloy::primitives::U256::from(i))
-                            .call()
-                            .await
-                        {
-                            Ok(ps) => scales.push(ps),
-                            Err(_) => {
-                                success = false;
-                                break;
+                    // Legacy CryptoSwap also has overloaded signatures:
+                    // - 2-coin pools: price_scale()
+                    // - 3-coin pools: price_scale(uint256)
+                    if n_coins == 2 {
+                        let contract = ICurveTwoCrypto::new(addr, provider.clone());
+                        contract.price_scale().call().await.ok().map(|ps| vec![ps])
+                    } else {
+                        let contract = ICurveTriCrypto::new(addr, provider.clone());
+                        let mut scales = Vec::new();
+                        let mut success = true;
+                        // n_coins=3 implies 2 price scales (0 and 1)
+                        for i in 0..(n_coins - 1) {
+                            match contract
+                                .price_scale(alloy::primitives::U256::from(i))
+                                .call()
+                                .await
+                            {
+                                Ok(ps) => scales.push(ps),
+                                Err(_) => {
+                                    success = false;
+                                    break;
+                                }
                             }
                         }
-                    }
-                    if success && !scales.is_empty() {
-                        Some(scales)
-                    } else {
-                        None
+                        if success && !scales.is_empty() {
+                            Some(scales)
+                        } else {
+                            None
+                        }
                     }
                 };
 

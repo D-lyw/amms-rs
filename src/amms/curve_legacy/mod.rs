@@ -1655,22 +1655,37 @@ impl AutomatedMarketMaker for CurveLegacyPool {
                     self.balances = new_balances;
                 }
 
-                // Price Scale - try no-args version first, then with-args version
+                // Price Scale - try no-args version first, then with-args version.
+                // Important: fallback decision must be based on this round's decode result,
+                // not previous self.price_scale value, otherwise 3-coin pools can stop refreshing.
+                let mut parsed_no_args_this_round = false;
+
                 // First: price_scale() without arguments (two-coin pools)
                 if let Some(idx) = crypto_scale_no_args_idx {
-                    if let Some(res) = results.get(idx).filter(|r| r.success && r.returnData.len() == 32) {
-                        if let Ok(ps) = ICurveLegacyPoolPriceScaleNoArgs::price_scaleCall::abi_decode_returns(&res.returnData) {
+                    if let Some(res) = results
+                        .get(idx)
+                        .filter(|r| r.success && r.returnData.len() == 32)
+                    {
+                        if let Ok(ps) =
+                            ICurveLegacyPoolPriceScaleNoArgs::price_scaleCall::abi_decode_returns(
+                                &res.returnData,
+                            )
+                        {
                             self.price_scale = Some(vec![ps]);
+                            parsed_no_args_this_round = true;
                             tracing::debug!(pool = ?self.address, ps = ?ps, "Updated price_scale (no args) from multicall");
                         }
                     }
                 }
 
-                // If no-args didn't work, try with-args version (three-coin pools)
-                if self.price_scale.is_none() {
+                // If no-args didn't decode in this round, try with-args version (three-coin pools)
+                if !parsed_no_args_this_round {
                     let mut new_scales = Vec::new();
                     for &idx in &crypto_scale_with_args_indices {
-                        if let Some(res) = results.get(idx).filter(|r| r.success && r.returnData.len() == 32) {
+                        if let Some(res) = results
+                            .get(idx)
+                            .filter(|r| r.success && r.returnData.len() == 32)
+                        {
                             if let Ok(ps) = ICurveLegacyPoolPriceScaleWithArgs::price_scaleCall::abi_decode_returns(&res.returnData) {
                                 new_scales.push(ps);
                             }

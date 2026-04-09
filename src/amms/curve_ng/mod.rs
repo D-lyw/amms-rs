@@ -46,6 +46,8 @@ pub mod types;
 
 #[cfg(test)]
 mod test_price;
+#[cfg(test)]
+mod test_sync_drift;
 
 pub use factory::CurveNGFactory;
 pub use types::{CurveNGPool, CurveNGPoolType};

@@ -1,4 +1,5 @@
 use alloy::{
+    providers::Provider,
     primitives::{address, U256},
     providers::ProviderBuilder,
     sol,
@@ -22,18 +23,26 @@ sol! {
     }
 }
 
+fn get_provider_url() -> Result<String> {
+    dotenv::dotenv().ok();
+    env::var("ETHEREUM_PROVIDER")
+        .or_else(|_| env::var("ETHEREUM_RPC_URL"))
+        .map_err(|_| eyre::eyre!("ETHEREUM_PROVIDER or ETHEREUM_RPC_URL must be set"))
+}
+
 #[tokio::test]
 async fn test_curve_legacy_3pool_simulation() -> Result<()> {
-    let rpc_url =
-        env::var("ETHEREUM_PROVIDER").unwrap_or("https://ethereum-rpc.publicnode.com".to_string());
+    let rpc_url = get_provider_url()?;
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    let block = provider.get_block_number().await?;
+    let block_id = alloy::eips::BlockId::number(block);
 
     // 3pool Address (DAI/USDC/USDT)
     let pool_addr = address!("bEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7");
 
     let mut pool = CurveLegacyPool::new(pool_addr, CurveLegacyPoolType::StableSwap);
     pool = pool
-        .init(alloy::eips::BlockId::latest(), provider.clone())
+        .init(block_id, provider.clone())
         .await?;
 
     println!("3pool Initialized");
@@ -57,6 +66,7 @@ async fn test_curve_legacy_3pool_simulation() -> Result<()> {
 
         let amount_out_chain = contract
             .get_dy(dai_idx as i128, usdc_idx as i128, amount_in)
+            .block(block_id)
             .call()
             .await?;
 
@@ -84,15 +94,17 @@ async fn test_curve_legacy_3pool_simulation() -> Result<()> {
 
 #[tokio::test]
 async fn test_curve_legacy_tricrypto2_simulation() -> Result<()> {
-    let rpc_url = env::var("ETHEREUM_PROVIDER").unwrap_or("https://eth.merkle.io".to_string());
+    let rpc_url = get_provider_url()?;
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    let block = provider.get_block_number().await?;
+    let block_id = alloy::eips::BlockId::number(block);
 
     // Tricrypto2 Address (USDT/WBTC/WETH)
     let pool_addr = address!("D51a44d3FaE010294C616388b506AcdA1bfAAE46");
 
     let mut pool = CurveLegacyPool::new(pool_addr, CurveLegacyPoolType::CryptoSwap);
     pool = pool
-        .init(alloy::eips::BlockId::latest(), provider.clone())
+        .init(block_id, provider.clone())
         .await?;
 
     println!("Tricrypto2 Initialized");
@@ -135,6 +147,7 @@ async fn test_curve_legacy_tricrypto2_simulation() -> Result<()> {
 
             let amount_out_chain = contract
                 .get_dy(U256::from(i), U256::from(j), amount_in)
+                .block(block_id)
                 .call()
                 .await?;
 
@@ -177,15 +190,17 @@ async fn test_curve_legacy_tricrypto2_simulation() -> Result<()> {
 
 #[tokio::test]
 async fn test_curve_legacy_3pool_exact_out() -> Result<()> {
-    let rpc_url = env::var("ETHEREUM_PROVIDER").unwrap_or("https://eth.merkle.io".to_string());
+    let rpc_url = get_provider_url()?;
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    let block = provider.get_block_number().await?;
+    let block_id = alloy::eips::BlockId::number(block);
 
     // 3pool Address (DAI/USDC/USDT)
     let pool_addr = address!("bEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7");
 
     let pool = CurveLegacyPool::new(pool_addr, CurveLegacyPoolType::StableSwap);
     let pool = pool
-        .init(alloy::eips::BlockId::latest(), provider.clone())
+        .init(block_id, provider.clone())
         .await?;
 
     println!("3pool Exact-Out Test");
@@ -239,16 +254,17 @@ async fn test_curve_legacy_3pool_exact_out() -> Result<()> {
 
 #[tokio::test]
 async fn test_curve_legacy_tricrypto2_exact_out() -> Result<()> {
-    dotenv::dotenv().ok();
-    let rpc_url = env::var("ETHEREUM_PROVIDER").unwrap_or("https://rpc.flashbots.net".to_string());
+    let rpc_url = get_provider_url()?;
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    let block = provider.get_block_number().await?;
+    let block_id = alloy::eips::BlockId::number(block);
 
     // Tricrypto2 Address (USDT/WBTC/WETH)
     let pool_addr = address!("D51a44d3FaE010294C616388b506AcdA1bfAAE46");
 
     let pool = CurveLegacyPool::new(pool_addr, CurveLegacyPoolType::CryptoSwap);
     let pool = pool
-        .init(alloy::eips::BlockId::latest(), provider.clone())
+        .init(block_id, provider.clone())
         .await?;
 
     println!("Tricrypto2 Exact-Out Test");

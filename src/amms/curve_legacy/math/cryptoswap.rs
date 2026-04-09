@@ -88,10 +88,15 @@ pub fn get_dy(
     y_cast[i] += dx;
 
     // 2. Solve for new y at j
-    // CRITICAL CORRECTION:
-    // Testing against on-chain data shows that using raw `amp` (A value from contract)
-    // produces exact matches (0.00% diff) with on-chain `get_dy`.
-    let ann = amp;
+    // Legacy 3-coin pools are not fully uniform on A scaling semantics.
+    // For low-A tricrypto deployments (e.g. A in the low-thousands), using
+    // A * 1e4 matches on-chain behavior better; for modern pools (A already
+    // scaled high), raw A remains correct.
+    let ann = if xp.len() == 3 && amp < U256::from(100_000u64) {
+        amp * U256::from(10_000u64)
+    } else {
+        amp
+    };
 
     let y_out = newton_y(ann, gamma, &y_cast, d, j)?;
 
