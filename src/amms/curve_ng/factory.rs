@@ -3,7 +3,7 @@
 //! 负责发现和初始化 Curve NG 协议的池子。
 
 use super::{
-    types::{CurveNGPool, CurveNGPoolType},
+    types::{CurveNGPool, CurveNGPoolType, CurveNGTwoCryptoVariant},
     AMMError,
 };
 use crate::amms::amm::{AutomatedMarketMaker, AMM};
@@ -515,6 +515,75 @@ impl CurveNGFactory {
 
                     // 单独重试间隔
                     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                }
+            }
+        }
+
+        // ---------------------------------------------------------
+        // TwoCrypto 变体识别: 标准 v2.1.0 vs periphery v2.1.0d
+        // ---------------------------------------------------------
+        let mut twocrypto_pools = Vec::new();
+        for amm in amms_map.values() {
+            if let AMM::CurveNGPool(pool) = amm {
+                if pool.pool_type == CurveNGPoolType::TwoCrypto {
+                    twocrypto_pools.push(pool.address);
+                }
+            }
+        }
+
+        if !twocrypto_pools.is_empty() {
+            let mut tasks = FuturesUnordered::new();
+            for pool_addr in twocrypto_pools {
+                let provider = provider.clone();
+                tasks.push(async move {
+                    let c = crate::amms::curve_ng::ICurveTwoCryptoMeta::new(pool_addr, provider);
+
+                    let version = c.version().block(block).call().await.ok();
+                    let view = c.VIEW().block(block).call().await.ok();
+                    let math = c.MATH().block(block).call().await.ok();
+                    let precisions = c.precisions().block(block).call().await.ok();
+                    let future_a_gamma_time =
+                        c.future_A_gamma_time().block(block).call().await.ok();
+                    let last_timestamp = c.last_timestamp().block(block).call().await.ok();
+
+                    (
+                        pool_addr,
+                        version,
+                        view,
+                        math,
+                        precisions,
+                        future_a_gamma_time,
+                        last_timestamp,
+                    )
+                });
+            }
+
+            while let Some((pool_addr, version, view, math, precisions, future_t, last_t)) =
+                tasks.next().await
+            {
+                if let Some(AMM::CurveNGPool(pool)) = amms_map.get_mut(&pool_addr) {
+                    if let Some(v) = version {
+                        pool.twocrypto_version = Some(v.clone());
+                        if v.trim() == "v2.1.0d" {
+                            pool.twocrypto_variant = CurveNGTwoCryptoVariant::PeripheryV210d;
+                        }
+                    }
+                    if let Some(view_addr) = view {
+                        if view_addr != Address::ZERO {
+                            pool.twocrypto_view = Some(view_addr);
+                            pool.twocrypto_variant = CurveNGTwoCryptoVariant::PeripheryV210d;
+                        }
+                    }
+                    if let Some(math_addr) = math {
+                        if math_addr != Address::ZERO {
+                            pool.twocrypto_math = Some(math_addr);
+                        }
+                    }
+                    if let Some(p) = precisions {
+                        pool.twocrypto_precisions = Some(vec![p[0], p[1]]);
+                    }
+                    pool.twocrypto_future_a_gamma_time = future_t;
+                    pool.twocrypto_last_timestamp = last_t;
                 }
             }
         }

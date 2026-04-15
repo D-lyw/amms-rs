@@ -6,3 +6,4 @@
 
 pub mod cryptoswap;
 pub mod stableswap;
+pub mod twocrypto_v210d;

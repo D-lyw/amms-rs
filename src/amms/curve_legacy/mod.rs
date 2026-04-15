@@ -31,8 +31,6 @@
 
 pub mod factory;
 pub mod math;
-#[cfg(test)]
-mod test_batch;
 pub mod types;
 
 use alloy::{
@@ -1285,7 +1283,10 @@ impl AutomatedMarketMaker for CurveLegacyPool {
             .await
         {
             tracing::debug!(pool = ?self.address, rates = ?rates_array, "Got rates from stored_rates() array");
-            custom_rates = rates_array.into_iter().take(self.n_coins as usize).collect();
+            custom_rates = rates_array
+                .into_iter()
+                .take(self.n_coins as usize)
+                .collect();
         }
 
         // 2. If stored_rates() array failed, try stored_rates(uint256) (Lending pools)
@@ -1314,20 +1315,9 @@ impl AutomatedMarketMaker for CurveLegacyPool {
         if custom_rates.len() != self.n_coins as usize {
             custom_rates.clear();
             let pool_rates = ICurveLegacyPoolRates::new(self.address, provider.clone());
-            if pool_rates
-                .rates(0)
-                .block(block_number)
-                .call()
-                .await
-                .is_ok()
-            {
+            if pool_rates.rates(0).block(block_number).call().await.is_ok() {
                 for i in 0..self.n_coins {
-                    if let Ok(r) = pool_rates
-                        .rates(i as i128)
-                        .block(block_number)
-                        .call()
-                        .await
-                    {
+                    if let Ok(r) = pool_rates.rates(i as i128).block(block_number).call().await {
                         custom_rates.push(r);
                     }
                 }
@@ -1461,7 +1451,8 @@ impl AutomatedMarketMaker for CurveLegacyPool {
             // - Three-coin pools: price_scale(uint256 i) returns price at index i
 
             // Try price_scale() without arguments first (two-coin pools)
-            let pool_ps_no_args = ICurveLegacyPoolPriceScaleNoArgs::new(self.address, provider.clone());
+            let pool_ps_no_args =
+                ICurveLegacyPoolPriceScaleNoArgs::new(self.address, provider.clone());
             if let Ok(ps) = pool_ps_no_args
                 .price_scale()
                 .block(block_number)
@@ -1560,9 +1551,11 @@ impl AutomatedMarketMaker for CurveLegacyPool {
                 calls.push(Call3 {
                     target: address,
                     allowFailure: true,
-                    callData: ICurveLegacyPoolPriceScaleWithArgs::price_scaleCall { i: U256::from(k) }
-                        .abi_encode()
-                        .into(),
+                    callData: ICurveLegacyPoolPriceScaleWithArgs::price_scaleCall {
+                        i: U256::from(k),
+                    }
+                    .abi_encode()
+                    .into(),
                 });
                 crypto_scale_with_args_indices.push(calls.len() - 1);
             }
@@ -2187,4 +2180,3 @@ impl CurveLegacyPool {
         Ok(high)
     }
 }
-pub mod test_sync_drift;

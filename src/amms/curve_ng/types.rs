@@ -26,6 +26,16 @@ impl CurveNGPoolType {
     }
 }
 
+/// TwoCrypto 的实现分支
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum CurveNGTwoCryptoVariant {
+    /// 标准 twocrypto-ng v2.1.0 路径
+    #[default]
+    StandardV210,
+    /// v2.1.0d periphery 路径 (TwocryptoView + StableswapMath)
+    PeripheryV210d,
+}
+
 /// Curve NG 池状态
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CurveNGPool {
@@ -85,6 +95,22 @@ pub struct CurveNGPool {
     /// 移动平均半衰期
     pub ma_half_time: Option<U256>,
 
+    // === TwoCrypto 变体识别/参数 ===
+    /// TwoCrypto 的具体实现分支
+    pub twocrypto_variant: CurveNGTwoCryptoVariant,
+    /// TwoCrypto periphery VIEW 地址（仅 v2.1.0d 使用）
+    pub twocrypto_view: Option<Address>,
+    /// TwoCrypto periphery MATH 地址（仅 v2.1.0d 使用）
+    pub twocrypto_math: Option<Address>,
+    /// TwoCrypto 合约版本字符串
+    pub twocrypto_version: Option<String>,
+    /// TwoCrypto precisions() 返回值（优先于 decimals 推导）
+    pub twocrypto_precisions: Option<Vec<U256>>,
+    /// TwoCrypto last_timestamp（用于 _calc_D_ramp 判定）
+    pub twocrypto_last_timestamp: Option<U256>,
+    /// TwoCrypto future_A_gamma_time（用于 _calc_D_ramp 判定）
+    pub twocrypto_future_a_gamma_time: Option<U256>,
+
     /// 缓存的现货价格 (base_token, quote_token) -> price
     #[serde(skip)]
     pub spot_prices: std::collections::HashMap<(Address, Address), f64>,
@@ -118,6 +144,13 @@ impl CurveNGPool {
             allowed_extra_profit: None,
             adjustment_step: None,
             ma_half_time: None,
+            twocrypto_variant: CurveNGTwoCryptoVariant::StandardV210,
+            twocrypto_view: None,
+            twocrypto_math: None,
+            twocrypto_version: None,
+            twocrypto_precisions: None,
+            twocrypto_last_timestamp: None,
+            twocrypto_future_a_gamma_time: None,
             spot_prices: std::collections::HashMap::new(),
         }
     }

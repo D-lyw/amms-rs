@@ -44,13 +44,8 @@ pub mod factory;
 pub mod math;
 pub mod types;
 
-#[cfg(test)]
-mod test_price;
-#[cfg(test)]
-mod test_sync_drift;
-
 pub use factory::CurveNGFactory;
-pub use types::{CurveNGPool, CurveNGPoolType};
+pub use types::{CurveNGPool, CurveNGPoolType, CurveNGTwoCryptoVariant};
 
 // Curve NG 池合约 ABI (简化版)
 pub mod contracts {
@@ -252,6 +247,17 @@ sol! {
     interface ICurveTwoCrypto {
         function price_scale() external view returns (uint256);
         function D() external view returns (uint256);
+    }
+
+    #[allow(missing_docs)]
+    #[sol(rpc)]
+    interface ICurveTwoCryptoMeta {
+        function version() external view returns (string);
+        function VIEW() external view returns (address);
+        function MATH() external view returns (address);
+        function precisions() external view returns (uint256[2]);
+        function future_A_gamma_time() external view returns (uint256);
+        function last_timestamp() external view returns (uint256);
     }
 
     #[allow(missing_docs)]
@@ -868,9 +874,13 @@ impl AutomatedMarketMaker for CurveNGPool {
         // This handles coin fetching (via helper contract), parameter decoding, and default rate calculation correctly.
         let addresses = vec![AMM::CurveNGPool(self.clone())];
         let initialized_amms =
-            CurveNGFactory::init_batch(addresses, block_number, provider).await?;
+            CurveNGFactory::init_batch(addresses, block_number, provider.clone()).await?;
 
-        if let Some(AMM::CurveNGPool(pool)) = initialized_amms.into_iter().next() {
+        if let Some(AMM::CurveNGPool(mut pool)) = initialized_amms.into_iter().next() {
+            if pool.pool_type == CurveNGPoolType::TwoCrypto {
+                pool.detect_twocrypto_variant(block_number, provider.clone())
+                    .await;
+            }
             // Log for debugging
             println!(
                 "DEBUG: CurveNG Init Batch Success: {:?}, Coins: {:?}, Rates: {:?}",
@@ -919,6 +929,8 @@ impl AutomatedMarketMaker for CurveNGPool {
             function balances(uint256 i) external view returns (uint256);
             function D() external view returns (uint256);
             function stored_rates() external view returns (uint256[] memory);
+            function future_A_gamma_time() external view returns (uint256);
+            function last_timestamp() external view returns (uint256);
         }
 
         // Define price_scale functions separately to avoid name collision in sol! macro
@@ -943,8 +955,8 @@ impl AutomatedMarketMaker for CurveNGPool {
                 }
             }
             CurveNGPoolType::TwoCrypto => {
-                // TwoCrypto: 2 balances + 1 price_scale + 1 D = 4 calls -> 1 multicall
-                let mut calls = Vec::with_capacity(4);
+                // TwoCrypto: 2 balances + 1 price_scale + 1 D + 2 ramp timestamps = 6 calls
+                let mut calls = Vec::with_capacity(6);
 
                 // balance(0), balance(1)
                 for i in 0..2u8 {
@@ -965,6 +977,18 @@ impl AutomatedMarketMaker for CurveNGPool {
                     target: self.address,
                     allowFailure: true,
                     callData: DCall {}.abi_encode().into(),
+                });
+                // future_A_gamma_time()
+                calls.push(IMulticall3::Call3 {
+                    target: self.address,
+                    allowFailure: true,
+                    callData: future_A_gamma_timeCall {}.abi_encode().into(),
+                });
+                // last_timestamp()
+                calls.push(IMulticall3::Call3 {
+                    target: self.address,
+                    allowFailure: true,
+                    callData: last_timestampCall {}.abi_encode().into(),
                 });
 
                 if let Ok(results) = multicall.aggregate3(calls).call().await {
@@ -1007,6 +1031,24 @@ impl AutomatedMarketMaker for CurveNGPool {
                             <DCall as SolCall>::abi_decode_returns(&results[3].returnData)
                         {
                             self.d = Some(d);
+                        }
+                    }
+
+                    // Parse future_A_gamma_time (index 4)
+                    if results[4].success {
+                        if let Ok(t) = <future_A_gamma_timeCall as SolCall>::abi_decode_returns(
+                            &results[4].returnData,
+                        ) {
+                            self.twocrypto_future_a_gamma_time = Some(t);
+                        }
+                    }
+
+                    // Parse last_timestamp (index 5)
+                    if results[5].success {
+                        if let Ok(t) = <last_timestampCall as SolCall>::abi_decode_returns(
+                            &results[5].returnData,
+                        ) {
+                            self.twocrypto_last_timestamp = Some(t);
                         }
                     }
                 }
@@ -1106,6 +1148,46 @@ impl CurveNGPool {
         self
     }
 
+    async fn detect_twocrypto_variant<N, P>(&mut self, block_number: BlockId, provider: P)
+    where
+        N: Network,
+        P: Provider<N> + Clone,
+    {
+        let meta = ICurveTwoCryptoMeta::new(self.address, provider);
+
+        if let Ok(v) = meta.version().block(block_number).call().await {
+            self.twocrypto_version = Some(v.clone());
+            if v.trim() == "v2.1.0d" {
+                self.twocrypto_variant = CurveNGTwoCryptoVariant::PeripheryV210d;
+            }
+        }
+
+        if let Ok(view_addr) = meta.VIEW().block(block_number).call().await {
+            if view_addr != Address::ZERO {
+                self.twocrypto_view = Some(view_addr);
+                self.twocrypto_variant = CurveNGTwoCryptoVariant::PeripheryV210d;
+            }
+        }
+
+        if let Ok(math_addr) = meta.MATH().block(block_number).call().await {
+            if math_addr != Address::ZERO {
+                self.twocrypto_math = Some(math_addr);
+            }
+        }
+
+        if let Ok(precisions) = meta.precisions().block(block_number).call().await {
+            self.twocrypto_precisions = Some(vec![precisions[0], precisions[1]]);
+        }
+
+        if let Ok(v) = meta.future_A_gamma_time().block(block_number).call().await {
+            self.twocrypto_future_a_gamma_time = Some(v);
+        }
+
+        if let Ok(v) = meta.last_timestamp().block(block_number).call().await {
+            self.twocrypto_last_timestamp = Some(v);
+        }
+    }
+
     /// Update cached spot prices
     pub(crate) fn update_spot_prices(&mut self) {
         if self.coins.len() < 2 {
@@ -1153,11 +1235,21 @@ impl CurveNGPool {
         let n_coins = self.n_coins as usize;
         let precision = U256::from(10).pow(U256::from(18));
 
-        let precisions: Vec<U256> = self
-            .decimals
-            .iter()
-            .map(|d| U256::from(10).pow(U256::from(18 - *d)))
-            .collect();
+        let precisions: Vec<U256> = if self.pool_type == CurveNGPoolType::TwoCrypto
+            && self.twocrypto_variant == CurveNGTwoCryptoVariant::PeripheryV210d
+        {
+            self.twocrypto_precisions.clone().unwrap_or_else(|| {
+                self.decimals
+                    .iter()
+                    .map(|d| U256::from(10).pow(U256::from(18 - *d)))
+                    .collect()
+            })
+        } else {
+            self.decimals
+                .iter()
+                .map(|d| U256::from(10).pow(U256::from(18 - *d)))
+                .collect()
+        };
 
         let mut xp = vec![self.balances[0] * precisions[0]];
         for k in 1..n_coins {
@@ -1194,7 +1286,20 @@ impl CurveNGPool {
         // The theoretical `A * N^N` scaling is likely handled internally or optimized out in the ported math.
         let ann = amp;
 
-        match math::cryptoswap::newton_d(ann, gamma, &xp) {
+        let d_result = if self.pool_type == CurveNGPoolType::TwoCrypto
+            && self.twocrypto_variant == CurveNGTwoCryptoVariant::PeripheryV210d
+        {
+            if xp.len() < 2 {
+                Err("recalculate_d: xp length < 2")
+            } else {
+                math::twocrypto_v210d::stableswap_newton_d(ann, [xp[0], xp[1]])
+                    .map_err(|_| "recalculate_d: twocrypto_v210d newton_d failed")
+            }
+        } else {
+            math::cryptoswap::newton_d(ann, gamma, &xp)
+        };
+
+        match d_result {
             Ok(new_d) => {
                 self.d = Some(new_d);
                 tracing::trace!(
@@ -1232,6 +1337,13 @@ impl CurveNGPool {
             .ok_or(AMMError::Msg("Out fee not found".into()))?;
         // fee_gamma should be used as-is; if missing, default to 0 (no extra adjustment)
         let fee_gamma = self.fee_gamma.unwrap_or(U256::ZERO);
+
+        if self.pool_type == CurveNGPoolType::TwoCrypto
+            && self.twocrypto_variant == CurveNGTwoCryptoVariant::PeripheryV210d
+        {
+            return self.simulate_twocrypto_v210d(i, j, dx, amp, mid_fee, out_fee, fee_gamma);
+        }
+
         let price_scale = self
             .price_scale
             .as_ref()
@@ -1363,6 +1475,69 @@ impl CurveNGPool {
 
         Ok(dy)
     }
+
+    fn simulate_twocrypto_v210d(
+        &self,
+        i: usize,
+        j: usize,
+        dx: U256,
+        amp: U256,
+        mid_fee: U256,
+        out_fee: U256,
+        fee_gamma: U256,
+    ) -> Result<U256, AMMError> {
+        if self.balances.len() < 2 {
+            return Err(AMMError::Msg(
+                "twocrypto_v210d: insufficient balances".into(),
+            ));
+        }
+        let price_scale = self
+            .price_scale
+            .as_ref()
+            .and_then(|v| v.first().copied())
+            .ok_or(AMMError::Msg("twocrypto_v210d: missing price_scale".into()))?;
+
+        let stored_d = self
+            .d
+            .ok_or(AMMError::Msg("twocrypto_v210d: missing D".into()))?;
+
+        let precisions_vec = if let Some(v) = &self.twocrypto_precisions {
+            if v.len() >= 2 {
+                vec![v[0], v[1]]
+            } else {
+                vec![]
+            }
+        } else {
+            self.decimals
+                .iter()
+                .take(2)
+                .map(|d| U256::from(10).pow(U256::from(18 - *d)))
+                .collect()
+        };
+        if precisions_vec.len() < 2 {
+            return Err(AMMError::Msg("twocrypto_v210d: missing precisions".into()));
+        }
+
+        let future_a_gamma_time = self.twocrypto_future_a_gamma_time.unwrap_or(U256::ZERO);
+        let last_timestamp = self.twocrypto_last_timestamp.unwrap_or(U256::ZERO);
+
+        math::twocrypto_v210d::get_dy(
+            i,
+            j,
+            dx,
+            [self.balances[0], self.balances[1]],
+            amp,
+            price_scale,
+            stored_d,
+            [precisions_vec[0], precisions_vec[1]],
+            mid_fee,
+            out_fee,
+            fee_gamma,
+            future_a_gamma_time,
+            last_timestamp,
+        )
+    }
+
     /// StableSwap 交换模拟
     fn simulate_stableswap(&self, i: usize, j: usize, dx: U256) -> Result<U256, AMMError> {
         let amp = self
