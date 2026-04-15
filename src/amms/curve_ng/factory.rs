@@ -521,6 +521,10 @@ impl CurveNGFactory {
 
         // ---------------------------------------------------------
         // TwoCrypto 变体识别: 标准 v2.1.0 vs periphery v2.1.0d
+        // 判定规则（与单池 detect_twocrypto_variant 保持一致）：
+        // - version() == "v2.1.0d" => PeripheryV210d
+        // - VIEW() != 0x0         => PeripheryV210d
+        // 详细背景见 `math/twocrypto_v210d.rs` 顶部文档。
         // ---------------------------------------------------------
         let mut twocrypto_pools = Vec::new();
         for amm in amms_map.values() {

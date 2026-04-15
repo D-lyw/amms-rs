@@ -8,6 +8,7 @@ use std::{
     str::FromStr,
 };
 
+// YieldBasis 特殊 TwoCrypto 池（v2.1.0d periphery 路径），详细背景见 twocrypto_v210d 模块文档。
 pub const YIELDBASIS_SPECIAL_TWOCRYPTO_POOLS: [&str; 4] = [
     "0xd9ff8396554a0d18b2cfbec53e1979b7ecce8373",
     "0x83f24023d15d835a213df24fd309c47dab5beb32",

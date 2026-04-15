@@ -33,6 +33,7 @@ pub enum CurveNGTwoCryptoVariant {
     #[default]
     StandardV210,
     /// v2.1.0d periphery 路径 (TwocryptoView + StableswapMath)
+    /// 典型于 YieldBasis 这组特殊池（见 docs.yieldbasis.com）
     PeripheryV210d,
 }
 

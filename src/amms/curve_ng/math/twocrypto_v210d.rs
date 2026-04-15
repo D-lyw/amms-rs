@@ -1,3 +1,19 @@
+//! TwoCrypto `v2.1.0d` periphery 数学实现（YieldBasis 特殊池）
+//!
+//! 背景：
+//! - 常规 TwoCrypto NG (`v2.1.0`) 走 CryptoSwap 数学路径；
+//! - YieldBasis 这组 TwoCrypto 池部署在 `v2.1.0d` 分支，`get_dy` 依赖
+//!   `TwocryptoView + StableswapMath` 组合逻辑（与标准路径不同）。
+//! - 若对这类池继续使用标准 TwoCrypto 公式，本地 quote 会出现明显偏差，历史上出现过负输出问题。
+//!
+//! 来源：
+//! - <https://github.com/curvefi/twocrypto-ng/blob/yb-pools-study/contracts/main/Twocrypto.vy>
+//! - <https://docs.yieldbasis.com/dev/contract-addresses>
+//!
+//! 维护说明：
+//! - 本文件目标是按链上 view 路径进行“位级行为复刻”（尤其是 rounding 和 ramp 分支）；
+//! - 后续升级时优先逐项比对 `_calc_D_ramp` / `_fee` / `get_dy` 相关逻辑。
+
 use crate::amms::error::AMMError;
 use alloy::primitives::U256;
 
@@ -181,6 +197,8 @@ pub fn calc_d_ramp(
     future_a_gamma_time: U256,
     last_timestamp: U256,
 ) -> Result<U256, AMMError> {
+    // 对齐 Twocrypto.vy 的 _calc_D_ramp:
+    // ramp 未结束时使用 stableswap_newton_d 重算 D；否则使用存储的 D。
     if future_a_gamma_time > last_timestamp {
         let scaled = [
             balances[0]
@@ -272,6 +290,10 @@ pub fn get_dy(
     future_a_gamma_time: U256,
     last_timestamp: U256,
 ) -> Result<U256, AMMError> {
+    // 对齐 Twocrypto.vy 的 get_dy:
+    // 1) 先经 _calc_D_ramp 得到 D
+    // 2) 用 stableswap_get_y 求目标币 y
+    // 3) 下采样并按 TwocryptoView._fee 扣费
     if i >= 2 || j >= 2 || i == j {
         return Err(AMMError::Msg(
             "twocrypto_v210d get_dy: coin index out of range".into(),

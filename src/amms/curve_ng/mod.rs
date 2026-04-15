@@ -411,6 +411,7 @@ impl AutomatedMarketMaker for CurveNGPool {
                 ICurveNGPool::ClaimAdminFees::SIGNATURE_HASH,
                 ICurveNGPool::NewParameters::SIGNATURE_HASH,
             ],
+            // v2.1.0 与 v2.1.0d 事件签名一致，不按变体区分。
             CurveNGPoolType::TwoCrypto => vec![
                 ICurveTwoCryptoEvent::TokenExchange::SIGNATURE_HASH,
                 ICurveTwoCryptoEvent::AddLiquidity::SIGNATURE_HASH,
@@ -878,6 +879,7 @@ impl AutomatedMarketMaker for CurveNGPool {
 
         if let Some(AMM::CurveNGPool(mut pool)) = initialized_amms.into_iter().next() {
             if pool.pool_type == CurveNGPoolType::TwoCrypto {
+                // 探测 TwoCrypto 变体；仅影响本地 quote 数学分支。
                 pool.detect_twocrypto_variant(block_number, provider.clone())
                     .await;
             }
@@ -1153,6 +1155,10 @@ impl CurveNGPool {
         N: Network,
         P: Provider<N> + Clone,
     {
+        // 判定策略：
+        // 1) `version() == "v2.1.0d"` 直接判定 periphery；
+        // 2) 即使 version 不可用，只要 `VIEW() != 0x0` 也判定 periphery。
+        // 详见 `math/twocrypto_v210d.rs` 顶部文档。
         let meta = ICurveTwoCryptoMeta::new(self.address, provider);
 
         if let Ok(v) = meta.version().block(block_number).call().await {
@@ -1235,6 +1241,7 @@ impl CurveNGPool {
         let n_coins = self.n_coins as usize;
         let precision = U256::from(10).pow(U256::from(18));
 
+        // v2.1.0d periphery 优先使用链上 precisions()。
         let precisions: Vec<U256> = if self.pool_type == CurveNGPoolType::TwoCrypto
             && self.twocrypto_variant == CurveNGTwoCryptoVariant::PeripheryV210d
         {
@@ -1341,6 +1348,7 @@ impl CurveNGPool {
         if self.pool_type == CurveNGPoolType::TwoCrypto
             && self.twocrypto_variant == CurveNGTwoCryptoVariant::PeripheryV210d
         {
+            // v2.1.0d periphery 本地模拟分支；详见 twocrypto_v210d 模块文档。
             return self.simulate_twocrypto_v210d(i, j, dx, amp, mid_fee, out_fee, fee_gamma);
         }
 
@@ -1486,6 +1494,7 @@ impl CurveNGPool {
         out_fee: U256,
         fee_gamma: U256,
     ) -> Result<U256, AMMError> {
+        // 详见 `math/twocrypto_v210d.rs` 顶部文档。
         if self.balances.len() < 2 {
             return Err(AMMError::Msg(
                 "twocrypto_v210d: insufficient balances".into(),
