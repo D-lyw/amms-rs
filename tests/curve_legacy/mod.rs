@@ -1,4 +1,3 @@
-mod batch_init;
 mod comprehensive;
 mod consistency_smoke;
 mod exact_out;

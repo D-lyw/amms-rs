@@ -351,31 +351,31 @@ impl PancakeInfinityFactory {
             })
             .collect();
         Self::sync_slot_0(&mut pools, block_number, provider.clone()).await?;
-        let (valid_pools, invalid_pools): (Vec<_>, Vec<_>) =
-            pools.into_par_iter().partition(|pool| {
-                pool.liquidity > 0 && pool.token_a.decimals > 0 && pool.token_b.decimals > 0
-            });
 
-        if !invalid_pools.is_empty() {
-            for pool in &invalid_pools {
-                tracing::info!(
-                    target: "amms::pancake_infinity::sync",
-                    pool_id = ?pool.pool_id,
-                    liquidity = ?pool.liquidity,
-                    "Filtering out PancakeInfinity pool"
-                );
-            }
+        // Clear previous tick data to prevent stale data buildup
+        for pool in pools.iter_mut() {
+            pool.tick_bitmap.clear();
+            pool.ticks.clear();
         }
 
-        let mut pools = valid_pools;
         Self::sync_tick_bitmap(&mut pools, block_number, provider.clone()).await?;
         Self::sync_tick_data(&mut pools, block_number, provider.clone()).await?;
 
         for pool in pools.iter_mut() {
-            pool.token_a_price =
-                pool.calculate_price(pool.token_a.address, pool.token_b.address)?;
-            pool.token_b_price =
-                pool.calculate_price(pool.token_b.address, pool.token_a.address)?;
+            match pool.calculate_price(pool.token_a.address, pool.token_b.address) {
+                Ok(price) => {
+                    pool.token_a_price = price;
+                    pool.token_b_price = if price != 0.0 { 1.0 / price } else { 0.0 };
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "amms::pancake_infinity::sync",
+                        pool_id = ?pool.pool_id,
+                        error = ?e,
+                        "Failed to refresh PancakeInfinity spot prices; keeping previous values"
+                    );
+                }
+            }
         }
 
         Ok(pools.into_iter().map(AMM::PancakeInfinityPool).collect())
@@ -406,27 +406,29 @@ impl PancakeInfinityFactory {
         Self::sync_slot_0(&mut pools, block_number, provider.clone()).await?;
         Self::sync_token_decimals(&mut pools, provider.clone()).await?;
 
-        let (valid_pools, invalid_pools): (Vec<_>, Vec<_>) =
+        let (structurally_valid, structurally_invalid): (Vec<_>, Vec<_>) =
             pools.into_par_iter().partition(|pool| {
-                pool.liquidity > 0 && pool.token_a.decimals > 0 && pool.token_b.decimals > 0
+                !pool.token_a.address.is_zero()
+                    && !pool.token_b.address.is_zero()
+                    && pool.token_a.decimals > 0
+                    && pool.token_b.decimals > 0
             });
 
-        if !invalid_pools.is_empty() {
-            for pool in &invalid_pools {
+        if !structurally_invalid.is_empty() {
+            for pool in &structurally_invalid {
                 tracing::info!(
                     target: "amms::pancake_infinity::init_batch",
                     pool_id = ?pool.pool_id,
-                    liquidity = ?pool.liquidity,
                     token_a = ?pool.token_a.address,
                     token_b = ?pool.token_b.address,
                     token_a_decimals = ?pool.token_a.decimals,
                     token_b_decimals = ?pool.token_b.decimals,
-                    "Filtering out PancakeInfinity pool"
+                    "Filtering out structurally invalid PancakeInfinity pool"
                 );
             }
         }
 
-        let mut pools = valid_pools;
+        let mut pools = structurally_valid;
 
         // Clear previous tick data to prevent stale data buildup
         for pool in pools.iter_mut() {
@@ -437,6 +439,23 @@ impl PancakeInfinityFactory {
         Self::sync_tick_bitmap(&mut pools, block_number, provider.clone()).await?;
         Self::sync_tick_data(&mut pools, block_number, provider.clone()).await?;
 
+        let (liquid_pools, dust_pools): (Vec<_>, Vec<_>) = pools
+            .into_par_iter()
+            .partition(|pool| pool.has_sufficient_liquidity());
+
+        if !dust_pools.is_empty() {
+            for pool in &dust_pools {
+                tracing::info!(
+                    target: "amms::pancake_infinity::init_batch",
+                    pool_id = ?pool.pool_id,
+                    liquidity = pool.liquidity,
+                    ticks = pool.ticks.len(),
+                    "Filtering out dust PancakeInfinity pool by has_sufficient_liquidity"
+                );
+            }
+        }
+
+        let mut pools = liquid_pools;
         for pool in pools.iter_mut() {
             pool.token_a_price =
                 pool.calculate_price(pool.token_a.address, pool.token_b.address)?;
@@ -446,7 +465,7 @@ impl PancakeInfinityFactory {
 
         let result: Vec<AMM> = pools.into_iter().map(AMM::PancakeInfinityPool).collect();
         let valid = result.len();
-        let invalid = total.saturating_sub(valid);
+        let invalid = structurally_invalid.len() + dust_pools.len();
         tracing::info!(
             target: "amms::pancake_infinity::init_batch",
             total = total,

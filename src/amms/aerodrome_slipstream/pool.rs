@@ -950,6 +950,11 @@ impl AutomatedMarketMaker for AerodromeSlipstreamPool {
             u128::MAX.isqrt()
         };
 
+        // Fast path: active in-range liquidity already meets the threshold.
+        if self.liquidity >= l_thresh {
+            return true;
+        }
+
         self.ticks
             .values()
             .any(|info| info.liquidity_gross >= l_thresh)
@@ -1768,38 +1773,31 @@ impl AerodromeSlipstreamFactory {
             .map_err(AMMError::from)?;
         sleep(Duration::from_millis(500)).await;
 
-        let (valid_amms, invalid_amms): (Vec<_>, Vec<_>) = amms.into_iter().partition(|amm| {
-            if let AMM::AerodromeSlipstreamPool(pool) = amm {
-                pool.liquidity > 0
-                    && pool.tick_spacing != 0
-                    && !pool.token_a.address.is_zero()
-                    && !pool.token_b.address.is_zero()
-                    && pool.token_a.decimals > 0
-                    && pool.token_b.decimals > 0
-            } else {
-                false
-            }
-        });
+        let (structurally_valid, structurally_invalid): (Vec<_>, Vec<_>) =
+            amms.into_iter().partition(|amm| {
+                if let AMM::AerodromeSlipstreamPool(pool) = amm {
+                    pool.tick_spacing != 0
+                        && !pool.token_a.address.is_zero()
+                        && !pool.token_b.address.is_zero()
+                        && pool.token_a.decimals > 0
+                        && pool.token_b.decimals > 0
+                } else {
+                    false
+                }
+            });
+        let structural_total = structurally_valid.len() + structurally_invalid.len();
 
-        if !invalid_amms.is_empty() {
-            for amm in &invalid_amms {
+        if !structurally_invalid.is_empty() {
+            for amm in &structurally_invalid {
                 tracing::warn!(
                     target = "amms::aerodrome_slipstream::init_batch",
                     addr = ?amm.address(),
-                    "Filtered out invalid pool"
+                    "Filtered out structurally invalid pool"
                 );
             }
         }
 
-        tracing::info!(
-            target = "amms::aerodrome_slipstream::init_batch",
-            total = valid_amms.len() + invalid_amms.len(),
-            valid = valid_amms.len(),
-            invalid = invalid_amms.len(),
-            "Batch initialization complete"
-        );
-
-        let mut valid_amms = valid_amms;
+        let mut valid_amms = structurally_valid;
         let pools_step = 50;
         for group in valid_amms.chunks_mut(pools_step) {
             Self::sync_tick_bitmaps(group, block_number, provider.clone()).await?;
@@ -1808,6 +1806,29 @@ impl AerodromeSlipstreamFactory {
             sleep(Duration::from_millis(500)).await;
         }
 
+        let (liquid_amms, dust_amms): (Vec<_>, Vec<_>) = valid_amms.into_iter().partition(|amm| {
+            if let AMM::AerodromeSlipstreamPool(pool) = amm {
+                pool.has_sufficient_liquidity()
+            } else {
+                false
+            }
+        });
+
+        if !dust_amms.is_empty() {
+            for amm in &dust_amms {
+                if let AMM::AerodromeSlipstreamPool(pool) = amm {
+                    tracing::info!(
+                        target = "amms::aerodrome_slipstream::init_batch",
+                        addr = ?pool.address,
+                        liquidity = pool.liquidity,
+                        ticks = pool.ticks.len(),
+                        "Filtering out dust Slipstream pool by has_sufficient_liquidity"
+                    );
+                }
+            }
+        }
+
+        let mut valid_amms = liquid_amms;
         for pool in valid_amms.iter_mut() {
             let AMM::AerodromeSlipstreamPool(ref mut slipstream_pool) = pool else {
                 continue;
@@ -1823,7 +1844,120 @@ impl AerodromeSlipstreamFactory {
             }
         }
 
+        tracing::info!(
+            target = "amms::aerodrome_slipstream::init_batch",
+            total = structural_total,
+            valid = valid_amms.len(),
+            invalid = structurally_invalid.len() + dust_amms.len(),
+            "Batch initialization complete"
+        );
+
         Ok(valid_amms)
+    }
+
+    pub async fn sync_all_pools<N, P>(
+        mut amms: Vec<AMM>,
+        block_number: BlockId,
+        provider: P,
+    ) -> Result<Vec<AMM>, AMMError>
+    where
+        N: Network,
+        P: Provider<N> + Clone,
+    {
+        use crate::amms::uniswap_v3::GetUniswapV3PoolStaticMetaBatchRequest;
+
+        // Slipstream fee is dynamic; refresh it at the target block so sync snapshots stay accurate
+        // even if fee events were missed.
+        let pool_addresses: Vec<Address> = amms.iter().map(|p| p.address()).collect();
+        if !pool_addresses.is_empty() {
+            let mut fee_map: HashMap<Address, u32> = HashMap::new();
+            let step = 150;
+            for chunk in pool_addresses.chunks(step) {
+                let chunk_addrs = chunk.to_vec();
+                let call_result = GetUniswapV3PoolStaticMetaBatchRequest::deploy_builder(
+                    provider.clone(),
+                    chunk_addrs.clone(),
+                )
+                .call_raw()
+                .block(block_number)
+                .await;
+
+                let Ok(return_data) = call_result else {
+                    tracing::warn!(
+                        target = "amms::aerodrome_slipstream::sync",
+                        "Batch static meta call failed while refreshing slipstream fee; skipping chunk"
+                    );
+                    continue;
+                };
+
+                let decoded =
+                    <Vec<(Address, Address, i32, u32)> as SolValue>::abi_decode(&return_data);
+                let Ok(meta) = decoded else {
+                    tracing::warn!(
+                        target = "amms::aerodrome_slipstream::sync",
+                        return_data_len = return_data.len(),
+                        "Failed to decode static meta while refreshing slipstream fee; skipping chunk"
+                    );
+                    continue;
+                };
+
+                for ((_, _, _, fee), pool_addr) in meta.iter().zip(chunk_addrs.iter()) {
+                    fee_map.insert(*pool_addr, *fee);
+                }
+
+                sleep(Duration::from_millis(500)).await;
+            }
+
+            for amm in amms.iter_mut() {
+                let AMM::AerodromeSlipstreamPool(pool) = amm else {
+                    continue;
+                };
+                if let Some(fee) = fee_map.get(&pool.address).copied() {
+                    pool.fee = fee;
+                }
+            }
+        }
+
+        Self::sync_slot_0(&mut amms, block_number, provider.clone()).await?;
+        sleep(Duration::from_millis(500)).await;
+
+        for amm in amms.iter_mut() {
+            let AMM::AerodromeSlipstreamPool(pool) = amm else {
+                continue;
+            };
+            pool.tick_bitmap.clear();
+            pool.ticks.clear();
+        }
+
+        let pools_step = 50;
+        for group in amms.chunks_mut(pools_step) {
+            Self::sync_tick_bitmaps(group, block_number, provider.clone()).await?;
+            sleep(Duration::from_millis(500)).await;
+            Self::sync_tick_data(group, block_number, provider.clone()).await?;
+            sleep(Duration::from_millis(500)).await;
+        }
+
+        for amm in amms.iter_mut() {
+            let AMM::AerodromeSlipstreamPool(pool) = amm else {
+                continue;
+            };
+            match pool.calculate_price(pool.token_a.address, pool.token_b.address) {
+                Ok(price) => {
+                    pool.token_a_price = price;
+                    pool.token_b_price = if price != 0.0 { 1.0 / price } else { 0.0 };
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target = "amms::aerodrome_slipstream::sync",
+                        address = ?pool.address,
+                        error = ?e,
+                        "Failed to refresh Slipstream spot prices; keeping previous values"
+                    );
+                }
+            }
+        }
+
+        Ok(amms)
     }
 }
 

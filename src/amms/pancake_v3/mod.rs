@@ -310,6 +310,11 @@ impl AutomatedMarketMaker for PancakeV3Pool {
             u128::MAX.isqrt()
         };
 
+        // Fast path: active in-range liquidity already meets the threshold.
+        if self.liquidity >= l_thresh {
+            return true;
+        }
+
         // Efficient O(1) best-case check for any tick containing enough liquidity
         self.ticks
             .values()
@@ -1168,12 +1173,11 @@ impl PancakeV3Factory {
         PancakeV3Factory::sync_token_decimals_safe(&mut pancake_pools, provider.clone()).await?;
         sleep(Duration::from_millis(500)).await;
 
-        // 5) Filter invalid pools
-        let (valid_pools, invalid_pools): (Vec<_>, Vec<_>) =
+        // 5) Filter structurally invalid pools
+        let (structurally_valid, structurally_invalid): (Vec<_>, Vec<_>) =
             pancake_pools.par_drain(..).partition(|pool| match pool {
                 AMM::PancakeV3Pool(pv3_pool) => {
-                    pv3_pool.liquidity > 0
-                        && pv3_pool.tick_spacing != 0
+                    pv3_pool.tick_spacing != 0
                         && !pv3_pool.token_a.address.is_zero()
                         && !pv3_pool.token_b.address.is_zero()
                         && pv3_pool.token_a.decimals > 0
@@ -1182,8 +1186,56 @@ impl PancakeV3Factory {
                 _ => false,
             });
 
-        // Init spot prices for valid pools
-        let mut pools = valid_pools;
+        if !structurally_invalid.is_empty() {
+            for pool in &structurally_invalid {
+                if let AMM::PancakeV3Pool(pv3_pool) = pool {
+                    info!(
+                        target: "amms::pancake_v3::init_batch",
+                        address = ?pv3_pool.address,
+                        tick_spacing = ?pv3_pool.tick_spacing,
+                        token_a = ?pv3_pool.token_a.address,
+                        token_b = ?pv3_pool.token_b.address,
+                        token_a_decimals = ?pv3_pool.token_a.decimals,
+                        token_b_decimals = ?pv3_pool.token_b.decimals,
+                        "Filtering out structurally invalid Pancake V3 pool"
+                    );
+                }
+            }
+        }
+        let mut pools = structurally_valid;
+
+        // 6) Sync tick bitmaps and tick data (chunked to reduce RPC pressure)
+        let pools_step = 50;
+        for group in pools.chunks_mut(pools_step) {
+            PancakeV3Factory::sync_tick_bitmaps(group, block_number, provider.clone()).await?;
+            sleep(Duration::from_millis(500)).await;
+            PancakeV3Factory::sync_tick_data(group, block_number, provider.clone()).await?;
+            sleep(Duration::from_millis(500)).await;
+        }
+
+        // 7) Filter out dust pools using tick-aware + active-liquidity-aware heuristic
+        let (liquid_pools, dust_pools): (Vec<_>, Vec<_>) =
+            pools.par_drain(..).partition(|pool| match pool {
+                AMM::PancakeV3Pool(pv3_pool) => pv3_pool.has_sufficient_liquidity(),
+                _ => false,
+            });
+
+        if !dust_pools.is_empty() {
+            for pool in &dust_pools {
+                if let AMM::PancakeV3Pool(pv3_pool) = pool {
+                    info!(
+                        target: "amms::pancake_v3::init_batch",
+                        address = ?pv3_pool.address,
+                        liquidity = ?pv3_pool.liquidity,
+                        ticks = pv3_pool.ticks.len(),
+                        "Filtering out dust Pancake V3 pool by has_sufficient_liquidity"
+                    );
+                }
+            }
+        }
+
+        // 8) Init spot prices for retained pools
+        let mut pools = liquid_pools;
         for amm in pools.iter_mut() {
             if let AMM::PancakeV3Pool(p) = amm {
                 if let Ok(price) = p.calculate_price(p.token_a.address, p.token_b.address) {
@@ -1197,35 +1249,8 @@ impl PancakeV3Factory {
             }
         }
 
-        if !invalid_pools.is_empty() {
-            for pool in &invalid_pools {
-                if let AMM::PancakeV3Pool(pv3_pool) = pool {
-                    info!(
-                        target: "amms::pancake_v3::init_batch",
-                        address = ?pv3_pool.address,
-                        liquidity = ?pv3_pool.liquidity,
-                        tick_spacing = ?pv3_pool.tick_spacing,
-                        token_a = ?pv3_pool.token_a.address,
-                        token_b = ?pv3_pool.token_b.address,
-                        token_a_decimals = ?pv3_pool.token_a.decimals,
-                        token_b_decimals = ?pv3_pool.token_b.decimals,
-                        "Filtering out Pancake V3 pool"
-                    );
-                }
-            }
-        }
-
-        // 6) Sync tick bitmaps and tick data (chunked to reduce RPC pressure)
-        let pools_step = 50;
-        for group in pools.chunks_mut(pools_step) {
-            PancakeV3Factory::sync_tick_bitmaps(group, block_number, provider.clone()).await?;
-            sleep(Duration::from_millis(500)).await;
-            PancakeV3Factory::sync_tick_data(group, block_number, provider.clone()).await?;
-            sleep(Duration::from_millis(500)).await;
-        }
-
         let valid = pools.len();
-        let invalid = invalid_pools.len();
+        let invalid = structurally_invalid.len() + dust_pools.len();
         info!(
             target: "amms::pancake_v3::init_batch",
             total = total,
@@ -1255,36 +1280,7 @@ impl PancakeV3Factory {
         // 2. Sync slot0 and liquidity using PancakeV3 compatible calls
         PancakeV3Factory::sync_slot_0(&mut pancake_pools, block_number, provider.clone()).await?;
 
-        // 3. Filter invalid pools
-        let (valid_pools, invalid_pools): (Vec<_>, Vec<_>) =
-            pancake_pools.par_drain(..).partition(|pool| match pool {
-                AMM::PancakeV3Pool(pv3_pool) => {
-                    pv3_pool.liquidity > 0
-                        && pv3_pool.token_a.decimals > 0
-                        && pv3_pool.token_b.decimals > 0
-                        && pv3_pool.tick_spacing > 0
-                }
-                _ => false,
-            });
-
-        let mut pools = valid_pools;
-
-        // Log dropped pools if any
-        if !invalid_pools.is_empty() {
-            for pool in &invalid_pools {
-                if let AMM::PancakeV3Pool(pv3_pool) = pool {
-                    tracing::debug!(
-                        target: "amms::pancake_v3::sync",
-                        address = ?pv3_pool.address,
-                        liquidity = ?pv3_pool.liquidity,
-                        token_a_decimals = ?pv3_pool.token_a.decimals,
-                        token_b_decimals = ?pv3_pool.token_b.decimals,
-                        tick_spacing = ?pv3_pool.tick_spacing,
-                        "Filtering out Pancake V3 pool"
-                    );
-                }
-            }
-        }
+        let mut pools = pancake_pools;
 
         // 4. Clear stale tick data before re-syncing to avoid residual entries
         for amm in pools.iter_mut() {
@@ -1307,12 +1303,22 @@ impl PancakeV3Factory {
         // 6. Recalculate spot prices after full re-sync
         for amm in pools.iter_mut() {
             if let AMM::PancakeV3Pool(p) = amm {
-                if let Ok(price) = p.calculate_price(p.token_a.address, p.token_b.address) {
-                    p.token_a_price = price;
-                    if price != 0.0 {
-                        p.token_b_price = 1.0 / price;
-                    } else {
-                        p.token_b_price = 0.0;
+                match p.calculate_price(p.token_a.address, p.token_b.address) {
+                    Ok(price) => {
+                        p.token_a_price = price;
+                        if price != 0.0 {
+                            p.token_b_price = 1.0 / price;
+                        } else {
+                            p.token_b_price = 0.0;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "amms::pancake_v3::sync",
+                            address = ?p.address,
+                            error = ?e,
+                            "Failed to refresh Pancake V3 spot prices; keeping previous values"
+                        );
                     }
                 }
             }

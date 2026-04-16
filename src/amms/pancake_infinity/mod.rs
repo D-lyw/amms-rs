@@ -192,6 +192,11 @@ impl AutomatedMarketMaker for PancakeInfinityPool {
             u128::MAX.isqrt()
         };
 
+        // Fast path: active in-range liquidity already meets the threshold.
+        if self.liquidity >= l_thresh {
+            return true;
+        }
+
         // Efficient O(1) best-case check for any tick containing enough liquidity
         self.ticks
             .values()

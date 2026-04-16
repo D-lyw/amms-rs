@@ -176,7 +176,6 @@ impl UniswapV4Factory {
                             manager = ?manager_address,
                             "Missing slot0 data for pool"
                         );
-                        pool.tick_spacing = 0;
                         continue;
                     }
                 };
@@ -189,21 +188,17 @@ impl UniswapV4Factory {
                             manager = ?manager_address,
                             "Missing liquidity data for pool"
                         );
-                        pool.tick_spacing = 0;
                         continue;
                     }
                 };
 
-                if slot0_data.is_zero() || liquidity_data.is_zero() {
+                if slot0_data.is_zero() {
                     warn!(
                         target: "amms::uniswap_v4::sync_slot_0",
                         pool_id = ?pool.pool_id,
                         manager = ?manager_address,
-                        slot0_zero = slot0_data.is_zero(),
-                        liquidity_zero = liquidity_data.is_zero(),
-                        "Pool has zero slot data"
+                        "Pool has zero slot0 data"
                     );
-                    pool.tick_spacing = 0;
                     continue;
                 }
 
@@ -220,6 +215,15 @@ impl UniswapV4Factory {
                 let lp_fee_bytes =
                     unsafe { (slot0_data.as_ptr().add(3) as *const [u8; 3]).read_unaligned() };
                 let lp_fee = alloy::primitives::aliases::U24::from_be_bytes(lp_fee_bytes);
+
+                if liquidity_data.is_zero() {
+                    info!(
+                        target: "amms::uniswap_v4::sync_slot_0",
+                        pool_id = ?pool.pool_id,
+                        manager = ?manager_address,
+                        "Pool active liquidity is zero at current tick; keeping pool tracked"
+                    );
+                }
 
                 let liquidity = u128::from_be_bytes(liquidity_data[16..32].try_into().unwrap());
 
@@ -488,16 +492,16 @@ impl UniswapV4Factory {
         Self::sync_slot_0(&mut pools, block_number, provider.clone()).await?;
         Self::sync_token_decimals(&mut pools, provider.clone()).await?;
 
-        let (valid_pools, invalid_pools): (Vec<_>, Vec<_>) =
+        let (structurally_valid, structurally_invalid): (Vec<_>, Vec<_>) =
             pools.into_par_iter().partition(|pool| {
                 pool.tick_spacing != 0
-                    && !(pool.token_a.address.is_zero() && pool.token_b.address.is_zero())
+                    && !pool.token_a.address.is_zero()
+                    && !pool.token_b.address.is_zero()
                     && pool.token_a.decimals > 0
                     && pool.token_b.decimals > 0
             });
 
-        let invalid = invalid_pools.len();
-        for pool in &invalid_pools {
+        for pool in &structurally_invalid {
             warn!(
                 target: "amms::uniswap_v4::init_batch",
                 pool_id = ?pool.pool_id,
@@ -509,10 +513,26 @@ impl UniswapV4Factory {
                 "Filtering out invalid V4 pool"
             );
         }
-        let mut pools = valid_pools;
+        let mut pools = structurally_valid;
 
         Self::sync_tick_bitmap(&mut pools, block_number, provider.clone()).await?;
         Self::sync_tick_data(&mut pools, block_number, provider.clone()).await?;
+
+        let (liquid_pools, dust_pools): (Vec<_>, Vec<_>) = pools
+            .into_par_iter()
+            .partition(|pool| pool.has_sufficient_liquidity());
+
+        for pool in &dust_pools {
+            info!(
+                target: "amms::uniswap_v4::init_batch",
+                pool_id = ?pool.pool_id,
+                liquidity = pool.liquidity,
+                ticks = pool.ticks.len(),
+                "Filtering out dust V4 pool by has_sufficient_liquidity"
+            );
+        }
+
+        let mut pools = liquid_pools;
 
         for pool in pools.iter_mut() {
             pool.token_a_price =
@@ -521,6 +541,7 @@ impl UniswapV4Factory {
                 pool.calculate_price(pool.token_b.address, pool.token_a.address)?;
         }
 
+        let invalid = structurally_invalid.len() + dust_pools.len();
         let valid = pools.len();
         info!(
             target: "amms::uniswap_v4::init_batch",
@@ -554,26 +575,6 @@ impl UniswapV4Factory {
             .collect();
 
         Self::sync_slot_0(&mut pools, block_number, provider.clone()).await?;
-        let (valid_pools, invalid_pools): (Vec<_>, Vec<_>) =
-            pools.into_par_iter().partition(|pool| {
-                pool.tick_spacing != 0
-                    && !(pool.token_a.address.is_zero() && pool.token_b.address.is_zero())
-            });
-
-        if !invalid_pools.is_empty() {
-            for pool in &invalid_pools {
-                info!(
-                    target: "amms::uniswap_v4::sync",
-                    pool_id = ?pool.pool_id,
-                    liquidity = ?pool.liquidity,
-                    tick_spacing = ?pool.tick_spacing,
-                    token_a = ?pool.token_a.address,
-                    token_b = ?pool.token_b.address,
-                    "Filtering out V4 pool"
-                );
-            }
-        }
-        let mut pools = valid_pools;
 
         // Clear previous tick data to prevent stale data buildup
         for pool in pools.iter_mut() {
@@ -585,10 +586,28 @@ impl UniswapV4Factory {
         Self::sync_tick_data(&mut pools, block_number, provider.clone()).await?;
 
         for pool in pools.iter_mut() {
-            pool.token_a_price =
-                pool.calculate_price(pool.token_a.address, pool.token_b.address)?;
-            pool.token_b_price =
-                pool.calculate_price(pool.token_b.address, pool.token_a.address)?;
+            match pool.calculate_price(pool.token_a.address, pool.token_b.address) {
+                Ok(p) => pool.token_a_price = p,
+                Err(e) => {
+                    warn!(
+                        target: "amms::uniswap_v4::sync",
+                        pool_id = ?pool.pool_id,
+                        error = ?e,
+                        "Failed to refresh token_a_price; keeping previous value"
+                    );
+                }
+            }
+            match pool.calculate_price(pool.token_b.address, pool.token_a.address) {
+                Ok(p) => pool.token_b_price = p,
+                Err(e) => {
+                    warn!(
+                        target: "amms::uniswap_v4::sync",
+                        pool_id = ?pool.pool_id,
+                        error = ?e,
+                        "Failed to refresh token_b_price; keeping previous value"
+                    );
+                }
+            }
         }
 
         Ok(pools.into_iter().map(AMM::UniswapV4Pool).collect())

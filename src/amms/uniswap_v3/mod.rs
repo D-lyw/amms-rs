@@ -933,6 +933,11 @@ impl AutomatedMarketMaker for UniswapV3Pool {
             u128::MAX.isqrt()
         };
 
+        // Fast path: active in-range liquidity already meets the threshold.
+        if self.liquidity >= l_thresh {
+            return true;
+        }
+
         // Efficient O(1) best-case check for any tick containing enough liquidity
         self.ticks
             .values()
@@ -1290,13 +1295,11 @@ impl UniswapV3Factory {
         UniswapV3Factory::sync_token_decimals(&mut pools, provider.clone()).await?;
         sleep(Duration::from_millis(500)).await;
 
-        // 5) Filter invalid pools AFTER slot0 + decimals are populated
-        // AND Initialize spot prices for valid pools
-        let (valid_pools, invalid_pools): (Vec<_>, Vec<_>) =
+        // 5) Filter structurally invalid pools AFTER slot0 + decimals are populated
+        let (structurally_valid, structurally_invalid): (Vec<_>, Vec<_>) =
             pools.par_drain(..).partition(|pool| match pool {
                 AMM::UniswapV3Pool(uv3_pool) => {
-                    uv3_pool.liquidity > 0
-                        && uv3_pool.tick_spacing != 0
+                    uv3_pool.tick_spacing != 0
                         && !uv3_pool.token_a.address.is_zero()
                         && !uv3_pool.token_b.address.is_zero()
                         && uv3_pool.token_a.decimals > 0
@@ -1305,9 +1308,57 @@ impl UniswapV3Factory {
                 _ => false,
             });
 
-        // Mutate valid pools to set initial prices
-        let mut valid_pools_mut = valid_pools;
-        for amm in valid_pools_mut.iter_mut() {
+        if !structurally_invalid.is_empty() {
+            for pool in &structurally_invalid {
+                if let AMM::UniswapV3Pool(uv3_pool) = pool {
+                    info!(
+                        target: "amms::uniswap_v3::init_batch",
+                        address = ?uv3_pool.address,
+                        tick_spacing = ?uv3_pool.tick_spacing,
+                        token_a = ?uv3_pool.token_a.address,
+                        token_b = ?uv3_pool.token_b.address,
+                        token_a_decimals = ?uv3_pool.token_a.decimals,
+                        token_b_decimals = ?uv3_pool.token_b.decimals,
+                        "Filtering out structurally invalid V3 pool"
+                    );
+                }
+            }
+        }
+        pools = structurally_valid;
+
+        // 6) Batch sync tick bitmaps and tick data (chunked to reduce RPC pressure)
+        let pools_step = 50;
+        for group in pools.chunks_mut(pools_step) {
+            UniswapV3Factory::sync_tick_bitmaps(group, block_number, provider.clone()).await?;
+            sleep(Duration::from_millis(500)).await;
+            UniswapV3Factory::sync_tick_data(group, block_number, provider.clone()).await?;
+            sleep(Duration::from_millis(500)).await;
+        }
+
+        // 7) Filter out dust pools using tick-aware + active-liquidity-aware heuristic
+        let (liquid_pools, dust_pools): (Vec<_>, Vec<_>) =
+            pools.par_drain(..).partition(|pool| match pool {
+                AMM::UniswapV3Pool(uv3_pool) => uv3_pool.has_sufficient_liquidity(),
+                _ => false,
+            });
+
+        if !dust_pools.is_empty() {
+            for pool in &dust_pools {
+                if let AMM::UniswapV3Pool(uv3_pool) = pool {
+                    info!(
+                        target: "amms::uniswap_v3::init_batch",
+                        address = ?uv3_pool.address,
+                        liquidity = ?uv3_pool.liquidity,
+                        ticks = uv3_pool.ticks.len(),
+                        "Filtering out dust V3 pool by has_sufficient_liquidity"
+                    );
+                }
+            }
+        }
+
+        // 8) Initialize spot prices for retained pools
+        let mut pools = liquid_pools;
+        for amm in pools.iter_mut() {
             if let AMM::UniswapV3Pool(p) = amm {
                 if let Ok(price) = p.calculate_price(p.token_a.address, p.token_b.address) {
                     p.token_a_price = price;
@@ -1319,38 +1370,9 @@ impl UniswapV3Factory {
                 }
             }
         }
-        let valid_pools = valid_pools_mut;
-
-        if !invalid_pools.is_empty() {
-            for pool in &invalid_pools {
-                if let AMM::UniswapV3Pool(uv3_pool) = pool {
-                    info!(
-                        target: "amms::uniswap_v3::init_batch",
-                        address = ?uv3_pool.address,
-                        liquidity = ?uv3_pool.liquidity,
-                        tick_spacing = ?uv3_pool.tick_spacing,
-                        token_a = ?uv3_pool.token_a.address,
-                        token_b = ?uv3_pool.token_b.address,
-                        token_a_decimals = ?uv3_pool.token_a.decimals,
-                        token_b_decimals = ?uv3_pool.token_b.decimals,
-                        "Filtering out V3 pool"
-                    );
-                }
-            }
-        }
-        pools = valid_pools;
-
-        // 6) Batch sync tick bitmaps and tick data (chunked to reduce RPC pressure)
-        let pools_step = 50;
-        for group in pools.chunks_mut(pools_step) {
-            UniswapV3Factory::sync_tick_bitmaps(group, block_number, provider.clone()).await?;
-            sleep(Duration::from_millis(500)).await;
-            UniswapV3Factory::sync_tick_data(group, block_number, provider.clone()).await?;
-            sleep(Duration::from_millis(500)).await;
-        }
 
         let valid = pools.len();
-        let invalid = invalid_pools.len();
+        let invalid = structurally_invalid.len() + dust_pools.len();
         info!(
             target: "amms::uniswap_v3::init_batch",
             total = total,
@@ -1373,34 +1395,6 @@ impl UniswapV3Factory {
     {
         UniswapV3Factory::sync_slot_0(&mut pools, block_number, provider.clone()).await?;
 
-        let (valid_pools, invalid_pools): (Vec<_>, Vec<_>) =
-            pools.par_drain(..).partition(|pool| match pool {
-                AMM::UniswapV3Pool(uv3_pool) => {
-                    uv3_pool.liquidity > 0
-                        && uv3_pool.tick_spacing != 0
-                        && !uv3_pool.token_a.address.is_zero()
-                        && !uv3_pool.token_b.address.is_zero()
-                }
-                _ => false,
-            });
-
-        if !invalid_pools.is_empty() {
-            for pool in &invalid_pools {
-                if let AMM::UniswapV3Pool(uv3_pool) = pool {
-                    info!(
-                        target: "amms::uniswap_v3::sync",
-                        address = ?uv3_pool.address,
-                        liquidity = ?uv3_pool.liquidity,
-                        tick_spacing = ?uv3_pool.tick_spacing,
-                        token_a = ?uv3_pool.token_a.address,
-                        token_b = ?uv3_pool.token_b.address,
-                        "Filtering out V3 pool"
-                    );
-                }
-            }
-        }
-        pools = valid_pools;
-
         // Clear previous tick data to prevent stale data buildup
         for pool in pools.iter_mut() {
             if let AMM::UniswapV3Pool(uv3_pool) = pool {
@@ -1420,11 +1414,19 @@ impl UniswapV3Factory {
         // Recalculate cached spot prices
         for pool in pools.iter_mut() {
             if let AMM::UniswapV3Pool(uv3_pool) = pool {
-                if let Ok(price) =
-                    uv3_pool.calculate_price(uv3_pool.token_a.address, uv3_pool.token_b.address)
-                {
-                    uv3_pool.token_a_price = price;
-                    uv3_pool.token_b_price = if price != 0.0 { 1.0 / price } else { 0.0 };
+                match uv3_pool.calculate_price(uv3_pool.token_a.address, uv3_pool.token_b.address) {
+                    Ok(price) => {
+                        uv3_pool.token_a_price = price;
+                        uv3_pool.token_b_price = if price != 0.0 { 1.0 / price } else { 0.0 };
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "amms::uniswap_v3::sync",
+                            address = ?uv3_pool.address,
+                            error = ?e,
+                            "Failed to refresh V3 spot prices; keeping previous values"
+                        );
+                    }
                 }
             }
         }

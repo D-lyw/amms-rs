@@ -1,15 +1,15 @@
 use std::sync::Arc;
 
 use alloy::{
+    eips::BlockId,
     primitives::address,
-    providers::ProviderBuilder,
+    providers::{Provider, ProviderBuilder},
     rpc::client::ClientBuilder,
     transports::layers::{RetryBackoffLayer, ThrottleLayer},
 };
 use amms::{
-    amms::{
-        aerodrome_slipstream::AerodromeSlipstreamPool, aerodrome_v2::AerodromeV2Pool, amm::AMM,
-    },
+    amms::amm::{AutomatedMarketMaker, Variant},
+    amms::{aerodrome_slipstream::AerodromeSlipstreamPool, aerodrome_v2::AerodromeV2Pool, amm::AMM},
     state_space::StateSpaceBuilder,
 };
 
@@ -126,6 +126,68 @@ async fn main() -> eyre::Result<()> {
     tracing::info!("========== SUMMARY ==========");
     tracing::info!("AerodromeSlipstream synced: {}/19", slipstream_count);
     tracing::info!("AerodromeV2 synced: {}/8", v2_count);
+
+    // Additional regression checks for Slipstream:
+    // 1) bidirectional swap simulation (ExactIn/ExactOut)
+    // 2) sync_all_pools result consistency vs init() at the same block
+    let sample_pool = state_space.state.values().find_map(|amm| match amm {
+        AMM::AerodromeSlipstreamPool(pool) => Some(pool.clone()),
+        _ => None,
+    });
+
+    if let Some(pool) = sample_pool {
+        let amount_in = alloy::primitives::U256::from(1_000_000u64);
+        let amount_out_target = alloy::primitives::U256::from(1_000u64);
+
+        let exact_in_a_to_b = pool.simulate_swap(pool.token_a.address, pool.token_b.address, amount_in);
+        let exact_in_b_to_a = pool.simulate_swap(pool.token_b.address, pool.token_a.address, amount_in);
+        let exact_out_a_to_b =
+            pool.simulate_swap_exact_out(pool.token_a.address, pool.token_b.address, amount_out_target);
+        let exact_out_b_to_a =
+            pool.simulate_swap_exact_out(pool.token_b.address, pool.token_a.address, amount_out_target);
+
+        tracing::info!(
+            "Slipstream sample pool={} exact_in_a_to_b={:?} exact_in_b_to_a={:?} exact_out_a_to_b={:?} exact_out_b_to_a={:?}",
+            pool.address, exact_in_a_to_b, exact_in_b_to_a, exact_out_a_to_b, exact_out_b_to_a
+        );
+
+        let latest_block = provider.get_block_number().await?;
+        let block_id = BlockId::from(latest_block);
+        let synced_vec = Variant::AerodromeSlipstreamPool
+            .sync_all_pools::<alloy::network::Ethereum, _>(
+                vec![AMM::AerodromeSlipstreamPool(pool.clone())],
+                block_id,
+                provider.clone(),
+            )
+            .await?;
+        let synced = match synced_vec.into_iter().next() {
+            Some(AMM::AerodromeSlipstreamPool(p)) => p,
+            _ => return Err(eyre::eyre!("sync_all_pools returned unexpected pool type")),
+        };
+
+        let inited = pool
+            .clone()
+            .init::<alloy::network::Ethereum, _>(block_id, provider.clone())
+            .await?;
+
+        let consistent = synced.sqrt_price == inited.sqrt_price
+            && synced.tick == inited.tick
+            && synced.liquidity == inited.liquidity
+            && synced.fee == inited.fee;
+
+        tracing::info!(
+            "Slipstream sync_all consistency: block={} pool={} consistent={} synced(fee={},tick={},liq={}) init(fee={},tick={},liq={})",
+            latest_block,
+            synced.address,
+            consistent,
+            synced.fee,
+            synced.tick,
+            synced.liquidity,
+            inited.fee,
+            inited.tick,
+            inited.liquidity
+        );
+    }
 
     Ok(())
 }

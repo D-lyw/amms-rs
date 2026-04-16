@@ -206,7 +206,7 @@ impl Variant {
                 AerodromeV2Factory::sync_all_pools::<N, _>(amms, to_block, provider).await
             }
             Variant::AerodromeSlipstreamPool => {
-                AerodromeSlipstreamFactory::init_batch::<N, _>(amms, to_block, provider).await
+                AerodromeSlipstreamFactory::sync_all_pools::<N, _>(amms, to_block, provider).await
             }
             Variant::SkyConverter => {
                 SkyConverter::init_batch::<N, _>(amms, to_block, provider).await

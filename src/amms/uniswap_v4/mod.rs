@@ -660,7 +660,14 @@ impl AutomatedMarketMaker for UniswapV4Pool {
             u128::MAX.isqrt()
         };
 
-        // Efficient O(1) best-case check for any tick containing enough liquidity
+        // Fast path: active liquidity already satisfies threshold.
+        // This avoids false negatives when tick data is temporarily incomplete.
+        if self.liquidity >= l_thresh {
+            return true;
+        }
+
+        // Fallback: accept pools that have enough liquidity on initialized ticks
+        // even if current active liquidity is zero (out-of-range / imbalanced pools).
         self.ticks
             .values()
             .any(|info| info.liquidity_gross >= l_thresh)
