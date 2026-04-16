@@ -19,14 +19,12 @@ use crate::state_space::hooks::HookRegistry;
 use crate::state_space::hooks::SnapshotConfig;
 use crate::state_space::hooks::StateHook;
 
-use alloy::consensus::BlockHeader;
 use alloy::eips::BlockId;
-use alloy::network::primitives::HeaderResponse;
 use alloy::network::Network;
 
-use alloy::primitives::{Address, Bloom, BloomInput, FixedBytes};
+use alloy::primitives::{Address, Bloom, BloomInput, Bytes, FixedBytes, LogData, B256};
 use alloy::providers::Provider;
-use alloy::rpc::types::{eth::Log, Block, Filter, FilterSet};
+use alloy::rpc::types::{eth::Log, Filter, FilterSet};
 use alloy::sol;
 use alloy::sol_types::SolEvent;
 use async_stream::stream;
@@ -37,21 +35,33 @@ use error::StateSpaceError;
 use filters::AMMFilter;
 use filters::PoolFilter;
 use futures::stream::FuturesUnordered;
-use futures::Stream;
-use futures::StreamExt;
-use std::collections::HashSet;
+use futures::{SinkExt, Stream, StreamExt};
+use serde::Deserialize;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Debug;
+use std::io::Read;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::str::FromStr;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::{collections::HashMap, future::Future, marker::PhantomData, sync::Arc};
-use tokio::sync::RwLock;
+use std::time::Instant;
+use std::{future::Future, marker::PhantomData, sync::Arc};
+use tokio::sync::{mpsc, RwLock};
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
 use tokio::time::{sleep, Duration};
 use tracing::{error, info, warn};
 
 pub const CACHE_SIZE: usize = 100;
+
+#[derive(Clone, Debug, Default)]
+pub enum RealtimeSyncSource {
+    #[default]
+    Auto,
+    WsLogs,
+    BaseFlashblocksRaw,
+}
 
 #[derive(Clone)]
 pub struct StateSpaceManager<N, P> {
@@ -59,6 +69,7 @@ pub struct StateSpaceManager<N, P> {
     pub block_filter: Filter,
     pub provider: P,
     pub latest_block: Arc<AtomicU64>,
+    realtime_source: RealtimeSyncSource,
     hooks: HookRegistry<Vec<Address>>,
     phantom: PhantomData<N>,
 }
@@ -67,6 +78,13 @@ const LOG_ADDRESS_CHUNK_SIZE: usize = 200;
 const BASE_CHAIN_ID: u64 = 8453;
 const ARBITRUM_CHAIN_ID: u64 = 42161;
 const ETHEREUM_MAINNET_CHAIN_ID: u64 = 1;
+const BASE_FLASHBLOCKS_RAW_WS_URL: &str = "wss://mainnet.flashblocks.base.org/ws";
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const STREAM_RECONNECT_DELAY: Duration = Duration::from_secs(2);
+const FLASHBLOCKS_DEDUP_PAYLOAD_WINDOW: usize = 4;
+const FLASHBLOCKS_HEX_CACHE_MAX: usize = 8192;
+const FLASHBLOCKS_PERF_LOG_EVERY_MESSAGES: u64 = 200;
+const FLASHBLOCKS_PERF_MAX_SAMPLES: usize = 200_000;
 
 sol! {
     #[derive(Debug)]
@@ -89,7 +107,7 @@ struct LogQueryChunk {
 }
 
 impl LogQueryChunk {
-    fn filter(&self, from_block: u64, to_block: u64) -> Filter {
+    fn ranged_filter(&self, from_block: u64, to_block: u64) -> Filter {
         let mut filter = Filter::new()
             .address(self.addresses.clone())
             .from_block(from_block)
@@ -103,6 +121,350 @@ impl LogQueryChunk {
 
         filter
     }
+
+    fn subscription_filter(&self) -> Filter {
+        let mut filter = Filter::new().address(self.addresses.clone());
+
+        if let QueryMode::TopicFiltered(topics) = &self.mode {
+            if !topics.is_empty() {
+                filter = filter.event_signature(topics.clone());
+            }
+        }
+
+        filter
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RawLogMatcher {
+    topic_addresses: HashSet<Address>,
+    topic_signatures: HashSet<FixedBytes<32>>,
+    address_only_addresses: HashSet<Address>,
+}
+
+impl RawLogMatcher {
+    fn from_query_chunks(chunks: &[LogQueryChunk]) -> Self {
+        let mut topic_addresses = HashSet::new();
+        let mut topic_signatures = HashSet::new();
+        let mut address_only_addresses = HashSet::new();
+
+        for chunk in chunks {
+            match &chunk.mode {
+                QueryMode::TopicFiltered(topics) => {
+                    for addr in &chunk.addresses {
+                        topic_addresses.insert(*addr);
+                    }
+                    for topic in topics {
+                        topic_signatures.insert(*topic);
+                    }
+                }
+                QueryMode::AddressOnly => {
+                    for addr in &chunk.addresses {
+                        address_only_addresses.insert(*addr);
+                    }
+                }
+            }
+        }
+
+        Self {
+            topic_addresses,
+            topic_signatures,
+            address_only_addresses,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct FlashblockMessage {
+    payload_id: String,
+    index: u64,
+    #[serde(default)]
+    base: Option<FlashblockBase>,
+    #[serde(default)]
+    metadata: Option<FlashblockMetadata>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FlashblockBase {
+    #[serde(default)]
+    block_number: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FlashblockMetadata {
+    #[serde(default)]
+    block_number: Option<u64>,
+    #[serde(default)]
+    receipts: HashMap<String, FlashblockReceipt>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FlashblockReceipt {
+    #[serde(default, rename = "transactionIndex")]
+    transaction_index: Option<String>,
+    #[serde(default)]
+    logs: Vec<FlashblockLog>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FlashblockLog {
+    address: String,
+    #[serde(default)]
+    topics: Vec<String>,
+    #[serde(default)]
+    data: String,
+}
+
+#[derive(Default)]
+struct FlashblockExtractStats {
+    decode_fail: usize,
+    total_logs: usize,
+    matched_logs: usize,
+}
+
+#[derive(Debug, Default)]
+struct FlashblocksParseCache {
+    address: HashMap<String, Address>,
+    topic: HashMap<String, B256>,
+}
+
+impl FlashblocksParseCache {
+    fn parse_address(&mut self, value: &str) -> Option<Address> {
+        if let Some(v) = self.address.get(value) {
+            return Some(*v);
+        }
+
+        let parsed = Address::from_str(value).ok()?;
+        if self.address.len() < FLASHBLOCKS_HEX_CACHE_MAX {
+            self.address.insert(value.to_string(), parsed);
+        }
+        Some(parsed)
+    }
+
+    fn parse_topic(&mut self, value: &str) -> Option<B256> {
+        if let Some(v) = self.topic.get(value) {
+            return Some(*v);
+        }
+
+        let parsed = B256::from_str(value).ok()?;
+        if self.topic.len() < FLASHBLOCKS_HEX_CACHE_MAX {
+            self.topic.insert(value.to_string(), parsed);
+        }
+        Some(parsed)
+    }
+}
+
+#[derive(Debug, Default)]
+struct FlashblocksPerfStats {
+    enabled: bool,
+    messages_total: u64,
+    messages_binary: u64,
+    messages_text: u64,
+    decode_fail_messages: u64,
+    log_decode_fail_total: u64,
+    raw_logs_total: u64,
+    matched_logs_total: u64,
+    sync_batches_total: u64,
+    affected_total: u64,
+    decode_ns_total: u128,
+    extract_ns_total: u128,
+    sync_ns_total: u128,
+    decode_ns_max: u128,
+    extract_ns_max: u128,
+    sync_ns_max: u128,
+    decode_samples_ns: Vec<u64>,
+    extract_samples_ns: Vec<u64>,
+    sync_samples_ns: Vec<u64>,
+}
+
+impl FlashblocksPerfStats {
+    fn from_env() -> Self {
+        Self {
+            enabled: std::env::var("AMMS_FLASHBLOCKS_PERF")
+                .ok()
+                .map(|v| {
+                    let lower = v.to_ascii_lowercase();
+                    lower == "1" || lower == "true" || lower == "yes" || lower == "on"
+                })
+                .unwrap_or(false),
+            ..Default::default()
+        }
+    }
+
+    fn on_message_kind(&mut self, is_binary: bool) {
+        if !self.enabled {
+            return;
+        }
+        self.messages_total += 1;
+        if is_binary {
+            self.messages_binary += 1;
+        } else {
+            self.messages_text += 1;
+        }
+    }
+
+    fn on_decode_stage(&mut self, elapsed_ns: u128, success: bool) {
+        if !self.enabled {
+            return;
+        }
+        self.decode_ns_total += elapsed_ns;
+        self.decode_ns_max = self.decode_ns_max.max(elapsed_ns);
+        if self.decode_samples_ns.len() < FLASHBLOCKS_PERF_MAX_SAMPLES {
+            self.decode_samples_ns.push(elapsed_ns as u64);
+        }
+        if !success {
+            self.decode_fail_messages += 1;
+        }
+    }
+
+    fn on_extract_stage(&mut self, elapsed_ns: u128, stats: &FlashblockExtractStats) {
+        if !self.enabled {
+            return;
+        }
+        self.extract_ns_total += elapsed_ns;
+        self.extract_ns_max = self.extract_ns_max.max(elapsed_ns);
+        if self.extract_samples_ns.len() < FLASHBLOCKS_PERF_MAX_SAMPLES {
+            self.extract_samples_ns.push(elapsed_ns as u64);
+        }
+        self.log_decode_fail_total += stats.decode_fail as u64;
+        self.raw_logs_total += stats.total_logs as u64;
+        self.matched_logs_total += stats.matched_logs as u64;
+    }
+
+    fn on_sync_stage(&mut self, elapsed_ns: u128, affected_count: usize) {
+        if !self.enabled {
+            return;
+        }
+        self.sync_ns_total += elapsed_ns;
+        self.sync_ns_max = self.sync_ns_max.max(elapsed_ns);
+        if self.sync_samples_ns.len() < FLASHBLOCKS_PERF_MAX_SAMPLES {
+            self.sync_samples_ns.push(elapsed_ns as u64);
+        }
+        self.sync_batches_total += 1;
+        self.affected_total += affected_count as u64;
+    }
+
+    fn percentile_ns(values: &[u64], p: f64) -> u64 {
+        if values.is_empty() {
+            return 0;
+        }
+        let mut sorted = values.to_vec();
+        sorted.sort_unstable();
+        let idx = ((sorted.len() - 1) as f64 * p).round() as usize;
+        sorted[idx]
+    }
+
+    fn maybe_log(&self) {
+        if !self.enabled {
+            return;
+        }
+
+        if self.messages_total == 0
+            || self.messages_total % FLASHBLOCKS_PERF_LOG_EVERY_MESSAGES != 0
+        {
+            return;
+        }
+
+        let decode_avg_us = self.decode_ns_total as f64 / self.messages_total as f64 / 1_000.0;
+        let extract_avg_us = self.extract_ns_total as f64 / self.messages_total as f64 / 1_000.0;
+        let sync_avg_us = if self.sync_batches_total > 0 {
+            self.sync_ns_total as f64 / self.sync_batches_total as f64 / 1_000.0
+        } else {
+            0.0
+        };
+        let decode_p50_us = Self::percentile_ns(&self.decode_samples_ns, 0.50) as f64 / 1_000.0;
+        let decode_p95_us = Self::percentile_ns(&self.decode_samples_ns, 0.95) as f64 / 1_000.0;
+        let extract_p50_us = Self::percentile_ns(&self.extract_samples_ns, 0.50) as f64 / 1_000.0;
+        let extract_p95_us = Self::percentile_ns(&self.extract_samples_ns, 0.95) as f64 / 1_000.0;
+        let sync_p50_us = Self::percentile_ns(&self.sync_samples_ns, 0.50) as f64 / 1_000.0;
+        let sync_p95_us = Self::percentile_ns(&self.sync_samples_ns, 0.95) as f64 / 1_000.0;
+
+        let stage_total = self.decode_ns_total + self.extract_ns_total + self.sync_ns_total;
+        let decode_share = if stage_total > 0 {
+            (self.decode_ns_total as f64 / stage_total as f64) * 100.0
+        } else {
+            0.0
+        };
+        let extract_share = if stage_total > 0 {
+            (self.extract_ns_total as f64 / stage_total as f64) * 100.0
+        } else {
+            0.0
+        };
+        let sync_share = if stage_total > 0 {
+            (self.sync_ns_total as f64 / stage_total as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        info!(
+            "Flashblocks perf: msgs={} (bin={}, text={}) decode_fail={} raw_logs={} matched_logs={} batches={} affected={} avg_us[decode={:.1}, extract={:.1}, sync={:.1}] p50_us[decode={:.1}, extract={:.1}, sync={:.1}] p95_us[decode={:.1}, extract={:.1}, sync={:.1}] max_us[decode={:.1}, extract={:.1}, sync={:.1}] stage_share[decode={:.1}%, extract={:.1}%, sync={:.1}%]",
+            self.messages_total,
+            self.messages_binary,
+            self.messages_text,
+            self.decode_fail_messages,
+            self.raw_logs_total,
+            self.matched_logs_total,
+            self.sync_batches_total,
+            self.affected_total,
+            decode_avg_us,
+            extract_avg_us,
+            sync_avg_us,
+            decode_p50_us,
+            extract_p50_us,
+            sync_p50_us,
+            decode_p95_us,
+            extract_p95_us,
+            sync_p95_us,
+            self.decode_ns_max as f64 / 1_000.0,
+            self.extract_ns_max as f64 / 1_000.0,
+            self.sync_ns_max as f64 / 1_000.0,
+            decode_share,
+            extract_share,
+            sync_share,
+        );
+    }
+}
+
+#[derive(Debug)]
+struct FlashblocksDedupCache {
+    per_payload: HashMap<String, HashSet<(u64, u64)>>,
+    order: VecDeque<String>,
+    max_payloads: usize,
+}
+
+impl FlashblocksDedupCache {
+    fn new(max_payloads: usize) -> Self {
+        Self {
+            per_payload: HashMap::new(),
+            order: VecDeque::new(),
+            max_payloads,
+        }
+    }
+
+    fn insert(&mut self, payload_id: &str, tx_index: u64, log_index: u64) -> bool {
+        if !self.per_payload.contains_key(payload_id) {
+            self.per_payload
+                .insert(payload_id.to_string(), HashSet::new());
+            self.order.push_back(payload_id.to_string());
+
+            while self.order.len() > self.max_payloads {
+                if let Some(evicted) = self.order.pop_front() {
+                    self.per_payload.remove(&evicted);
+                }
+            }
+        }
+
+        match self.per_payload.get_mut(payload_id) {
+            Some(seen) => seen.insert((tx_index, log_index)),
+            None => false,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum SelectedRealtimeSource {
+    WsLogs,
+    BaseFlashblocksRaw,
 }
 
 impl<N, P> StateSpaceManager<N, P> {
@@ -111,9 +473,9 @@ impl<N, P> StateSpaceManager<N, P> {
         self.hooks.register(hook).await
     }
 
-    /// Subscribes to AMM state changes via newHeads + eth_getLogs pull mode.
-    ///
-    /// Flow: newHeads(N) -> logsBloom prefilter -> eth_getLogs(block=N) -> sync
+    /// Subscribes to AMM state changes through a configurable realtime source:
+    /// - Base: Flashblocks infrastructure stream by default.
+    /// - Other chains: standard ws logs subscription.
     pub async fn subscribe(
         &self,
     ) -> Result<
@@ -122,197 +484,587 @@ impl<N, P> StateSpaceManager<N, P> {
     >
     where
         P: Provider<N> + Clone + 'static,
-        N: Network<BlockResponse = Block>,
+        N: Network,
     {
         let provider = self.provider.clone();
         let latest_block = self.latest_block.clone();
         let state = self.state.clone();
         let hooks = self.hooks.clone();
+        let realtime_source = self.realtime_source.clone();
 
         let chain_id = { state.read().await.chain_id };
         let query_chunks = Self::build_query_chunks(&provider, &state, chain_id).await;
 
-        info!(
-            "Starting newHeads + logsBloom + getLogs sync ({} query chunks)",
-            query_chunks.len()
-        );
+        let selected = Self::resolve_realtime_source(chain_id, &realtime_source);
 
-        Ok(Box::pin(stream! {
-            let mut last_hash: Option<FixedBytes<32>> = None;
+        match selected {
+            SelectedRealtimeSource::WsLogs => {
+                info!(
+                    "Starting wsLogs sync (chain_id={}, {} query chunks)",
+                    chain_id,
+                    query_chunks.len()
+                );
+                Ok(Box::pin(Self::subscribe_ws_logs_stream(
+                    provider,
+                    state,
+                    hooks,
+                    latest_block,
+                    query_chunks,
+                    chain_id,
+                )))
+            }
+            SelectedRealtimeSource::BaseFlashblocksRaw => {
+                info!(
+                    "Starting Flashblocks raw sync (chain_id={}, ws_url={}, {} query chunks)",
+                    chain_id,
+                    BASE_FLASHBLOCKS_RAW_WS_URL,
+                    query_chunks.len()
+                );
+                Ok(Box::pin(Self::subscribe_flashblocks_raw_stream(
+                    provider,
+                    state,
+                    hooks,
+                    latest_block,
+                    query_chunks,
+                    chain_id,
+                )))
+            }
+        }
+    }
 
+    fn resolve_realtime_source(
+        chain_id: u64,
+        source: &RealtimeSyncSource,
+    ) -> SelectedRealtimeSource {
+        match source {
+            RealtimeSyncSource::Auto => {
+                if chain_id == BASE_CHAIN_ID {
+                    SelectedRealtimeSource::BaseFlashblocksRaw
+                } else {
+                    SelectedRealtimeSource::WsLogs
+                }
+            }
+            RealtimeSyncSource::WsLogs => SelectedRealtimeSource::WsLogs,
+            RealtimeSyncSource::BaseFlashblocksRaw => SelectedRealtimeSource::BaseFlashblocksRaw,
+        }
+    }
+
+    async fn initial_backfill_results(
+        provider: &P,
+        state: &Arc<RwLock<StateSpace>>,
+        hooks: &HookRegistry<Vec<Address>>,
+        chunks: &[LogQueryChunk],
+        latest_block: &Arc<AtomicU64>,
+        chain_id: u64,
+    ) -> Result<Vec<Vec<Address>>, StateSpaceError>
+    where
+        P: Provider<N> + Clone,
+        N: Network,
+    {
+        let current_synced = latest_block.load(Ordering::Relaxed);
+        if current_synced == 0 {
+            return Ok(vec![]);
+        }
+
+        let chain_head = provider.get_block_number().await?;
+        if chain_head <= current_synced {
+            return Ok(vec![]);
+        }
+
+        Self::backfill_range(
+            provider,
+            state,
+            hooks,
+            chunks,
+            current_synced + 1,
+            chain_head,
+            latest_block,
+            chain_id,
+        )
+        .await
+    }
+
+    fn subscribe_ws_logs_stream(
+        provider: P,
+        state: Arc<RwLock<StateSpace>>,
+        hooks: HookRegistry<Vec<Address>>,
+        latest_block: Arc<AtomicU64>,
+        query_chunks: Vec<LogQueryChunk>,
+        chain_id: u64,
+    ) -> impl Stream<Item = Result<Vec<Address>, StateSpaceError>> + Send
+    where
+        P: Provider<N> + Clone + 'static,
+        N: Network + 'static,
+    {
+        stream! {
             loop {
-                let mut heads_stream = match provider.subscribe_blocks().await {
-                    Ok(sub) => sub.into_stream(),
-                    Err(e) => {
-                        error!("Failed to subscribe to newHeads: {}", e);
-                        sleep(Duration::from_secs(5)).await;
-                        continue;
+                match Self::initial_backfill_results(
+                    &provider,
+                    &state,
+                    &hooks,
+                    &query_chunks,
+                    &latest_block,
+                    chain_id,
+                )
+                .await
+                {
+                    Ok(results) => {
+                        for affected in results {
+                            if !affected.is_empty() {
+                                yield Ok(affected);
+                            }
+                        }
                     }
-                };
+                    Err(e) => {
+                        warn!("Initial backfill failed before wsLogs subscribe: {}", e);
+                    }
+                }
 
-                info!("Subscribed to newHeads");
+                let (tx, mut rx) = mpsc::channel::<Log>(8192);
+                let mut active_subscriptions = 0usize;
 
-                let current_synced = latest_block.load(Ordering::Relaxed);
-                if let Ok(chain_head) = provider.get_block_number().await {
-                    if chain_head > current_synced && current_synced > 0 {
-                        match Self::backfill_range(
-                            &provider,
-                            &state,
-                            &hooks,
-                            &query_chunks,
-                            current_synced + 1,
-                            chain_head,
-                            &latest_block,
-                            chain_id,
-                        )
-                        .await
-                        {
-                            Ok(results) => {
-                                for affected in results {
-                                    if !affected.is_empty() {
-                                        yield Ok(affected);
+                for chunk in &query_chunks {
+                    let filter = chunk.subscription_filter();
+                    match provider.subscribe_logs(&filter).await {
+                        Ok(sub) => {
+                            active_subscriptions += 1;
+                            let mut stream = sub.into_stream();
+                            let tx_cloned = tx.clone();
+                            tokio::spawn(async move {
+                                while let Some(log) = stream.next().await {
+                                    if tx_cloned.send(log).await.is_err() {
+                                        break;
                                     }
                                 }
-                            }
-                            Err(e) => {
-                                error!("Initial backfill failed: {}", e);
-                            }
+                            });
+                        }
+                        Err(e) => {
+                            warn!("wsLogs chunk subscribe failed: {}", e);
                         }
                     }
                 }
 
+                drop(tx);
+
+                if active_subscriptions == 0 {
+                    warn!("No active wsLogs subscriptions; reconnecting");
+                    sleep(STREAM_RECONNECT_DELAY).await;
+                    continue;
+                }
+
                 loop {
-                    match tokio::time::timeout(Duration::from_secs(60), heads_stream.next()).await {
-                        Ok(Some(new_head)) => {
-                            let block_num = new_head.number();
-                            let block_hash = new_head.hash();
-                            let parent_hash = new_head.parent_hash();
-                            let logs_bloom = new_head.logs_bloom();
-
-                            let last_processed = latest_block.load(Ordering::Relaxed);
-
-                            if block_num < last_processed {
-                                continue;
+                    match tokio::time::timeout(STREAM_IDLE_TIMEOUT, rx.recv()).await {
+                        Ok(Some(first_log)) => {
+                            let mut logs = vec![first_log];
+                            while let Ok(log) = rx.try_recv() {
+                                logs.push(log);
                             }
 
-                            if block_num == last_processed {
-                                if let Some(last) = last_hash {
-                                    if last == block_hash {
-                                        continue;
-                                    }
-                                }
-                            } else {
-                                if block_num > last_processed + 1 {
-                                    match Self::backfill_range(
-                                        &provider,
-                                        &state,
-                                        &hooks,
-                                        &query_chunks,
-                                        last_processed + 1,
-                                        block_num - 1,
-                                        &latest_block,
-                                        chain_id,
-                                    )
-                                    .await
-                                    {
-                                        Ok(results) => {
-                                            for affected in results {
-                                                if !affected.is_empty() {
-                                                    yield Ok(affected);
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            error!(
-                                                "Gap backfill {}..{} failed: {}",
-                                                last_processed + 1,
-                                                block_num - 1,
-                                                e
-                                            );
-                                            continue;
-                                        }
-                                    }
-                                } else if let Some(last) = last_hash {
-                                    if parent_hash != last {
-                                        warn!(
-                                            "Parent hash mismatch at block {} (expected parent {}, got {})",
-                                            block_num,
-                                            last,
-                                            parent_hash
-                                        );
-
-                                        match provider.get_block(block_num.into()).await {
-                                            Ok(Some(block)) => {
-                                                if block.header.parent_hash != last {
-                                                    warn!(
-                                                        "Canonical parent mismatch confirmed at block {}",
-                                                        block_num
-                                                    );
-                                                }
-                                            }
-                                            Ok(None) => {
-                                                warn!("Fallback get_block returned None for block {}", block_num);
-                                            }
-                                            Err(e) => {
-                                                warn!("Fallback get_block failed for block {}: {}", block_num, e);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            let all_logs = match Self::collect_logs_for_chunks(
-                                &provider,
-                                &query_chunks,
-                                block_num,
-                                block_num,
-                                Some(&logs_bloom),
-                            )
-                            .await
-                            {
-                                Ok(logs) => logs,
-                                Err(e) => {
-                                    error!("get_logs failed for block {}: {}", block_num, e);
-                                    continue;
-                                }
-                            };
+                            let block_num = logs
+                                .iter()
+                                .filter_map(|l| l.block_number)
+                                .max()
+                                .unwrap_or_else(|| latest_block.load(Ordering::Relaxed));
 
                             match Self::apply_logs_for_block(
                                 &provider,
                                 &state,
                                 &hooks,
                                 block_num,
-                                all_logs,
+                                logs,
                                 &latest_block,
                             )
                             .await
                             {
                                 Ok(affected) => {
-                                    last_hash = Some(block_hash);
                                     if !affected.is_empty() {
                                         yield Ok(affected);
                                     }
                                 }
                                 Err(e) => {
-                                    error!("Process block {} failed: {}", block_num, e);
+                                    error!("wsLogs processing failed: {}", e);
                                 }
                             }
                         }
                         Ok(None) => {
-                            warn!("newHeads stream ended");
+                            warn!("wsLogs subscription stream ended");
                             break;
                         }
                         Err(_) => {
-                            warn!("newHeads timeout (60s), reconnecting...");
+                            warn!("wsLogs stream timeout, reconnecting");
                             break;
                         }
                     }
                 }
 
-                warn!("Reconnecting in 2s...");
-                sleep(Duration::from_secs(2)).await;
+                sleep(STREAM_RECONNECT_DELAY).await;
             }
-        }))
+        }
+    }
+
+    fn parse_hex_u64(value: &str) -> Option<u64> {
+        let raw = value.strip_prefix("0x").unwrap_or(value);
+        u64::from_str_radix(raw, 16).ok()
+    }
+
+    fn decode_flashblock_message_brotli(
+        raw: &[u8],
+        decompressed: &mut Vec<u8>,
+    ) -> Option<FlashblockMessage> {
+        decompressed.clear();
+        let target_capacity = raw.len().saturating_mul(6);
+        if decompressed.capacity() < target_capacity {
+            decompressed.reserve(target_capacity - decompressed.capacity());
+        }
+
+        let mut reader = brotli::Decompressor::new(raw, 16 * 1024);
+        if reader.read_to_end(decompressed).is_err() {
+            return None;
+        }
+
+        serde_json::from_slice::<FlashblockMessage>(decompressed).ok()
+    }
+
+    fn extract_logs_from_flashblock(
+        fb: &FlashblockMessage,
+        matcher: &RawLogMatcher,
+        dedup_cache: &mut FlashblocksDedupCache,
+        parse_cache: &mut FlashblocksParseCache,
+    ) -> (Vec<Log>, Option<u64>, FlashblockExtractStats) {
+        let mut out = Vec::new();
+        let mut stats = FlashblockExtractStats::default();
+
+        let block_number = fb
+            .metadata
+            .as_ref()
+            .and_then(|m| m.block_number)
+            .or_else(|| {
+                fb.base
+                    .as_ref()
+                    .and_then(|base| base.block_number.as_deref())
+                    .and_then(Self::parse_hex_u64)
+            });
+
+        let Some(block_number) = block_number else {
+            return (out, None, stats);
+        };
+
+        let Some(metadata) = fb.metadata.as_ref() else {
+            return (out, Some(block_number), stats);
+        };
+
+        for (fallback_tx_idx, (_tx_hash, receipt)) in metadata.receipts.iter().enumerate() {
+            let transaction_index = receipt
+                .transaction_index
+                .as_deref()
+                .and_then(Self::parse_hex_u64)
+                .unwrap_or(fallback_tx_idx as u64);
+
+            for (log_idx, raw_log) in receipt.logs.iter().enumerate() {
+                stats.total_logs += 1;
+
+                if !dedup_cache.insert(&fb.payload_id, transaction_index, log_idx as u64) {
+                    continue;
+                }
+
+                let Some(address) = parse_cache.parse_address(&raw_log.address) else {
+                    stats.decode_fail += 1;
+                    continue;
+                };
+
+                let is_address_only = matcher.address_only_addresses.contains(&address);
+                let is_topic_candidate = matcher.topic_addresses.contains(&address);
+                if !is_address_only && !is_topic_candidate {
+                    continue;
+                }
+
+                if raw_log.topics.len() > 4 {
+                    stats.decode_fail += 1;
+                    continue;
+                }
+
+                let mut topics = Vec::with_capacity(raw_log.topics.len());
+                if is_topic_candidate {
+                    let Some(topic0_raw) = raw_log.topics.first() else {
+                        continue;
+                    };
+                    let Some(topic0) = parse_cache.parse_topic(topic0_raw) else {
+                        stats.decode_fail += 1;
+                        continue;
+                    };
+                    if !matcher.topic_signatures.contains(&topic0) {
+                        continue;
+                    }
+                    topics.push(topic0);
+
+                    let mut topic_decode_failed = false;
+                    for topic in raw_log.topics.iter().skip(1) {
+                        match parse_cache.parse_topic(topic) {
+                            Some(parsed) => topics.push(parsed),
+                            None => {
+                                topic_decode_failed = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if topic_decode_failed {
+                        stats.decode_fail += 1;
+                        continue;
+                    }
+                } else {
+                    let mut topic_decode_failed = false;
+                    for topic in &raw_log.topics {
+                        match parse_cache.parse_topic(topic) {
+                            Some(parsed) => topics.push(parsed),
+                            None => {
+                                topic_decode_failed = true;
+                                break;
+                            }
+                        }
+                    }
+                    if topic_decode_failed {
+                        stats.decode_fail += 1;
+                        continue;
+                    }
+                }
+
+                let data = match Bytes::from_str(&raw_log.data) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        stats.decode_fail += 1;
+                        continue;
+                    }
+                };
+
+                let Some(log_data) = LogData::new(topics, data) else {
+                    stats.decode_fail += 1;
+                    continue;
+                };
+
+                let log = Log {
+                    inner: alloy::primitives::Log {
+                        address,
+                        data: log_data,
+                    },
+                    block_hash: None,
+                    block_number: Some(block_number),
+                    block_timestamp: None,
+                    transaction_hash: None,
+                    transaction_index: Some(transaction_index),
+                    log_index: Some(log_idx as u64),
+                    removed: false,
+                };
+
+                stats.matched_logs += 1;
+                out.push(log);
+            }
+        }
+
+        (out, Some(block_number), stats)
+    }
+
+    fn subscribe_flashblocks_raw_stream(
+        provider: P,
+        state: Arc<RwLock<StateSpace>>,
+        hooks: HookRegistry<Vec<Address>>,
+        latest_block: Arc<AtomicU64>,
+        query_chunks: Vec<LogQueryChunk>,
+        chain_id: u64,
+    ) -> impl Stream<Item = Result<Vec<Address>, StateSpaceError>> + Send
+    where
+        P: Provider<N> + Clone + 'static,
+        N: Network + 'static,
+    {
+        let matcher = RawLogMatcher::from_query_chunks(&query_chunks);
+
+        stream! {
+            let mut dedup_cache = FlashblocksDedupCache::new(FLASHBLOCKS_DEDUP_PAYLOAD_WINDOW);
+            let mut parse_cache = FlashblocksParseCache::default();
+            let mut flashblocks_decode_buf = Vec::with_capacity(64 * 1024);
+            let mut perf = FlashblocksPerfStats::from_env();
+            if perf.enabled {
+                info!(
+                    "Flashblocks perf stats enabled via AMMS_FLASHBLOCKS_PERF=1 (log every {} messages)",
+                    FLASHBLOCKS_PERF_LOG_EVERY_MESSAGES
+                );
+            }
+
+            loop {
+                match Self::initial_backfill_results(
+                    &provider,
+                    &state,
+                    &hooks,
+                    &query_chunks,
+                    &latest_block,
+                    chain_id,
+                )
+                .await
+                {
+                    Ok(results) => {
+                        for affected in results {
+                            if !affected.is_empty() {
+                                yield Ok(affected);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Initial backfill failed before Flashblocks subscribe: {}", e);
+                    }
+                }
+
+                let connect = connect_async(BASE_FLASHBLOCKS_RAW_WS_URL).await;
+                let (mut socket, _) = match connect {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!("Flashblocks ws connect failed: {}", e);
+                        sleep(STREAM_RECONNECT_DELAY).await;
+                        continue;
+                    }
+                };
+
+                loop {
+                    let next = tokio::time::timeout(STREAM_IDLE_TIMEOUT, socket.next()).await;
+                    let maybe_message_result = match next {
+                        Ok(v) => v,
+                        Err(_) => {
+                            warn!("Flashblocks raw stream timeout, reconnecting");
+                            break;
+                        }
+                    };
+
+                    let Some(message_result) = maybe_message_result else {
+                        warn!("Flashblocks raw stream ended");
+                        break;
+                    };
+
+                    let message = match message_result {
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!("Flashblocks raw stream receive error: {}", e);
+                            break;
+                        }
+                    };
+
+                    let (logs, block_number) = match message {
+                        Message::Text(text) => {
+                            perf.on_message_kind(false);
+                            let decode_started = Instant::now();
+                            let fb = match serde_json::from_str::<FlashblockMessage>(&text) {
+                                Ok(v) => {
+                                    perf.on_decode_stage(decode_started.elapsed().as_nanos(), true);
+                                    v
+                                }
+                                Err(_) => {
+                                    perf.on_decode_stage(decode_started.elapsed().as_nanos(), false);
+                                    perf.maybe_log();
+                                    continue;
+                                }
+                            };
+
+                            let extract_started = Instant::now();
+                            let (logs, block_number, stats) =
+                                Self::extract_logs_from_flashblock(
+                                    &fb,
+                                    &matcher,
+                                    &mut dedup_cache,
+                                    &mut parse_cache,
+                                );
+                            perf.on_extract_stage(extract_started.elapsed().as_nanos(), &stats);
+                            if stats.decode_fail > 0 {
+                                warn!(
+                                    "Flashblocks log decode failures: payload_id={} index={} count={}",
+                                    fb.payload_id,
+                                    fb.index,
+                                    stats.decode_fail
+                                );
+                            }
+
+                            (logs, block_number)
+                        }
+                        Message::Binary(bin) => {
+                            perf.on_message_kind(true);
+                            let decode_started = Instant::now();
+                            let fb = match Self::decode_flashblock_message_brotli(
+                                &bin,
+                                &mut flashblocks_decode_buf,
+                            ) {
+                                Some(v) => {
+                                    perf.on_decode_stage(decode_started.elapsed().as_nanos(), true);
+                                    v
+                                }
+                                None => {
+                                    perf.on_decode_stage(decode_started.elapsed().as_nanos(), false);
+                                    perf.maybe_log();
+                                    continue;
+                                }
+                            };
+
+                            let extract_started = Instant::now();
+                            let (logs, block_number, stats) =
+                                Self::extract_logs_from_flashblock(
+                                    &fb,
+                                    &matcher,
+                                    &mut dedup_cache,
+                                    &mut parse_cache,
+                                );
+                            perf.on_extract_stage(extract_started.elapsed().as_nanos(), &stats);
+                            if stats.decode_fail > 0 {
+                                warn!(
+                                    "Flashblocks log decode failures: payload_id={} index={} count={}",
+                                    fb.payload_id,
+                                    fb.index,
+                                    stats.decode_fail
+                                );
+                            }
+
+                            (logs, block_number)
+                        }
+                        Message::Ping(v) => {
+                            let _ = socket.send(Message::Pong(v)).await;
+                            continue;
+                        }
+                        Message::Pong(_) => continue,
+                        Message::Close(_) => break,
+                        Message::Frame(_) => continue,
+                    };
+
+                    if logs.is_empty() {
+                        perf.maybe_log();
+                        continue;
+                    }
+
+                    let block_num = block_number.unwrap_or_else(|| latest_block.load(Ordering::Relaxed));
+
+                    let sync_started = Instant::now();
+                    match Self::apply_logs_for_block(
+                        &provider,
+                        &state,
+                        &hooks,
+                        block_num,
+                        logs,
+                        &latest_block,
+                    )
+                    .await
+                    {
+                        Ok(affected) => {
+                            perf.on_sync_stage(sync_started.elapsed().as_nanos(), affected.len());
+                            perf.maybe_log();
+                            if !affected.is_empty() {
+                                yield Ok(affected);
+                            }
+                        }
+                        Err(e) => {
+                            perf.on_sync_stage(sync_started.elapsed().as_nanos(), 0);
+                            perf.maybe_log();
+                            error!("Flashblocks raw batch process failed: {}", e);
+                        }
+                    }
+                }
+
+                sleep(STREAM_RECONNECT_DELAY).await;
+            }
+        }
     }
 
     async fn execute_batch_tasks<F, Fut>(
@@ -453,7 +1205,7 @@ impl<N, P> StateSpaceManager<N, P> {
                 }
             }
 
-            let filter = chunk.filter(from_block, to_block);
+            let filter = chunk.ranged_filter(from_block, to_block);
             let logs = provider
                 .get_logs(&filter)
                 .await
@@ -729,6 +1481,7 @@ pub struct StateSpaceBuilder<N, P> {
     pub rate_sync_interval: Option<Duration>,
     pub curve_sync_interval: Option<Duration>,
     pub maintenance_interval: Option<Duration>,
+    pub realtime_source: RealtimeSyncSource,
     phantom: PhantomData<N>,
 }
 
@@ -750,6 +1503,7 @@ where
             rate_sync_interval: None,
             curve_sync_interval: None,
             maintenance_interval: None,
+            realtime_source: RealtimeSyncSource::Auto,
             hooks: vec![],
         }
     }
@@ -809,6 +1563,13 @@ where
     pub fn with_curve_sync_interval(self, interval: Duration) -> StateSpaceBuilder<N, P> {
         StateSpaceBuilder {
             curve_sync_interval: Some(interval),
+            ..self
+        }
+    }
+
+    pub fn with_realtime_source(self, source: RealtimeSyncSource) -> StateSpaceBuilder<N, P> {
+        StateSpaceBuilder {
+            realtime_source: source,
             ..self
         }
     }
@@ -1062,6 +1823,7 @@ where
             state: state_space,
             block_filter,
             provider: self.provider,
+            realtime_source: self.realtime_source,
             phantom: PhantomData,
             hooks: HookRegistry::new(self.hooks),
         })

@@ -226,11 +226,20 @@ impl AutomatedMarketMaker for PancakeV3Pool {
                 // For this iteration, I will implement a placeholder that warns.
                 // The user asked to decouple, so I should copy the logic.
                 let mint_event = IPancakeV3PoolEvents::Mint::decode_log(log.as_ref())?;
-                self.modify_position(
+                if let Err(e) = self.modify_position(
                     mint_event.tickLower.unchecked_into(),
                     mint_event.tickUpper.unchecked_into(),
                     mint_event.amount as i128,
-                )?;
+                ) {
+                    tracing::warn!(
+                        target: "amms::pancake_v3::sync",
+                        address = ?self.address,
+                        block_number = ?log.block_number,
+                        error = %e,
+                        "Mint position update failed, scheduling resync"
+                    );
+                    return Ok(SyncAction::Resync);
+                }
 
                 tracing::info!(
                     target = "amms::pancake_v3::sync",
@@ -244,11 +253,20 @@ impl AutomatedMarketMaker for PancakeV3Pool {
             }
             IPancakeV3PoolEvents::Burn::SIGNATURE_HASH => {
                 let burn_event = IPancakeV3PoolEvents::Burn::decode_log(log.as_ref())?;
-                self.modify_position(
+                if let Err(e) = self.modify_position(
                     burn_event.tickLower.unchecked_into(),
                     burn_event.tickUpper.unchecked_into(),
                     -(burn_event.amount as i128),
-                )?;
+                ) {
+                    tracing::warn!(
+                        target: "amms::pancake_v3::sync",
+                        address = ?self.address,
+                        block_number = ?log.block_number,
+                        error = %e,
+                        "Burn position update failed, scheduling resync"
+                    );
+                    return Ok(SyncAction::Resync);
+                }
 
                 tracing::info!(
                     target = "amms::pancake_v3::sync",
@@ -873,9 +891,13 @@ impl PancakeV3Pool {
         if liquidity_delta != 0 {
             if self.tick >= tick_lower && self.tick < tick_upper {
                 self.liquidity = if liquidity_delta < 0 {
-                    self.liquidity - ((-liquidity_delta) as u128)
+                    self.liquidity
+                        .checked_sub((-liquidity_delta) as u128)
+                        .ok_or(AMMError::ArithmeticError)?
                 } else {
-                    self.liquidity + (liquidity_delta as u128)
+                    self.liquidity
+                        .checked_add(liquidity_delta as u128)
+                        .ok_or(AMMError::ArithmeticError)?
                 }
             }
         }
@@ -922,9 +944,13 @@ impl PancakeV3Pool {
         let info = self.ticks.entry(tick).or_default();
         let liquidity_gross_before = info.liquidity_gross;
         let liquidity_gross_after = if liquidity_delta < 0 {
-            liquidity_gross_before - ((-liquidity_delta) as u128)
+            liquidity_gross_before
+                .checked_sub((-liquidity_delta) as u128)
+                .ok_or(AMMError::ArithmeticError)?
         } else {
-            liquidity_gross_before + (liquidity_delta as u128)
+            liquidity_gross_before
+                .checked_add(liquidity_delta as u128)
+                .ok_or(AMMError::ArithmeticError)?
         };
         let flipped = (liquidity_gross_after == 0) != (liquidity_gross_before == 0);
         if liquidity_gross_before == 0 {
@@ -932,9 +958,13 @@ impl PancakeV3Pool {
         }
         info.liquidity_gross = liquidity_gross_after;
         info.liquidity_net = if upper {
-            info.liquidity_net - liquidity_delta
+            info.liquidity_net
+                .checked_sub(liquidity_delta)
+                .ok_or(AMMError::ArithmeticError)?
         } else {
-            info.liquidity_net + liquidity_delta
+            info.liquidity_net
+                .checked_add(liquidity_delta)
+                .ok_or(AMMError::ArithmeticError)?
         };
         Ok(flipped)
     }

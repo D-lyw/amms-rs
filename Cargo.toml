@@ -1,6 +1,6 @@
 [package]
 name = "amms"
-version = "1.2.7"
+version = "1.2.8"
 edition = "2021"
 license = "MIT"
 description = "A library to interact with automated market makers across EVM chains."
@@ -37,6 +37,8 @@ async-stream = "0.3.6"
 serde = { version = "1.0", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
 serde_json = { version = "1.0", features = ["arbitrary_precision"] }
+tokio-tungstenite = "0.26.2"
+brotli = "8.0.2"
 ruint = "1.17.2"
 
 [dev-dependencies]
