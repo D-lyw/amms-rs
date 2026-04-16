@@ -495,8 +495,6 @@ impl UniswapV4Factory {
         let (structurally_valid, structurally_invalid): (Vec<_>, Vec<_>) =
             pools.into_par_iter().partition(|pool| {
                 pool.tick_spacing != 0
-                    && !pool.token_a.address.is_zero()
-                    && !pool.token_b.address.is_zero()
                     && pool.token_a.decimals > 0
                     && pool.token_b.decimals > 0
             });
