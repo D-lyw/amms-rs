@@ -445,7 +445,7 @@ impl PancakeInfinityFactory {
 
         if !dust_pools.is_empty() {
             for pool in &dust_pools {
-                tracing::info!(
+                tracing::warn!(
                     target: "amms::pancake_infinity::init_batch",
                     pool_id = ?pool.pool_id,
                     liquidity = pool.liquidity,

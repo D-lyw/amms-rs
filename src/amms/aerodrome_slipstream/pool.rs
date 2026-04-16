@@ -1817,7 +1817,7 @@ impl AerodromeSlipstreamFactory {
         if !dust_amms.is_empty() {
             for amm in &dust_amms {
                 if let AMM::AerodromeSlipstreamPool(pool) = amm {
-                    tracing::info!(
+                    tracing::warn!(
                         target = "amms::aerodrome_slipstream::init_batch",
                         addr = ?pool.address,
                         liquidity = pool.liquidity,

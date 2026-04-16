@@ -521,7 +521,7 @@ impl UniswapV4Factory {
             .partition(|pool| pool.has_sufficient_liquidity());
 
         for pool in &dust_pools {
-            info!(
+            warn!(
                 target: "amms::uniswap_v4::init_batch",
                 pool_id = ?pool.pool_id,
                 liquidity = pool.liquidity,

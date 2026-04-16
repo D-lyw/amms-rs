@@ -1223,7 +1223,7 @@ impl PancakeV3Factory {
         if !dust_pools.is_empty() {
             for pool in &dust_pools {
                 if let AMM::PancakeV3Pool(pv3_pool) = pool {
-                    info!(
+                    tracing::warn!(
                         target: "amms::pancake_v3::init_batch",
                         address = ?pv3_pool.address,
                         liquidity = ?pv3_pool.liquidity,

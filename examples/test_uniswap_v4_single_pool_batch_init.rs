@@ -1,5 +1,4 @@
-use std::str::FromStr;
-use std::sync::Arc;
+use std::{str::FromStr, sync::Arc};
 
 use alloy::{
     primitives::{
@@ -19,29 +18,32 @@ use amms::{
     state_space::StateSpaceBuilder,
 };
 
-fn create_v4_pool(
-    token0: Address,
-    token1: Address,
-    fee: u32,
-    tick_spacing: i32,
-    hooks: Address,
-    manager_address: Address,
-) -> AMM {
-    let pool_key = PoolKey {
-        currency0: token0,
-        currency1: token1,
-        fee: U24::from(fee as u64),
-        tickSpacing: I24::from_str(&tick_spacing.to_string()).unwrap_or(I24::ZERO),
-        hooks,
-    };
-    UniswapV4Pool::new(manager_address, pool_key).into()
+fn parse_env_address(key: &str, default: Address) -> Address {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| Address::from_str(v.trim()).ok())
+        .unwrap_or(default)
+}
+
+fn parse_env_u32(key: &str, default: u32) -> u32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(default)
+}
+
+fn parse_env_i32(key: &str, default: i32) -> i32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<i32>().ok())
+        .unwrap_or(default)
 }
 
 fn format_amount(amount: U256, decimals: u8) -> String {
-    let s = amount.to_string();
     if decimals == 0 {
-        return s;
+        return amount.to_string();
     }
+    let s = amount.to_string();
     let d = decimals as usize;
     if s.len() <= d {
         format!("0.{}{}", "0".repeat(d - s.len()), s)
@@ -51,151 +53,165 @@ fn format_amount(amount: U256, decimals: u8) -> String {
     }
 }
 
+fn small_amount(decimals: u8) -> U256 {
+    // 0.001 token
+    if decimals >= 3 {
+        U256::from(10u8).pow(U256::from(decimals - 3))
+    } else {
+        U256::from(1u8)
+    }
+}
+
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
     dotenv::dotenv().ok();
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
-        .with_target(false)
+        .with_target(true)
         .init();
 
-    let rpc_endpoint = std::env::var("ETHEREUM_PROVIDER")
+    // Supports both production env naming and generic RPC_URL.
+    let rpc_endpoint = std::env::var("BASE_PROVIDER")
+        .or_else(|_| std::env::var("RPC_URL"))
+        .or_else(|_| std::env::var("ETHEREUM_PROVIDER"))
         .or_else(|_| std::env::var("MAINNET_RPC_URL"))
-        .expect("Please set ETHEREUM_PROVIDER or MAINNET_RPC_URL");
+        .expect("Please set BASE_PROVIDER / RPC_URL / ETHEREUM_PROVIDER / MAINNET_RPC_URL");
 
     let client = ClientBuilder::default()
         .layer(ThrottleLayer::new(500))
         .layer(RetryBackoffLayer::new(5, 200, 330))
         .http(rpc_endpoint.parse()?);
-
     let provider = Arc::new(ProviderBuilder::new().connect_client(client));
 
-    let manager_address = address!("000000000004444c5dc75cb358380d2e3de08a90");
-    let hooks_zero = address!("0000000000000000000000000000000000000000");
-    let token0 = address!("7f39c581f595b53c5cb19bd0b3f8da6c935e2ca0"); // wstETH
-    let token1 = address!("a1290d69c65a6fe4df752f95823fae25cb99e5a7"); // rsETH
-    let fee = 475u32;
-    let tick_spacing = 2i32;
+    // Default target = Base: native ETH / USDC, fee 2500, tick spacing 50.
+    // The corresponding virtual pool address is:
+    // 0xbc158a569b62211e27b358581ff1420df0e5c120
+    let manager_address = parse_env_address(
+        "POOL_MANAGER",
+        address!("498581ff718922c3f8e6a244956af099b2652b2b"),
+    );
+    let token0 = parse_env_address(
+        "TOKEN0",
+        address!("0000000000000000000000000000000000000000"),
+    );
+    let token1 = parse_env_address(
+        "TOKEN1",
+        address!("833589fcd6edb6e08f4c7c32d4f71b54bda02913"),
+    );
+    let fee = parse_env_u32("FEE", 2500);
+    let tick_spacing = parse_env_i32("TICK_SPACING", 50);
+    let hooks = parse_env_address("HOOKS", address!("0000000000000000000000000000000000000000"));
 
-    let v4_pools: Vec<AMM> = vec![create_v4_pool(
-        token0,
-        token1,
-        fee,
-        tick_spacing,
-        hooks_zero,
-        manager_address,
-    )];
+    let pool_key = PoolKey {
+        currency0: token0,
+        currency1: token1,
+        fee: U24::from(fee as u64),
+        tickSpacing: I24::from_str(&tick_spacing.to_string()).unwrap_or(I24::ZERO),
+        hooks,
+    };
+    let probe_pool = UniswapV4Pool::new(manager_address, pool_key.clone());
+    let expected_pool_id = probe_pool.pool_id;
+    let expected_virtual_addr = probe_pool.address();
 
-    println!("Initializing target UniswapV4 pool via StateSpaceBuilder with batch init...");
+    println!("=== INPUT ===");
+    println!("manager={:?}", manager_address);
+    println!(
+        "pool_key=(token0={:?}, token1={:?}, fee={}, tick_spacing={}, hooks={:?})",
+        token0, token1, fee, tick_spacing, hooks
+    );
+    println!("expected_pool_id={:?}", expected_pool_id);
+    println!("expected_virtual_address={:?}", expected_virtual_addr);
+
+    let amms: Vec<AMM> = vec![AMM::UniswapV4Pool(probe_pool.clone())];
+
+    println!("\n=== BATCH INIT (production path) ===");
+    println!("StateSpaceBuilder::new(provider).with_amms(...).sync().await");
     let state_space_manager = StateSpaceBuilder::new(provider.clone())
-        .with_amms(v4_pools.clone())
+        .with_amms(amms)
         .sync()
         .await?;
 
-    let state_space = state_space_manager.state.read().await;
-    println!("state_size={}", state_space.state.len());
+    let state_guard = state_space_manager.state.read().await;
+    println!("state_size={}", state_guard.state.len());
 
-    let pool = state_space
+    let maybe_pool = state_guard
         .state
-        .values()
-        .find_map(|amm| match amm {
+        .get(&expected_virtual_addr)
+        .and_then(|amm| match amm {
             AMM::UniswapV4Pool(p) => Some(p.clone()),
             _ => None,
-        })
-        .expect("Pool not found in state after sync");
+        });
 
-    println!("Pool initialized:");
-    println!("  pool_id={:?}", pool.pool_id);
+    if maybe_pool.is_none() {
+        println!("\n[RESULT] POOL NOT FOUND AFTER INIT");
+        println!(
+            "The pool is not retained in state. It was filtered during init (structural invalid or dust)."
+        );
+        println!("Available V4 pools in state:");
+        for amm in state_guard.state.values() {
+            if let AMM::UniswapV4Pool(p) = amm {
+                println!(
+                    "  v4_addr={:?} pool_id={:?} liq={} ticks={}",
+                    p.address(),
+                    p.pool_id,
+                    p.liquidity,
+                    p.ticks.len()
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    let pool = maybe_pool.expect("checked above");
+    println!("\n[RESULT] POOL RETAINED");
+    println!("pool_id={:?}", pool.pool_id);
     println!(
-        "  token0={:?} decimals={}",
-        pool.token_a.address, pool.token_a.decimals
+        "token0={:?} decimals={}, token1={:?} decimals={}",
+        pool.token_a.address, pool.token_a.decimals, pool.token_b.address, pool.token_b.decimals
     );
     println!(
-        "  token1={:?} decimals={}",
-        pool.token_b.address, pool.token_b.decimals
-    );
-    println!(
-        "  tick={} sqrt_price={} liquidity={}",
-        pool.tick, pool.sqrt_price, pool.liquidity
-    );
-    println!(
-        "  tick_bitmap_words={} tick_entries={}",
+        "tick={} sqrt_price={} liquidity={} tick_words={} tick_entries={}",
+        pool.tick,
+        pool.sqrt_price,
+        pool.liquidity,
         pool.tick_bitmap.len(),
         pool.ticks.len()
     );
 
-    let amount_in_0 = U256::from(10u64).pow(U256::from(pool.token_a.decimals.saturating_sub(2))); // 0.01 token0
-    let amount_in_1 = U256::from(10u64).pow(U256::from(pool.token_b.decimals.saturating_sub(2))); // 0.01 token1
+    println!("\n=== SWAP SIMULATION ===");
+    let amount_in_0 = small_amount(pool.token_a.decimals);
+    let amount_in_1 = small_amount(pool.token_b.decimals);
 
-    let out_0_to_1 = pool.simulate_swap(pool.token_a.address, pool.token_b.address, amount_in_0)?;
-    let out_1_to_0 = pool.simulate_swap(pool.token_b.address, pool.token_a.address, amount_in_1)?;
-
-    println!("\nExactIn simulations:");
-    println!(
-        "  token0 -> token1: in={} (raw={}) out={} (raw={})",
-        format_amount(amount_in_0, pool.token_a.decimals),
-        amount_in_0,
-        format_amount(out_0_to_1, pool.token_b.decimals),
-        out_0_to_1
-    );
-    println!(
-        "  token1 -> token0: in={} (raw={}) out={} (raw={})",
-        format_amount(amount_in_1, pool.token_b.decimals),
-        amount_in_1,
-        format_amount(out_1_to_0, pool.token_a.decimals),
-        out_1_to_0
-    );
-
-    let target_out_1 = if out_0_to_1 > U256::ZERO {
-        out_0_to_1 / U256::from(10u64)
-    } else {
-        U256::from(10u64).pow(U256::from(pool.token_b.decimals.saturating_sub(6)))
-    };
-    let target_out_0 = if out_1_to_0 > U256::ZERO {
-        out_1_to_0 / U256::from(10u64)
-    } else {
-        U256::from(10u64).pow(U256::from(pool.token_a.decimals.saturating_sub(6)))
-    };
-
-    println!("\nExactOut simulations:");
-    match pool.simulate_swap_exact_out(pool.token_a.address, pool.token_b.address, target_out_1) {
-        Ok(amount_in) => {
-            println!(
-                "  token0 -> token1: target_out={} (raw={}) required_in={} (raw={})",
-                format_amount(target_out_1, pool.token_b.decimals),
-                target_out_1,
-                format_amount(amount_in, pool.token_a.decimals),
-                amount_in
-            );
-        }
-        Err(e) => {
-            println!(
-                "  token0 -> token1: target_out={} (raw={}) error={}",
-                format_amount(target_out_1, pool.token_b.decimals),
-                target_out_1,
-                e
-            );
-        }
+    match pool.simulate_swap(pool.token_a.address, pool.token_b.address, amount_in_0) {
+        Ok(out) => println!(
+            "ExactIn token0->token1: in={} (raw={}) out={} (raw={})",
+            format_amount(amount_in_0, pool.token_a.decimals),
+            amount_in_0,
+            format_amount(out, pool.token_b.decimals),
+            out
+        ),
+        Err(e) => println!(
+            "ExactIn token0->token1: in={} (raw={}) error={}",
+            format_amount(amount_in_0, pool.token_a.decimals),
+            amount_in_0,
+            e
+        ),
     }
 
-    match pool.simulate_swap_exact_out(pool.token_b.address, pool.token_a.address, target_out_0) {
-        Ok(amount_in) => {
-            println!(
-                "  token1 -> token0: target_out={} (raw={}) required_in={} (raw={})",
-                format_amount(target_out_0, pool.token_a.decimals),
-                target_out_0,
-                format_amount(amount_in, pool.token_b.decimals),
-                amount_in
-            );
-        }
-        Err(e) => {
-            println!(
-                "  token1 -> token0: target_out={} (raw={}) error={}",
-                format_amount(target_out_0, pool.token_a.decimals),
-                target_out_0,
-                e
-            );
-        }
+    match pool.simulate_swap(pool.token_b.address, pool.token_a.address, amount_in_1) {
+        Ok(out) => println!(
+            "ExactIn token1->token0: in={} (raw={}) out={} (raw={})",
+            format_amount(amount_in_1, pool.token_b.decimals),
+            amount_in_1,
+            format_amount(out, pool.token_a.decimals),
+            out
+        ),
+        Err(e) => println!(
+            "ExactIn token1->token0: in={} (raw={}) error={}",
+            format_amount(amount_in_1, pool.token_b.decimals),
+            amount_in_1,
+            e
+        ),
     }
 
     Ok(())
