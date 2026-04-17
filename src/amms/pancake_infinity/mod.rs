@@ -103,7 +103,6 @@ impl AutomatedMarketMaker for PancakeInfinityPool {
 
     fn sync_events(&self) -> Vec<B256> {
         vec![
-            ICLPoolManager::Initialize::SIGNATURE_HASH,
             ICLPoolManager::ModifyLiquidity::SIGNATURE_HASH,
             ICLPoolManager::Swap::SIGNATURE_HASH,
         ]
@@ -115,6 +114,10 @@ impl AutomatedMarketMaker for PancakeInfinityPool {
             return Ok(SyncAction::None);
         }
         match event_signature {
+            ICLPoolManager::Initialize::SIGNATURE_HASH => {
+                // Initialize is not needed for steady-state realtime syncing of tracked pools.
+                return Ok(SyncAction::None);
+            }
             ICLPoolManager::ModifyLiquidity::SIGNATURE_HASH => {
                 let event = ICLPoolManager::ModifyLiquidity::decode_log(&log.inner)?;
                 let liquidity_delta: i128 = event.liquidityDelta.try_into().map_err(|_| {

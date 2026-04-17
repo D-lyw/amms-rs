@@ -185,7 +185,6 @@ impl AutomatedMarketMaker for UniswapV4Pool {
 
     fn sync_events(&self) -> Vec<B256> {
         vec![
-            IPoolManager::Initialize::SIGNATURE_HASH,
             IPoolManager::ModifyLiquidity::SIGNATURE_HASH,
             IPoolManager::Swap::SIGNATURE_HASH,
         ]
@@ -200,6 +199,11 @@ impl AutomatedMarketMaker for UniswapV4Pool {
         }
 
         match event_signature {
+            IPoolManager::Initialize::SIGNATURE_HASH => {
+                // Initialize is only relevant when the pool is first created/initialized.
+                // For runtime realtime sync of an already tracked pool, it's a no-op.
+                return Ok(SyncAction::None);
+            }
             IPoolManager::ModifyLiquidity::SIGNATURE_HASH => {
                 let event = IPoolManager::ModifyLiquidity::decode_log(&log.inner)?;
                 let liquidity_delta: i128 = event.liquidityDelta.try_into().map_err(|_| {

@@ -100,7 +100,10 @@ async fn main() -> eyre::Result<()> {
     );
     let fee = parse_env_u32("FEE", 2500);
     let tick_spacing = parse_env_i32("TICK_SPACING", 50);
-    let hooks = parse_env_address("HOOKS", address!("0000000000000000000000000000000000000000"));
+    let hooks = parse_env_address(
+        "HOOKS",
+        address!("0000000000000000000000000000000000000000"),
+    );
 
     let pool_key = PoolKey {
         currency0: token0,

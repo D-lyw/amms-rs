@@ -9,7 +9,9 @@ use alloy::{
 };
 use amms::{
     amms::amm::{AutomatedMarketMaker, Variant},
-    amms::{aerodrome_slipstream::AerodromeSlipstreamPool, aerodrome_v2::AerodromeV2Pool, amm::AMM},
+    amms::{
+        aerodrome_slipstream::AerodromeSlipstreamPool, aerodrome_v2::AerodromeV2Pool, amm::AMM,
+    },
     state_space::StateSpaceBuilder,
 };
 
@@ -139,12 +141,20 @@ async fn main() -> eyre::Result<()> {
         let amount_in = alloy::primitives::U256::from(1_000_000u64);
         let amount_out_target = alloy::primitives::U256::from(1_000u64);
 
-        let exact_in_a_to_b = pool.simulate_swap(pool.token_a.address, pool.token_b.address, amount_in);
-        let exact_in_b_to_a = pool.simulate_swap(pool.token_b.address, pool.token_a.address, amount_in);
-        let exact_out_a_to_b =
-            pool.simulate_swap_exact_out(pool.token_a.address, pool.token_b.address, amount_out_target);
-        let exact_out_b_to_a =
-            pool.simulate_swap_exact_out(pool.token_b.address, pool.token_a.address, amount_out_target);
+        let exact_in_a_to_b =
+            pool.simulate_swap(pool.token_a.address, pool.token_b.address, amount_in);
+        let exact_in_b_to_a =
+            pool.simulate_swap(pool.token_b.address, pool.token_a.address, amount_in);
+        let exact_out_a_to_b = pool.simulate_swap_exact_out(
+            pool.token_a.address,
+            pool.token_b.address,
+            amount_out_target,
+        );
+        let exact_out_b_to_a = pool.simulate_swap_exact_out(
+            pool.token_b.address,
+            pool.token_a.address,
+            amount_out_target,
+        );
 
         tracing::info!(
             "Slipstream sample pool={} exact_in_a_to_b={:?} exact_in_b_to_a={:?} exact_out_a_to_b={:?} exact_out_b_to_a={:?}",
