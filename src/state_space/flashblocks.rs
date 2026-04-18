@@ -370,10 +370,8 @@ impl<N, P> StateSpaceManager<N, P> {
         }
 
         if needs_lazy_evaluation {
-            let start = std::time::Instant::now();
             let mut real_tx_index_map = HashMap::new();
             if let Some(diff) = fb.diff.as_ref() {
-                // Determine if Rayon par_iter is necessary
                 for (real_idx, raw_tx_hex) in diff.transactions.iter().enumerate() {
                     let raw_hex = raw_tx_hex.strip_prefix("0x").unwrap_or(raw_tx_hex);
                     if let Ok(raw_bytes) = alloy::hex::decode(raw_hex) {
@@ -382,8 +380,6 @@ impl<N, P> StateSpaceManager<N, P> {
                     }
                 }
             }
-            let elapsed = start.elapsed();
-            println!("\n[Sync Engine] 🔥 Lazy Evaluation Triggered! Decoded {} transactions to compute true transactionIndex. Time elapsed: {:?}\n", real_tx_index_map.len(), elapsed);
 
             for log in &mut out {
                 if let Some(hash) = log.transaction_hash {
