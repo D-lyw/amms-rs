@@ -1,20 +1,16 @@
-use alloy::eips::BlockId;
 use alloy::network::Network;
 use alloy::primitives::{Address, B256, U256};
 use alloy::providers::Provider;
-use std::collections::HashMap;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tracing::{error, info};
 
-use crate::amms::amm::{AutomatedMarketMaker, Variant, AMM};
+use crate::amms::amm::AMM;
 use crate::amms::balancer_v2::BalancerV2Pool;
 use crate::amms::balancer_v3::BalancerV3Pool;
 use crate::amms::curve_ng::{ICurveNGPool, ICurveNGStableSwap, ICurveTriCrypto, ICurveTwoCrypto};
-use crate::amms::factory::Factory;
 use crate::amms::fluid_dex::{
     DexReservesResolver, FluidDexT1, FluidLiquidity, TokenLimitData, FLUID_DEX_RESOLVER,
 };
@@ -42,119 +38,6 @@ fn decode_price_from_dex_variables(dex_variables: U256, shift: u32) -> U256 {
 
 fn decode_liquidity_utilization(exchange_price_word: U256) -> U256 {
     (exchange_price_word >> 30u32) & mask(14)
-}
-
-/// Periodically syncs a subset of AMMs (round-robin) to ensure they are up-to-date with the latest block.
-pub async fn start_state_maintenance_task<N, P>(
-    state: Arc<RwLock<StateSpace>>,
-    _factories: Vec<Factory>,
-    provider: P,
-    interval: Duration,
-) where
-    N: Network,
-    P: Provider<N> + Clone + 'static,
-{
-    let batch_size = 50;
-    let mut current_index = 0;
-
-    loop {
-        sleep(interval).await;
-
-        // 1. Get target block
-        let target_block = { state.read().await.latest_block.load(Ordering::Relaxed) };
-
-        if target_block == 0 {
-            continue;
-        }
-
-        // 2. Select a batch of pools to update
-        // We sort addresses to ensure deterministic iteration order across updates
-        let mut all_addresses: Vec<Address> =
-            { state.read().await.state.keys().cloned().collect() };
-
-        if all_addresses.is_empty() {
-            continue;
-        }
-
-        all_addresses.sort();
-
-        // Calculate batch range
-        if current_index >= all_addresses.len() {
-            current_index = 0;
-        }
-        let end = (current_index + batch_size).min(all_addresses.len());
-        let batch_addresses = &all_addresses[current_index..end];
-
-        info!(
-            "Starting state maintenance for block {} (Batch: {}/{} pools)",
-            target_block,
-            batch_addresses.len(),
-            all_addresses.len()
-        );
-
-        // Group pools by variant to batch requests
-        let mut pools_by_variant: HashMap<Variant, Vec<AMM>> = HashMap::new();
-        {
-            let read_guard = state.read().await;
-            for addr in batch_addresses {
-                if let Some(amm) = read_guard.state.get(addr) {
-                    pools_by_variant
-                        .entry(amm.variant())
-                        .or_default()
-                        .push(amm.clone());
-                }
-            }
-        }
-
-        // 3. Fetch selected pools at target block (Async, No Lock)
-        let mut synced_pools = Vec::new();
-        let chain_tip = BlockId::from(target_block);
-
-        for (variant, amms) in pools_by_variant {
-            let provider = provider.clone();
-            let res = variant
-                .sync_all_pools::<N, _>(amms, chain_tip, provider)
-                .await;
-
-            match res {
-                Ok(pools) => synced_pools.extend(pools),
-                Err(e) => {
-                    error!(
-                        "State maintenance failed for variant {:?}: {:?}",
-                        variant, e
-                    );
-                }
-            }
-        }
-
-        // 4. Commit (Per-pool monotonic)
-        {
-            let mut write_guard = state.write().await;
-            let mut updated = 0usize;
-            let mut skipped_newer = 0usize;
-
-            for mut pool in synced_pools {
-                let address = pool.address();
-                if let Some(existing) = write_guard.state.get(&address) {
-                    if existing.last_synced_block() > target_block {
-                        skipped_newer += 1;
-                        continue;
-                    }
-                }
-
-                pool.set_last_synced_block(target_block);
-                write_guard.state.insert(address, pool);
-                updated += 1;
-            }
-
-            info!(
-                "State maintenance committed at block {}. Updated {}, skipped {} newer pools.",
-                target_block, updated, skipped_newer
-            );
-
-            current_index = end;
-        }
-    }
 }
 
 /// Periodically updates rates for Balancer V2 pools that have rate providers.

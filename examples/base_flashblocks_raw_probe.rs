@@ -948,7 +948,7 @@ async fn main() -> eyre::Result<()> {
             .or(block_number_opt)
             .unwrap_or_else(|| {
                 manager
-                    .latest_block
+                    .realtime_head
                     .load(std::sync::atomic::Ordering::Relaxed)
             });
 
@@ -990,14 +990,16 @@ async fn main() -> eyre::Result<()> {
         total_async_update += async_updated;
 
         println!(
-            "[fb payload={} idx={}] matched_logs={} affected={} resync={} async_update={} latest_block={}",
+            "[fb payload={} idx={}] matched_logs={} affected={} resync={} async_update={} realtime_head={}",
             fb.payload_id,
             fb.index,
             logs.len(),
             affected_len,
             resynced,
             async_updated,
-            manager.latest_block.load(std::sync::atomic::Ordering::Relaxed)
+            manager
+                .realtime_head
+                .load(std::sync::atomic::Ordering::Relaxed)
         );
     }
 

@@ -296,7 +296,7 @@ where
     N: Network<BlockResponse = Block>,
     P: Provider<N> + Clone + 'static,
 {
-    let block = manager.latest_block.load(Ordering::Relaxed);
+    let block = manager.realtime_head.load(Ordering::Relaxed);
     if block == 0 {
         println!("[audit] latest block is 0, skip");
         return Ok(());

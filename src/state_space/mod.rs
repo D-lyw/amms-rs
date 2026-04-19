@@ -4,6 +4,7 @@ pub mod error;
 pub mod filters;
 mod flashblocks;
 pub mod hooks;
+mod maintenance;
 pub mod sync_services;
 mod ws_logs;
 
@@ -21,6 +22,7 @@ use crate::state_space::hooks::HookRegistry;
 use crate::state_space::hooks::SnapshotConfig;
 use crate::state_space::hooks::StateHook;
 
+use alloy::consensus::BlockHeader;
 use alloy::eips::BlockId;
 use alloy::network::Network;
 
@@ -37,14 +39,15 @@ use filters::AMMFilter;
 use filters::PoolFilter;
 use futures::stream::FuturesUnordered;
 use futures::{Stream, StreamExt};
-use std::collections::{HashMap, HashSet};
+use maintenance::{PendingSyncAction, PendingSyncQueue, PendingSyncReason};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Debug;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::{future::Future, marker::PhantomData, sync::Arc};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use tokio::time::{sleep, Duration};
 use tracing::{error, info, warn};
@@ -64,7 +67,13 @@ pub struct StateSpaceManager<N, P> {
     pub state: Arc<RwLock<StateSpace>>,
     pub block_filter: Filter,
     pub provider: P,
-    pub latest_block: Arc<AtomicU64>,
+    pub realtime_head: Arc<AtomicU64>,
+    pub canonical_head: Arc<AtomicU64>,
+    pub reconcile_cursor: Arc<AtomicU64>,
+    pending_sync_queue: Arc<Mutex<PendingSyncQueue>>,
+    applied_log_dedup: Arc<Mutex<AppliedLogDedupCache>>,
+    background_started: Arc<std::sync::atomic::AtomicBool>,
+    maintenance_interval: Option<Duration>,
     realtime_source: RealtimeSyncSource,
     hooks: HookRegistry<Vec<Address>>,
     phantom: PhantomData<N>,
@@ -77,12 +86,87 @@ const ETHEREUM_MAINNET_CHAIN_ID: u64 = 1;
 const BASE_FLASHBLOCKS_RAW_WS_URL: &str = "wss://mainnet.flashblocks.base.org/ws";
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const STREAM_RECONNECT_DELAY: Duration = Duration::from_secs(2);
+const APPLIED_LOG_DEDUP_CAPACITY: usize = 300_000;
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LogSource {
+    RealtimeFlashblock,
+    CanonicalReconcile,
+    WsLogs,
+    Maintenance,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct AppliedLogKey {
+    tx_hash: Option<alloy::primitives::B256>,
+    // Canonical get_logs uses block-global log_index, while Flashblocks carries
+    // receipt-local log order. We normalize to tx-local ordinal in apply path.
+    tx_log_ordinal: u32,
+    address: Address,
+    topic0: Option<FixedBytes<32>>,
+}
+
+#[derive(Default)]
+struct AppliedLogDedupCache {
+    seen: HashSet<AppliedLogKey>,
+    order: VecDeque<AppliedLogKey>,
+}
+
+impl AppliedLogDedupCache {
+    fn insert_if_new(&mut self, key: AppliedLogKey) -> bool {
+        if self.seen.contains(&key) {
+            return false;
+        }
+        self.seen.insert(key.clone());
+        self.order.push_back(key);
+        while self.order.len() > APPLIED_LOG_DEDUP_CAPACITY {
+            if let Some(old) = self.order.pop_front() {
+                self.seen.remove(&old);
+            }
+        }
+        true
+    }
+}
 
 sol! {
     #[derive(Debug)]
     #[sol(rpc)]
     interface ICLFactoryReader {
         function swapFeeModule() external view returns (address);
+    }
+}
+
+sol! {
+    #[derive(Debug, PartialEq, Eq)]
+    #[sol(rpc)]
+    interface IV3StateProbe {
+        function slot0() external view returns (
+            uint160 sqrtPriceX96,
+            int24 tick,
+            uint16 observationIndex,
+            uint16 observationCardinality,
+            uint16 observationCardinalityNext,
+            uint8 feeProtocol,
+            bool unlocked
+        );
+        function liquidity() external view returns (uint128);
+    }
+}
+
+sol! {
+    #[derive(Debug, PartialEq, Eq)]
+    #[sol(rpc)]
+    interface ISlipstreamStateProbe {
+        function slot0() external view returns (
+            uint160 sqrtPriceX96,
+            int24 tick,
+            uint16 observationIndex,
+            uint16 observationCardinality,
+            uint16 observationCardinalityNext,
+            bool unlocked
+        );
+        function liquidity() external view returns (uint128);
     }
 }
 
@@ -139,6 +223,94 @@ impl<N, P> StateSpaceManager<N, P> {
         self.hooks.register(hook).await
     }
 
+    async fn ensure_background_tasks(
+        &self,
+        query_chunks: Vec<LogQueryChunk>,
+        chain_id: u64,
+    ) -> Result<(), StateSpaceError>
+    where
+        P: Provider<N> + Clone + 'static,
+        N: Network + 'static,
+    {
+        if self
+            .background_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(());
+        }
+
+        if chain_id == BASE_CHAIN_ID {
+            let provider = self.provider.clone();
+            let state = self.state.clone();
+            let canonical_head = self.canonical_head.clone();
+            tokio::spawn(async move {
+                Self::run_canonical_head_tracker(provider, state, canonical_head).await;
+            });
+        }
+
+        let provider = self.provider.clone();
+        let state = self.state.clone();
+        let queue = self.pending_sync_queue.clone();
+        let canonical_head = self.canonical_head.clone();
+        tokio::spawn(async move {
+            Self::run_pending_sync_worker(provider, state, queue, canonical_head).await;
+        });
+
+        if chain_id == BASE_CHAIN_ID {
+            let provider = self.provider.clone();
+            let state = self.state.clone();
+            let hooks = self.hooks.clone();
+            let realtime_head = self.realtime_head.clone();
+            let canonical_head = self.canonical_head.clone();
+            let reconcile_cursor = self.reconcile_cursor.clone();
+            let queue = self.pending_sync_queue.clone();
+            let dedup = self.applied_log_dedup.clone();
+            tokio::spawn(async move {
+                Self::run_reconcile_worker(
+                    provider,
+                    state,
+                    hooks,
+                    query_chunks,
+                    realtime_head,
+                    canonical_head,
+                    reconcile_cursor,
+                    queue,
+                    dedup,
+                    chain_id,
+                )
+                .await;
+            });
+        }
+
+        let provider = self.provider.clone();
+        let state = self.state.clone();
+        let queue = self.pending_sync_queue.clone();
+        let canonical_head = self.canonical_head.clone();
+        tokio::spawn(async move {
+            Self::run_silent_drift_probe_task(provider, state, queue, canonical_head).await;
+        });
+
+        if let Some(interval) = self.maintenance_interval {
+            let provider = self.provider.clone();
+            let state = self.state.clone();
+            let queue = self.pending_sync_queue.clone();
+            let canonical_head = self.canonical_head.clone();
+            tokio::spawn(async move {
+                Self::run_maintenance_coverage_scheduler(
+                    provider,
+                    state,
+                    queue,
+                    canonical_head,
+                    interval,
+                )
+                .await;
+            });
+        }
+
+        Ok(())
+    }
+
     /// Subscribes to AMM state changes through a configurable realtime source:
     /// - Base: Flashblocks infrastructure stream by default.
     /// - Other chains: standard ws logs subscription.
@@ -153,13 +325,18 @@ impl<N, P> StateSpaceManager<N, P> {
         N: Network,
     {
         let provider = self.provider.clone();
-        let latest_block = self.latest_block.clone();
+        let realtime_head = self.realtime_head.clone();
+        let canonical_head = self.canonical_head.clone();
         let state = self.state.clone();
         let hooks = self.hooks.clone();
+        let pending_sync_queue = self.pending_sync_queue.clone();
+        let applied_log_dedup = self.applied_log_dedup.clone();
         let realtime_source = self.realtime_source.clone();
 
         let chain_id = { state.read().await.chain_id };
         let query_chunks = Self::build_query_chunks(&provider, &state, chain_id).await?;
+        self.ensure_background_tasks(query_chunks.clone(), chain_id)
+            .await?;
 
         let selected = Self::resolve_realtime_source(chain_id, &realtime_source);
 
@@ -174,7 +351,10 @@ impl<N, P> StateSpaceManager<N, P> {
                     provider,
                     state,
                     hooks,
-                    latest_block,
+                    realtime_head,
+                    canonical_head,
+                    pending_sync_queue,
+                    applied_log_dedup,
                     query_chunks,
                     chain_id,
                 )))
@@ -190,7 +370,10 @@ impl<N, P> StateSpaceManager<N, P> {
                     provider,
                     state,
                     hooks,
-                    latest_block,
+                    realtime_head,
+                    canonical_head,
+                    pending_sync_queue,
+                    applied_log_dedup,
                     query_chunks,
                     chain_id,
                 )))
@@ -220,14 +403,18 @@ impl<N, P> StateSpaceManager<N, P> {
         state: &Arc<RwLock<StateSpace>>,
         hooks: &HookRegistry<Vec<Address>>,
         chunks: &[LogQueryChunk],
-        latest_block: &Arc<AtomicU64>,
+        realtime_head: &Arc<AtomicU64>,
+        canonical_head: &Arc<AtomicU64>,
+        pending_sync_queue: &Arc<Mutex<PendingSyncQueue>>,
+        applied_log_dedup: &Arc<Mutex<AppliedLogDedupCache>>,
+        source: LogSource,
         chain_id: u64,
     ) -> Result<Vec<Vec<Address>>, StateSpaceError>
     where
         P: Provider<N> + Clone,
         N: Network,
     {
-        let current_synced = latest_block.load(Ordering::Relaxed);
+        let current_synced = realtime_head.load(Ordering::Relaxed);
         if current_synced == 0 {
             return Ok(vec![]);
         }
@@ -244,12 +431,17 @@ impl<N, P> StateSpaceManager<N, P> {
             chunks,
             current_synced + 1,
             chain_head,
-            latest_block,
+            realtime_head,
+            canonical_head,
+            pending_sync_queue,
+            applied_log_dedup,
+            source,
             chain_id,
         )
         .await
     }
 
+    #[allow(dead_code)]
     async fn execute_batch_tasks<F, Fut>(
         state: &Arc<RwLock<StateSpace>>,
         amms: Vec<AMM>,
@@ -291,18 +483,36 @@ impl<N, P> StateSpaceManager<N, P> {
     }
 
     async fn apply_logs_for_block(
-        provider: &P,
+        _provider: &P,
         state: &Arc<RwLock<StateSpace>>,
         hooks: &HookRegistry<Vec<Address>>,
         block_num: u64,
         mut logs: Vec<Log>,
-        latest_block: &Arc<AtomicU64>,
+        realtime_head: &Arc<AtomicU64>,
+        canonical_head: &Arc<AtomicU64>,
+        pending_sync_queue: &Arc<Mutex<PendingSyncQueue>>,
+        applied_log_dedup: &Arc<Mutex<AppliedLogDedupCache>>,
+        source: LogSource,
     ) -> Result<Vec<Address>, StateSpaceError>
     where
         P: Provider<N> + Clone,
         N: Network,
     {
-        latest_block.store(block_num, Ordering::Relaxed);
+        let mut prev = realtime_head.load(Ordering::Relaxed);
+        while block_num > prev
+            && realtime_head
+                .compare_exchange(prev, block_num, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            prev = realtime_head.load(Ordering::Relaxed);
+        }
+
+        // For non-Base wsLogs mode, canonical progress is event-driven from logs.
+        if matches!(source, LogSource::WsLogs) {
+            Self::store_monotonic_head(canonical_head, block_num);
+            let guard = state.read().await;
+            Self::store_monotonic_head(&guard.canonical_head, block_num);
+        }
 
         if logs.is_empty() {
             return Ok(vec![]);
@@ -316,49 +526,61 @@ impl<N, P> StateSpaceManager<N, P> {
             )
         });
 
-        let (affected, needs_resync, needs_async_update) = state.write().await.sync(&logs)?;
+        logs = {
+            let mut dedup = applied_log_dedup.lock().await;
+            let mut per_tx_ordinal: HashMap<alloy::primitives::B256, u32> = HashMap::new();
+            let mut kept = Vec::with_capacity(logs.len());
 
-        let amms_to_resync: Vec<AMM> = {
-            let guard = state.read().await;
-            needs_resync
-                .iter()
-                .filter_map(|addr| guard.state.get(addr).cloned())
-                .collect()
+            for log in logs {
+                let tx_log_ordinal = match log.transaction_hash {
+                    Some(tx_hash) => {
+                        let entry = per_tx_ordinal.entry(tx_hash).or_insert(0);
+                        let ordinal = *entry;
+                        *entry = entry.saturating_add(1);
+                        ordinal
+                    }
+                    None => log.log_index.unwrap_or_default().min(u32::MAX as u64) as u32,
+                };
+
+                let key = AppliedLogKey {
+                    tx_hash: log.transaction_hash,
+                    tx_log_ordinal,
+                    address: log.address(),
+                    topic0: log.topics().first().copied(),
+                };
+
+                if dedup.insert_if_new(key) {
+                    kept.push(log);
+                }
+            }
+
+            kept
         };
 
-        if !amms_to_resync.is_empty() {
-            let _ = Self::execute_batch_tasks(
-                state,
-                amms_to_resync,
-                provider.clone(),
-                "auto-resync",
-                |amm, provider| async move {
-                    amm.init(BlockId::Number(block_num.into()), provider).await
-                },
-            )
-            .await;
+        if logs.is_empty() {
+            return Ok(vec![]);
         }
 
-        let amms_to_update: Vec<AMM> = {
-            let guard = state.read().await;
-            needs_async_update
-                .iter()
-                .filter_map(|addr| guard.state.get(addr).cloned())
-                .collect()
-        };
+        let (affected, needs_resync, needs_async_update) = state.write().await.sync(&logs)?;
 
-        if !amms_to_update.is_empty() {
-            let _ = Self::execute_batch_tasks(
-                state,
-                amms_to_update,
-                provider.clone(),
-                "async-update",
-                |mut amm, provider| async move {
-                    amm.update(provider).await?;
-                    Ok(amm)
-                },
-            )
-            .await;
+        if !needs_resync.is_empty() || !needs_async_update.is_empty() {
+            let mut queue = pending_sync_queue.lock().await;
+            for address in needs_resync {
+                queue.enqueue(
+                    address,
+                    PendingSyncAction::Resync,
+                    block_num,
+                    PendingSyncReason::Resync,
+                );
+            }
+            for address in needs_async_update {
+                queue.enqueue(
+                    address,
+                    PendingSyncAction::AsyncUpdate,
+                    block_num,
+                    PendingSyncReason::AsyncUpdate,
+                );
+            }
         }
 
         if !affected.is_empty() {
@@ -406,7 +628,11 @@ impl<N, P> StateSpaceManager<N, P> {
         chunks: &[LogQueryChunk],
         from_block: u64,
         to_block: u64,
-        latest_block: &Arc<AtomicU64>,
+        realtime_head: &Arc<AtomicU64>,
+        canonical_head: &Arc<AtomicU64>,
+        pending_sync_queue: &Arc<Mutex<PendingSyncQueue>>,
+        applied_log_dedup: &Arc<Mutex<AppliedLogDedupCache>>,
+        source: LogSource,
         chain_id: u64,
     ) -> Result<Vec<Vec<Address>>, StateSpaceError>
     where
@@ -453,7 +679,11 @@ impl<N, P> StateSpaceManager<N, P> {
                                 hooks,
                                 block_num,
                                 block_logs,
-                                latest_block,
+                                realtime_head,
+                                canonical_head,
+                                pending_sync_queue,
+                                applied_log_dedup,
+                                source,
                             )
                             .await?;
 
@@ -649,12 +879,66 @@ impl<N, P> StateSpaceManager<N, P> {
             _ => 50,
         }
     }
+
+    fn store_monotonic_head(head: &Arc<AtomicU64>, incoming: u64) {
+        let mut prev = head.load(Ordering::Relaxed);
+        while incoming > prev {
+            match head.compare_exchange(prev, incoming, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => break,
+                Err(cur) => prev = cur,
+            }
+        }
+    }
+
+    async fn run_canonical_head_tracker(
+        provider: P,
+        state: Arc<RwLock<StateSpace>>,
+        canonical_head: Arc<AtomicU64>,
+    ) where
+        P: Provider<N> + Clone + 'static,
+        N: Network + 'static,
+    {
+        let stream_idle_timeout = Duration::from_secs(15);
+        loop {
+            match provider.subscribe_blocks().await {
+                Ok(sub) => {
+                    info!("canonical head tracker subscribed to newHeads");
+                    let mut stream = sub.into_stream();
+
+                    loop {
+                        match tokio::time::timeout(stream_idle_timeout, stream.next()).await {
+                            Ok(Some(header)) => {
+                                let block = header.number();
+                                Self::store_monotonic_head(&canonical_head, block);
+                                {
+                                    let guard = state.read().await;
+                                    Self::store_monotonic_head(&guard.canonical_head, block);
+                                }
+                            }
+                            Ok(None) => {
+                                warn!("canonical newHeads stream ended, reconnecting");
+                                break;
+                            }
+                            Err(_) => {
+                                warn!("canonical newHeads stream timeout, reconnecting");
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("canonical newHeads subscribe failed: {}", e);
+                }
+            }
+            sleep(STREAM_RECONNECT_DELAY).await;
+        }
+    }
 }
 
 #[derive(Clone)]
 pub struct StateSpaceBuilder<N, P> {
     pub provider: P,
-    pub latest_block: u64,
+    pub initial_block: u64,
     pub factories: Vec<Factory>,
     pub amms: Vec<AMM>,
     pub filters: Vec<PoolFilter>,
@@ -676,7 +960,7 @@ where
     pub fn new(provider: P) -> StateSpaceBuilder<N, P> {
         Self {
             provider,
-            latest_block: 0,
+            initial_block: 0,
             factories: vec![],
             amms: vec![],
             filters: vec![],
@@ -691,9 +975,9 @@ where
         }
     }
 
-    pub fn block(self, latest_block: u64) -> StateSpaceBuilder<N, P> {
+    pub fn block(self, block: u64) -> StateSpaceBuilder<N, P> {
         StateSpaceBuilder {
-            latest_block,
+            initial_block: block,
             ..self
         }
     }
@@ -763,15 +1047,15 @@ where
         let chain_id = self.provider.get_chain_id().await?;
         info!(target: "state_space::sync", "Syncing AMMs for chain {}", chain_id);
 
-        let chain_tip_u64 = if self.latest_block > 0 {
-            self.latest_block
+        let chain_tip_u64 = if self.initial_block > 0 {
+            self.initial_block
         } else {
             self.provider.get_block_number().await?
         };
 
-        // If latest_block was not set (0), update it with the fetched chain tip
-        if self.latest_block == 0 {
-            self.latest_block = chain_tip_u64;
+        // If block() was not explicitly configured, initialize all runtime heads with chain tip
+        if self.initial_block == 0 {
+            self.initial_block = chain_tip_u64;
         }
 
         let chain_tip = BlockId::from(chain_tip_u64);
@@ -946,8 +1230,12 @@ where
             }
         }
 
-        let latest_block = Arc::new(AtomicU64::new(self.latest_block));
-        state_space.latest_block = latest_block.clone();
+        let realtime_head = Arc::new(AtomicU64::new(self.initial_block));
+        let canonical_head = Arc::new(AtomicU64::new(self.initial_block));
+        let reconcile_cursor = Arc::new(AtomicU64::new(self.initial_block));
+        state_space.realtime_head = realtime_head.clone();
+        state_space.canonical_head = canonical_head.clone();
+        state_space.reconcile_cursor = reconcile_cursor.clone();
         state_space.chain_id = chain_id;
 
         let state_space = Arc::new(RwLock::new(state_space));
@@ -992,21 +1280,18 @@ where
             ));
         }
 
-        if let Some(interval) = self.maintenance_interval {
-            tokio::spawn(sync_services::start_state_maintenance_task(
-                state_space.clone(),
-                self.factories.clone(),
-                self.provider.clone(),
-                interval,
-            ));
-        }
-
         Ok(StateSpaceManager {
-            latest_block,
+            realtime_head,
+            canonical_head,
+            reconcile_cursor,
             state: state_space,
             block_filter,
             provider: self.provider,
             realtime_source: self.realtime_source,
+            pending_sync_queue: Arc::new(Mutex::new(PendingSyncQueue::default())),
+            applied_log_dedup: Arc::new(Mutex::new(AppliedLogDedupCache::default())),
+            background_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            maintenance_interval: self.maintenance_interval,
             phantom: PhantomData,
             hooks: HookRegistry::new(self.hooks),
         })
@@ -1016,7 +1301,9 @@ where
 #[derive(Clone, Debug, Default)]
 pub struct StateSpace {
     pub state: HashMap<Address, AMM>,
-    pub latest_block: Arc<AtomicU64>,
+    pub realtime_head: Arc<AtomicU64>,
+    pub canonical_head: Arc<AtomicU64>,
+    pub reconcile_cursor: Arc<AtomicU64>,
     pub chain_id: u64,
     cache: StateChangeCache<CACHE_SIZE>,
 }
@@ -1066,14 +1353,14 @@ impl StateSpace {
             )
         });
 
-        let latest = self.latest_block.load(Ordering::Relaxed);
+        let latest = self.realtime_head.load(Ordering::Relaxed);
 
         // We do not check for reorgs here using block numbers because partitioned log subscriptions
         // (chunking) can cause logs to arrive out of order or in interleaved batches.
         // A "late" batch from one chunk is not a reorg of the chain.
         // We rely on:
         // 1. Per-AMM `last_synced_block` checks to prevent rewinding individual pools.
-        // 2. The periodic `start_state_maintenance_task` to handle actual chain reorgs/discrepancies.
+        // 2. The maintenance coverage scheduler + canonical reconcile path to repair drift/discrepancies.
         // 3. The `needs_resync` set to handle syncs that fail due to insufficient data (e.g. Curve V1 RemoveLiquidityOne)
 
         let mut affected_amms = HashSet::new();
@@ -1190,13 +1477,14 @@ impl StateSpace {
 
                 Err(e) => {
                     error!(target: "state_space::sync", ?address, ?log_block_number, "Failed to sync AMM with log: {}", e);
+                    needs_resync.insert(target_address);
                 }
             }
         }
 
-        // Update latest_block internally to ensure consistency with state lock
+        // Update realtime head internally to ensure consistency with state lock
         if max_processed_block > latest {
-            self.latest_block
+            self.realtime_head
                 .store(max_processed_block, Ordering::Relaxed);
         }
 
@@ -1211,7 +1499,12 @@ impl StateSpace {
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct SerializableStateSpace {
     pub state: HashMap<Address, AMM>,
-    pub latest_block: u64,
+    #[serde(default)]
+    pub realtime_head: u64,
+    #[serde(default)]
+    pub canonical_head: u64,
+    #[serde(default)]
+    pub reconcile_cursor: u64,
     pub cache: (Vec<StateChange>, u64),
 }
 
@@ -1219,7 +1512,9 @@ impl From<StateSpace> for SerializableStateSpace {
     fn from(ss: StateSpace) -> Self {
         Self {
             state: ss.state,
-            latest_block: ss.latest_block.load(Ordering::Relaxed),
+            realtime_head: ss.realtime_head.load(Ordering::Relaxed),
+            canonical_head: ss.canonical_head.load(Ordering::Relaxed),
+            reconcile_cursor: ss.reconcile_cursor.load(Ordering::Relaxed),
             cache: (ss.cache.cache.into_iter().collect(), ss.cache.oldest_block),
         }
     }
@@ -1323,10 +1618,33 @@ mod tests {
 
 impl From<SerializableStateSpace> for StateSpace {
     fn from(val: SerializableStateSpace) -> Self {
+        let inferred_head = val
+            .state
+            .values()
+            .map(AutomatedMarketMaker::last_synced_block)
+            .max()
+            .unwrap_or_default();
         let (cache, oldest_block) = val.cache;
+        let realtime_head = if val.realtime_head == 0 {
+            inferred_head
+        } else {
+            val.realtime_head
+        };
+        let canonical_head = if val.canonical_head == 0 {
+            inferred_head.max(realtime_head)
+        } else {
+            val.canonical_head
+        };
+        let reconcile_cursor = if val.reconcile_cursor == 0 {
+            inferred_head.max(canonical_head)
+        } else {
+            val.reconcile_cursor
+        };
         StateSpace {
             state: val.state,
-            latest_block: Arc::new(AtomicU64::new(val.latest_block)),
+            realtime_head: Arc::new(AtomicU64::new(realtime_head)),
+            canonical_head: Arc::new(AtomicU64::new(canonical_head)),
+            reconcile_cursor: Arc::new(AtomicU64::new(reconcile_cursor)),
             cache: StateChangeCache {
                 cache: cache.into_iter().collect(),
                 oldest_block,

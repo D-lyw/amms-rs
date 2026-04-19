@@ -1,4 +1,7 @@
-use super::{HookRegistry, LogQueryChunk, StateSpace, StateSpaceError, StateSpaceManager};
+use super::{
+    AppliedLogDedupCache, HookRegistry, LogQueryChunk, LogSource, PendingSyncQueue, StateSpace,
+    StateSpaceError, StateSpaceManager,
+};
 use crate::state_space::{STREAM_IDLE_TIMEOUT, STREAM_RECONNECT_DELAY};
 use alloy::network::Network;
 use alloy::providers::Provider;
@@ -7,7 +10,7 @@ use async_stream::stream;
 use futures::{Stream, StreamExt};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::time::sleep;
 use tracing::{error, warn};
 
@@ -16,7 +19,10 @@ impl<N, P> StateSpaceManager<N, P> {
         provider: P,
         state: Arc<RwLock<StateSpace>>,
         hooks: HookRegistry<Vec<alloy::primitives::Address>>,
-        latest_block: Arc<AtomicU64>,
+        realtime_head: Arc<AtomicU64>,
+        canonical_head: Arc<AtomicU64>,
+        pending_sync_queue: Arc<Mutex<PendingSyncQueue>>,
+        applied_log_dedup: Arc<Mutex<AppliedLogDedupCache>>,
         query_chunks: Vec<LogQueryChunk>,
         chain_id: u64,
     ) -> impl Stream<Item = Result<Vec<alloy::primitives::Address>, StateSpaceError>> + Send
@@ -31,7 +37,11 @@ impl<N, P> StateSpaceManager<N, P> {
                     &state,
                     &hooks,
                     &query_chunks,
-                    &latest_block,
+                    &realtime_head,
+                    &canonical_head,
+                    &pending_sync_queue,
+                    &applied_log_dedup,
+                    LogSource::WsLogs,
                     chain_id,
                 )
                 .await
@@ -92,7 +102,7 @@ impl<N, P> StateSpaceManager<N, P> {
                                 .iter()
                                 .filter_map(|l| l.block_number)
                                 .max()
-                                .unwrap_or_else(|| latest_block.load(Ordering::Relaxed));
+                                .unwrap_or_else(|| realtime_head.load(Ordering::Relaxed));
 
                             match Self::apply_logs_for_block(
                                 &provider,
@@ -100,7 +110,11 @@ impl<N, P> StateSpaceManager<N, P> {
                                 &hooks,
                                 block_num,
                                 logs,
-                                &latest_block,
+                                &realtime_head,
+                                &canonical_head,
+                                &pending_sync_queue,
+                                &applied_log_dedup,
+                                LogSource::WsLogs,
                             )
                             .await
                             {

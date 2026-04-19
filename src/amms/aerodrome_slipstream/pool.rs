@@ -45,6 +45,13 @@ use rug::Float;
 use uniswap_v3_math::tick_math::{MAX_SQRT_RATIO, MAX_TICK, MIN_SQRT_RATIO, MIN_TICK};
 
 pub const BASE_SLIPSTREAM_FACTORY: Address = address!("5e7BB104d84c7CB9B682AaC2F3d509f5F406809A");
+const SLIPSTREAM_BATCH_RETRY_ATTEMPTS: u8 = 3;
+const SLIPSTREAM_BATCH_RETRY_BASE_DELAY_MS: u64 = 200;
+
+fn slipstream_retry_delay(attempt: u8) -> Duration {
+    let exp = attempt.saturating_sub(1).min(5);
+    Duration::from_millis(SLIPSTREAM_BATCH_RETRY_BASE_DELAY_MS.saturating_mul(1u64 << exp))
+}
 
 sol! {
     #[derive(Debug, PartialEq, Eq)]
@@ -1388,28 +1395,44 @@ impl AerodromeSlipstreamFactory {
         for (pool_info, calldata) in jobs {
             let provider = provider.clone();
             futures.push(Box::pin(async move {
-                Ok::<(Vec<Address>, Bytes), AMMError>((
-                    pool_info,
-                    GetUniswapV3PoolTickBitmapBatchRequest::deploy_builder(provider, calldata)
-                        .call_raw()
-                        .block(block_number)
-                        .await?,
-                ))
+                let mut attempt = 1u8;
+                loop {
+                    match GetUniswapV3PoolTickBitmapBatchRequest::deploy_builder(
+                        provider.clone(),
+                        calldata.clone(),
+                    )
+                    .call_raw()
+                    .block(block_number)
+                    .await
+                    {
+                        Ok(return_data) => {
+                            break Ok::<(Vec<Address>, Bytes), AMMError>((pool_info, return_data));
+                        }
+                        Err(e) if attempt < SLIPSTREAM_BATCH_RETRY_ATTEMPTS => {
+                            let delay = slipstream_retry_delay(attempt);
+                            tracing::warn!(
+                                target = "amms::aerodrome_slipstream::sync_tick_bitmaps",
+                                attempt,
+                                max_attempts = SLIPSTREAM_BATCH_RETRY_ATTEMPTS,
+                                error = ?e,
+                                "Batch tick bitmap call failed, retrying"
+                            );
+                            sleep(delay).await;
+                            attempt = attempt.saturating_add(1);
+                        }
+                        Err(e) => break Err(e.into()),
+                    }
+                }
             }));
 
             if futures.len() >= max_in_flight {
                 if let Some(res) = futures.next().await {
-                    let (pools_addrs, return_data) = match res {
-                        Ok(data) => data,
-                        Err(e) => {
-                            tracing::warn!(
-                                target = "amms::aerodrome_slipstream::sync_tick_bitmaps",
-                                error = ?e,
-                                "Batch tick bitmap call failed, skipping batch"
-                            );
-                            continue;
-                        }
-                    };
+                    let (pools_addrs, return_data) = res.map_err(|e| {
+                        AMMError::Msg(format!(
+                            "Slipstream tick bitmap batch failed after retries: {}",
+                            e
+                        ))
+                    })?;
                     let return_data = match <Vec<Vec<U256>> as SolValue>::abi_decode(&return_data) {
                         Ok(data) => data,
                         Err(e) => {
@@ -1417,9 +1440,12 @@ impl AerodromeSlipstreamFactory {
                                 target = "amms::aerodrome_slipstream::sync_tick_bitmaps",
                                 error = ?e,
                                 return_data_len = return_data.len(),
-                                "Failed to decode tick bitmap data, skipping batch"
+                                "Failed to decode tick bitmap data"
                             );
-                            continue;
+                            return Err(AMMError::Msg(format!(
+                                "Slipstream tick bitmap decode failed: {}",
+                                e
+                            )));
                         }
                     };
 
@@ -1443,17 +1469,12 @@ impl AerodromeSlipstreamFactory {
         }
 
         while let Some(res) = futures.next().await {
-            let (pools_addrs, return_data) = match res {
-                Ok(data) => data,
-                Err(e) => {
-                    tracing::warn!(
-                        target = "amms::aerodrome_slipstream::sync_tick_bitmaps",
-                        error = ?e,
-                        "Batch tick bitmap call failed, skipping batch"
-                    );
-                    continue;
-                }
-            };
+            let (pools_addrs, return_data) = res.map_err(|e| {
+                AMMError::Msg(format!(
+                    "Slipstream tick bitmap batch failed after retries: {}",
+                    e
+                ))
+            })?;
             let return_data = match <Vec<Vec<U256>> as SolValue>::abi_decode(&return_data) {
                 Ok(data) => data,
                 Err(e) => {
@@ -1461,9 +1482,12 @@ impl AerodromeSlipstreamFactory {
                         target = "amms::aerodrome_slipstream::sync_tick_bitmaps",
                         error = ?e,
                         return_data_len = return_data.len(),
-                        "Failed to decode tick bitmap data, skipping batch"
+                        "Failed to decode tick bitmap data"
                     );
-                    continue;
+                    return Err(AMMError::Msg(format!(
+                        "Slipstream tick bitmap decode failed: {}",
+                        e
+                    )));
                 }
             };
 
@@ -1579,30 +1603,47 @@ impl AerodromeSlipstreamFactory {
             let provider = provider.clone();
             let calldata_clone = calldata.clone();
             futures.push(Box::pin(async move {
-                Ok::<(Vec<TickDataInfo>, Bytes), AMMError>((
-                    calldata_clone,
-                    GetAerodromeSlipstreamPoolTickDataBatchRequest::deploy_builder(
-                        provider, calldata,
+                let mut attempt = 1u8;
+                loop {
+                    match GetAerodromeSlipstreamPoolTickDataBatchRequest::deploy_builder(
+                        provider.clone(),
+                        calldata.clone(),
                     )
                     .call_raw()
                     .block(block_number)
-                    .await?,
-                ))
+                    .await
+                    {
+                        Ok(return_data) => {
+                            break Ok::<(Vec<TickDataInfo>, Bytes), AMMError>((
+                                calldata_clone,
+                                return_data,
+                            ));
+                        }
+                        Err(e) if attempt < SLIPSTREAM_BATCH_RETRY_ATTEMPTS => {
+                            let delay = slipstream_retry_delay(attempt);
+                            tracing::warn!(
+                                target = "amms::aerodrome_slipstream::sync_tick_data",
+                                attempt,
+                                max_attempts = SLIPSTREAM_BATCH_RETRY_ATTEMPTS,
+                                error = ?e,
+                                "Batch tick data call failed, retrying"
+                            );
+                            sleep(delay).await;
+                            attempt = attempt.saturating_add(1);
+                        }
+                        Err(e) => break Err(e.into()),
+                    }
+                }
             }));
 
             if futures.len() >= max_in_flight {
                 if let Some(res) = futures.next().await {
-                    let (tick_info, return_data) = match res {
-                        Ok(data) => data,
-                        Err(e) => {
-                            tracing::warn!(
-                                target = "amms::aerodrome_slipstream::sync_tick_data",
-                                error = ?e,
-                                "Batch tick data call failed, skipping batch"
-                            );
-                            continue;
-                        }
-                    };
+                    let (tick_info, return_data) = res.map_err(|e| {
+                        AMMError::Msg(format!(
+                            "Slipstream tick data batch failed after retries: {}",
+                            e
+                        ))
+                    })?;
                     let return_data =
                         match <Vec<Vec<(u128, i128)>> as SolValue>::abi_decode(&return_data) {
                             Ok(data) => data,
@@ -1611,9 +1652,12 @@ impl AerodromeSlipstreamFactory {
                                     target = "amms::aerodrome_slipstream::sync_tick_data",
                                     error = ?e,
                                     return_data_len = return_data.len(),
-                                    "Failed to decode tick data, skipping batch"
+                                    "Failed to decode tick data"
                                 );
-                                continue;
+                                return Err(AMMError::Msg(format!(
+                                    "Slipstream tick data decode failed: {}",
+                                    e
+                                )));
                             }
                         };
 
@@ -1641,17 +1685,12 @@ impl AerodromeSlipstreamFactory {
         }
 
         while let Some(res) = futures.next().await {
-            let (tick_info, return_data) = match res {
-                Ok(data) => data,
-                Err(e) => {
-                    tracing::warn!(
-                        target = "amms::aerodrome_slipstream::sync_tick_data",
-                        error = ?e,
-                        "Batch tick data call failed, skipping batch"
-                    );
-                    continue;
-                }
-            };
+            let (tick_info, return_data) = res.map_err(|e| {
+                AMMError::Msg(format!(
+                    "Slipstream tick data batch failed after retries: {}",
+                    e
+                ))
+            })?;
             let return_data = match <Vec<Vec<(u128, i128)>> as SolValue>::abi_decode(&return_data) {
                 Ok(data) => data,
                 Err(e) => {
@@ -1659,9 +1698,12 @@ impl AerodromeSlipstreamFactory {
                         target = "amms::aerodrome_slipstream::sync_tick_data",
                         error = ?e,
                         return_data_len = return_data.len(),
-                        "Failed to decode tick data, skipping batch"
+                        "Failed to decode tick data"
                     );
-                    continue;
+                    return Err(AMMError::Msg(format!(
+                        "Slipstream tick data decode failed: {}",
+                        e
+                    )));
                 }
             };
 

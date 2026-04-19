@@ -1,5 +1,6 @@
 use super::{
-    HookRegistry, LogQueryChunk, QueryMode, StateSpace, StateSpaceError, StateSpaceManager,
+    AppliedLogDedupCache, HookRegistry, LogQueryChunk, LogSource, PendingSyncQueue, QueryMode,
+    StateSpace, StateSpaceError, StateSpaceManager,
 };
 use crate::state_space::{
     BASE_FLASHBLOCKS_RAW_WS_URL, STREAM_IDLE_TIMEOUT, STREAM_RECONNECT_DELAY,
@@ -16,14 +17,15 @@ use std::io::Read;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::RwLock;
-use tokio::time::sleep;
+use tokio::sync::{Mutex, RwLock};
+use tokio::time::{sleep, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tracing::{error, warn};
 
 const FLASHBLOCKS_DEDUP_PAYLOAD_WINDOW: usize = 4;
 const FLASHBLOCKS_HEX_CACHE_MAX: usize = 8192;
 const FLASHBLOCKS_BROTLI_READER_BUF_SIZE: usize = 64 * 1024;
+const BASE_RECONCILE_CHUNK_BLOCKS: u64 = 100;
 
 #[derive(Clone, Debug)]
 struct RawLogMatcher {
@@ -218,9 +220,10 @@ impl<N, P> StateSpaceManager<N, P> {
         matcher: &RawLogMatcher,
         dedup_cache: &mut FlashblocksDedupCache,
         parse_cache: &mut FlashblocksParseCache,
-    ) -> (Vec<Log>, Option<u64>, usize) {
+    ) -> (Vec<Log>, Option<u64>, usize, HashSet<Address>) {
         let mut out = Vec::new();
         let mut decode_fail = 0usize;
+        let mut decode_failed_addresses = HashSet::new();
 
         let block_number = fb
             .metadata
@@ -234,11 +237,16 @@ impl<N, P> StateSpaceManager<N, P> {
             });
 
         let Some(block_number) = block_number else {
-            return (out, None, decode_fail);
+            return (out, None, decode_fail, decode_failed_addresses);
         };
 
         let Some(metadata) = fb.metadata.as_ref() else {
-            return (out, Some(block_number), decode_fail);
+            return (
+                out,
+                Some(block_number),
+                decode_fail,
+                decode_failed_addresses,
+            );
         };
 
         for (fallback_tx_idx, (tx_hash, receipt)) in metadata.receipts.iter().enumerate() {
@@ -266,6 +274,7 @@ impl<N, P> StateSpaceManager<N, P> {
 
                 if raw_log.topics.len() > 4 {
                     decode_fail += 1;
+                    decode_failed_addresses.insert(address);
                     continue;
                 }
 
@@ -276,6 +285,7 @@ impl<N, P> StateSpaceManager<N, P> {
                     };
                     let Some(topic0) = parse_cache.parse_topic(topic0_raw) else {
                         decode_fail += 1;
+                        decode_failed_addresses.insert(address);
                         continue;
                     };
                     if !matcher.topic_signatures.contains(&topic0) {
@@ -296,6 +306,7 @@ impl<N, P> StateSpaceManager<N, P> {
 
                     if topic_decode_failed {
                         decode_fail += 1;
+                        decode_failed_addresses.insert(address);
                         continue;
                     }
                 } else {
@@ -311,6 +322,7 @@ impl<N, P> StateSpaceManager<N, P> {
                     }
                     if topic_decode_failed {
                         decode_fail += 1;
+                        decode_failed_addresses.insert(address);
                         continue;
                     }
                 }
@@ -319,12 +331,14 @@ impl<N, P> StateSpaceManager<N, P> {
                     Ok(v) => v,
                     Err(_) => {
                         decode_fail += 1;
+                        decode_failed_addresses.insert(address);
                         continue;
                     }
                 };
 
                 let Some(log_data) = LogData::new(topics, data) else {
                     decode_fail += 1;
+                    decode_failed_addresses.insert(address);
                     continue;
                 };
 
@@ -354,7 +368,8 @@ impl<N, P> StateSpaceManager<N, P> {
         // wrong local order will cause irreversible state rollback (e.g. outdated sqrtPriceX96).
         // To maintain 0ms overhead for 99% of normal blocks, we natively ONLY trigger the intensive
         // Keccak256 RLP hashing (to find true transaction order) if a collision perfectly strikes.
-        let mut pool_collision_detector: HashMap<Address, HashSet<alloy::primitives::B256>> = HashMap::new();
+        let mut pool_collision_detector: HashMap<Address, HashSet<alloy::primitives::B256>> =
+            HashMap::new();
         let mut needs_lazy_evaluation = false;
 
         for log in &out {
@@ -390,14 +405,22 @@ impl<N, P> StateSpaceManager<N, P> {
             }
         }
 
-        (out, Some(block_number), decode_fail)
+        (
+            out,
+            Some(block_number),
+            decode_fail,
+            decode_failed_addresses,
+        )
     }
 
     pub(super) fn subscribe_flashblocks_raw_stream(
         provider: P,
         state: Arc<RwLock<StateSpace>>,
         hooks: HookRegistry<Vec<Address>>,
-        latest_block: Arc<AtomicU64>,
+        realtime_head: Arc<AtomicU64>,
+        canonical_head: Arc<AtomicU64>,
+        pending_sync_queue: Arc<Mutex<PendingSyncQueue>>,
+        applied_log_dedup: Arc<Mutex<AppliedLogDedupCache>>,
         query_chunks: Vec<LogQueryChunk>,
         chain_id: u64,
     ) -> impl Stream<Item = Result<Vec<Address>, StateSpaceError>> + Send
@@ -418,7 +441,11 @@ impl<N, P> StateSpaceManager<N, P> {
                     &state,
                     &hooks,
                     &query_chunks,
-                    &latest_block,
+                    &realtime_head,
+                    &canonical_head,
+                    &pending_sync_queue,
+                    &applied_log_dedup,
+                    LogSource::RealtimeFlashblock,
                     chain_id,
                 )
                 .await
@@ -486,12 +513,15 @@ impl<N, P> StateSpaceManager<N, P> {
                         continue;
                     };
 
-                    let (logs, block_number, decode_fail) = Self::extract_logs_from_flashblock(
+                    let (logs, block_number, decode_fail, decode_failed_addresses) = Self::extract_logs_from_flashblock(
                         &fb,
                         &matcher,
                         &mut dedup_cache,
                         &mut parse_cache,
                     );
+                    let block_num =
+                        block_number.unwrap_or_else(|| realtime_head.load(Ordering::Relaxed));
+
                     if decode_fail > 0 {
                         warn!(
                             "Flashblocks log decode failures: payload_id={} index={} count={}",
@@ -499,14 +529,32 @@ impl<N, P> StateSpaceManager<N, P> {
                             fb.index,
                             decode_fail
                         );
+
+                        if !decode_failed_addresses.is_empty() {
+                            let resolvable: Vec<Address> = {
+                                let guard = state.read().await;
+                                decode_failed_addresses
+                                    .into_iter()
+                                    .filter(|addr| guard.state.contains_key(addr))
+                                    .collect()
+                            };
+                            if !resolvable.is_empty() {
+                                let mut queue = pending_sync_queue.lock().await;
+                                for address in resolvable {
+                                    queue.enqueue(
+                                        address,
+                                        super::PendingSyncAction::Resync,
+                                        block_num,
+                                        super::PendingSyncReason::SyncError,
+                                    );
+                                }
+                            }
+                        }
                     }
 
                     if logs.is_empty() {
                         continue;
                     }
-
-                    let block_num =
-                        block_number.unwrap_or_else(|| latest_block.load(Ordering::Relaxed));
 
                     match Self::apply_logs_for_block(
                         &provider,
@@ -514,7 +562,11 @@ impl<N, P> StateSpaceManager<N, P> {
                         &hooks,
                         block_num,
                         logs,
-                        &latest_block,
+                        &realtime_head,
+                        &canonical_head,
+                        &pending_sync_queue,
+                        &applied_log_dedup,
+                        LogSource::RealtimeFlashblock,
                     )
                     .await
                     {
@@ -530,6 +582,67 @@ impl<N, P> StateSpaceManager<N, P> {
                 }
 
                 sleep(STREAM_RECONNECT_DELAY).await;
+            }
+        }
+    }
+
+    pub(super) async fn run_reconcile_worker(
+        provider: P,
+        state: Arc<RwLock<StateSpace>>,
+        hooks: HookRegistry<Vec<Address>>,
+        chunks: Vec<LogQueryChunk>,
+        realtime_head: Arc<AtomicU64>,
+        canonical_head: Arc<AtomicU64>,
+        reconcile_cursor: Arc<AtomicU64>,
+        pending_sync_queue: Arc<Mutex<PendingSyncQueue>>,
+        applied_log_dedup: Arc<Mutex<AppliedLogDedupCache>>,
+        chain_id: u64,
+    ) where
+        P: Provider<N> + Clone + 'static,
+        N: Network + 'static,
+    {
+        loop {
+            let canonical = canonical_head.load(Ordering::Relaxed);
+            let cursor = reconcile_cursor.load(Ordering::Relaxed);
+
+            if canonical == 0 || cursor >= canonical {
+                sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+
+            let start = cursor.saturating_add(1);
+            let end = (start + BASE_RECONCILE_CHUNK_BLOCKS - 1).min(canonical);
+
+            match Self::backfill_range(
+                &provider,
+                &state,
+                &hooks,
+                &chunks,
+                start,
+                end,
+                &realtime_head,
+                &canonical_head,
+                &pending_sync_queue,
+                &applied_log_dedup,
+                LogSource::CanonicalReconcile,
+                chain_id,
+            )
+            .await
+            {
+                Ok(_) => {
+                    Self::store_monotonic_head(&reconcile_cursor, end);
+                    let guard = state.read().await;
+                    Self::store_monotonic_head(&guard.reconcile_cursor, end);
+                }
+                Err(e) => {
+                    warn!(
+                        from_block = start,
+                        to_block = end,
+                        "Canonical reconcile range failed: {}",
+                        e
+                    );
+                    sleep(STREAM_RECONNECT_DELAY).await;
+                }
             }
         }
     }
