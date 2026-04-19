@@ -3,19 +3,20 @@ use super::{
     StateSpaceError, StateSpaceManager,
 };
 use crate::state_space::{STREAM_IDLE_TIMEOUT, STREAM_RECONNECT_DELAY};
+use alloy::consensus::BlockHeader;
 use alloy::network::Network;
+use alloy::network::primitives::HeaderResponse;
 use alloy::providers::Provider;
-use alloy::rpc::types::eth::Log;
 use async_stream::stream;
 use futures::{Stream, StreamExt};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock};
 use tokio::time::sleep;
 use tracing::{error, warn};
 
 impl<N, P> StateSpaceManager<N, P> {
-    pub(super) fn subscribe_ws_logs_stream(
+    pub(super) fn subscribe_new_heads_stream(
         provider: P,
         state: Arc<RwLock<StateSpace>>,
         hooks: HookRegistry<Vec<alloy::primitives::Address>>,
@@ -32,6 +33,15 @@ impl<N, P> StateSpaceManager<N, P> {
     {
         stream! {
             loop {
+                let mut heads_stream = match provider.subscribe_blocks().await {
+                    Ok(sub) => sub.into_stream(),
+                    Err(e) => {
+                        error!("Failed to subscribe to newHeads: {}", e);
+                        sleep(STREAM_RECONNECT_DELAY).await;
+                        continue;
+                    }
+                };
+
                 match Self::initial_backfill_results(
                     &provider,
                     &state,
@@ -41,7 +51,7 @@ impl<N, P> StateSpaceManager<N, P> {
                     &canonical_head,
                     &pending_sync_queue,
                     &applied_log_dedup,
-                    LogSource::WsLogs,
+                    LogSource::NewHeadsPull,
                     chain_id,
                 )
                 .await
@@ -54,55 +64,93 @@ impl<N, P> StateSpaceManager<N, P> {
                         }
                     }
                     Err(e) => {
-                        warn!("Initial backfill failed before wsLogs subscribe: {}", e);
+                        warn!("Initial backfill failed before newHeads subscribe: {}", e);
                     }
                 }
 
-                let (tx, mut rx) = mpsc::channel::<Log>(8192);
-                let mut active_subscriptions = 0usize;
-
-                for chunk in &query_chunks {
-                    let filter = chunk.subscription_filter();
-                    match provider.subscribe_logs(&filter).await {
-                        Ok(sub) => {
-                            active_subscriptions += 1;
-                            let mut stream = sub.into_stream();
-                            let tx_cloned = tx.clone();
-                            tokio::spawn(async move {
-                                while let Some(log) = stream.next().await {
-                                    if tx_cloned.send(log).await.is_err() {
-                                        break;
-                                    }
-                                }
-                            });
-                        }
-                        Err(e) => {
-                            warn!("wsLogs chunk subscribe failed: {}", e);
-                        }
-                    }
-                }
-
-                drop(tx);
-
-                if active_subscriptions == 0 {
-                    warn!("No active wsLogs subscriptions; reconnecting");
-                    sleep(STREAM_RECONNECT_DELAY).await;
-                    continue;
-                }
+                let mut last_hash: Option<alloy::primitives::FixedBytes<32>> = None;
 
                 loop {
-                    match tokio::time::timeout(STREAM_IDLE_TIMEOUT, rx.recv()).await {
-                        Ok(Some(first_log)) => {
-                            let mut logs = vec![first_log];
-                            while let Ok(log) = rx.try_recv() {
-                                logs.push(log);
+                    match tokio::time::timeout(STREAM_IDLE_TIMEOUT, heads_stream.next()).await {
+                        Ok(Some(new_head)) => {
+                            let block_num = new_head.number();
+                            let block_hash = new_head.hash();
+                            let parent_hash = new_head.parent_hash();
+                            let logs_bloom = new_head.logs_bloom();
+
+                            let last_processed = realtime_head.load(Ordering::Relaxed);
+                            if block_num < last_processed {
+                                continue;
                             }
 
-                            let block_num = logs
-                                .iter()
-                                .filter_map(|l| l.block_number)
-                                .max()
-                                .unwrap_or_else(|| realtime_head.load(Ordering::Relaxed));
+                            if block_num == last_processed {
+                                if let Some(last) = last_hash {
+                                    if last == block_hash {
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                if block_num > last_processed + 1 {
+                                    match Self::backfill_range(
+                                        &provider,
+                                        &state,
+                                        &hooks,
+                                        &query_chunks,
+                                        last_processed + 1,
+                                        block_num - 1,
+                                        &realtime_head,
+                                        &canonical_head,
+                                        &pending_sync_queue,
+                                        &applied_log_dedup,
+                                        LogSource::NewHeadsPull,
+                                        chain_id,
+                                    )
+                                    .await
+                                    {
+                                        Ok(results) => {
+                                            for affected in results {
+                                                if !affected.is_empty() {
+                                                    yield Ok(affected);
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            error!(
+                                                "Gap backfill {}..{} failed: {}",
+                                                last_processed + 1,
+                                                block_num - 1,
+                                                e
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                } else if let Some(last) = last_hash {
+                                    if parent_hash != last {
+                                        warn!(
+                                            "Parent hash mismatch at block {} (expected parent {}, got {})",
+                                            block_num,
+                                            last,
+                                            parent_hash
+                                        );
+                                    }
+                                }
+                            }
+
+                            let logs = match Self::collect_logs_for_chunks(
+                                &provider,
+                                &query_chunks,
+                                block_num,
+                                block_num,
+                                Some(&logs_bloom),
+                            )
+                            .await
+                            {
+                                Ok(logs) => logs,
+                                Err(e) => {
+                                    error!("get_logs failed for block {}: {}", block_num, e);
+                                    continue;
+                                }
+                            };
 
                             match Self::apply_logs_for_block(
                                 &provider,
@@ -114,26 +162,27 @@ impl<N, P> StateSpaceManager<N, P> {
                                 &canonical_head,
                                 &pending_sync_queue,
                                 &applied_log_dedup,
-                                LogSource::WsLogs,
+                                LogSource::NewHeadsPull,
                             )
                             .await
                             {
                                 Ok(affected) => {
+                                    last_hash = Some(block_hash);
                                     if !affected.is_empty() {
                                         yield Ok(affected);
                                     }
                                 }
                                 Err(e) => {
-                                    error!("wsLogs processing failed: {}", e);
+                                    error!("newHeads processing failed for block {}: {}", block_num, e);
                                 }
                             }
                         }
                         Ok(None) => {
-                            warn!("wsLogs subscription stream ended");
+                            warn!("newHeads stream ended");
                             break;
                         }
                         Err(_) => {
-                            warn!("wsLogs stream timeout, reconnecting");
+                            warn!("newHeads stream timeout, reconnecting");
                             break;
                         }
                     }

@@ -58,6 +58,8 @@ pub const CACHE_SIZE: usize = 100;
 pub enum RealtimeSyncSource {
     #[default]
     Auto,
+    // Legacy compatibility knob: non-Base realtime path now follows
+    // newHeads + per-block get_logs pull mode.
     WsLogs,
     BaseFlashblocksRaw,
 }
@@ -93,7 +95,7 @@ const APPLIED_LOG_DEDUP_CAPACITY: usize = 300_000;
 enum LogSource {
     RealtimeFlashblock,
     CanonicalReconcile,
-    WsLogs,
+    NewHeadsPull,
     Maintenance,
 }
 
@@ -198,22 +200,11 @@ impl LogQueryChunk {
         filter
     }
 
-    fn subscription_filter(&self) -> Filter {
-        let mut filter = Filter::new().address(self.addresses.clone());
-
-        if let QueryMode::TopicFiltered(topics) = &self.mode {
-            if !topics.is_empty() {
-                filter = filter.event_signature(topics.clone());
-            }
-        }
-
-        filter
-    }
 }
 
 #[derive(Clone, Debug)]
 enum SelectedRealtimeSource {
-    WsLogs,
+    NewHeadsPull,
     BaseFlashblocksRaw,
 }
 
@@ -313,7 +304,7 @@ impl<N, P> StateSpaceManager<N, P> {
 
     /// Subscribes to AMM state changes through a configurable realtime source:
     /// - Base: Flashblocks infrastructure stream by default.
-    /// - Other chains: standard ws logs subscription.
+    /// - Other chains: newHeads + logsBloom prefilter + per-block get_logs.
     pub async fn subscribe(
         &self,
     ) -> Result<
@@ -341,13 +332,13 @@ impl<N, P> StateSpaceManager<N, P> {
         let selected = Self::resolve_realtime_source(chain_id, &realtime_source);
 
         match selected {
-            SelectedRealtimeSource::WsLogs => {
+            SelectedRealtimeSource::NewHeadsPull => {
                 info!(
-                    "Starting wsLogs sync (chain_id={}, {} query chunks)",
+                    "Starting newHeads + logsBloom + getLogs sync (chain_id={}, {} query chunks)",
                     chain_id,
                     query_chunks.len()
                 );
-                Ok(Box::pin(Self::subscribe_ws_logs_stream(
+                Ok(Box::pin(Self::subscribe_new_heads_stream(
                     provider,
                     state,
                     hooks,
@@ -390,10 +381,10 @@ impl<N, P> StateSpaceManager<N, P> {
                 if chain_id == BASE_CHAIN_ID {
                     SelectedRealtimeSource::BaseFlashblocksRaw
                 } else {
-                    SelectedRealtimeSource::WsLogs
+                    SelectedRealtimeSource::NewHeadsPull
                 }
             }
-            RealtimeSyncSource::WsLogs => SelectedRealtimeSource::WsLogs,
+            RealtimeSyncSource::WsLogs => SelectedRealtimeSource::NewHeadsPull,
             RealtimeSyncSource::BaseFlashblocksRaw => SelectedRealtimeSource::BaseFlashblocksRaw,
         }
     }
@@ -507,8 +498,8 @@ impl<N, P> StateSpaceManager<N, P> {
             prev = realtime_head.load(Ordering::Relaxed);
         }
 
-        // For non-Base wsLogs mode, canonical progress is event-driven from logs.
-        if matches!(source, LogSource::WsLogs) {
+        // For non-Base newHeads mode, canonical progress is event-driven from heads.
+        if matches!(source, LogSource::NewHeadsPull) {
             Self::store_monotonic_head(canonical_head, block_num);
             let guard = state.read().await;
             Self::store_monotonic_head(&guard.canonical_head, block_num);
