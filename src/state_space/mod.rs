@@ -1,4 +1,3 @@
-pub mod cache;
 pub mod discovery;
 pub mod error;
 pub mod filters;
@@ -31,8 +30,6 @@ use alloy::providers::Provider;
 use alloy::rpc::types::{eth::Log, Filter, FilterSet};
 use alloy::sol;
 use alloy::sol_types::SolEvent;
-use cache::StateChange;
-use cache::StateChangeCache;
 
 use error::StateSpaceError;
 use filters::AMMFilter;
@@ -51,8 +48,6 @@ use tokio::sync::{Mutex, RwLock};
 
 use tokio::time::{sleep, Duration};
 use tracing::{error, info, warn};
-
-pub const CACHE_SIZE: usize = 100;
 
 #[derive(Clone, Debug, Default)]
 pub enum RealtimeSyncSource {
@@ -199,7 +194,6 @@ impl LogQueryChunk {
 
         filter
     }
-
 }
 
 #[derive(Clone, Debug)]
@@ -462,7 +456,7 @@ impl<N, P> StateSpaceManager<N, P> {
         while let Some((addr, res)) = futures.next().await {
             match res {
                 Ok(new_amm) => {
-                    state.write().await.state.insert(addr, new_amm);
+                    state.write().await.insert_amm(new_amm);
                     affected.push(addr);
                 }
                 Err(e) => {
@@ -730,7 +724,7 @@ impl<N, P> StateSpaceManager<N, P> {
                 }
             }
 
-            match amm {
+            match amm.as_ref() {
                 AMM::UniswapV4Pool(p) => {
                     if has_events {
                         topic_addresses.insert(p.manager_address);
@@ -1181,7 +1175,7 @@ where
             for amm in synced_amms {
                 let mut amm = amm;
                 amm.set_last_synced_block(chain_tip_u64);
-                state_space.state.insert(amm.address(), amm);
+                state_space.insert_amm(amm);
             }
         }
 
@@ -1189,35 +1183,17 @@ where
         for (variant, remaining_amms) in amm_variants.drain() {
             info!(target: "state_space::sync", variant = ?variant, count = remaining_amms.len(), "Syncing batch");
             let provider = self.provider.clone();
-            if variant == crate::amms::amm::Variant::UniswapV3Pool {
-                let chunk_size = 25;
-                for chunk in remaining_amms.chunks(chunk_size) {
-                    let synced = variant
-                        .init_batch::<N, _>(chunk.to_vec(), chain_tip, provider.clone())
-                        .await?;
+            let synced = variant
+                .init_batch::<N, _>(remaining_amms, chain_tip, provider.clone())
+                .await?;
 
-                    // 在每次循环结束时短暂 sleep，避免超出 RPC 调用频率
-                    sleep(Duration::from_millis(1500)).await;
+            // 仅做通用调度节流；具体批量大小/并发策略由各 AMM init_batch 内部负责。
+            sleep(Duration::from_millis(1200)).await;
 
-                    for amm in synced {
-                        let mut amm = amm;
-                        amm.set_last_synced_block(chain_tip_u64);
-                        state_space.state.insert(amm.address(), amm);
-                    }
-                }
-            } else {
-                let synced = variant
-                    .init_batch::<N, _>(remaining_amms, chain_tip, provider.clone())
-                    .await?;
-
-                // 在每次循环结束时短暂 sleep，避免超出 RPC 调用频率
-                sleep(Duration::from_millis(1500)).await;
-
-                for amm in synced {
-                    let mut amm = amm;
-                    amm.set_last_synced_block(chain_tip_u64);
-                    state_space.state.insert(amm.address(), amm);
-                }
+            for amm in synced {
+                let mut amm = amm;
+                amm.set_last_synced_block(chain_tip_u64);
+                state_space.insert_amm(amm);
             }
         }
 
@@ -1291,21 +1267,36 @@ where
 
 #[derive(Clone, Debug, Default)]
 pub struct StateSpace {
-    pub state: HashMap<Address, AMM>,
+    pub state: HashMap<Address, Arc<AMM>>,
     pub realtime_head: Arc<AtomicU64>,
     pub canonical_head: Arc<AtomicU64>,
     pub reconcile_cursor: Arc<AtomicU64>,
     pub chain_id: u64,
-    cache: StateChangeCache<CACHE_SIZE>,
 }
 
 impl StateSpace {
     pub fn get(&self, address: &Address) -> Option<&AMM> {
+        self.state.get(address).map(Arc::as_ref)
+    }
+
+    pub fn get_shared(&self, address: &Address) -> Option<&Arc<AMM>> {
         self.state.get(address)
     }
 
+    pub fn get_mut_cow(&mut self, address: &Address) -> Option<&mut AMM> {
+        self.state.get_mut(address).map(Arc::make_mut)
+    }
+
     pub fn get_mut(&mut self, address: &Address) -> Option<&mut AMM> {
-        self.state.get_mut(address)
+        self.get_mut_cow(address)
+    }
+
+    pub fn insert_amm(&mut self, amm: AMM) {
+        self.state.insert(amm.address(), Arc::new(amm));
+    }
+
+    pub fn insert_shared(&mut self, address: Address, amm: Arc<AMM>) {
+        self.state.insert(address, amm);
     }
 
     fn resolve_slipstream_fee_event_pool(&self, topics: &[FixedBytes<32>]) -> Option<Address> {
@@ -1318,7 +1309,7 @@ impl StateSpace {
         }
 
         let pool_address = Address::from_word(topics[1]);
-        match self.state.get(&pool_address) {
+        match self.state.get(&pool_address).map(Arc::as_ref) {
             Some(AMM::AerodromeSlipstreamPool(_)) => Some(pool_address),
             _ => None,
         }
@@ -1329,8 +1320,8 @@ impl StateSpace {
         logs: &[Log],
     ) -> Result<(Vec<Address>, Vec<Address>, Vec<Address>), StateSpaceError> {
         // 处理流程：
-        // 1) 先按 (block_number, transaction_index, log_index) 排序，避免 WS/回补乱序破坏缓存与回滚语义
-        // 2) 逐条应用 log 到对应池子的本地状态，并缓存“该区块开始前”的 AMM 快照用于 reorg unwind
+        // 1) 先按 (block_number, transaction_index, log_index) 排序，避免 WS/回补乱序破坏应用顺序
+        // 2) 逐条应用 log 到对应池子的本地状态
         if logs.is_empty() {
             return Ok((vec![], vec![], vec![]));
         }
@@ -1377,7 +1368,7 @@ impl StateSpace {
             } else if log.topics().len() >= 2 {
                 if Some(address) == get_liquidity_layer(self.chain_id) {
                     let pool_address = Address::from_word(log.topics()[1]);
-                    match self.state.get(&pool_address) {
+                    match self.state.get(&pool_address).map(Arc::as_ref) {
                         Some(AMM::FluidDexPool(_)) => Some(pool_address),
                         _ => None,
                     }
@@ -1387,7 +1378,7 @@ impl StateSpace {
                     let pool_id = log.topics()[1];
                     let pool_address = Address::from_slice(&pool_id.as_slice()[0..20]);
 
-                    match self.state.get(&pool_address) {
+                    match self.state.get(&pool_address).map(Arc::as_ref) {
                         Some(AMM::BalancerV2Pool(p)) if p.pool_id == pool_id => Some(pool_address),
                         _ => None,
                     }
@@ -1406,7 +1397,7 @@ impl StateSpace {
                 } else {
                     let pool_id = log.topics()[1];
                     let virtual_address = Address::from_slice(&pool_id.as_slice()[0..20]);
-                    match self.state.get(&virtual_address) {
+                    match self.state.get(&virtual_address).map(Arc::as_ref) {
                         Some(AMM::UniswapV4Pool(p)) if p.manager_address == address => {
                             Some(virtual_address)
                         }
@@ -1426,7 +1417,7 @@ impl StateSpace {
                     // Ekubo uses the first 20 bytes of pool_id as the virtual address key in StateSpace
                     let virtual_address = Address::from_slice(&pool_id.as_slice()[0..20]);
 
-                    match self.state.get(&virtual_address) {
+                    match self.state.get(&virtual_address).map(Arc::as_ref) {
                         Some(AMM::EkuboPool(p)) if p.pool_id == pool_id => Some(virtual_address),
                         _ => None,
                     }
@@ -1441,7 +1432,7 @@ impl StateSpace {
                 continue;
             };
 
-            let Some(amm) = self.state.get_mut(&target_address) else {
+            let Some(amm) = self.get_mut_cow(&target_address) else {
                 continue;
             };
 
@@ -1496,17 +1487,19 @@ pub struct SerializableStateSpace {
     pub canonical_head: u64,
     #[serde(default)]
     pub reconcile_cursor: u64,
-    pub cache: (Vec<StateChange>, u64),
 }
 
 impl From<StateSpace> for SerializableStateSpace {
     fn from(ss: StateSpace) -> Self {
         Self {
-            state: ss.state,
+            state: ss
+                .state
+                .into_iter()
+                .map(|(address, amm)| (address, amm.as_ref().clone()))
+                .collect(),
             realtime_head: ss.realtime_head.load(Ordering::Relaxed),
             canonical_head: ss.canonical_head.load(Ordering::Relaxed),
             reconcile_cursor: ss.reconcile_cursor.load(Ordering::Relaxed),
-            cache: (ss.cache.cache.into_iter().collect(), ss.cache.oldest_block),
         }
     }
 }
@@ -1514,7 +1507,16 @@ impl From<StateSpace> for SerializableStateSpace {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::amms::uniswap_v2::UniswapV2Pool;
     use alloy::primitives::{address, FixedBytes};
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+
+    fn make_v2_amm(pool_address: Address, last_synced_block: u64) -> AMM {
+        let mut amm = AMM::UniswapV2Pool(UniswapV2Pool::new(pool_address));
+        amm.set_last_synced_block(last_synced_block);
+        amm
+    }
 
     #[test]
     fn bloom_prefilter_address_only_matches() {
@@ -1576,12 +1578,9 @@ mod tests {
     fn slipstream_custom_fee_event_routes_to_pool_topic1() {
         let pool_address = address!("b2cc224c1c9fee385f8ad6a55b4d94e92359dc59");
         let mut state = StateSpace::default();
-        state.state.insert(
-            pool_address,
-            AMM::AerodromeSlipstreamPool(
-                crate::amms::aerodrome_slipstream::AerodromeSlipstreamPool::new(pool_address),
-            ),
-        );
+        state.insert_amm(AMM::AerodromeSlipstreamPool(
+            crate::amms::aerodrome_slipstream::AerodromeSlipstreamPool::new(pool_address),
+        ));
 
         let topics = vec![
             ICustomFeeModule::CustomFeeSet::SIGNATURE_HASH,
@@ -1605,6 +1604,66 @@ mod tests {
 
         assert_eq!(state.resolve_slipstream_fee_event_pool(&topics), None);
     }
+
+    #[test]
+    fn get_mut_cow_keeps_pointer_when_uniquely_owned() {
+        let pool_address = address!("1000000000000000000000000000000000000001");
+        let mut state = StateSpace::default();
+        state.insert_amm(make_v2_amm(pool_address, 10));
+
+        let arc_before = state.get_shared(&pool_address).unwrap();
+        assert_eq!(Arc::strong_count(arc_before), 1);
+        let ptr_before = Arc::as_ptr(arc_before);
+
+        let amm_mut = state.get_mut_cow(&pool_address).unwrap();
+        amm_mut.set_last_synced_block(42);
+
+        let arc_after = state.get_shared(&pool_address).unwrap();
+        let ptr_after = Arc::as_ptr(arc_after);
+        assert_eq!(ptr_before, ptr_after);
+        assert_eq!(state.get(&pool_address).unwrap().last_synced_block(), 42);
+    }
+
+    #[test]
+    fn get_mut_cow_clones_when_snapshot_holds_reference() {
+        let pool_address = address!("2000000000000000000000000000000000000002");
+        let mut state = StateSpace::default();
+        state.insert_amm(make_v2_amm(pool_address, 15));
+
+        let snapshot_arc = Arc::clone(state.get_shared(&pool_address).unwrap());
+        let ptr_before = Arc::as_ptr(state.get_shared(&pool_address).unwrap());
+        assert!(Arc::strong_count(state.get_shared(&pool_address).unwrap()) > 1);
+
+        let amm_mut = state.get_mut_cow(&pool_address).unwrap();
+        amm_mut.set_last_synced_block(77);
+
+        let ptr_after = Arc::as_ptr(state.get_shared(&pool_address).unwrap());
+        assert_ne!(ptr_before, ptr_after);
+        assert_eq!(snapshot_arc.as_ref().last_synced_block(), 15);
+        assert_eq!(state.get(&pool_address).unwrap().last_synced_block(), 77);
+    }
+
+    #[test]
+    fn serializable_state_space_roundtrip_preserves_state() {
+        let pool_address = address!("3000000000000000000000000000000000000003");
+        let mut state = StateSpace::default();
+        state.insert_amm(make_v2_amm(pool_address, 123));
+        state.realtime_head.store(300, Ordering::Relaxed);
+        state.canonical_head.store(290, Ordering::Relaxed);
+        state.reconcile_cursor.store(280, Ordering::Relaxed);
+
+        let serializable = SerializableStateSpace::from(state);
+        let restored = StateSpace::from(serializable);
+
+        assert_eq!(restored.state.len(), 1);
+        assert_eq!(
+            restored.get(&pool_address).unwrap().last_synced_block(),
+            123
+        );
+        assert_eq!(restored.realtime_head.load(Ordering::Relaxed), 300);
+        assert_eq!(restored.canonical_head.load(Ordering::Relaxed), 290);
+        assert_eq!(restored.reconcile_cursor.load(Ordering::Relaxed), 280);
+    }
 }
 
 impl From<SerializableStateSpace> for StateSpace {
@@ -1615,7 +1674,6 @@ impl From<SerializableStateSpace> for StateSpace {
             .map(AutomatedMarketMaker::last_synced_block)
             .max()
             .unwrap_or_default();
-        let (cache, oldest_block) = val.cache;
         let realtime_head = if val.realtime_head == 0 {
             inferred_head
         } else {
@@ -1631,15 +1689,16 @@ impl From<SerializableStateSpace> for StateSpace {
         } else {
             val.reconcile_cursor
         };
+        let state = val
+            .state
+            .into_iter()
+            .map(|(address, amm)| (address, Arc::new(amm)))
+            .collect();
         StateSpace {
-            state: val.state,
+            state,
             realtime_head: Arc::new(AtomicU64::new(realtime_head)),
             canonical_head: Arc::new(AtomicU64::new(canonical_head)),
             reconcile_cursor: Arc::new(AtomicU64::new(reconcile_cursor)),
-            cache: StateChangeCache {
-                cache: cache.into_iter().collect(),
-                oldest_block,
-            },
             chain_id: 0,
         }
     }

@@ -1,6 +1,6 @@
 [package]
 name = "amms"
-version = "1.2.13"
+version = "1.2.14"
 edition = "2021"
 license = "MIT"
 description = "A library to interact with automated market makers across EVM chains."
@@ -28,7 +28,6 @@ futures = "0.3"
 async-trait = "0.1"
 
 # misc
-arraydeque = "0.5"
 thiserror = "1.0"
 rug = "1.24.1"
 itertools = "0.14.0"
@@ -37,6 +36,7 @@ async-stream = "0.3.6"
 serde = { version = "1.0", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
 serde_json = { version = "1.0", features = ["arbitrary_precision"] }
+simd-json = "0.14"
 tokio-tungstenite = "0.26.2"
 brotli = "8.0.2"
 ruint = "1.17.2"

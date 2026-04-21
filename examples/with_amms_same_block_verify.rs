@@ -304,7 +304,11 @@ where
 
     let local_amms: Vec<AMM> = {
         let guard = manager.state.read().await;
-        guard.state.values().cloned().collect()
+        guard
+            .state
+            .values()
+            .map(|amm| amm.as_ref().clone())
+            .collect()
     };
 
     let mut checked = 0usize;

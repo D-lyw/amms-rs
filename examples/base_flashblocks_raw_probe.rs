@@ -526,7 +526,7 @@ where
         let guard = state.read().await;
         needs_resync
             .iter()
-            .filter_map(|addr| guard.state.get(addr).cloned())
+            .filter_map(|addr| guard.state.get(addr).map(|amm| amm.as_ref().clone()))
             .collect()
     };
 
@@ -534,7 +534,7 @@ where
         let guard = state.read().await;
         needs_async_update
             .iter()
-            .filter_map(|addr| guard.state.get(addr).cloned())
+            .filter_map(|addr| guard.state.get(addr).map(|amm| amm.as_ref().clone()))
             .collect()
     };
 
@@ -553,7 +553,7 @@ where
 
         while let Some(res) = tasks.next().await {
             if let Ok(new_amm) = res {
-                state.write().await.state.insert(new_amm.address(), new_amm);
+                state.write().await.insert_amm(new_amm);
                 resynced += 1;
             }
         }
@@ -571,7 +571,7 @@ where
 
         while let Some(res) = tasks.next().await {
             if let Ok(new_amm) = res {
-                state.write().await.state.insert(new_amm.address(), new_amm);
+                state.write().await.insert_amm(new_amm);
                 updated += 1;
             }
         }

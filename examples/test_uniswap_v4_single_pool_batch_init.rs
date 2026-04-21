@@ -140,7 +140,7 @@ async fn main() -> eyre::Result<()> {
     let maybe_pool = state_guard
         .state
         .get(&expected_virtual_addr)
-        .and_then(|amm| match amm {
+        .and_then(|amm| match amm.as_ref() {
             AMM::UniswapV4Pool(p) => Some(p.clone()),
             _ => None,
         });
@@ -152,7 +152,7 @@ async fn main() -> eyre::Result<()> {
         );
         println!("Available V4 pools in state:");
         for amm in state_guard.state.values() {
-            if let AMM::UniswapV4Pool(p) = amm {
+            if let AMM::UniswapV4Pool(p) = amm.as_ref() {
                 println!(
                     "  v4_addr={:?} pool_id={:?} liq={} ticks={}",
                     p.address(),

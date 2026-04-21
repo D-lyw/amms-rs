@@ -62,7 +62,7 @@ async fn main() -> eyre::Result<()> {
     tracing::info!("Successfully synced: {} AMMs", state.state.len());
 
     for (addr, amm) in state.state.iter() {
-        if let AMM::PancakeV3Pool(pool) = amm {
+        if let AMM::PancakeV3Pool(pool) = amm.as_ref() {
             tracing::info!(
                 "[OK] {} | token_a={} | token_b={} | tick_spacing={} | fee={} | liquidity={} | tick={} | sqrt_price={}",
                 addr,

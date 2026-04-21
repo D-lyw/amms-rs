@@ -192,7 +192,13 @@ pub struct StepComputations {
     pub fee_amount: U256,
 }
 
-const MAX_IN_FLIGHT_REQUESTS: usize = 8;
+const UNISWAP_V3_MAX_IN_FLIGHT_REQUESTS: usize = 3;
+const UNISWAP_V3_INTER_BATCH_SLEEP_MS: u64 = 700;
+const UNISWAP_V3_META_STEP: usize = 100;
+const UNISWAP_V3_SLOT0_STEP: usize = 120;
+const UNISWAP_V3_POOLS_STEP: usize = 30;
+const UNISWAP_V3_MAX_RANGE: i32 = 200;
+const UNISWAP_V3_MAX_TICKS: usize = 40;
 
 pub struct Tick {
     pub liquidity_gross: u128,
@@ -1281,7 +1287,7 @@ impl UniswapV3Factory {
         // 2) 批量获取静态元数据：token0、token1、tickSpacing、fee
         if !addresses.is_empty() {
             let mut meta_map: HashMap<Address, (Address, Address, i32, u32)> = HashMap::new();
-            let step = 150; // 保守下调批量大小，避免节点对 initcode/返回体大小的限制
+            let step = UNISWAP_V3_META_STEP;
             for chunk in addresses.chunks(step) {
                 let chunk_addrs = chunk.to_vec();
                 let return_data = GetUniswapV3PoolStaticMetaBatchRequest::deploy_builder(
@@ -1298,7 +1304,7 @@ impl UniswapV3Factory {
                     let (t0, t1, ts, fee) = *meta;
                     meta_map.insert(*pool_addr, (t0, t1, ts, fee));
                 }
-                sleep(Duration::from_millis(500)).await;
+                sleep(Duration::from_millis(UNISWAP_V3_INTER_BATCH_SLEEP_MS)).await;
             }
 
             for amm in pools.iter_mut() {
@@ -1319,11 +1325,11 @@ impl UniswapV3Factory {
 
         // 3) Batch sync slot0 (tick, liquidity, sqrt_price)
         UniswapV3Factory::sync_slot_0(&mut pools, block_number, provider.clone()).await?;
-        sleep(Duration::from_millis(500)).await;
+        sleep(Duration::from_millis(UNISWAP_V3_INTER_BATCH_SLEEP_MS)).await;
 
         // 4) Batch sync token decimals
         UniswapV3Factory::sync_token_decimals(&mut pools, provider.clone()).await?;
-        sleep(Duration::from_millis(500)).await;
+        sleep(Duration::from_millis(UNISWAP_V3_INTER_BATCH_SLEEP_MS)).await;
 
         // 5) Filter structurally invalid pools AFTER slot0 + decimals are populated
         let (structurally_valid, structurally_invalid): (Vec<_>, Vec<_>) =
@@ -1357,12 +1363,12 @@ impl UniswapV3Factory {
         pools = structurally_valid;
 
         // 6) Batch sync tick bitmaps and tick data (chunked to reduce RPC pressure)
-        let pools_step = 50;
+        let pools_step = UNISWAP_V3_POOLS_STEP;
         for group in pools.chunks_mut(pools_step) {
             UniswapV3Factory::sync_tick_bitmaps(group, block_number, provider.clone()).await?;
-            sleep(Duration::from_millis(500)).await;
+            sleep(Duration::from_millis(UNISWAP_V3_INTER_BATCH_SLEEP_MS)).await;
             UniswapV3Factory::sync_tick_data(group, block_number, provider.clone()).await?;
-            sleep(Duration::from_millis(500)).await;
+            sleep(Duration::from_millis(UNISWAP_V3_INTER_BATCH_SLEEP_MS)).await;
         }
 
         // 7) Filter out dust pools using tick-aware + active-liquidity-aware heuristic
@@ -1433,12 +1439,12 @@ impl UniswapV3Factory {
             }
         }
 
-        let pools_step = 50;
+        let pools_step = UNISWAP_V3_POOLS_STEP;
         for group in pools.chunks_mut(pools_step) {
             UniswapV3Factory::sync_tick_bitmaps(group, block_number, provider.clone()).await?;
-            sleep(Duration::from_millis(500)).await;
+            sleep(Duration::from_millis(UNISWAP_V3_INTER_BATCH_SLEEP_MS)).await;
             UniswapV3Factory::sync_tick_data(group, block_number, provider.clone()).await?;
-            sleep(Duration::from_millis(500)).await;
+            sleep(Duration::from_millis(UNISWAP_V3_INTER_BATCH_SLEEP_MS)).await;
         }
 
         // Recalculate cached spot prices
@@ -1508,7 +1514,7 @@ impl UniswapV3Factory {
         N: Network,
         P: Provider<N> + Clone,
     {
-        let step = 255;
+        let step = UNISWAP_V3_SLOT0_STEP;
 
         let mut requests: Vec<(usize, Vec<Address>)> = Vec::new();
         let mut start = 0usize;
@@ -1537,7 +1543,7 @@ impl UniswapV3Factory {
                 ))
             });
 
-            if futures.len() >= MAX_IN_FLIGHT_REQUESTS {
+            if futures.len() >= UNISWAP_V3_MAX_IN_FLIGHT_REQUESTS {
                 if let Some(res) = futures.next().await {
                     let (start, return_data) = res?;
                     let return_data =
@@ -1586,7 +1592,7 @@ impl UniswapV3Factory {
         // Keep returned "runtime code" under EVM max code size (24KB).
         // Each word returns 2 * U256 (64 bytes), so 300 words ~= 19.2KB + ABI overhead.
         // This avoids "max code size exceeded" on Arbitrum during constructor-return batching.
-        let max_range = 300;
+        let max_range = UNISWAP_V3_MAX_RANGE;
         let mut group_range = 0;
         let mut group = vec![];
         let mut requests: Vec<(Vec<Address>, Vec<TickBitmapInfo>)> = Vec::new();
@@ -1653,7 +1659,7 @@ impl UniswapV3Factory {
                 ))
             }));
 
-            if futures.len() >= MAX_IN_FLIGHT_REQUESTS {
+            if futures.len() >= UNISWAP_V3_MAX_IN_FLIGHT_REQUESTS {
                 if let Some(res) = futures.next().await {
                     let (pools, return_data) = res?;
                     let return_data = <Vec<Vec<U256>> as SolValue>::abi_decode(&return_data)?;
@@ -1751,7 +1757,7 @@ impl UniswapV3Factory {
             })
             .collect::<Vec<(Address, Vec<Signed<24, 1>>)>>();
 
-        let max_ticks = 60;
+        let max_ticks = UNISWAP_V3_MAX_TICKS;
         let mut group_ticks = 0;
         let mut group = vec![];
         let mut requests: Vec<Vec<TickDataInfo>> = Vec::new();
@@ -1803,7 +1809,7 @@ impl UniswapV3Factory {
                 ))
             }));
 
-            if futures.len() >= MAX_IN_FLIGHT_REQUESTS {
+            if futures.len() >= UNISWAP_V3_MAX_IN_FLIGHT_REQUESTS {
                 if let Some(res) = futures.next().await {
                     let (tick_info, return_data) = res?;
                     let return_data =

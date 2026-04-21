@@ -12,6 +12,7 @@ use alloy::rpc::types::eth::Log;
 use async_stream::stream;
 use futures::{SinkExt, Stream, StreamExt};
 use serde::Deserialize;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read;
 use std::str::FromStr;
@@ -67,52 +68,54 @@ impl RawLogMatcher {
 }
 
 #[derive(Debug, Deserialize)]
-struct FlashblockMessage {
-    payload_id: String,
+struct FlashblockMessage<'a> {
+    #[serde(borrow)]
+    payload_id: Cow<'a, str>,
     index: u64,
     #[serde(default)]
-    base: Option<FlashblockBase>,
+    base: Option<FlashblockBase<'a>>,
     #[serde(default)]
-    diff: Option<FlashblockDiff>,
+    diff: Option<FlashblockDiff<'a>>,
     #[serde(default)]
-    metadata: Option<FlashblockMetadata>,
+    metadata: Option<FlashblockMetadata<'a>>,
 }
 
 #[derive(Debug, Deserialize)]
-struct FlashblockDiff {
-    #[serde(default)]
-    transactions: Vec<String>,
+struct FlashblockDiff<'a> {
+    #[serde(default, borrow)]
+    transactions: Vec<Cow<'a, str>>,
 }
 
 #[derive(Debug, Deserialize)]
-struct FlashblockBase {
-    #[serde(default)]
-    block_number: Option<String>,
+struct FlashblockBase<'a> {
+    #[serde(default, borrow)]
+    block_number: Option<Cow<'a, str>>,
 }
 
 #[derive(Debug, Deserialize)]
-struct FlashblockMetadata {
+struct FlashblockMetadata<'a> {
     #[serde(default)]
     block_number: Option<u64>,
-    #[serde(default)]
-    receipts: HashMap<String, FlashblockReceipt>,
+    #[serde(default, borrow)]
+    receipts: HashMap<Cow<'a, str>, FlashblockReceipt<'a>>,
 }
 
 #[derive(Debug, Deserialize)]
-struct FlashblockReceipt {
-    #[serde(default, rename = "transactionIndex")]
-    transaction_index: Option<String>,
+struct FlashblockReceipt<'a> {
+    #[serde(default, rename = "transactionIndex", borrow)]
+    transaction_index: Option<Cow<'a, str>>,
     #[serde(default)]
-    logs: Vec<FlashblockLog>,
+    logs: Vec<FlashblockLog<'a>>,
 }
 
 #[derive(Debug, Deserialize)]
-struct FlashblockLog {
-    address: String,
-    #[serde(default)]
-    topics: Vec<String>,
-    #[serde(default)]
-    data: String,
+struct FlashblockLog<'a> {
+    #[serde(borrow)]
+    address: Cow<'a, str>,
+    #[serde(default, borrow)]
+    topics: Vec<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    data: Cow<'a, str>,
 }
 
 #[derive(Debug, Default)]
@@ -193,14 +196,16 @@ impl<N, P> StateSpaceManager<N, P> {
         u64::from_str_radix(raw, 16).ok()
     }
 
-    fn decode_flashblock_text(raw: &str) -> Option<FlashblockMessage> {
-        serde_json::from_str::<FlashblockMessage>(raw).ok()
+    fn decode_flashblock_text<'a>(
+        raw: &'a mut [u8],
+    ) -> Option<FlashblockMessage<'a>> {
+        simd_json::from_slice::<FlashblockMessage<'a>>(raw).ok()
     }
 
-    fn decode_flashblock_binary(
+    fn decode_flashblock_binary<'a>(
         raw: &[u8],
-        decompressed: &mut Vec<u8>,
-    ) -> Option<FlashblockMessage> {
+        decompressed: &'a mut Vec<u8>,
+    ) -> Option<FlashblockMessage<'a>> {
         decompressed.clear();
         let target_capacity = raw.len().saturating_mul(6);
         if decompressed.capacity() < target_capacity {
@@ -212,7 +217,7 @@ impl<N, P> StateSpaceManager<N, P> {
             return None;
         }
 
-        serde_json::from_slice::<FlashblockMessage>(decompressed).ok()
+        simd_json::from_slice::<FlashblockMessage<'a>>(decompressed).ok()
     }
 
     fn extract_logs_from_flashblock(
@@ -496,7 +501,11 @@ impl<N, P> StateSpaceManager<N, P> {
                     };
 
                     let fb = match message {
-                        Message::Text(text) => Self::decode_flashblock_text(text.as_ref()),
+                        Message::Text(text) => {
+                            flashblocks_decode_buf.clear();
+                            flashblocks_decode_buf.extend_from_slice(text.as_bytes());
+                            Self::decode_flashblock_text(&mut flashblocks_decode_buf)
+                        }
                         Message::Binary(bin) => {
                             Self::decode_flashblock_binary(bin.as_ref(), &mut flashblocks_decode_buf)
                         }

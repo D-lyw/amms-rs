@@ -95,7 +95,7 @@ async fn main() -> eyre::Result<()> {
     let mut v2_count = 0;
 
     for (address, amm) in &state_space.state {
-        match amm {
+        match amm.as_ref() {
             AMM::AerodromeSlipstreamPool(pool) => {
                 slipstream_count += 1;
                 tracing::info!(
@@ -132,7 +132,7 @@ async fn main() -> eyre::Result<()> {
     // Additional regression checks for Slipstream:
     // 1) bidirectional swap simulation (ExactIn/ExactOut)
     // 2) sync_all_pools result consistency vs init() at the same block
-    let sample_pool = state_space.state.values().find_map(|amm| match amm {
+    let sample_pool = state_space.state.values().find_map(|amm| match amm.as_ref() {
         AMM::AerodromeSlipstreamPool(pool) => Some(pool.clone()),
         _ => None,
     });

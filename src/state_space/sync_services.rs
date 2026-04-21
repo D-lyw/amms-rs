@@ -62,7 +62,7 @@ pub async fn start_balancer_v2_rate_sync_task<N, P>(
                 .state
                 .values()
                 .filter_map(|amm| {
-                    if let AMM::BalancerV2Pool(pool) = amm {
+                    if let AMM::BalancerV2Pool(pool) = amm.as_ref() {
                         // Check if pool has any token with rate provider
                         if pool.tokens.values().any(|t| t.rate_provider.is_some()) {
                             return Some(pool.clone());
@@ -95,15 +95,15 @@ pub async fn start_balancer_v2_rate_sync_task<N, P>(
             let mut write_guard = state.write().await;
             for pool in target_pools {
                 // Update only if it still exists
-                if let Some(AMM::BalancerV2Pool(existing_pool)) =
-                    write_guard.state.get_mut(&pool.address)
-                {
-                    for (token_addr, token_state) in pool.tokens {
-                        if let Some(existing_token_state) =
-                            existing_pool.tokens.get_mut(&token_addr)
-                        {
-                            if let Some(new_rate) = token_state.rate {
-                                existing_token_state.rate = Some(new_rate);
+                if let Some(existing_amm) = write_guard.get_mut_cow(&pool.address) {
+                    if let AMM::BalancerV2Pool(existing_pool) = existing_amm {
+                        for (token_addr, token_state) in pool.tokens {
+                            if let Some(existing_token_state) =
+                                existing_pool.tokens.get_mut(&token_addr)
+                            {
+                                if let Some(new_rate) = token_state.rate {
+                                    existing_token_state.rate = Some(new_rate);
+                                }
                             }
                         }
                     }
@@ -133,7 +133,7 @@ pub async fn start_balancer_v3_rate_sync_task<N, P>(
                 .state
                 .values()
                 .filter_map(|amm| {
-                    if let AMM::BalancerV3Pool(pool) = amm {
+                    if let AMM::BalancerV3Pool(pool) = amm.as_ref() {
                         // Check if pool has any token with rate provider
                         if pool.tokens.values().any(|t| t.rate_provider.is_some()) {
                             return Some(pool.clone());
@@ -166,14 +166,14 @@ pub async fn start_balancer_v3_rate_sync_task<N, P>(
             let mut write_guard = state.write().await;
             for pool in target_pools {
                 // Update only if it still exists
-                if let Some(AMM::BalancerV3Pool(existing_pool)) =
-                    write_guard.state.get_mut(&pool.address)
-                {
-                    for (token_addr, token_state) in pool.tokens {
-                        if let Some(existing_token_state) =
-                            existing_pool.tokens.get_mut(&token_addr)
-                        {
-                            existing_token_state.rate = token_state.rate;
+                if let Some(existing_amm) = write_guard.get_mut_cow(&pool.address) {
+                    if let AMM::BalancerV3Pool(existing_pool) = existing_amm {
+                        for (token_addr, token_state) in pool.tokens {
+                            if let Some(existing_token_state) =
+                                existing_pool.tokens.get_mut(&token_addr)
+                            {
+                                existing_token_state.rate = token_state.rate;
+                            }
                         }
                     }
                 }
@@ -205,7 +205,7 @@ pub async fn start_balancer_v3_fee_sync_task<N, P>(
                 .state
                 .values()
                 .filter_map(|amm| {
-                    if let AMM::BalancerV3Pool(pool) = amm {
+                    if let AMM::BalancerV3Pool(pool) = amm.as_ref() {
                         Some(pool.clone())
                     } else {
                         None
@@ -237,14 +237,14 @@ pub async fn start_balancer_v3_fee_sync_task<N, P>(
             let mut write_guard = state.write().await;
             let mut updated_count = 0;
             for pool in target_pools {
-                if let Some(AMM::BalancerV3Pool(existing_pool)) =
-                    write_guard.state.get_mut(&pool.address)
-                {
-                    // Only update if swap_fee actually changed or was zero
-                    if existing_pool.swap_fee.is_zero() || existing_pool.swap_fee != pool.swap_fee {
-                        if !pool.swap_fee.is_zero() {
-                            existing_pool.swap_fee = pool.swap_fee;
-                            updated_count += 1;
+                if let Some(existing_amm) = write_guard.get_mut_cow(&pool.address) {
+                    if let AMM::BalancerV3Pool(existing_pool) = existing_amm {
+                        // Only update if swap_fee actually changed or was zero
+                        if existing_pool.swap_fee.is_zero() || existing_pool.swap_fee != pool.swap_fee {
+                            if !pool.swap_fee.is_zero() {
+                                existing_pool.swap_fee = pool.swap_fee;
+                                updated_count += 1;
+                            }
                         }
                     }
                 }
@@ -292,7 +292,7 @@ pub async fn start_curve_rate_sync_task<N, P>(
             read_guard
                 .state
                 .values()
-                .filter_map(|amm| match amm {
+                .filter_map(|amm| match amm.as_ref() {
                     AMM::CurveNGPool(pool) => {
                         if pool.pool_type.is_stable() && pool.n_coins > 0 {
                             Some(pool.address)
@@ -340,7 +340,7 @@ pub async fn start_curve_rate_sync_task<N, P>(
 
                 if let Ok(rates) = rates_res {
                     let mut write_guard = state.write().await;
-                    if let Some(amm) = write_guard.state.get_mut(addr) {
+                    if let Some(amm) = write_guard.get_mut_cow(addr) {
                         let success = match amm {
                             AMM::CurveNGPool(pool) => {
                                 let mut updated = false;
@@ -393,7 +393,7 @@ pub async fn start_curve_rate_sync_task<N, P>(
             read_guard
                 .state
                 .values()
-                .filter_map(|amm| match amm {
+                .filter_map(|amm| match amm.as_ref() {
                     AMM::CurveNGPool(pool) => {
                         if pool.pool_type.is_crypto() && pool.n_coins > 0 {
                             Some((pool.address, pool.n_coins, true))
@@ -517,7 +517,7 @@ pub async fn start_curve_rate_sync_task<N, P>(
                 // Apply update if fetch succeeded
                 if let Some(new_price_scale) = price_scale_result {
                     let mut write_guard = state.write().await;
-                    match write_guard.state.get_mut(&addr) {
+                    match write_guard.get_mut_cow(&addr) {
                         Some(AMM::CurveNGPool(pool)) => {
                             pool.price_scale = Some(new_price_scale);
                             // Use D value fetched from chain instead of local recalculation
@@ -589,7 +589,7 @@ pub async fn start_fluid_dex_limits_sync_task<N, P>(
                 .state
                 .values()
                 .filter_map(|amm| {
-                    if let AMM::FluidDexPool(pool) = amm {
+                    if let AMM::FluidDexPool(pool) = amm.as_ref() {
                         Some(pool.address)
                     } else {
                         None
@@ -631,9 +631,10 @@ pub async fn start_fluid_dex_limits_sync_task<N, P>(
         {
             let mut write_guard = state.write().await;
             for pr in pools_reserves {
-                if let Some(AMM::FluidDexPool(pool)) = write_guard.state.get_mut(&pr.pool) {
-                    // Update center price
-                    pool.center_price_1e27 = pr.centerPrice;
+                if let Some(amm) = write_guard.get_mut_cow(&pr.pool) {
+                    if let AMM::FluidDexPool(pool) = amm {
+                        // Update center price
+                        pool.center_price_1e27 = pr.centerPrice;
 
                     // Update combined reserves
                     pool.token0_real_reserves_1e12 = pr.collateralReserves.token0RealReserves
@@ -757,8 +758,9 @@ pub async fn start_fluid_dex_limits_sync_task<N, P>(
                             decode_liquidity_utilization(exchange_price_token1);
                     }
 
-                    pool.limits_sync_time = current_time;
-                    updated_count += 1;
+                        pool.limits_sync_time = current_time;
+                        updated_count += 1;
+                    }
                 }
             }
         }

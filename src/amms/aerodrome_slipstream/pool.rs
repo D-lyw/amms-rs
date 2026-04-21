@@ -46,7 +46,8 @@ use uniswap_v3_math::tick_math::{MAX_SQRT_RATIO, MAX_TICK, MIN_SQRT_RATIO, MIN_T
 
 pub const BASE_SLIPSTREAM_FACTORY: Address = address!("5e7BB104d84c7CB9B682AaC2F3d509f5F406809A");
 const SLIPSTREAM_BATCH_RETRY_ATTEMPTS: u8 = 3;
-const SLIPSTREAM_BATCH_RETRY_BASE_DELAY_MS: u64 = 200;
+const SLIPSTREAM_BATCH_RETRY_BASE_DELAY_MS: u64 = 400;
+const SLIPSTREAM_INTER_BATCH_SLEEP_MS: u64 = 700;
 
 fn slipstream_retry_delay(attempt: u8) -> Duration {
     let exp = attempt.saturating_sub(1).min(5);
@@ -1233,7 +1234,7 @@ impl AerodromeSlipstreamFactory {
                     .await?,
                 ))
             });
-            sleep(Duration::from_millis(500)).await;
+            sleep(Duration::from_millis(SLIPSTREAM_INTER_BATCH_SLEEP_MS)).await;
         }
 
         while let Some(res) = futures.next().await {
@@ -1339,8 +1340,8 @@ impl AerodromeSlipstreamFactory {
     {
         use crate::amms::uniswap_v3::GetUniswapV3PoolTickBitmapBatchRequest::TickBitmapInfo;
 
-        let max_range = 300;
-        let max_in_flight = 8;
+        let max_range = 200;
+        let max_in_flight = 3;
         let mut group_range = 0;
         let mut group = vec![];
         let mut jobs: Vec<(Vec<Address>, Vec<TickBitmapInfo>)> = Vec::new();
@@ -1561,8 +1562,8 @@ impl AerodromeSlipstreamFactory {
             })
             .collect::<Vec<(Address, Vec<Signed<24, 1>>)>>();
 
-        let max_in_flight = 8;
-        let max_ticks = 60;
+        let max_in_flight = 3;
+        let max_ticks = 40;
         let mut group_ticks = 0;
         let mut group = vec![];
         let mut jobs: Vec<Vec<TickDataInfo>> = Vec::new();
@@ -1761,7 +1762,7 @@ impl AerodromeSlipstreamFactory {
                     .await?,
                 ))
             }));
-            sleep(Duration::from_millis(500)).await;
+            sleep(Duration::from_millis(SLIPSTREAM_INTER_BATCH_SLEEP_MS)).await;
         }
 
         while let Some(res) = futures.next().await {
@@ -1808,12 +1809,12 @@ impl AerodromeSlipstreamFactory {
         }
 
         Self::sync_slot_0(&mut amms, block_number, provider.clone()).await?;
-        sleep(Duration::from_millis(500)).await;
+        sleep(Duration::from_millis(SLIPSTREAM_INTER_BATCH_SLEEP_MS)).await;
 
         Self::sync_token_decimals(&mut amms, provider.clone())
             .await
             .map_err(AMMError::from)?;
-        sleep(Duration::from_millis(500)).await;
+        sleep(Duration::from_millis(SLIPSTREAM_INTER_BATCH_SLEEP_MS)).await;
 
         let (structurally_valid, structurally_invalid): (Vec<_>, Vec<_>) =
             amms.into_iter().partition(|amm| {
@@ -1840,12 +1841,12 @@ impl AerodromeSlipstreamFactory {
         }
 
         let mut valid_amms = structurally_valid;
-        let pools_step = 50;
+        let pools_step = 30;
         for group in valid_amms.chunks_mut(pools_step) {
             Self::sync_tick_bitmaps(group, block_number, provider.clone()).await?;
-            sleep(Duration::from_millis(500)).await;
+            sleep(Duration::from_millis(SLIPSTREAM_INTER_BATCH_SLEEP_MS)).await;
             Self::sync_tick_data(group, block_number, provider.clone()).await?;
-            sleep(Duration::from_millis(500)).await;
+            sleep(Duration::from_millis(SLIPSTREAM_INTER_BATCH_SLEEP_MS)).await;
         }
 
         let (liquid_amms, dust_amms): (Vec<_>, Vec<_>) = valid_amms.into_iter().partition(|amm| {
@@ -1947,7 +1948,7 @@ impl AerodromeSlipstreamFactory {
                     fee_map.insert(*pool_addr, *fee);
                 }
 
-                sleep(Duration::from_millis(500)).await;
+                sleep(Duration::from_millis(SLIPSTREAM_INTER_BATCH_SLEEP_MS)).await;
             }
 
             for amm in amms.iter_mut() {
@@ -1961,7 +1962,7 @@ impl AerodromeSlipstreamFactory {
         }
 
         Self::sync_slot_0(&mut amms, block_number, provider.clone()).await?;
-        sleep(Duration::from_millis(500)).await;
+        sleep(Duration::from_millis(SLIPSTREAM_INTER_BATCH_SLEEP_MS)).await;
 
         for amm in amms.iter_mut() {
             let AMM::AerodromeSlipstreamPool(pool) = amm else {
@@ -1971,12 +1972,12 @@ impl AerodromeSlipstreamFactory {
             pool.ticks.clear();
         }
 
-        let pools_step = 50;
+        let pools_step = 30;
         for group in amms.chunks_mut(pools_step) {
             Self::sync_tick_bitmaps(group, block_number, provider.clone()).await?;
-            sleep(Duration::from_millis(500)).await;
+            sleep(Duration::from_millis(SLIPSTREAM_INTER_BATCH_SLEEP_MS)).await;
             Self::sync_tick_data(group, block_number, provider.clone()).await?;
-            sleep(Duration::from_millis(500)).await;
+            sleep(Duration::from_millis(SLIPSTREAM_INTER_BATCH_SLEEP_MS)).await;
         }
 
         for amm in amms.iter_mut() {

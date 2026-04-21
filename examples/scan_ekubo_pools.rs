@@ -27,7 +27,7 @@ sol! {
 #[tokio::main]
 async fn main() -> Result<()> {
     let rpc_url = std::env::var("ETHEREUM_RPC_URL").unwrap_or("https://eth.merkle.io".to_string());
-    let provider = ProviderBuilder::new().on_http(rpc_url.parse()?);
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
     let core_address = address!("e0e0e08a6a4b9dc7bd67bcb7aade5cf48157d444");
 
     // Retry loop for getting current block

@@ -168,7 +168,7 @@ async fn main() -> eyre::Result<()> {
     tracing::info!("Failed/Skipped: {}", failed_count);
 
     for (address, amm) in &state_space.state {
-        if let AMM::UniswapV4Pool(pool) = amm {
+        if let AMM::UniswapV4Pool(pool) = amm.as_ref() {
             tracing::info!(
                 "Synced V4 pool: pool_id={:?}, sqrt_price={}, tick={}, liquidity={}",
                 pool.pool_id,

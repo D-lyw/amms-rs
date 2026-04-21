@@ -8,7 +8,7 @@ use amms::amms::curve_ng::types::CurveNGPoolType;
 async fn main() -> eyre::Result<()> {
     dotenv::dotenv().ok();
     let rpc_url = std::env::var("ETHEREUM_PROVIDER")?;
-    let provider = ProviderBuilder::new().on_http(rpc_url.parse()?);
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
 
     // TriCrypto-NG Factory 地址 (Ethereum Mainnet)
     let tricrypto_factory_address = address!("0c0e5f2fF0ff18a3be9b835635039256dC4B4963");

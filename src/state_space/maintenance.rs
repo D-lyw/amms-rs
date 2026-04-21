@@ -261,7 +261,7 @@ impl<N, P> StateSpaceManager<N, P> {
                     by_variant
                         .entry(amm.variant())
                         .or_default()
-                        .push(amm.clone());
+                        .push(amm.as_ref().clone());
                     variant_addresses
                         .entry(amm.variant())
                         .or_default()
@@ -318,7 +318,7 @@ impl<N, P> StateSpaceManager<N, P> {
                     }
                 }
                 pool.set_last_synced_block(canonical);
-                guard.state.insert(address, pool);
+                guard.insert_amm(pool);
                 success_addresses.push(address);
             }
         }
@@ -351,7 +351,7 @@ impl<N, P> StateSpaceManager<N, P> {
         P: Provider<N> + Clone,
         N: Network,
     {
-        let Some(mut local_amm) = ({ state.read().await.state.get(&address).cloned() }) else {
+        let Some(mut local_amm) = ({ state.read().await.get(&address).cloned() }) else {
             return Ok(PendingExecutionOutcome::MissingPool);
         };
 
@@ -373,7 +373,7 @@ impl<N, P> StateSpaceManager<N, P> {
                         });
                     }
                 }
-                guard.state.insert(address, local_amm);
+                guard.insert_amm(local_amm);
                 Ok(PendingExecutionOutcome::Applied)
             }
             PendingSyncAction::Resync => {
@@ -400,7 +400,7 @@ impl<N, P> StateSpaceManager<N, P> {
                         });
                     }
                 }
-                guard.state.insert(address, synced);
+                guard.insert_amm(synced);
                 Ok(PendingExecutionOutcome::Applied)
             }
         }
@@ -647,7 +647,7 @@ impl<N, P> StateSpaceManager<N, P> {
                     .iter()
                     .filter_map(|(addr, amm)| {
                         if Self::local_cl_probe_snapshot(amm).is_some() {
-                            Some((*addr, amm.clone()))
+                            Some((*addr, amm.as_ref().clone()))
                         } else {
                             None
                         }

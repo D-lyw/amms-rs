@@ -36,6 +36,14 @@ use tokio::time::{sleep, Duration};
 use tracing::info;
 use uniswap_v3_math::tick_math::{MAX_SQRT_RATIO, MAX_TICK, MIN_SQRT_RATIO, MIN_TICK};
 
+const PANCAKE_V3_INTER_BATCH_SLEEP_MS: u64 = 800;
+const PANCAKE_V3_META_STEP: usize = 100;
+const PANCAKE_V3_SLOT0_STEP: usize = 120;
+const PANCAKE_V3_POOLS_STEP: usize = 30;
+const PANCAKE_V3_MAX_RANGE: i32 = 200;
+const PANCAKE_V3_MAX_TICKS: usize = 40;
+const PANCAKE_V3_MAX_IN_FLIGHT: usize = 3;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Info {
     pub liquidity_gross: u128,
@@ -1163,7 +1171,7 @@ impl PancakeV3Factory {
         //    (PancakeV3 has identical ABI: token0, token1, tickSpacing, fee)
         if !addresses.is_empty() {
             let mut meta_map: HashMap<Address, (Address, Address, i32, u32)> = HashMap::new();
-            let step = 150;
+            let step = PANCAKE_V3_META_STEP;
             for chunk in addresses.chunks(step) {
                 let chunk_addrs = chunk.to_vec();
                 let return_data = GetUniswapV3PoolStaticMetaBatchRequest::deploy_builder(
@@ -1180,7 +1188,7 @@ impl PancakeV3Factory {
                     let (t0, t1, ts, fee) = *meta;
                     meta_map.insert(*pool_addr, (t0, t1, ts, fee));
                 }
-                sleep(Duration::from_millis(500)).await;
+                sleep(Duration::from_millis(PANCAKE_V3_INTER_BATCH_SLEEP_MS)).await;
             }
 
             for amm in pancake_pools.iter_mut() {
@@ -1197,11 +1205,11 @@ impl PancakeV3Factory {
 
         // 3) Sync dynamic state: slot0 (tick, liquidity, sqrtPrice)
         PancakeV3Factory::sync_slot_0(&mut pancake_pools, block_number, provider.clone()).await?;
-        sleep(Duration::from_millis(500)).await;
+        sleep(Duration::from_millis(PANCAKE_V3_INTER_BATCH_SLEEP_MS)).await;
 
         // 4) Sync token decimals
         PancakeV3Factory::sync_token_decimals_safe(&mut pancake_pools, provider.clone()).await?;
-        sleep(Duration::from_millis(500)).await;
+        sleep(Duration::from_millis(PANCAKE_V3_INTER_BATCH_SLEEP_MS)).await;
 
         // 5) Filter structurally invalid pools
         let (structurally_valid, structurally_invalid): (Vec<_>, Vec<_>) =
@@ -1235,12 +1243,12 @@ impl PancakeV3Factory {
         let mut pools = structurally_valid;
 
         // 6) Sync tick bitmaps and tick data (chunked to reduce RPC pressure)
-        let pools_step = 50;
+        let pools_step = PANCAKE_V3_POOLS_STEP;
         for group in pools.chunks_mut(pools_step) {
             PancakeV3Factory::sync_tick_bitmaps(group, block_number, provider.clone()).await?;
-            sleep(Duration::from_millis(500)).await;
+            sleep(Duration::from_millis(PANCAKE_V3_INTER_BATCH_SLEEP_MS)).await;
             PancakeV3Factory::sync_tick_data(group, block_number, provider.clone()).await?;
-            sleep(Duration::from_millis(500)).await;
+            sleep(Duration::from_millis(PANCAKE_V3_INTER_BATCH_SLEEP_MS)).await;
         }
 
         // 7) Filter out dust pools using tick-aware + active-liquidity-aware heuristic
@@ -1322,12 +1330,12 @@ impl PancakeV3Factory {
 
         // 5. Sync ticks (use PancakeV3 specific logic to avoid batch contract incompatibility)
         // Chunked to reduce RPC pressure
-        let pools_step = 50;
+        let pools_step = PANCAKE_V3_POOLS_STEP;
         for group in pools.chunks_mut(pools_step) {
             PancakeV3Factory::sync_tick_bitmaps(group, block_number, provider.clone()).await?;
-            sleep(Duration::from_millis(500)).await;
+            sleep(Duration::from_millis(PANCAKE_V3_INTER_BATCH_SLEEP_MS)).await;
             PancakeV3Factory::sync_tick_data(group, block_number, provider.clone()).await?;
-            sleep(Duration::from_millis(500)).await;
+            sleep(Duration::from_millis(PANCAKE_V3_INTER_BATCH_SLEEP_MS)).await;
         }
 
         // 6. Recalculate spot prices after full re-sync
@@ -1407,7 +1415,7 @@ impl PancakeV3Factory {
         N: Network,
         P: Provider<N> + Clone,
     {
-        let step = 255;
+        let step = PANCAKE_V3_SLOT0_STEP;
 
         for group in pools.chunks_mut(step) {
             let pool_addresses: Vec<Address> = group
@@ -1441,7 +1449,7 @@ impl PancakeV3Factory {
                 }
             }
 
-            sleep(Duration::from_millis(500)).await;
+            sleep(Duration::from_millis(PANCAKE_V3_INTER_BATCH_SLEEP_MS)).await;
         }
 
         Ok(())
@@ -1459,7 +1467,7 @@ impl PancakeV3Factory {
         P: Provider<N> + Clone,
     {
         let mut jobs: Vec<(Vec<Address>, Vec<TickBitmapInfo>)> = Vec::new();
-        let max_range = 300;
+        let max_range = PANCAKE_V3_MAX_RANGE;
         let mut group_range = 0;
         let mut group = vec![];
 
@@ -1509,7 +1517,7 @@ impl PancakeV3Factory {
             pool_index.insert(pool.address(), idx);
         }
 
-        let max_in_flight = 8;
+        let max_in_flight = PANCAKE_V3_MAX_IN_FLIGHT;
         let mut futures: FuturesUnordered<BoxFuture<'_, _>> = FuturesUnordered::new();
 
         for (pool_info, calldata) in jobs {
@@ -1621,7 +1629,7 @@ impl PancakeV3Factory {
 
         // Step 2: Batch fetch tick data
         let mut futures: FuturesUnordered<BoxFuture<'_, _>> = FuturesUnordered::new();
-        let max_ticks = 60;
+        let max_ticks = PANCAKE_V3_MAX_TICKS;
         let mut group_ticks = 0;
         let mut group = vec![];
         let mut jobs: Vec<Vec<TickDataInfo>> = Vec::new();
@@ -1657,7 +1665,7 @@ impl PancakeV3Factory {
             pool_index.insert(pool.address(), idx);
         }
 
-        let max_in_flight = 8;
+        let max_in_flight = PANCAKE_V3_MAX_IN_FLIGHT;
 
         for job in jobs {
             let provider = provider.clone();
