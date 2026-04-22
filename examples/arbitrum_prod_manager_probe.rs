@@ -345,7 +345,7 @@ async fn main() -> eyre::Result<()> {
         Duration::from_secs(init_timeout_secs),
         StateSpaceBuilder::new(provider.clone())
             .with_amms(amms)
-            .with_rate_sync_interval(Duration::from_secs(300))
+            .with_non_event_sync_interval(Duration::from_secs(300))
             .with_curve_sync_interval(Duration::from_secs(120))
             .with_maintenance_interval(Duration::from_secs(366))
             .sync(),

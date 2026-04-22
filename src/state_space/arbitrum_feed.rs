@@ -17,6 +17,7 @@ use tracing::{error, info, warn};
 
 pub(crate) const ARBITRUM_FEED_WS_URL: &str = "wss://arb1-feed.arbitrum.io/feed";
 pub(crate) const ARBITRUM_ONE_L2_OFFSET: u64 = 22_207_817;
+pub(crate) const ARBITRUM_FEED_SAFETY_BLOCKS: u64 = 1;
 pub(crate) const ARBITRUM_FEED_RETRY_BASE_MS: u64 = 50;
 pub(crate) const ARBITRUM_FEED_RETRY_MAX_MS: u64 = 500;
 pub(crate) const ARBITRUM_FEED_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -33,7 +34,7 @@ impl UnreadableBlockRetryState {
         Self {
             block,
             retry_attempt: 0,
-            next_retry_at: Instant::now(),
+            next_retry_at: Instant::now() + unreadable_retry_delay(0),
         }
     }
 
@@ -109,6 +110,7 @@ impl<N, P> StateSpaceManager<N, P> {
         msg.contains("block not found")
             || msg.contains("header not found")
             || msg.contains("requested to block")
+            || msg.contains("invalid block range")
     }
 
     async fn drive_arbitrum_feed_progress(
@@ -128,7 +130,8 @@ impl<N, P> StateSpaceManager<N, P> {
         N: Network,
     {
         let mut updates = Vec::new();
-        let candidate_l2_head = max_seq.saturating_add(ARBITRUM_ONE_L2_OFFSET);
+        let raw_feed_head = max_seq.saturating_add(ARBITRUM_ONE_L2_OFFSET);
+        let candidate_l2_head = raw_feed_head.saturating_sub(ARBITRUM_FEED_SAFETY_BLOCKS);
 
         loop {
             let synced_head = realtime_head.load(Ordering::Relaxed);
@@ -167,7 +170,9 @@ impl<N, P> StateSpaceManager<N, P> {
                             retry_attempt = next.retry_attempt,
                             retry_delay_ms = unreadable_retry_delay(next.retry_attempt).as_millis(),
                             realtime_head = synced_head,
+                            raw_feed_head,
                             candidate_l2_head,
+                            safety_blocks = ARBITRUM_FEED_SAFETY_BLOCKS,
                             "Arbitrum feed block not readable yet; scheduling retry"
                         );
                         *unreadable_block = Some(next);
@@ -223,6 +228,7 @@ impl<N, P> StateSpaceManager<N, P> {
             let mut seq_non_monotonic_count = 0u64;
             let mut max_seq = realtime_head
                 .load(Ordering::Relaxed)
+                .saturating_add(ARBITRUM_FEED_SAFETY_BLOCKS)
                 .saturating_sub(ARBITRUM_ONE_L2_OFFSET);
             let mut last_metrics_log = Instant::now();
             let mut unreadable_block: Option<UnreadableBlockRetryState> = None;
@@ -300,10 +306,13 @@ impl<N, P> StateSpaceManager<N, P> {
 
                     if last_metrics_log.elapsed() >= Duration::from_secs(5) {
                         let realtime = realtime_head.load(Ordering::Relaxed);
-                        let candidate = max_seq.saturating_add(ARBITRUM_ONE_L2_OFFSET);
+                        let raw_feed_head = max_seq.saturating_add(ARBITRUM_ONE_L2_OFFSET);
+                        let candidate = raw_feed_head.saturating_sub(ARBITRUM_FEED_SAFETY_BLOCKS);
                         info!(
                             max_seq,
+                            raw_feed_head,
                             candidate_l2_head = candidate,
+                            safety_blocks = ARBITRUM_FEED_SAFETY_BLOCKS,
                             realtime_head = realtime,
                             head_lag = candidate.saturating_sub(realtime),
                             seq_duplicate_count,
@@ -392,9 +401,12 @@ mod tests {
         assert_eq!(max_seq, 14);
         assert_eq!(dup, 4);
         assert_eq!(non_mono, 2);
+        let raw_feed_head = max_seq.saturating_add(ARBITRUM_ONE_L2_OFFSET);
+        let candidate_l2_head = raw_feed_head.saturating_sub(ARBITRUM_FEED_SAFETY_BLOCKS);
+        assert_eq!(raw_feed_head, 14 + ARBITRUM_ONE_L2_OFFSET);
         assert_eq!(
-            max_seq.saturating_add(ARBITRUM_ONE_L2_OFFSET),
-            14 + ARBITRUM_ONE_L2_OFFSET
+            candidate_l2_head,
+            14 + ARBITRUM_ONE_L2_OFFSET - ARBITRUM_FEED_SAFETY_BLOCKS
         );
     }
 
@@ -413,6 +425,7 @@ mod tests {
         let first = UnreadableBlockRetryState::new(1234);
         assert_eq!(first.block, 1234);
         assert_eq!(first.retry_attempt, 0);
+        assert!(first.next_retry_at > Instant::now());
 
         let second = first.bump();
         assert_eq!(second.block, 1234);
@@ -422,5 +435,17 @@ mod tests {
         assert_eq!(third.block, 1234);
         assert_eq!(third.retry_attempt, 2);
         assert!(third.next_retry_at > Instant::now());
+    }
+
+    #[test]
+    fn invalid_block_range_is_treated_as_temporarily_unreadable() {
+        let err = StateSpaceError::AMMError(crate::amms::error::AMMError::Msg(
+            "server returned an error response: error code -32000: invalid block range params"
+                .to_string(),
+        ));
+        assert!(
+            StateSpaceManager::<(), ()>::is_temporarily_unreadable_block_error(&err),
+            "invalid block range params should trigger fast retry path"
+        );
     }
 }

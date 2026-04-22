@@ -355,7 +355,7 @@ async fn main() -> eyre::Result<()> {
         let manager = StateSpaceBuilder::new(provider.clone())
             .with_amms(chunk.to_vec())
             // align with dex-arbitrage production setup
-            .with_rate_sync_interval(Duration::from_secs(300))
+            .with_non_event_sync_interval(Duration::from_secs(300))
             .with_curve_sync_interval(Duration::from_secs(120))
             .with_maintenance_interval(Duration::from_secs(180))
             .sync()

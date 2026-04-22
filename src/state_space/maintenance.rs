@@ -420,6 +420,7 @@ impl<N, P> StateSpaceManager<N, P> {
         msg.contains("block not found")
             || msg.contains("header not found")
             || msg.contains("requested to block")
+            || msg.contains("invalid block range")
     }
 
     pub(super) async fn drain_pending_sync_queue(

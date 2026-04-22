@@ -386,7 +386,7 @@ async fn main() -> eyre::Result<()> {
 
     let manager = StateSpaceBuilder::new(provider.clone())
         .with_amms(amms)
-        .with_rate_sync_interval(Duration::from_secs(500))
+        .with_non_event_sync_interval(Duration::from_secs(500))
         .with_curve_sync_interval(Duration::from_secs(240))
         .with_maintenance_interval(Duration::from_secs(600))
         .sync()
