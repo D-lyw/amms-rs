@@ -1466,7 +1466,7 @@ impl AerodromeSlipstreamFactory {
                         }
                     }
 
-                    sleep(Duration::from_millis(10)).await;
+                    sleep(Duration::from_millis(2)).await;
                 }
             }
         }
@@ -1509,7 +1509,7 @@ impl AerodromeSlipstreamFactory {
                 }
             }
 
-            sleep(Duration::from_millis(10)).await;
+            sleep(Duration::from_millis(2)).await;
         }
         Ok(())
     }
@@ -1686,7 +1686,7 @@ impl AerodromeSlipstreamFactory {
                         }
                     }
 
-                    sleep(Duration::from_millis(10)).await;
+                    sleep(Duration::from_millis(2)).await;
                 }
             }
         }
@@ -1732,7 +1732,7 @@ impl AerodromeSlipstreamFactory {
                 }
             }
 
-            sleep(Duration::from_millis(10)).await;
+            sleep(Duration::from_millis(2)).await;
         }
         Ok(())
     }
