@@ -1465,6 +1465,8 @@ impl AerodromeSlipstreamFactory {
                             slipstream_pool.tick_bitmap.insert(word_pos, tick_bitmap);
                         }
                     }
+
+                    sleep(Duration::from_millis(300)).await;
                 }
             }
         }
@@ -1506,6 +1508,8 @@ impl AerodromeSlipstreamFactory {
                     slipstream_pool.tick_bitmap.insert(word_pos, tick_bitmap);
                 }
             }
+
+            sleep(Duration::from_millis(300)).await;
         }
         Ok(())
     }
@@ -1681,6 +1685,8 @@ impl AerodromeSlipstreamFactory {
                             slipstream_pool.ticks.insert(tick_idx.as_i32(), info);
                         }
                     }
+
+                    sleep(Duration::from_millis(300)).await;
                 }
             }
         }
@@ -1725,6 +1731,8 @@ impl AerodromeSlipstreamFactory {
                     slipstream_pool.ticks.insert(tick_idx.as_i32(), info);
                 }
             }
+
+            sleep(Duration::from_millis(300)).await;
         }
         Ok(())
     }

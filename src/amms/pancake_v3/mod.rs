@@ -1551,6 +1551,8 @@ impl PancakeV3Factory {
                             pv3_pool.tick_bitmap.insert(word_pos, tick_bitmap);
                         }
                     }
+
+                    sleep(Duration::from_millis(300)).await;
                 }
             }
         }
@@ -1573,6 +1575,8 @@ impl PancakeV3Factory {
                     pv3_pool.tick_bitmap.insert(word_pos, tick_bitmap);
                 }
             }
+
+            sleep(Duration::from_millis(300)).await;
         }
         Ok(())
     }
@@ -1702,6 +1706,8 @@ impl PancakeV3Factory {
                             pv3_pool.ticks.insert(tick_idx.as_i32(), info);
                         }
                     }
+
+                    sleep(Duration::from_millis(300)).await;
                 }
             }
         }
@@ -1727,6 +1733,8 @@ impl PancakeV3Factory {
                     pv3_pool.ticks.insert(tick_idx.as_i32(), info);
                 }
             }
+
+            sleep(Duration::from_millis(300)).await;
         }
         Ok(())
     }
