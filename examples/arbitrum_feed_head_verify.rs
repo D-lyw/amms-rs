@@ -241,8 +241,7 @@ async fn main() -> Result<()> {
                 match provider.get_logs(&filter).await {
                     Ok(logs) => {
                         getlogs_success_blocks = getlogs_success_blocks.saturating_add(1);
-                        getlogs_total_logs =
-                            getlogs_total_logs.saturating_add(logs.len() as u64);
+                        getlogs_total_logs = getlogs_total_logs.saturating_add(logs.len() as u64);
                         last_checked_block = Some(block);
                         pending_retry = None;
                         processed_in_cycle = processed_in_cycle.saturating_add(1);
@@ -250,8 +249,7 @@ async fn main() -> Result<()> {
                     Err(e) => {
                         let msg = e.to_string();
                         if is_temporarily_unreadable_error(&msg) {
-                            getlogs_unreadable_blocks =
-                                getlogs_unreadable_blocks.saturating_add(1);
+                            getlogs_unreadable_blocks = getlogs_unreadable_blocks.saturating_add(1);
                         } else {
                             getlogs_other_error_blocks =
                                 getlogs_other_error_blocks.saturating_add(1);
@@ -265,8 +263,7 @@ async fn main() -> Result<()> {
                         pending_retry = Some(PendingRetry {
                             block,
                             attempt: next_attempt,
-                            next_retry_at: Instant::now()
-                                + Duration::from_millis(delay_ms),
+                            next_retry_at: Instant::now() + Duration::from_millis(delay_ms),
                         });
                         break;
                     }

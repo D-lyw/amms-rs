@@ -21,7 +21,6 @@ pub(crate) const ARBITRUM_FEED_RETRY_BASE_MS: u64 = 50;
 pub(crate) const ARBITRUM_FEED_RETRY_MAX_MS: u64 = 500;
 pub(crate) const ARBITRUM_FEED_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-
 #[derive(Clone, Debug)]
 struct UnreadableBlockRetryState {
     block: u64,

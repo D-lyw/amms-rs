@@ -132,10 +132,13 @@ async fn main() -> eyre::Result<()> {
     // Additional regression checks for Slipstream:
     // 1) bidirectional swap simulation (ExactIn/ExactOut)
     // 2) sync_all_pools result consistency vs init() at the same block
-    let sample_pool = state_space.state.values().find_map(|amm| match amm.as_ref() {
-        AMM::AerodromeSlipstreamPool(pool) => Some(pool.clone()),
-        _ => None,
-    });
+    let sample_pool = state_space
+        .state
+        .values()
+        .find_map(|amm| match amm.as_ref() {
+            AMM::AerodromeSlipstreamPool(pool) => Some(pool.clone()),
+            _ => None,
+        });
 
     if let Some(pool) = sample_pool {
         let amount_in = alloy::primitives::U256::from(1_000_000u64);

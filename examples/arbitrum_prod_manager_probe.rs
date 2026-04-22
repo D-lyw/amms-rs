@@ -324,10 +324,7 @@ async fn main() -> eyre::Result<()> {
         run_secs, heartbeat_secs, pool_limit, init_timeout_secs
     );
 
-    let provider = Arc::new(
-        ProviderBuilder::new()
-            .connect_http(rpc_http.parse()?)
-    );
+    let provider = Arc::new(ProviderBuilder::new().connect_http(rpc_http.parse()?));
     let chain_id = provider.get_chain_id().await?;
     println!("[arb-prod-probe] connected chain_id={}", chain_id);
     if chain_id != ARBITRUM_CHAIN_ID {
@@ -405,7 +402,10 @@ async fn main() -> eyre::Result<()> {
             next_heartbeat += Duration::from_secs(heartbeat_secs);
         }
 
-        let timeout = std::cmp::min(Duration::from_secs(2), deadline.saturating_duration_since(now));
+        let timeout = std::cmp::min(
+            Duration::from_secs(2),
+            deadline.saturating_duration_since(now),
+        );
         match tokio::time::timeout(timeout, stream.next()).await {
             Ok(Some(Ok(affected))) => {
                 updates_total += 1;

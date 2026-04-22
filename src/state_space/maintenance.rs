@@ -24,6 +24,15 @@ pub(super) const DRIFT_MAX_POOLS_PER_TICK: usize = 32;
 pub(super) const DRIFT_HOT_WINDOW_BLOCKS: u64 = 60;
 pub(super) const MAINT_COVERAGE_BATCH_SIZE: usize = 80;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ClProbeSnapshot {
+    sqrt_price: U256,
+    tick: i32,
+    liquidity: u128,
+    // Only Slipstream currently needs dynamic fee drift checks.
+    fee: Option<u32>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum PendingSyncAction {
     AsyncUpdate,
@@ -562,13 +571,26 @@ impl<N, P> StateSpaceManager<N, P> {
         }
     }
 
-    fn local_cl_probe_snapshot(amm: &AMM) -> Option<(U256, i32, u128)> {
+    fn local_cl_probe_snapshot(amm: &AMM) -> Option<ClProbeSnapshot> {
         match amm {
-            AMM::UniswapV3Pool(pool) => Some((pool.sqrt_price, pool.tick, pool.liquidity)),
-            AMM::PancakeV3Pool(pool) => Some((pool.sqrt_price, pool.tick, pool.liquidity)),
-            AMM::AerodromeSlipstreamPool(pool) => {
-                Some((pool.sqrt_price, pool.tick, pool.liquidity))
-            }
+            AMM::UniswapV3Pool(pool) => Some(ClProbeSnapshot {
+                sqrt_price: pool.sqrt_price,
+                tick: pool.tick,
+                liquidity: pool.liquidity,
+                fee: None,
+            }),
+            AMM::PancakeV3Pool(pool) => Some(ClProbeSnapshot {
+                sqrt_price: pool.sqrt_price,
+                tick: pool.tick,
+                liquidity: pool.liquidity,
+                fee: None,
+            }),
+            AMM::AerodromeSlipstreamPool(pool) => Some(ClProbeSnapshot {
+                sqrt_price: pool.sqrt_price,
+                tick: pool.tick,
+                liquidity: pool.liquidity,
+                fee: Some(pool.fee),
+            }),
             _ => None,
         }
     }
@@ -577,7 +599,7 @@ impl<N, P> StateSpaceManager<N, P> {
         provider: &P,
         amm: &AMM,
         block: u64,
-    ) -> Result<Option<(U256, i32, u128)>, AMMError>
+    ) -> Result<Option<ClProbeSnapshot>, AMMError>
     where
         P: Provider<N> + Clone,
         N: Network,
@@ -588,31 +610,35 @@ impl<N, P> StateSpaceManager<N, P> {
                 let contract = IV3StateProbe::new(pool.address, provider.clone());
                 let slot0 = contract.slot0().block(block).call().await?;
                 let liquidity = contract.liquidity().block(block).call().await?;
-                Ok(Some((
-                    slot0.sqrtPriceX96.to(),
-                    slot0.tick.as_i32(),
+                Ok(Some(ClProbeSnapshot {
+                    sqrt_price: slot0.sqrtPriceX96.to(),
+                    tick: slot0.tick.as_i32(),
                     liquidity,
-                )))
+                    fee: None,
+                }))
             }
             AMM::PancakeV3Pool(pool) => {
                 let contract = IV3StateProbe::new(pool.address, provider.clone());
                 let slot0 = contract.slot0().block(block).call().await?;
                 let liquidity = contract.liquidity().block(block).call().await?;
-                Ok(Some((
-                    slot0.sqrtPriceX96.to(),
-                    slot0.tick.as_i32(),
+                Ok(Some(ClProbeSnapshot {
+                    sqrt_price: slot0.sqrtPriceX96.to(),
+                    tick: slot0.tick.as_i32(),
                     liquidity,
-                )))
+                    fee: None,
+                }))
             }
             AMM::AerodromeSlipstreamPool(pool) => {
                 let contract = ISlipstreamStateProbe::new(pool.address, provider.clone());
                 let slot0 = contract.slot0().block(block).call().await?;
                 let liquidity = contract.liquidity().block(block).call().await?;
-                Ok(Some((
-                    slot0.sqrtPriceX96.to(),
-                    slot0.tick.as_i32(),
+                let fee = contract.fee().block(block).call().await?.to::<u32>();
+                Ok(Some(ClProbeSnapshot {
+                    sqrt_price: slot0.sqrtPriceX96.to(),
+                    tick: slot0.tick.as_i32(),
                     liquidity,
-                )))
+                    fee: Some(fee),
+                }))
             }
             _ => Ok(None),
         }

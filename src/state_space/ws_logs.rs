@@ -4,8 +4,8 @@ use super::{
 };
 use crate::state_space::{STREAM_IDLE_TIMEOUT, STREAM_RECONNECT_DELAY};
 use alloy::consensus::BlockHeader;
-use alloy::network::Network;
 use alloy::network::primitives::HeaderResponse;
+use alloy::network::Network;
 use alloy::providers::Provider;
 use async_stream::stream;
 use futures::{Stream, StreamExt};

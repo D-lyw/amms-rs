@@ -196,9 +196,7 @@ impl<N, P> StateSpaceManager<N, P> {
         u64::from_str_radix(raw, 16).ok()
     }
 
-    fn decode_flashblock_text<'a>(
-        raw: &'a mut [u8],
-    ) -> Option<FlashblockMessage<'a>> {
+    fn decode_flashblock_text<'a>(raw: &'a mut [u8]) -> Option<FlashblockMessage<'a>> {
         simd_json::from_slice::<FlashblockMessage<'a>>(raw).ok()
     }
 

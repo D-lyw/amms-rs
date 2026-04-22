@@ -167,6 +167,7 @@ sol! {
             bool unlocked
         );
         function liquidity() external view returns (uint128);
+        function fee() external view returns (uint24);
     }
 }
 
@@ -965,6 +966,10 @@ pub struct StateSpaceBuilder<N, P> {
     pub hooks: Vec<StateHook<Vec<Address>>>,
     pub snapshot_path: Option<PathBuf>,
     pub snapshot_config: Option<SnapshotConfig>,
+    /// Periodic sync for data that can drift without reliable events
+    /// (e.g. Balancer rates/fees, Fluid limits/price, Slipstream fee).
+    pub non_event_sync_interval: Option<Duration>,
+    /// Legacy compatibility alias. Prefer `non_event_sync_interval`.
     pub rate_sync_interval: Option<Duration>,
     pub curve_sync_interval: Option<Duration>,
     pub maintenance_interval: Option<Duration>,
@@ -987,6 +992,7 @@ where
             phantom: PhantomData,
             snapshot_path: None,
             snapshot_config: None,
+            non_event_sync_interval: None,
             rate_sync_interval: None,
             curve_sync_interval: None,
             maintenance_interval: None,
@@ -1033,11 +1039,17 @@ where
         }
     }
 
-    pub fn with_rate_sync_interval(self, interval: Duration) -> StateSpaceBuilder<N, P> {
+    pub fn with_non_event_sync_interval(self, interval: Duration) -> StateSpaceBuilder<N, P> {
         StateSpaceBuilder {
+            non_event_sync_interval: Some(interval),
             rate_sync_interval: Some(interval),
             ..self
         }
+    }
+
+    /// Backward-compatible alias of `with_non_event_sync_interval`.
+    pub fn with_rate_sync_interval(self, interval: Duration) -> StateSpaceBuilder<N, P> {
+        self.with_non_event_sync_interval(interval)
     }
 
     pub fn with_maintenance_interval(self, interval: Duration) -> StateSpaceBuilder<N, P> {
@@ -1247,7 +1259,8 @@ where
             self.hooks.push(hook);
         }
 
-        if let Some(interval) = self.rate_sync_interval {
+        let non_event_interval = self.non_event_sync_interval.or(self.rate_sync_interval);
+        if let Some(interval) = non_event_interval {
             tokio::spawn(sync_services::start_balancer_v2_rate_sync_task(
                 state_space.clone(),
                 self.provider.clone(),
@@ -1271,10 +1284,17 @@ where
                 self.provider.clone(),
                 interval,
             ));
+
+            // Slipstream pools: dynamic fee can drift without reliably observed fee events.
+            tokio::spawn(sync_services::start_slipstream_fee_sync_task(
+                state_space.clone(),
+                self.provider.clone(),
+                interval,
+            ));
         }
 
         // Curve NG StableSwap pools: stored_rates for rebasing tokens & D value sync
-        if let Some(interval) = self.curve_sync_interval.or(self.rate_sync_interval) {
+        if let Some(interval) = self.curve_sync_interval.or(non_event_interval) {
             tokio::spawn(sync_services::start_curve_rate_sync_task(
                 state_space.clone(),
                 self.provider.clone(),
