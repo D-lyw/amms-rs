@@ -1,3 +1,4 @@
+mod arbitrum_feed;
 pub mod discovery;
 pub mod error;
 pub mod filters;
@@ -57,6 +58,7 @@ pub enum RealtimeSyncSource {
     // newHeads + per-block get_logs pull mode.
     WsLogs,
     BaseFlashblocksRaw,
+    ArbitrumSequencerFeed,
 }
 
 #[derive(Clone)]
@@ -89,6 +91,7 @@ const APPLIED_LOG_DEDUP_CAPACITY: usize = 300_000;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LogSource {
     RealtimeFlashblock,
+    ArbitrumFeedPull,
     CanonicalReconcile,
     NewHeadsPull,
     Maintenance,
@@ -196,10 +199,11 @@ impl LogQueryChunk {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 enum SelectedRealtimeSource {
     NewHeadsPull,
     BaseFlashblocksRaw,
+    ArbitrumFeedPull,
 }
 
 impl<N, P> StateSpaceManager<N, P> {
@@ -212,6 +216,7 @@ impl<N, P> StateSpaceManager<N, P> {
         &self,
         query_chunks: Vec<LogQueryChunk>,
         chain_id: u64,
+        selected: SelectedRealtimeSource,
     ) -> Result<(), StateSpaceError>
     where
         P: Provider<N> + Clone + 'static,
@@ -225,7 +230,9 @@ impl<N, P> StateSpaceManager<N, P> {
             return Ok(());
         }
 
-        if chain_id == BASE_CHAIN_ID {
+        if chain_id == BASE_CHAIN_ID
+            && matches!(selected, SelectedRealtimeSource::BaseFlashblocksRaw)
+        {
             let provider = self.provider.clone();
             let state = self.state.clone();
             let canonical_head = self.canonical_head.clone();
@@ -242,7 +249,10 @@ impl<N, P> StateSpaceManager<N, P> {
             Self::run_pending_sync_worker(provider, state, queue, canonical_head).await;
         });
 
-        if chain_id == BASE_CHAIN_ID {
+        if matches!(
+            selected,
+            SelectedRealtimeSource::BaseFlashblocksRaw | SelectedRealtimeSource::ArbitrumFeedPull
+        ) {
             let provider = self.provider.clone();
             let state = self.state.clone();
             let hooks = self.hooks.clone();
@@ -320,10 +330,9 @@ impl<N, P> StateSpaceManager<N, P> {
 
         let chain_id = { state.read().await.chain_id };
         let query_chunks = Self::build_query_chunks(&provider, &state, chain_id).await?;
-        self.ensure_background_tasks(query_chunks.clone(), chain_id)
-            .await?;
-
         let selected = Self::resolve_realtime_source(chain_id, &realtime_source);
+        self.ensure_background_tasks(query_chunks.clone(), chain_id, selected)
+            .await?;
 
         match selected {
             SelectedRealtimeSource::NewHeadsPull => {
@@ -363,6 +372,25 @@ impl<N, P> StateSpaceManager<N, P> {
                     chain_id,
                 )))
             }
+            SelectedRealtimeSource::ArbitrumFeedPull => {
+                info!(
+                    "Starting Arbitrum feed + getLogs sync (chain_id={}, ws_url={}, {} query chunks)",
+                    chain_id,
+                    arbitrum_feed::ARBITRUM_FEED_WS_URL,
+                    query_chunks.len()
+                );
+                Ok(Box::pin(Self::subscribe_arbitrum_feed_stream(
+                    provider,
+                    state,
+                    hooks,
+                    realtime_head,
+                    canonical_head,
+                    pending_sync_queue,
+                    applied_log_dedup,
+                    query_chunks,
+                    chain_id,
+                )))
+            }
         }
     }
 
@@ -374,12 +402,15 @@ impl<N, P> StateSpaceManager<N, P> {
             RealtimeSyncSource::Auto => {
                 if chain_id == BASE_CHAIN_ID {
                     SelectedRealtimeSource::BaseFlashblocksRaw
+                } else if chain_id == ARBITRUM_CHAIN_ID {
+                    SelectedRealtimeSource::ArbitrumFeedPull
                 } else {
                     SelectedRealtimeSource::NewHeadsPull
                 }
             }
             RealtimeSyncSource::WsLogs => SelectedRealtimeSource::NewHeadsPull,
             RealtimeSyncSource::BaseFlashblocksRaw => SelectedRealtimeSource::BaseFlashblocksRaw,
+            RealtimeSyncSource::ArbitrumSequencerFeed => SelectedRealtimeSource::ArbitrumFeedPull,
         }
     }
 
@@ -492,11 +523,15 @@ impl<N, P> StateSpaceManager<N, P> {
             prev = realtime_head.load(Ordering::Relaxed);
         }
 
-        // For non-Base newHeads mode, canonical progress is event-driven from heads.
-        if matches!(source, LogSource::NewHeadsPull) {
+        // Canonical progress is event-driven from sources that process canonical block logs directly.
+        if matches!(
+            source,
+            LogSource::NewHeadsPull | LogSource::ArbitrumFeedPull
+        ) {
             Self::store_monotonic_head(canonical_head, block_num);
             let guard = state.read().await;
             Self::store_monotonic_head(&guard.canonical_head, block_num);
+            Self::store_monotonic_head(&guard.reconcile_cursor, block_num);
         }
 
         if logs.is_empty() {
