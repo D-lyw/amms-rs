@@ -1558,7 +1558,7 @@ impl UniswapV3Factory {
                         uv3_pool.liquidity = slot_0_data.1;
                         uv3_pool.sqrt_price = slot_0_data.2;
                     }
-                    sleep(Duration::from_millis(300)).await;
+                    sleep(Duration::from_millis(10)).await;
                 }
             }
         }
@@ -1576,7 +1576,7 @@ impl UniswapV3Factory {
                 uv3_pool.liquidity = slot_0_data.1;
                 uv3_pool.sqrt_price = slot_0_data.2;
             }
-            sleep(Duration::from_millis(300)).await;
+            sleep(Duration::from_millis(10)).await;
         }
 
         Ok(())
@@ -1680,7 +1680,7 @@ impl UniswapV3Factory {
                             uv3_pool.tick_bitmap.insert(word_pos, tick_bitmap);
                         }
                     }
-                    sleep(Duration::from_millis(300)).await;
+                    sleep(Duration::from_millis(10)).await;
                 }
             }
         }
@@ -1703,7 +1703,7 @@ impl UniswapV3Factory {
                     uv3_pool.tick_bitmap.insert(word_pos, tick_bitmap);
                 }
             }
-            sleep(Duration::from_millis(300)).await;
+            sleep(Duration::from_millis(10)).await;
         }
         Ok(())
     }
@@ -1836,7 +1836,7 @@ impl UniswapV3Factory {
                             uv3_pool.ticks.insert(tick_idx.as_i32(), info);
                         }
                     }
-                    sleep(Duration::from_millis(300)).await;
+                    sleep(Duration::from_millis(10)).await;
                 }
             }
         }
@@ -1862,7 +1862,7 @@ impl UniswapV3Factory {
                     uv3_pool.ticks.insert(tick_idx.as_i32(), info);
                 }
             }
-            sleep(Duration::from_millis(300)).await;
+            sleep(Duration::from_millis(10)).await;
         }
         Ok(())
     }

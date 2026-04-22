@@ -1552,7 +1552,7 @@ impl PancakeV3Factory {
                         }
                     }
 
-                    sleep(Duration::from_millis(300)).await;
+                    sleep(Duration::from_millis(10)).await;
                 }
             }
         }
@@ -1576,7 +1576,7 @@ impl PancakeV3Factory {
                 }
             }
 
-            sleep(Duration::from_millis(300)).await;
+            sleep(Duration::from_millis(10)).await;
         }
         Ok(())
     }
@@ -1707,7 +1707,7 @@ impl PancakeV3Factory {
                         }
                     }
 
-                    sleep(Duration::from_millis(300)).await;
+                    sleep(Duration::from_millis(10)).await;
                 }
             }
         }
@@ -1734,7 +1734,7 @@ impl PancakeV3Factory {
                 }
             }
 
-            sleep(Duration::from_millis(300)).await;
+            sleep(Duration::from_millis(10)).await;
         }
         Ok(())
     }
