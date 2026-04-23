@@ -139,6 +139,12 @@ sol! {
 
 sol! {
     #[sol(rpc)]
+    GetAerodromeSlipstreamProbeBatchRequest,
+    "src/amms/abi/GetAerodromeSlipstreamProbeBatchRequest.json",
+}
+
+sol! {
+    #[sol(rpc)]
     GetAerodromeSlipstreamPoolTickDataBatchRequest,
     "src/amms/abi/GetAerodromeSlipstreamPoolTickDataBatchRequest.json",
 }

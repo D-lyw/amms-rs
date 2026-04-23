@@ -1547,16 +1547,19 @@ impl UniswapV3Factory {
                 if let Some(res) = futures.next().await {
                     let (start, return_data) = res?;
                     let return_data =
-                        <Vec<(i32, u128, U256)> as SolValue>::abi_decode(&return_data)?;
+                        <Vec<(bool, i32, u128, U256)> as SolValue>::abi_decode(&return_data)?;
                     let end = (start + return_data.len()).min(pools.len());
                     for (slot_0_data, pool) in return_data.iter().zip(pools[start..end].iter_mut())
                     {
                         let AMM::UniswapV3Pool(ref mut uv3_pool) = pool else {
                             unreachable!()
                         };
-                        uv3_pool.tick = slot_0_data.0;
-                        uv3_pool.liquidity = slot_0_data.1;
-                        uv3_pool.sqrt_price = slot_0_data.2;
+                        if !slot_0_data.0 {
+                            continue;
+                        }
+                        uv3_pool.tick = slot_0_data.1;
+                        uv3_pool.liquidity = slot_0_data.2;
+                        uv3_pool.sqrt_price = slot_0_data.3;
                     }
                     sleep(Duration::from_millis(2)).await;
                 }
@@ -1565,16 +1568,19 @@ impl UniswapV3Factory {
 
         while let Some(res) = futures.next().await {
             let (start, return_data) = res?;
-            let return_data = <Vec<(i32, u128, U256)> as SolValue>::abi_decode(&return_data)?;
+            let return_data = <Vec<(bool, i32, u128, U256)> as SolValue>::abi_decode(&return_data)?;
             let end = (start + return_data.len()).min(pools.len());
             for (slot_0_data, pool) in return_data.iter().zip(pools[start..end].iter_mut()) {
                 let AMM::UniswapV3Pool(ref mut uv3_pool) = pool else {
                     unreachable!()
                 };
 
-                uv3_pool.tick = slot_0_data.0;
-                uv3_pool.liquidity = slot_0_data.1;
-                uv3_pool.sqrt_price = slot_0_data.2;
+                if !slot_0_data.0 {
+                    continue;
+                }
+                uv3_pool.tick = slot_0_data.1;
+                uv3_pool.liquidity = slot_0_data.2;
+                uv3_pool.sqrt_price = slot_0_data.3;
             }
             sleep(Duration::from_millis(2)).await;
         }

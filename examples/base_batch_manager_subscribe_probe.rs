@@ -9,7 +9,7 @@ use amms::{
     amms::{
         aerodrome_slipstream::AerodromeSlipstreamPool,
         aerodrome_v2::AerodromeV2Pool,
-        amm::{AutomatedMarketMaker, AMM},
+        amm::AMM,
         balancer_v2::{BalancerV2Pool, BalancerV2PoolType},
         balancer_v3::{BalancerV3Pool, BalancerV3PoolType},
         curve_legacy::{CurveLegacyPool, CurveLegacyPoolType},
@@ -34,7 +34,6 @@ use std::{
     collections::HashMap,
     path::Path,
     str::FromStr,
-    sync::atomic::Ordering,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -65,13 +64,6 @@ struct BatchReport {
     updates_total: usize,
     affected_total: usize,
     stream_errors: usize,
-    realtime_head: u64,
-    canonical_head: u64,
-    reconcile_cursor: u64,
-    max_pool_lag_blocks: u64,
-    lag_gt_3_blocks: usize,
-    lag_gt_30_blocks: usize,
-    lag_gt_300_blocks: usize,
 }
 
 fn parse_addr(v: Option<&str>) -> Option<Address> {
@@ -320,7 +312,7 @@ async fn main() -> eyre::Result<()> {
     let run_secs: u64 = std::env::var("RUN_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(90);
+        .unwrap_or(420);
 
     println!("=== Base Batch StateSpaceManager Subscribe Probe ===");
     println!("rpc_ws: {}", rpc_ws);
@@ -357,20 +349,19 @@ async fn main() -> eyre::Result<()> {
             // align with dex-arbitrage production setup
             .with_non_event_sync_interval(Duration::from_secs(300))
             .with_curve_sync_interval(Duration::from_secs(120))
-            .with_maintenance_interval(Duration::from_secs(180))
+            .with_pending_sync_worker_interval(Duration::from_secs(2))
+            .with_drift_probe_interval(Duration::from_secs(60))
+            .with_maintenance_coverage_interval(Duration::from_secs(180))
             .sync()
             .await
             .with_context(|| format!("batch {} init failed", batch_id))?;
 
         let init_ms = init_start.elapsed().as_millis();
         println!(
-            "[batch {}] init pools={} init_ms={} realtime_head={} canonical_head={} reconcile_cursor={}",
+            "[batch {}] init pools={} init_ms={}",
             batch_id,
             chunk.len(),
-            init_ms,
-            manager.realtime_head.load(Ordering::Relaxed),
-            manager.canonical_head.load(Ordering::Relaxed),
-            manager.reconcile_cursor.load(Ordering::Relaxed),
+            init_ms
         );
         managers.push((batch_id, chunk.len(), init_ms, manager));
     }
@@ -401,13 +392,8 @@ async fn main() -> eyre::Result<()> {
                 let now = Instant::now();
                 if now >= next_heartbeat {
                     println!(
-                        "[batch {}] heartbeat realtime_head={} canonical_head={} reconcile_cursor={} updates={} affected={}",
-                        batch_id,
-                        manager.realtime_head.load(Ordering::Relaxed),
-                        manager.canonical_head.load(Ordering::Relaxed),
-                        manager.reconcile_cursor.load(Ordering::Relaxed),
-                        updates_total,
-                        affected_total
+                        "[batch {}] heartbeat updates={} affected={} stream_err={}",
+                        batch_id, updates_total, affected_total, stream_errors
                     );
                     next_heartbeat += Duration::from_secs(15);
                 }
@@ -430,30 +416,6 @@ async fn main() -> eyre::Result<()> {
                 }
             }
 
-            let realtime_head = manager.realtime_head.load(Ordering::Relaxed);
-            let canonical_head = manager.canonical_head.load(Ordering::Relaxed);
-            let reconcile_cursor = manager.reconcile_cursor.load(Ordering::Relaxed);
-            let state = manager.state.read().await;
-
-            let mut max_pool_lag_blocks = 0u64;
-            let mut lag_gt_3_blocks = 0usize;
-            let mut lag_gt_30_blocks = 0usize;
-            let mut lag_gt_300_blocks = 0usize;
-
-            for amm in state.state.values() {
-                let lag = canonical_head.saturating_sub(amm.last_synced_block());
-                max_pool_lag_blocks = max_pool_lag_blocks.max(lag);
-                if lag > 3 {
-                    lag_gt_3_blocks += 1;
-                }
-                if lag > 30 {
-                    lag_gt_30_blocks += 1;
-                }
-                if lag > 300 {
-                    lag_gt_300_blocks += 1;
-                }
-            }
-
             Ok::<BatchReport, eyre::Report>(BatchReport {
                 batch_id,
                 pools,
@@ -461,13 +423,6 @@ async fn main() -> eyre::Result<()> {
                 updates_total,
                 affected_total,
                 stream_errors,
-                realtime_head,
-                canonical_head,
-                reconcile_cursor,
-                max_pool_lag_blocks,
-                lag_gt_3_blocks,
-                lag_gt_30_blocks,
-                lag_gt_300_blocks,
             })
         });
         handles.push(handle);
@@ -485,36 +440,16 @@ async fn main() -> eyre::Result<()> {
     let mut total_updates = 0usize;
     let mut total_affected = 0usize;
     let mut total_errors = 0usize;
-    let mut total_lag_gt_3 = 0usize;
-    let mut total_lag_gt_30 = 0usize;
-    let mut total_lag_gt_300 = 0usize;
-    let mut max_lag_all = 0u64;
 
     for r in &reports {
         println!(
-            "[batch {}] pools={} init_ms={} updates={} affected={} stream_err={} realtime={} canonical={} reconcile={} max_lag={} lag>3={} lag>30={} lag>300={}",
-            r.batch_id,
-            r.pools,
-            r.init_ms,
-            r.updates_total,
-            r.affected_total,
-            r.stream_errors,
-            r.realtime_head,
-            r.canonical_head,
-            r.reconcile_cursor,
-            r.max_pool_lag_blocks,
-            r.lag_gt_3_blocks,
-            r.lag_gt_30_blocks,
-            r.lag_gt_300_blocks
+            "[batch {}] pools={} init_ms={} updates={} affected={} stream_err={}",
+            r.batch_id, r.pools, r.init_ms, r.updates_total, r.affected_total, r.stream_errors
         );
         total_pools += r.pools;
         total_updates += r.updates_total;
         total_affected += r.affected_total;
         total_errors += r.stream_errors;
-        total_lag_gt_3 += r.lag_gt_3_blocks;
-        total_lag_gt_30 += r.lag_gt_30_blocks;
-        total_lag_gt_300 += r.lag_gt_300_blocks;
-        max_lag_all = max_lag_all.max(r.max_pool_lag_blocks);
     }
 
     println!("\n=== Aggregate Summary ===");
@@ -523,10 +458,6 @@ async fn main() -> eyre::Result<()> {
     println!("total_updates: {}", total_updates);
     println!("total_affected: {}", total_affected);
     println!("total_stream_errors: {}", total_errors);
-    println!("max_pool_lag_blocks_all: {}", max_lag_all);
-    println!("total_lag_gt_3_blocks: {}", total_lag_gt_3);
-    println!("total_lag_gt_30_blocks: {}", total_lag_gt_30);
-    println!("total_lag_gt_300_blocks: {}", total_lag_gt_300);
 
     Ok(())
 }

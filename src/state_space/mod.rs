@@ -72,6 +72,8 @@ pub struct StateSpaceManager<N, P> {
     pending_sync_queue: Arc<Mutex<PendingSyncQueue>>,
     applied_log_dedup: Arc<Mutex<AppliedLogDedupCache>>,
     background_started: Arc<std::sync::atomic::AtomicBool>,
+    pending_sync_worker_interval: Duration,
+    drift_probe_interval: Duration,
     maintenance_interval: Option<Duration>,
     realtime_source: RealtimeSyncSource,
     hooks: HookRegistry<Vec<Address>>,
@@ -86,6 +88,8 @@ const BASE_FLASHBLOCKS_RAW_WS_URL: &str = "wss://mainnet.flashblocks.base.org/ws
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const STREAM_RECONNECT_DELAY: Duration = Duration::from_secs(2);
 const APPLIED_LOG_DEDUP_CAPACITY: usize = 300_000;
+const DEFAULT_PENDING_SYNC_WORKER_INTERVAL: Duration = Duration::from_secs(2);
+const DEFAULT_DRIFT_PROBE_INTERVAL: Duration = Duration::from_secs(120);
 
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -134,6 +138,23 @@ sol! {
     #[sol(rpc)]
     interface ICLFactoryReader {
         function swapFeeModule() external view returns (address);
+    }
+}
+
+sol! {
+    #[derive(Debug, PartialEq, Eq)]
+    #[sol(rpc)]
+    interface IPancakeV3StateProbe {
+        function slot0() external view returns (
+            uint160 sqrtPriceX96,
+            int24 tick,
+            uint16 observationIndex,
+            uint16 observationCardinality,
+            uint16 observationCardinalityNext,
+            uint32 feeProtocol,
+            bool unlocked
+        );
+        function liquidity() external view returns (uint128);
     }
 }
 
@@ -246,8 +267,10 @@ impl<N, P> StateSpaceManager<N, P> {
         let state = self.state.clone();
         let queue = self.pending_sync_queue.clone();
         let canonical_head = self.canonical_head.clone();
+        let pending_interval = self.pending_sync_worker_interval;
         tokio::spawn(async move {
-            Self::run_pending_sync_worker(provider, state, queue, canonical_head).await;
+            Self::run_pending_sync_worker(provider, state, queue, canonical_head, pending_interval)
+                .await;
         });
 
         if matches!(
@@ -283,8 +306,16 @@ impl<N, P> StateSpaceManager<N, P> {
         let state = self.state.clone();
         let queue = self.pending_sync_queue.clone();
         let canonical_head = self.canonical_head.clone();
+        let drift_interval = self.drift_probe_interval.max(Duration::from_secs(1));
         tokio::spawn(async move {
-            Self::run_silent_drift_probe_task(provider, state, queue, canonical_head).await;
+            Self::run_silent_drift_probe_task(
+                provider,
+                state,
+                queue,
+                canonical_head,
+                drift_interval,
+            )
+            .await;
         });
 
         if let Some(interval) = self.maintenance_interval {
@@ -972,6 +1003,8 @@ pub struct StateSpaceBuilder<N, P> {
     /// Legacy compatibility alias. Prefer `non_event_sync_interval`.
     pub rate_sync_interval: Option<Duration>,
     pub curve_sync_interval: Option<Duration>,
+    pub pending_sync_worker_interval: Duration,
+    pub drift_probe_interval: Duration,
     pub maintenance_interval: Option<Duration>,
     pub realtime_source: RealtimeSyncSource,
     phantom: PhantomData<N>,
@@ -995,6 +1028,8 @@ where
             non_event_sync_interval: None,
             rate_sync_interval: None,
             curve_sync_interval: None,
+            pending_sync_worker_interval: DEFAULT_PENDING_SYNC_WORKER_INTERVAL,
+            drift_probe_interval: DEFAULT_DRIFT_PROBE_INTERVAL,
             maintenance_interval: None,
             realtime_source: RealtimeSyncSource::Auto,
             hooks: vec![],
@@ -1055,6 +1090,24 @@ where
     pub fn with_maintenance_interval(self, interval: Duration) -> StateSpaceBuilder<N, P> {
         StateSpaceBuilder {
             maintenance_interval: Some(interval),
+            ..self
+        }
+    }
+
+    pub fn with_maintenance_coverage_interval(self, interval: Duration) -> StateSpaceBuilder<N, P> {
+        self.with_maintenance_interval(interval)
+    }
+
+    pub fn with_pending_sync_worker_interval(self, interval: Duration) -> StateSpaceBuilder<N, P> {
+        StateSpaceBuilder {
+            pending_sync_worker_interval: interval,
+            ..self
+        }
+    }
+
+    pub fn with_drift_probe_interval(self, interval: Duration) -> StateSpaceBuilder<N, P> {
+        StateSpaceBuilder {
+            drift_probe_interval: interval,
             ..self
         }
     }
@@ -1313,6 +1366,8 @@ where
             pending_sync_queue: Arc::new(Mutex::new(PendingSyncQueue::default())),
             applied_log_dedup: Arc::new(Mutex::new(AppliedLogDedupCache::default())),
             background_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            pending_sync_worker_interval: self.pending_sync_worker_interval,
+            drift_probe_interval: self.drift_probe_interval,
             maintenance_interval: self.maintenance_interval,
             phantom: PhantomData,
             hooks: HookRegistry::new(self.hooks),

@@ -9,10 +9,10 @@ use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tracing::{error, info};
 
-use crate::amms::amm::AMM;
+use crate::amms::amm::{AutomatedMarketMaker, AMM};
 use crate::amms::balancer_v2::BalancerV2Pool;
 use crate::amms::balancer_v3::BalancerV3Pool;
-use crate::amms::curve_ng::{ICurveNGPool, ICurveNGStableSwap, ICurveTriCrypto, ICurveTwoCrypto};
+use crate::amms::curve_ng::{ICurveNGPool, ICurveNGStableSwap};
 use crate::amms::fluid_dex::{
     DexReservesResolver, FluidDexT1, FluidLiquidity, TokenLimitData, FLUID_DEX_RESOLVER,
 };
@@ -528,8 +528,7 @@ pub async fn start_curve_rate_sync_task<N, P>(
         // =========================================================================
 
         // B.1 Collect target pools (CryptoSwap only)
-        // Tuple: (Address, n_coins, is_ng)
-        let crypto_targets: Vec<(Address, u8, bool)> = {
+        let crypto_targets: Vec<Address> = {
             let read_guard = state.read().await;
             read_guard
                 .state
@@ -537,7 +536,7 @@ pub async fn start_curve_rate_sync_task<N, P>(
                 .filter_map(|amm| match amm.as_ref() {
                     AMM::CurveNGPool(pool) => {
                         if pool.pool_type.is_crypto() && pool.n_coins > 0 {
-                            Some((pool.address, pool.n_coins, true))
+                            Some(pool.address)
                         } else {
                             None
                         }
@@ -547,7 +546,7 @@ pub async fn start_curve_rate_sync_task<N, P>(
                             == crate::amms::curve_legacy::CurveLegacyPoolType::CryptoSwap
                             && pool.n_coins > 0
                         {
-                            Some((pool.address, pool.n_coins, false))
+                            Some(pool.address)
                         } else {
                             None
                         }
@@ -561,136 +560,60 @@ pub async fn start_curve_rate_sync_task<N, P>(
             let mut ps_updated_count = 0;
 
             // B.2 Fetch and Update
-            for (addr, n_coins, is_ng) in crypto_targets {
-                // Fetch logic depends on pool variant and coin count
-                let price_scale_result = if is_ng {
-                    // --- Curve NG Strategy ---
-                    if n_coins == 2 {
-                        // TwoCrypto: single uint256
-                        let contract = ICurveTwoCrypto::new(addr, provider.clone());
-                        contract.price_scale().call().await.ok().map(|ps| vec![ps])
-                    } else {
-                        // TriCrypto: array of uint256s, accessed by index
-                        let contract = ICurveTriCrypto::new(addr, provider.clone());
-                        let mut scales = Vec::new();
-                        let mut success = true;
-                        for i in 0..(n_coins - 1) {
-                            match contract
-                                .price_scale(alloy::primitives::U256::from(i))
-                                .call()
-                                .await
-                            {
-                                Ok(ps) => scales.push(ps),
-                                Err(_) => {
-                                    success = false;
-                                    break;
-                                }
-                            }
-                        }
-                        if success && !scales.is_empty() {
-                            Some(scales)
-                        } else {
-                            None
-                        }
-                    }
-                } else {
-                    // --- Curve Legacy Strategy ---
-                    // Legacy CryptoSwap also has overloaded signatures:
-                    // - 2-coin pools: price_scale()
-                    // - 3-coin pools: price_scale(uint256)
-                    if n_coins == 2 {
-                        let contract = ICurveTwoCrypto::new(addr, provider.clone());
-                        contract.price_scale().call().await.ok().map(|ps| vec![ps])
-                    } else {
-                        let contract = ICurveTriCrypto::new(addr, provider.clone());
-                        let mut scales = Vec::new();
-                        let mut success = true;
-                        // n_coins=3 implies 2 price scales (0 and 1)
-                        for i in 0..(n_coins - 1) {
-                            match contract
-                                .price_scale(alloy::primitives::U256::from(i))
-                                .call()
-                                .await
-                            {
-                                Ok(ps) => scales.push(ps),
-                                Err(_) => {
-                                    success = false;
-                                    break;
-                                }
-                            }
-                        }
-                        if success && !scales.is_empty() {
-                            Some(scales)
-                        } else {
-                            None
-                        }
-                    }
+            // Reuse per-pool update(multicall) to preserve variant-specific logic paths.
+            for addr in crypto_targets {
+                let Some(mut updated_amm) = ({
+                    let read_guard = state.read().await;
+                    read_guard.get(&addr).cloned()
+                }) else {
+                    continue;
                 };
 
-                // For CryptoSwap pools (both NG and Legacy), fetch D value from chain
-                // D is critical for accurate get_dy calculations and must be in sync with on-chain state
-                // Our local newton_d implementation may differ slightly from chain's newton_D,
-                // causing significant swap output errors (up to 18% observed)
-                let d_result = {
-                    let pool_contract = ICurveNGPool::new(addr, provider.clone());
-                    pool_contract.D().call().await.ok()
-                };
-
-                // Fetch balances for CryptoSwap pools to fix admin fee drift
-                let mut new_balances = Vec::new();
-                let pool_contract = ICurveNGPool::new(addr, provider.clone());
-                let mut balances_ok = true;
-                for i in 0..n_coins {
-                    // Use uint256 index for CryptoSwap
-                    match pool_contract
-                        .balances(alloy::primitives::U256::from(i))
-                        .call()
-                        .await
-                    {
-                        Ok(b) => new_balances.push(b),
-                        Err(_) => {
-                            balances_ok = false;
-                            break;
-                        }
-                    }
+                if let Err(e) = updated_amm.update::<N, _>(provider.clone()).await {
+                    error!(
+                        "Curve crypto update(multicall) failed: addr={:?}, err={:?}",
+                        addr, e
+                    );
+                    continue;
                 }
 
-                // Apply update if fetch succeeded
-                if let Some(new_price_scale) = price_scale_result {
-                    let mut write_guard = state.write().await;
-                    match write_guard.get_mut_cow(&addr) {
-                        Some(AMM::CurveNGPool(pool)) => {
+                let mut write_guard = state.write().await;
+                match (write_guard.get_mut_cow(&addr), updated_amm) {
+                    (Some(AMM::CurveNGPool(pool)), AMM::CurveNGPool(mut updated))
+                        if pool.pool_type.is_crypto() =>
+                    {
+                        if let Some(new_price_scale) = updated.price_scale.take() {
                             pool.price_scale = Some(new_price_scale);
-                            // Use D value fetched from chain instead of local recalculation
-                            // Our newton_d has precision differences from chain's newton_D,
-                            // causing significant swap simulation errors
-                            if let Some(d) = d_result {
-                                pool.d = Some(d);
-                            }
-
-                            if balances_ok && new_balances.len() == pool.n_coins as usize {
-                                pool.balances = new_balances;
-                            }
-
                             ps_updated_count += 1;
                         }
-
-                        Some(AMM::CurveLegacyPool(pool)) => {
-                            pool.price_scale = Some(new_price_scale.clone());
-                            // Also update D value for Legacy CryptoSwap to ensure consistency
-                            // D must be in sync with price_scale for accurate get_dy calculations
-                            if let Some(d) = d_result {
-                                pool.d = Some(d);
-                            }
-
-                            if balances_ok && new_balances.len() == pool.n_coins as usize {
-                                pool.balances = new_balances;
-                            }
-
-                            ps_updated_count += 1;
+                        if let Some(d) = updated.d {
+                            pool.d = Some(d);
                         }
-                        _ => {}
+                        if updated.balances.len() == pool.n_coins as usize {
+                            pool.balances = updated.balances;
+                        }
+                        // TwoCrypto-specific runtime params refreshed in update(multicall).
+                        pool.twocrypto_future_a_gamma_time = updated.twocrypto_future_a_gamma_time;
+                        pool.twocrypto_last_timestamp = updated.twocrypto_last_timestamp;
+                        pool.spot_prices = updated.spot_prices;
                     }
+                    (Some(AMM::CurveLegacyPool(pool)), AMM::CurveLegacyPool(mut updated))
+                        if pool.pool_type
+                            == crate::amms::curve_legacy::CurveLegacyPoolType::CryptoSwap =>
+                    {
+                        if let Some(new_price_scale) = updated.price_scale.take() {
+                            pool.price_scale = Some(new_price_scale);
+                            ps_updated_count += 1;
+                        }
+                        if let Some(d) = updated.d {
+                            pool.d = Some(d);
+                        }
+                        if updated.balances.len() == pool.n_coins as usize {
+                            pool.balances = updated.balances;
+                        }
+                        pool.spot_prices = updated.spot_prices;
+                    }
+                    _ => {}
                 }
             }
 

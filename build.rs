@@ -34,6 +34,7 @@ const TARGET_CONTRACTS: &[&str] = &[
     "GetAerodromeV2PoolDataBatchRequest",
     // Aerodrome Slipstream
     "GetAerodromeSlipstreamSlot0BatchRequest",
+    "GetAerodromeSlipstreamProbeBatchRequest",
     "GetAerodromeSlipstreamPoolTickDataBatchRequest",
     // PancakeV3
     "GetPancakeV3PoolSlot0BatchRequest",

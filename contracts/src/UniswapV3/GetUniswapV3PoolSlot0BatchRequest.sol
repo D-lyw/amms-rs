@@ -7,6 +7,7 @@ pragma solidity ^0.8.0;
  */
 contract GetUniswapV3PoolSlot0BatchRequest {
     struct Slot0Data {
+        bool ok;
         int24 tick;
         uint128 liquidity;
         uint256 sqrtPrice;
@@ -20,11 +21,27 @@ contract GetUniswapV3PoolSlot0BatchRequest {
             address poolAddress = pools[i];
 
             IUniswapV3PoolState pool = IUniswapV3PoolState(poolAddress);
-            slot0Data.liquidity = pool.liquidity();
-
-            (slot0Data.sqrtPrice, slot0Data.tick, , , , , ) = pool.slot0();
-
-            allSlot0Data[i] = slot0Data;
+            try pool.liquidity() returns (uint128 liquidity) {
+                try pool.slot0() returns (
+                    uint160 sqrtPriceX96,
+                    int24 tick,
+                    uint16,
+                    uint16,
+                    uint16,
+                    uint8,
+                    bool
+                ) {
+                    slot0Data.ok = true;
+                    slot0Data.liquidity = liquidity;
+                    slot0Data.sqrtPrice = uint256(sqrtPriceX96);
+                    slot0Data.tick = tick;
+                    allSlot0Data[i] = slot0Data;
+                } catch {
+                    continue;
+                }
+            } catch {
+                continue;
+            }
         }
 
         // ensure abi encoding, not needed here but increase reusability for different return types

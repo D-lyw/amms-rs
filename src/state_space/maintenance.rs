@@ -1,13 +1,15 @@
-use super::{ISlipstreamStateProbe, IV3StateProbe, StateSpace, StateSpaceManager};
+use super::{StateSpace, StateSpaceManager};
+use crate::amms::aerodrome_slipstream::pool::GetAerodromeSlipstreamProbeBatchRequest;
 use crate::amms::amm::{AutomatedMarketMaker, SyncAction, AMM};
 use crate::amms::error::AMMError;
+use crate::amms::pancake_v3::GetPancakeV3PoolSlot0BatchRequest;
+use crate::amms::uniswap_v3::GetUniswapV3PoolSlot0BatchRequest;
 use crate::state_space::error::StateSpaceError;
 use alloy::eips::BlockId;
 use alloy::network::Network;
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
-use futures::stream;
-use futures::StreamExt;
+use alloy::sol_types::SolValue;
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -20,9 +22,12 @@ use tracing::{info, warn};
 pub(super) const DRIFT_HOT_POOL_INTERVAL: Duration = Duration::from_secs(30);
 pub(super) const DRIFT_COLD_POOL_INTERVAL: Duration = Duration::from_secs(300);
 pub(super) const DRIFT_MISMATCH_TRIGGER: u8 = 2;
-pub(super) const DRIFT_MAX_POOLS_PER_TICK: usize = 32;
+pub(super) const DRIFT_MAX_POOLS_PER_TICK: usize = 100;
 pub(super) const DRIFT_HOT_WINDOW_BLOCKS: u64 = 60;
 pub(super) const MAINT_COVERAGE_BATCH_SIZE: usize = 80;
+const DRIFT_V3_SLOT0_BATCH_STEP: usize = DRIFT_MAX_POOLS_PER_TICK;
+const DRIFT_SLIPSTREAM_PROBE_BATCH_STEP: usize = DRIFT_MAX_POOLS_PER_TICK;
+const DRIFT_CANDIDATE_CACHE_TTL: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ClProbeSnapshot {
@@ -31,6 +36,21 @@ struct ClProbeSnapshot {
     liquidity: u128,
     // Only Slipstream currently needs dynamic fee drift checks.
     fee: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DriftProbeKind {
+    V3Like,
+    Slipstream,
+}
+
+impl DriftProbeKind {
+    fn next(self) -> Self {
+        match self {
+            DriftProbeKind::V3Like => DriftProbeKind::Slipstream,
+            DriftProbeKind::Slipstream => DriftProbeKind::V3Like,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -230,6 +250,51 @@ impl PendingSyncQueue {
 }
 
 impl<N, P> StateSpaceManager<N, P> {
+    async fn diagnose_v3_probe_failures(
+        provider: &P,
+        addresses: &[Address],
+        block: u64,
+    ) -> Vec<Address>
+    where
+        P: Provider<N> + Clone,
+        N: Network,
+    {
+        let mut failed = Vec::new();
+        let block = BlockId::from(block);
+        for &address in addresses {
+            let probe = super::IV3StateProbe::new(address, provider.clone());
+            let slot0_ok = probe.slot0().block(block).call().await.is_ok();
+            let liq_ok = probe.liquidity().block(block).call().await.is_ok();
+            if !(slot0_ok && liq_ok) {
+                failed.push(address);
+            }
+        }
+        failed
+    }
+
+    async fn diagnose_slipstream_probe_failures(
+        provider: &P,
+        addresses: &[Address],
+        block: u64,
+    ) -> Vec<Address>
+    where
+        P: Provider<N> + Clone,
+        N: Network,
+    {
+        let mut failed = Vec::new();
+        let block = BlockId::from(block);
+        for &address in addresses {
+            let probe = super::ISlipstreamStateProbe::new(address, provider.clone());
+            let slot0_ok = probe.slot0().block(block).call().await.is_ok();
+            let liq_ok = probe.liquidity().block(block).call().await.is_ok();
+            let fee_ok = probe.fee().block(block).call().await.is_ok();
+            if !(slot0_ok && liq_ok && fee_ok) {
+                failed.push(address);
+            }
+        }
+        failed
+    }
+
     async fn drain_maintenance_coverage_batch(
         provider: &P,
         state: &Arc<RwLock<StateSpace>>,
@@ -448,7 +513,6 @@ impl<N, P> StateSpaceManager<N, P> {
                 queue.claim_due_non_coverage(canonical)
             }
         };
-
         for (address, task) in due_tasks {
             match Self::execute_pending_task(provider, state, address, &task, canonical).await {
                 Ok(PendingExecutionOutcome::Applied) => {
@@ -498,6 +562,7 @@ impl<N, P> StateSpaceManager<N, P> {
         state: Arc<RwLock<StateSpace>>,
         pending_sync_queue: Arc<Mutex<PendingSyncQueue>>,
         canonical_head: Arc<AtomicU64>,
+        interval: Duration,
     ) where
         P: Provider<N> + Clone + 'static,
         N: Network + 'static,
@@ -512,7 +577,7 @@ impl<N, P> StateSpaceManager<N, P> {
                 usize::MAX,
             )
             .await;
-            sleep(Duration::from_secs(2)).await;
+            sleep(interval).await;
         }
     }
 
@@ -551,7 +616,8 @@ impl<N, P> StateSpaceManager<N, P> {
             let coverage_batch = MAINT_COVERAGE_BATCH_SIZE;
 
             let mut queue = pending_sync_queue.lock().await;
-            for (address, _) in pools.into_iter().take(coverage_batch) {
+            let selected: Vec<(Address, u64)> = pools.into_iter().take(coverage_batch).collect();
+            for (address, _) in selected {
                 queue.enqueue(
                     address,
                     PendingSyncAction::Resync,
@@ -596,53 +662,276 @@ impl<N, P> StateSpaceManager<N, P> {
         }
     }
 
-    async fn fetch_cl_probe_snapshot(
+    async fn fetch_v3_probe_snapshots_batch(
         provider: &P,
-        amm: &AMM,
+        addresses: &[Address],
         block: u64,
-    ) -> Result<Option<ClProbeSnapshot>, AMMError>
+    ) -> Result<HashMap<Address, ClProbeSnapshot>, AMMError>
     where
         P: Provider<N> + Clone,
         N: Network,
     {
+        let mut snapshots = HashMap::with_capacity(addresses.len());
         let block = BlockId::from(block);
-        match amm {
-            AMM::UniswapV3Pool(pool) => {
-                let contract = IV3StateProbe::new(pool.address, provider.clone());
-                let slot0 = contract.slot0().block(block).call().await?;
-                let liquidity = contract.liquidity().block(block).call().await?;
-                Ok(Some(ClProbeSnapshot {
-                    sqrt_price: slot0.sqrtPriceX96.to(),
-                    tick: slot0.tick.as_i32(),
-                    liquidity,
-                    fee: None,
-                }))
+        for chunk in addresses.chunks(DRIFT_V3_SLOT0_BATCH_STEP) {
+            let mut pending_groups: Vec<Vec<Address>> = vec![chunk.to_vec()];
+
+            while let Some(group) = pending_groups.pop() {
+                let attempt = GetUniswapV3PoolSlot0BatchRequest::deploy_builder(
+                    provider.clone(),
+                    group.clone(),
+                )
+                .call_raw()
+                .block(block)
+                .await;
+
+                match attempt {
+                    Ok(return_data) => {
+                        let decoded =
+                            <Vec<(bool, i32, u128, U256)> as SolValue>::abi_decode(&return_data)?;
+                        if decoded.len() != group.len() {
+                            warn!(
+                                expected = group.len(),
+                                decoded = decoded.len(),
+                                "V3 drift probe batch decode length mismatch"
+                            );
+                        }
+
+                        let mut ok_false_addresses = Vec::new();
+                        for (address, (ok, tick, liquidity, sqrt_price)) in
+                            group.into_iter().zip(decoded)
+                        {
+                            if !ok {
+                                ok_false_addresses.push(address);
+                                continue;
+                            }
+                            snapshots.insert(
+                                address,
+                                ClProbeSnapshot {
+                                    sqrt_price,
+                                    tick,
+                                    liquidity,
+                                    fee: None,
+                                },
+                            );
+                        }
+
+                        // Batch succeeded: only retry addresses explicitly marked as unreadable (ok=false).
+                        for address in ok_false_addresses {
+                            let probe = super::IV3StateProbe::new(address, provider.clone());
+                            let slot0 = probe.slot0().block(block).call().await;
+                            let liquidity = probe.liquidity().block(block).call().await;
+                            match (slot0, liquidity) {
+                                (Ok(slot0), Ok(liquidity)) => {
+                                    snapshots.insert(
+                                        address,
+                                        ClProbeSnapshot {
+                                            sqrt_price: U256::from(slot0.sqrtPriceX96),
+                                            tick: slot0.tick.as_i32(),
+                                            liquidity,
+                                            fee: None,
+                                        },
+                                    );
+                                }
+                                _ => {
+                                    // Keep as unreadable this round; handled by higher-level retry/enqueue logic.
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        if group.len() <= 1 {
+                            let address = group[0];
+                            let probe = super::IV3StateProbe::new(address, provider.clone());
+                            let slot0 = probe.slot0().block(block).call().await;
+                            let liquidity = probe.liquidity().block(block).call().await;
+                            match (slot0, liquidity) {
+                                (Ok(slot0), Ok(liquidity)) => {
+                                    snapshots.insert(
+                                        address,
+                                        ClProbeSnapshot {
+                                            sqrt_price: U256::from(slot0.sqrtPriceX96),
+                                            tick: slot0.tick.as_i32(),
+                                            liquidity,
+                                            fee: None,
+                                        },
+                                    );
+                                }
+                                _ => warn!(
+                                    address = ?address,
+                                    "V3 probe single fallback failed: {}",
+                                    err
+                                ),
+                            }
+                            continue;
+                        }
+
+                        let split = group.len() / 2;
+                        let left = group[..split].to_vec();
+                        let right = group[split..].to_vec();
+                        warn!(
+                            size = group.len(),
+                            left = left.len(),
+                            right = right.len(),
+                            "V3 probe batch failed, fallback split: {}",
+                            err
+                        );
+                        pending_groups.push(right);
+                        pending_groups.push(left);
+                    }
+                }
             }
-            AMM::PancakeV3Pool(pool) => {
-                let contract = IV3StateProbe::new(pool.address, provider.clone());
-                let slot0 = contract.slot0().block(block).call().await?;
-                let liquidity = contract.liquidity().block(block).call().await?;
-                Ok(Some(ClProbeSnapshot {
-                    sqrt_price: slot0.sqrtPriceX96.to(),
-                    tick: slot0.tick.as_i32(),
-                    liquidity,
-                    fee: None,
-                }))
-            }
-            AMM::AerodromeSlipstreamPool(pool) => {
-                let contract = ISlipstreamStateProbe::new(pool.address, provider.clone());
-                let slot0 = contract.slot0().block(block).call().await?;
-                let liquidity = contract.liquidity().block(block).call().await?;
-                let fee = contract.fee().block(block).call().await?.to::<u32>();
-                Ok(Some(ClProbeSnapshot {
-                    sqrt_price: slot0.sqrtPriceX96.to(),
-                    tick: slot0.tick.as_i32(),
-                    liquidity,
-                    fee: Some(fee),
-                }))
-            }
-            _ => Ok(None),
         }
+
+        Ok(snapshots)
+    }
+
+    async fn fetch_slipstream_probe_snapshots_batch(
+        provider: &P,
+        addresses: &[Address],
+        block: u64,
+    ) -> Result<HashMap<Address, ClProbeSnapshot>, AMMError>
+    where
+        P: Provider<N> + Clone,
+        N: Network,
+    {
+        let mut snapshots = HashMap::with_capacity(addresses.len());
+        let block = BlockId::from(block);
+        for chunk in addresses.chunks(DRIFT_SLIPSTREAM_PROBE_BATCH_STEP) {
+            let chunk_addrs = chunk.to_vec();
+            let return_data = GetAerodromeSlipstreamProbeBatchRequest::deploy_builder(
+                provider.clone(),
+                chunk_addrs.clone(),
+            )
+            .call_raw()
+            .block(block)
+            .await?;
+
+            let decoded =
+                <Vec<(bool, i32, u128, U256, u32)> as SolValue>::abi_decode(&return_data)?;
+            if decoded.len() != chunk_addrs.len() {
+                warn!(
+                    expected = chunk_addrs.len(),
+                    decoded = decoded.len(),
+                    "Slipstream drift probe decode length mismatch"
+                );
+            }
+
+            for (address, (ok, tick, liquidity, sqrt_price, fee)) in
+                chunk_addrs.into_iter().zip(decoded)
+            {
+                if !ok {
+                    continue;
+                }
+                snapshots.insert(
+                    address,
+                    ClProbeSnapshot {
+                        sqrt_price,
+                        tick,
+                        liquidity,
+                        fee: Some(fee),
+                    },
+                );
+            }
+        }
+
+        Ok(snapshots)
+    }
+
+    async fn fetch_pancake_probe_snapshots_batch(
+        provider: &P,
+        addresses: &[Address],
+        block: u64,
+    ) -> Result<HashMap<Address, ClProbeSnapshot>, AMMError>
+    where
+        P: Provider<N> + Clone,
+        N: Network,
+    {
+        let mut snapshots = HashMap::with_capacity(addresses.len());
+        let block = BlockId::from(block);
+        for chunk in addresses.chunks(DRIFT_V3_SLOT0_BATCH_STEP) {
+            let mut pending_groups: Vec<Vec<Address>> = vec![chunk.to_vec()];
+
+            while let Some(group) = pending_groups.pop() {
+                let attempt = GetPancakeV3PoolSlot0BatchRequest::deploy_builder(
+                    provider.clone(),
+                    group.clone(),
+                )
+                .call_raw()
+                .block(block)
+                .await;
+
+                match attempt {
+                    Ok(return_data) => {
+                        let decoded =
+                            <Vec<(i32, u128, U256)> as SolValue>::abi_decode(&return_data)?;
+                        if decoded.len() != group.len() {
+                            warn!(
+                                expected = group.len(),
+                                decoded = decoded.len(),
+                                "Pancake V3 drift probe batch decode length mismatch"
+                            );
+                        }
+
+                        for (address, (tick, liquidity, sqrt_price)) in
+                            group.into_iter().zip(decoded)
+                        {
+                            snapshots.insert(
+                                address,
+                                ClProbeSnapshot {
+                                    sqrt_price,
+                                    tick,
+                                    liquidity,
+                                    fee: None,
+                                },
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        if group.len() <= 1 {
+                            let address = group[0];
+                            let probe = super::IPancakeV3StateProbe::new(address, provider.clone());
+                            let slot0 = probe.slot0().block(block).call().await;
+                            let liquidity = probe.liquidity().block(block).call().await;
+                            match (slot0, liquidity) {
+                                (Ok(slot0), Ok(liquidity)) => {
+                                    snapshots.insert(
+                                        address,
+                                        ClProbeSnapshot {
+                                            sqrt_price: U256::from(slot0.sqrtPriceX96),
+                                            tick: slot0.tick.as_i32(),
+                                            liquidity,
+                                            fee: None,
+                                        },
+                                    );
+                                }
+                                _ => warn!(
+                                    address = ?address,
+                                    "Pancake V3 probe single fallback failed: {}",
+                                    err
+                                ),
+                            }
+                            continue;
+                        }
+
+                        let split = group.len() / 2;
+                        let left = group[..split].to_vec();
+                        let right = group[split..].to_vec();
+                        warn!(
+                            size = group.len(),
+                            left = left.len(),
+                            right = right.len(),
+                            "Pancake V3 probe batch failed, fallback split: {}",
+                            err
+                        );
+                        pending_groups.push(right);
+                        pending_groups.push(left);
+                    }
+                }
+            }
+        }
+
+        Ok(snapshots)
     }
 
     pub(super) async fn run_silent_drift_probe_task(
@@ -650,14 +939,19 @@ impl<N, P> StateSpaceManager<N, P> {
         state: Arc<RwLock<StateSpace>>,
         pending_sync_queue: Arc<Mutex<PendingSyncQueue>>,
         canonical_head: Arc<AtomicU64>,
+        scan_tick: Duration,
     ) where
         P: Provider<N> + Clone + 'static,
         N: Network + 'static,
     {
         let mut mismatch_streak: HashMap<Address, u8> = HashMap::new();
         let mut last_probe_at: HashMap<Address, Instant> = HashMap::new();
-        let scan_tick = Duration::from_secs(10);
-        let probe_concurrency = 4usize;
+        let mut cached_v3_addresses: Vec<Address> = Vec::new();
+        let mut cached_slipstream_addresses: Vec<Address> = Vec::new();
+        let mut v3_cursor: usize = 0;
+        let mut slipstream_cursor: usize = 0;
+        let mut active_kind = DriftProbeKind::V3Like;
+        let mut last_cache_refresh: Option<Instant> = None;
 
         loop {
             sleep(scan_tick).await;
@@ -667,44 +961,95 @@ impl<N, P> StateSpaceManager<N, P> {
                 continue;
             }
 
-            let mut candidates: Vec<(Address, AMM)> = {
+            let now = Instant::now();
+            let cache_stale = last_cache_refresh
+                .map(|t| now.saturating_duration_since(t) >= DRIFT_CANDIDATE_CACHE_TTL)
+                .unwrap_or(true);
+            if cache_stale
+                || (cached_v3_addresses.is_empty() && cached_slipstream_addresses.is_empty())
+            {
                 let guard = state.read().await;
-                guard
-                    .state
-                    .iter()
-                    .filter_map(|(addr, amm)| {
-                        if Self::local_cl_probe_snapshot(amm).is_some() {
-                            Some((*addr, amm.as_ref().clone()))
-                        } else {
-                            None
+                cached_v3_addresses.clear();
+                cached_slipstream_addresses.clear();
+                for (addr, amm) in &guard.state {
+                    match amm.as_ref() {
+                        AMM::UniswapV3Pool(_) | AMM::PancakeV3Pool(_) => {
+                            cached_v3_addresses.push(*addr)
                         }
-                    })
-                    .collect()
-            };
-
-            if candidates.is_empty() {
-                continue;
+                        AMM::AerodromeSlipstreamPool(_) => cached_slipstream_addresses.push(*addr),
+                        _ => {}
+                    }
+                }
+                cached_v3_addresses.sort_unstable();
+                cached_slipstream_addresses.sort_unstable();
+                if v3_cursor >= cached_v3_addresses.len() {
+                    v3_cursor = 0;
+                }
+                if slipstream_cursor >= cached_slipstream_addresses.len() {
+                    slipstream_cursor = 0;
+                }
+                last_cache_refresh = Some(now);
             }
 
-            candidates.sort_by_key(|(addr, _)| *addr);
-            let now = Instant::now();
-            let mut due = Vec::new();
+            let mut selected_kind = active_kind;
+            let mut selected_addresses = match selected_kind {
+                DriftProbeKind::V3Like => &cached_v3_addresses,
+                DriftProbeKind::Slipstream => &cached_slipstream_addresses,
+            };
+            if selected_addresses.is_empty() {
+                selected_kind = selected_kind.next();
+                selected_addresses = match selected_kind {
+                    DriftProbeKind::V3Like => &cached_v3_addresses,
+                    DriftProbeKind::Slipstream => &cached_slipstream_addresses,
+                };
+                if selected_addresses.is_empty() {
+                    continue;
+                }
+            }
+            active_kind = selected_kind.next();
 
-            for (address, amm) in candidates {
+            let cursor = match selected_kind {
+                DriftProbeKind::V3Like => &mut v3_cursor,
+                DriftProbeKind::Slipstream => &mut slipstream_cursor,
+            };
+            if *cursor >= selected_addresses.len() {
+                *cursor = 0;
+            }
+
+            let mut due = Vec::new();
+            let guard = state.read().await;
+            for offset in 0..selected_addresses.len() {
                 if due.len() >= DRIFT_MAX_POOLS_PER_TICK {
                     break;
                 }
+                let idx = (*cursor + offset) % selected_addresses.len();
+                let address = selected_addresses[idx];
+                let Some(amm) = guard.state.get(&address) else {
+                    continue;
+                };
+                let amm_ref = amm.as_ref();
+                let kind = match amm_ref {
+                    AMM::UniswapV3Pool(_) | AMM::PancakeV3Pool(_) => DriftProbeKind::V3Like,
+                    AMM::AerodromeSlipstreamPool(_) => DriftProbeKind::Slipstream,
+                    _ => continue,
+                };
+                if kind != selected_kind {
+                    continue;
+                }
+                let Some(local) = Self::local_cl_probe_snapshot(amm_ref) else {
+                    continue;
+                };
+                let last_synced_block = amm_ref.last_synced_block();
 
                 // If local state is already ahead of canonical head (common on Base flashblocks),
                 // probing against canonical reads would create known transient mismatches.
                 // Skip probing until canonical catches up to avoid repeated probe/enqueue churn.
-                if amm.last_synced_block() > canonical {
+                if last_synced_block > canonical {
                     mismatch_streak.remove(&address);
                     continue;
                 }
 
-                let hot =
-                    canonical.saturating_sub(amm.last_synced_block()) <= DRIFT_HOT_WINDOW_BLOCKS;
+                let hot = canonical.saturating_sub(last_synced_block) <= DRIFT_HOT_WINDOW_BLOCKS;
                 let interval = if hot {
                     DRIFT_HOT_POOL_INTERVAL
                 } else {
@@ -717,55 +1062,140 @@ impl<N, P> StateSpaceManager<N, P> {
                     }
                 }
 
-                let Some(local) = Self::local_cl_probe_snapshot(&amm) else {
-                    continue;
-                };
-
                 last_probe_at.insert(address, now);
-                due.push((address, amm, local));
+                let is_pancake = matches!(amm_ref, AMM::PancakeV3Pool(_));
+                due.push((address, kind, local, is_pancake));
             }
+            if !selected_addresses.is_empty() {
+                // Round-robin advance within the selected probe type.
+                let advance = due.len().max(1);
+                *cursor = (*cursor + advance) % selected_addresses.len();
+            }
+            drop(guard);
 
             if due.is_empty() {
                 continue;
             }
 
-            let results = stream::iter(due.into_iter().map(|(address, amm, local)| {
-                let provider = provider.clone();
-                async move {
-                    (
-                        address,
-                        local,
-                        Self::fetch_cl_probe_snapshot(&provider, &amm, canonical).await,
-                    )
+            let mut remote_by_address: HashMap<Address, ClProbeSnapshot> = HashMap::new();
+
+            let v3_due: Vec<Address> = due
+                .iter()
+                .filter_map(|(address, kind, _, is_pancake)| {
+                    if *kind == DriftProbeKind::V3Like && !*is_pancake {
+                        Some(*address)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if !v3_due.is_empty() {
+                match Self::fetch_v3_probe_snapshots_batch(&provider, &v3_due, canonical).await {
+                    Ok(map) => remote_by_address.extend(map),
+                    Err(e) => {
+                        let failed_addresses =
+                            Self::diagnose_v3_probe_failures(&provider, &v3_due, canonical).await;
+                        let sample: Vec<_> = failed_addresses
+                            .iter()
+                            .take(8)
+                            .map(|a| format!("{a:#x}"))
+                            .collect();
+                        warn!(
+                            count = v3_due.len(),
+                            failed_count = failed_addresses.len(),
+                            failed_sample = ?sample,
+                            "V3 drift probe batch failed: {}",
+                            e
+                        );
+                    }
                 }
-            }))
-            .buffer_unordered(probe_concurrency)
-            .collect::<Vec<_>>()
-            .await;
+            }
+
+            let pancake_due: Vec<Address> = due
+                .iter()
+                .filter_map(|(address, kind, _, is_pancake)| {
+                    if *kind == DriftProbeKind::V3Like && *is_pancake {
+                        Some(*address)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if !pancake_due.is_empty() {
+                match Self::fetch_pancake_probe_snapshots_batch(&provider, &pancake_due, canonical)
+                    .await
+                {
+                    Ok(map) => remote_by_address.extend(map),
+                    Err(e) => {
+                        warn!(
+                            count = pancake_due.len(),
+                            "Pancake V3 drift probe batch failed: {}", e
+                        );
+                    }
+                }
+            }
+
+            let slipstream_due: Vec<Address> = due
+                .iter()
+                .filter_map(|(address, kind, _, _)| {
+                    if *kind == DriftProbeKind::Slipstream {
+                        Some(*address)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if !slipstream_due.is_empty() {
+                match Self::fetch_slipstream_probe_snapshots_batch(
+                    &provider,
+                    &slipstream_due,
+                    canonical,
+                )
+                .await
+                {
+                    Ok(map) => remote_by_address.extend(map),
+                    Err(e) => {
+                        let failed_addresses = Self::diagnose_slipstream_probe_failures(
+                            &provider,
+                            &slipstream_due,
+                            canonical,
+                        )
+                        .await;
+                        let sample: Vec<_> = failed_addresses
+                            .iter()
+                            .take(8)
+                            .map(|a| format!("{a:#x}"))
+                            .collect();
+                        warn!(
+                            count = slipstream_due.len(),
+                            failed_count = failed_addresses.len(),
+                            failed_sample = ?sample,
+                            "Slipstream drift probe batch failed: {}",
+                            e
+                        );
+                    }
+                }
+            }
 
             let mut enqueue_resync = Vec::new();
-            for (address, local, remote_res) in results {
-                match remote_res {
-                    Ok(Some(remote)) => {
-                        if local == remote {
-                            mismatch_streak.remove(&address);
-                            continue;
-                        }
+            for (address, _, local, _) in due {
+                let Some(remote) = remote_by_address.get(&address).copied() else {
+                    continue;
+                };
 
-                        let streak = mismatch_streak
-                            .entry(address)
-                            .and_modify(|v| *v = v.saturating_add(1))
-                            .or_insert(1);
+                if local == remote {
+                    mismatch_streak.remove(&address);
+                    continue;
+                }
 
-                        if *streak >= DRIFT_MISMATCH_TRIGGER {
-                            enqueue_resync.push(address);
-                            mismatch_streak.remove(&address);
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        warn!(?address, "drift probe RPC failed: {}", e);
-                    }
+                let streak = mismatch_streak
+                    .entry(address)
+                    .and_modify(|v| *v = v.saturating_add(1))
+                    .or_insert(1);
+
+                if *streak >= DRIFT_MISMATCH_TRIGGER {
+                    enqueue_resync.push(address);
+                    mismatch_streak.remove(&address);
                 }
             }
 
