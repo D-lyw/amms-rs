@@ -21,7 +21,6 @@ use tracing::{info, warn};
 
 pub(super) const DRIFT_HOT_POOL_INTERVAL: Duration = Duration::from_secs(30);
 pub(super) const DRIFT_COLD_POOL_INTERVAL: Duration = Duration::from_secs(300);
-pub(super) const DRIFT_MISMATCH_TRIGGER: u8 = 2;
 pub(super) const DRIFT_MAX_POOLS_PER_TICK: usize = 100;
 pub(super) const DRIFT_HOT_WINDOW_BLOCKS: u64 = 60;
 pub(super) const MAINT_COVERAGE_BATCH_SIZE: usize = 80;
@@ -116,7 +115,6 @@ pub(super) struct PendingSyncQueue {
 enum PendingExecutionOutcome {
     Applied,
     MissingPool,
-    Deferred { required_block: u64 },
 }
 
 impl PendingSyncQueue {
@@ -429,24 +427,17 @@ impl<N, P> StateSpaceManager<N, P> {
             return Ok(PendingExecutionOutcome::MissingPool);
         };
 
-        if local_amm.last_synced_block() > target_block {
-            return Ok(PendingExecutionOutcome::Deferred {
-                required_block: local_amm.last_synced_block(),
-            });
-        };
-
         match task.action {
             PendingSyncAction::AsyncUpdate => {
+                // AsyncUpdate: no last_synced_block guard.
+                // RPC availability is already guaranteed by claim_due_filtered's
+                // required_block ≤ canonical_head check at pop time.
+                // On Ethereum this is always safe (canonical == realtime).
+                // On Base, insert_amm may briefly overwrite flashblock data
+                // from N+2, but the next event ~200ms later corrects it.
                 local_amm.update::<N, _>(provider.clone()).await?;
                 local_amm.set_last_synced_block(target_block);
                 let mut guard = state.write().await;
-                if let Some(existing) = guard.state.get(&address) {
-                    if existing.last_synced_block() > target_block {
-                        return Ok(PendingExecutionOutcome::Deferred {
-                            required_block: existing.last_synced_block(),
-                        });
-                    }
-                }
                 guard.insert_amm(local_amm);
                 Ok(PendingExecutionOutcome::Applied)
             }
@@ -467,13 +458,6 @@ impl<N, P> StateSpaceManager<N, P> {
                 };
                 synced.set_last_synced_block(target_block);
                 let mut guard = state.write().await;
-                if let Some(existing) = guard.state.get(&address) {
-                    if existing.last_synced_block() > target_block {
-                        return Ok(PendingExecutionOutcome::Deferred {
-                            required_block: existing.last_synced_block(),
-                        });
-                    }
-                }
                 guard.insert_amm(synced);
                 Ok(PendingExecutionOutcome::Applied)
             }
@@ -531,12 +515,6 @@ impl<N, P> StateSpaceManager<N, P> {
                 }
                 Ok(PendingExecutionOutcome::MissingPool) => {
                     pending_sync_queue.lock().await.drop_task(address);
-                }
-                Ok(PendingExecutionOutcome::Deferred { required_block }) => {
-                    pending_sync_queue
-                        .lock()
-                        .await
-                        .defer_task(address, required_block);
                 }
                 Err(e) => {
                     let recoverable = Self::is_recoverable_delay_error(&e);
@@ -944,7 +922,6 @@ impl<N, P> StateSpaceManager<N, P> {
         P: Provider<N> + Clone + 'static,
         N: Network + 'static,
     {
-        let mut mismatch_streak: HashMap<Address, u8> = HashMap::new();
         let mut last_probe_at: HashMap<Address, Instant> = HashMap::new();
         let mut cached_v3_addresses: Vec<Address> = Vec::new();
         let mut cached_slipstream_addresses: Vec<Address> = Vec::new();
@@ -1045,7 +1022,6 @@ impl<N, P> StateSpaceManager<N, P> {
                 // probing against canonical reads would create known transient mismatches.
                 // Skip probing until canonical catches up to avoid repeated probe/enqueue churn.
                 if last_synced_block > canonical {
-                    mismatch_streak.remove(&address);
                     continue;
                 }
 
@@ -1183,20 +1159,32 @@ impl<N, P> StateSpaceManager<N, P> {
                     continue;
                 };
 
+                // Don't probe reads at canonical block, so local == remote means
+                // chain state matches. A single mismatch is definitive.
                 if local == remote {
-                    mismatch_streak.remove(&address);
                     continue;
                 }
 
-                let streak = mismatch_streak
-                    .entry(address)
-                    .and_modify(|v| *v = v.saturating_add(1))
-                    .or_insert(1);
+                // Fee-only diff: get_mut_cow in-place, no Resync needed.
+                let fee_only = local.sqrt_price == remote.sqrt_price
+                    && local.tick == remote.tick
+                    && local.liquidity == remote.liquidity
+                    && local.fee != remote.fee;
 
-                if *streak >= DRIFT_MISMATCH_TRIGGER {
-                    enqueue_resync.push(address);
-                    mismatch_streak.remove(&address);
+                if fee_only {
+                    if let Some(remote_fee) = remote.fee {
+                        let mut guard = state.write().await;
+                        if let Some(amm) = guard.get_mut_cow(&address) {
+                            if let AMM::AerodromeSlipstreamPool(p) = amm {
+                                p.fee = remote_fee;
+                            }
+                        }
+                    }
+                    continue;
                 }
+
+                // sqrt_price/tick/liquidity mismatch — possibly corrupted state.
+                enqueue_resync.push(address);
             }
 
             if !enqueue_resync.is_empty() {
