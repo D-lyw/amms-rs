@@ -1002,6 +1002,8 @@ pub struct StateSpaceBuilder<N, P> {
     pub non_event_sync_interval: Option<Duration>,
     /// Legacy compatibility alias. Prefer `non_event_sync_interval`.
     pub rate_sync_interval: Option<Duration>,
+    /// Dedicated interval for Slipstream fee refresh.
+    pub slipstream_fee_sync_interval: Option<Duration>,
     pub curve_sync_interval: Option<Duration>,
     pub pending_sync_worker_interval: Duration,
     pub drift_probe_interval: Duration,
@@ -1027,6 +1029,7 @@ where
             snapshot_config: None,
             non_event_sync_interval: None,
             rate_sync_interval: None,
+            slipstream_fee_sync_interval: None,
             curve_sync_interval: None,
             pending_sync_worker_interval: DEFAULT_PENDING_SYNC_WORKER_INTERVAL,
             drift_probe_interval: DEFAULT_DRIFT_PROBE_INTERVAL,
@@ -1085,6 +1088,15 @@ where
     /// Backward-compatible alias of `with_non_event_sync_interval`.
     pub fn with_rate_sync_interval(self, interval: Duration) -> StateSpaceBuilder<N, P> {
         self.with_non_event_sync_interval(interval)
+    }
+
+    /// Set a dedicated interval for Slipstream fee refresh.
+    /// Falls back to `non_event_sync_interval` when not set.
+    pub fn with_slipstream_fee_sync_interval(self, interval: Duration) -> StateSpaceBuilder<N, P> {
+        StateSpaceBuilder {
+            slipstream_fee_sync_interval: Some(interval),
+            ..self
+        }
     }
 
     pub fn with_maintenance_interval(self, interval: Duration) -> StateSpaceBuilder<N, P> {
@@ -1337,14 +1349,15 @@ where
                 self.provider.clone(),
                 interval,
             ));
-
-            // Slipstream pools: dynamic fee can drift without reliably observed fee events.
-            tokio::spawn(sync_services::start_slipstream_fee_sync_task(
-                state_space.clone(),
-                self.provider.clone(),
-                interval,
-            ));
         }
+
+        // Slipstream fee: always sync at configured interval (default 100s).
+        tokio::spawn(sync_services::start_slipstream_fee_sync_task(
+            state_space.clone(),
+            self.provider.clone(),
+            self.slipstream_fee_sync_interval
+                .unwrap_or(Duration::from_secs(100)),
+        ));
 
         // Curve NG StableSwap pools: stored_rates for rebasing tokens & D value sync
         if let Some(interval) = self.curve_sync_interval.or(non_event_interval) {
