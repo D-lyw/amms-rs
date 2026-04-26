@@ -473,7 +473,7 @@ impl AutomatedMarketMaker for CurveLegacyPool {
 
             // CryptoSwap Check (Defensive: shouldn't happen for Crypto, but if it does...)
             if self.pool_type == CurveLegacyPoolType::CryptoSwap {
-                // CryptoSwap needs full update for D and price_scale
+                self.recalculate_crypto_state()?;
                 return Ok(SyncAction::AsyncUpdate);
             } else {
                 self.update_spot_prices();
@@ -494,6 +494,9 @@ impl AutomatedMarketMaker for CurveLegacyPool {
                     .checked_sub(event.tokens_bought)
                     .ok_or(AMMError::Msg("Balance underflow".into()))?;
             }
+
+            // Recalculate D from updated balances BEFORE updating price_scale.
+            self.recalculate_crypto_state()?;
 
             let mask = U256::from(2).pow(U256::from(128)) - U256::from(1);
             // packed_price_scale format: price_scale[1] << 128 | price_scale[0]
@@ -545,8 +548,7 @@ impl AutomatedMarketMaker for CurveLegacyPool {
                 "TokenExchange (Crypto)"
             );
 
-            // CRITICAL: CryptoSwap price_scale changes dynamically.
-            // We MUST fetch the new state from chain.
+            self.recalculate_crypto_state()?;
             return Ok(SyncAction::AsyncUpdate);
 
         // === 4. Token Exchange (Tricrypto2 - uint256 indices, 5 params) ===
@@ -575,8 +577,14 @@ impl AutomatedMarketMaker for CurveLegacyPool {
                 "TokenExchange (Tricrypto2)"
             );
 
-            // CRITICAL: CryptoSwap price_scale changes dynamically.
-            // We MUST fetch the new state from chain.
+            // IMMEDIATELY recalculate D from updated balances via newton_d.
+            // This eliminates the race condition between sync() and the async update:
+            // D is now consistent with the updated balances, so any simulation that runs
+            // before the pending sync worker calls update() will see a self-consistent state.
+            // price_scale is still refreshed asynchronously via the pending sync worker.
+            if self.pool_type == CryptoSwap {
+                self.recalculate_crypto_state()?;
+            }
             return Ok(SyncAction::AsyncUpdate);
 
         // === 5. Token Exchange Underlying ===
@@ -603,18 +611,24 @@ impl AutomatedMarketMaker for CurveLegacyPool {
             }
 
             if self.pool_type == CurveLegacyPoolType::CryptoSwap {
+                self.recalculate_crypto_state()?;
                 return Ok(SyncAction::AsyncUpdate);
             }
             self.update_spot_prices();
             return Ok(SyncAction::None);
 
-        // === 5. Add Liquidity (Crypto packed price_scale) ===
+        // === 6. Add Liquidity (Crypto packed price_scale) ===
         } else if topic0 == ICurveLegacyCryptoEvent::AddLiquidity::SIGNATURE_HASH {
             let event = ICurveLegacyCryptoEvent::AddLiquidity::decode_log(&log.inner)?;
             for (i, &amount) in event.token_amounts.iter().enumerate() {
                 if i < self.balances.len() {
                     self.balances[i] = self.balances[i].saturating_add(amount);
                 }
+            }
+
+            // Recalculate D from updated balances BEFORE updating price_scale.
+            if self.pool_type == CryptoSwap {
+                self.recalculate_crypto_state()?;
             }
 
             let mask = U256::from(2).pow(U256::from(128)) - U256::from(1);
@@ -624,8 +638,8 @@ impl AutomatedMarketMaker for CurveLegacyPool {
                 vec![event.packed_price_scale & mask]
             } else {
                 vec![
-                    event.packed_price_scale & mask, // low bits = price_scale[0]
-                    event.packed_price_scale >> 128, // high bits = price_scale[1]
+                    event.packed_price_scale & mask,
+                    event.packed_price_scale >> 128,
                 ]
             };
             self.price_scale = Some(new_price_scale);
@@ -665,6 +679,7 @@ impl AutomatedMarketMaker for CurveLegacyPool {
             tracing::info!(target = "amms::curve_legacy::sync", pool = ?self.address, "AddLiquidity (StableSwap)");
 
             if self.pool_type == CurveLegacyPoolType::CryptoSwap {
+                self.recalculate_crypto_state()?;
                 return Ok(SyncAction::AsyncUpdate);
             }
             self.update_spot_prices();
@@ -696,6 +711,7 @@ impl AutomatedMarketMaker for CurveLegacyPool {
             tracing::info!(target = "amms::curve_legacy::sync", pool = ?self.address, "RemoveLiquidity (StableSwap)");
 
             if self.pool_type == CurveLegacyPoolType::CryptoSwap {
+                self.recalculate_crypto_state()?;
                 return Ok(SyncAction::AsyncUpdate);
             }
             self.update_spot_prices();
@@ -728,6 +744,7 @@ impl AutomatedMarketMaker for CurveLegacyPool {
             tracing::info!(target = "amms::curve_legacy::sync", pool = ?self.address, "RemoveLiquidityImbalance (StableSwap)");
 
             if self.pool_type == CurveLegacyPoolType::CryptoSwap {
+                self.recalculate_crypto_state()?;
                 return Ok(SyncAction::AsyncUpdate);
             }
             self.update_spot_prices();
@@ -762,14 +779,13 @@ impl AutomatedMarketMaker for CurveLegacyPool {
                 "RemoveLiquidityOne (CryptoSwap)"
             );
 
-            // CryptoSwap needs AsyncUpdate for D and price_scale
+            self.recalculate_crypto_state()?;
             return Ok(SyncAction::AsyncUpdate);
 
         // === 11. CryptoSwap AddLiquidity (2/3 coins, no fees array) ===
         } else if topic0 == ICurveCryptoSwap2Event::AddLiquidity::SIGNATURE_HASH
             || topic0 == ICurveCryptoSwap3Event::AddLiquidity::SIGNATURE_HASH
         {
-            // Parse event and update local balances BEFORE triggering async update
             let amounts: Vec<U256> =
                 if topic0 == ICurveCryptoSwap2Event::AddLiquidity::SIGNATURE_HASH {
                     let e = ICurveCryptoSwap2Event::AddLiquidity::decode_log(&log.inner)?;
@@ -785,11 +801,13 @@ impl AutomatedMarketMaker for CurveLegacyPool {
                 }
             }
 
+            self.recalculate_crypto_state()?;
+
             tracing::info!(
                 target = "amms::curve_legacy::sync",
                 pool = ?self.address,
                 amounts = ?amounts,
-                "AddLiquidity (CryptoSwap) - Balances updated, triggering async update for D/price_scale"
+                "AddLiquidity (CryptoSwap) - Balances updated, D recalculated locally"
             );
             return Ok(SyncAction::AsyncUpdate);
 
@@ -797,7 +815,6 @@ impl AutomatedMarketMaker for CurveLegacyPool {
         } else if topic0 == ICurveCryptoSwap2Event::RemoveLiquidity::SIGNATURE_HASH
             || topic0 == ICurveCryptoSwap3Event::RemoveLiquidity::SIGNATURE_HASH
         {
-            // Parse event and update local balances BEFORE triggering async update
             let amounts: Vec<U256> =
                 if topic0 == ICurveCryptoSwap2Event::RemoveLiquidity::SIGNATURE_HASH {
                     let e = ICurveCryptoSwap2Event::RemoveLiquidity::decode_log(&log.inner)?;
@@ -813,11 +830,13 @@ impl AutomatedMarketMaker for CurveLegacyPool {
                 }
             }
 
+            self.recalculate_crypto_state()?;
+
             tracing::info!(
                 target = "amms::curve_legacy::sync",
                 pool = ?self.address,
                 amounts = ?amounts,
-                "RemoveLiquidity (CryptoSwap) - Balances updated, triggering async update for D/price_scale"
+                "RemoveLiquidity (CryptoSwap) - Balances updated, D recalculated locally"
             );
             return Ok(SyncAction::AsyncUpdate);
 

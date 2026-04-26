@@ -553,6 +553,11 @@ impl AutomatedMarketMaker for CurveNGPool {
                             .ok_or(AMMError::Msg("Balance underflow".into()))?;
                     }
 
+                    // Recalculate D from updated balances BEFORE updating price_scale.
+                    // This matches the contract's order: D is computed with the current price_scale,
+                    // then price_scale is updated via oracle tweak_price.
+                    self.recalculate_d()?;
+
                     let mask = U256::from(2).pow(U256::from(128)) - U256::from(1);
                     let price_scale = event.packed_price_scale & mask;
                     self.price_scale = Some(vec![price_scale]);
@@ -569,8 +574,6 @@ impl AutomatedMarketMaker for CurveNGPool {
                         "TokenExchange (TwoCrypto)"
                     );
 
-                    // D not recalculated locally - trigger async sync to fetch from chain
-                    // (our local newton_d has precision issues vs chain's newton_D)
                     self.update_spot_prices();
                     return Ok(SyncAction::AsyncUpdate);
                 } else if topic0 == ICurveTwoCryptoEvent::AddLiquidity::SIGNATURE_HASH {
@@ -580,10 +583,11 @@ impl AutomatedMarketMaker for CurveNGPool {
                             self.balances[i] = self.balances[i].saturating_add(amount);
                         }
                     }
+                    // Recalculate D from updated balances before updating price_scale.
+                    self.recalculate_d()?;
                     let mask = U256::from(2).pow(U256::from(128)) - U256::from(1);
                     let price_scale = event.packed_price_scale & mask;
                     self.price_scale = Some(vec![price_scale]);
-                    // D not recalculated locally - trigger async sync to fetch from chain
                     self.update_spot_prices();
                     return Ok(SyncAction::AsyncUpdate);
                 } else if topic0 == ICurveTwoCryptoEvent::RemoveLiquidity::SIGNATURE_HASH {
@@ -594,13 +598,14 @@ impl AutomatedMarketMaker for CurveNGPool {
                             self.balances[i] = self.balances[i].saturating_sub(amount);
                         }
                     }
+                    self.recalculate_d()?;
                     tracing::info!(
                         target = "amms::curve_ng::sync",
                         pool = ?self.address,
                         token_amounts = ?event.token_amounts,
                         "RemoveLiquidity (TwoCrypto)"
                     );
-                    // D not recalculated locally - trigger async sync to fetch from chain
+                    self.update_spot_prices();
                     return Ok(SyncAction::AsyncUpdate);
                 } else if topic0 == ICurveTwoCryptoEvent::RemoveLiquidityOne::SIGNATURE_HASH {
                     // TwoCrypto NG 专用事件 - coin_index 是 uint256
@@ -611,6 +616,7 @@ impl AutomatedMarketMaker for CurveNGPool {
                             .checked_sub(event.coin_amount)
                             .ok_or(AMMError::Msg("Balance underflow".into()))?;
                     }
+                    self.recalculate_d()?;
                     tracing::info!(
                         target = "amms::curve_ng::sync",
                         pool = ?self.address,
@@ -618,7 +624,7 @@ impl AutomatedMarketMaker for CurveNGPool {
                         coin_amount = ?event.coin_amount,
                         "RemoveLiquidityOne (TwoCrypto)"
                     );
-                    // D not recalculated locally - trigger async sync to fetch from chain
+                    self.update_spot_prices();
                     return Ok(SyncAction::AsyncUpdate);
                 } else if topic0 == ICurveTwoCryptoEvent::NewParameters::SIGNATURE_HASH {
                     // TwoCrypto NG 专用事件
@@ -653,11 +659,13 @@ impl AutomatedMarketMaker for CurveNGPool {
                             .ok_or(AMMError::Msg("Balance underflow".into()))?;
                     }
 
+                    // Recalculate D from updated balances BEFORE updating price_scale.
+                    self.recalculate_d()?;
+
                     // packed_price_scale format: price_scale[1] << 128 | price_scale[0]
-                    // low 128 bits = price_scale[0], high 128 bits = price_scale[1]
                     let mask = U256::from(2).pow(U256::from(128)) - U256::from(1);
-                    let price_scale_0 = event.packed_price_scale & mask; // low bits
-                    let price_scale_1 = event.packed_price_scale >> 128; // high bits
+                    let price_scale_0 = event.packed_price_scale & mask;
+                    let price_scale_1 = event.packed_price_scale >> 128;
                     self.price_scale = Some(vec![price_scale_0, price_scale_1]);
 
                     tracing::info!(
@@ -673,7 +681,6 @@ impl AutomatedMarketMaker for CurveNGPool {
                         "TokenExchange (TriCrypto)"
                     );
 
-                    // D not recalculated locally - trigger async sync to fetch from chain
                     self.update_spot_prices();
                     return Ok(SyncAction::AsyncUpdate);
                 } else if topic0 == ICurveTriCryptoEvent::AddLiquidity::SIGNATURE_HASH {
@@ -683,30 +690,29 @@ impl AutomatedMarketMaker for CurveNGPool {
                             self.balances[i] = self.balances[i].saturating_add(amount);
                         }
                     }
-                    // packed_price_scale format: price_scale[1] << 128 | price_scale[0]
-                    // low 128 bits = price_scale[0], high 128 bits = price_scale[1]
+                    // Recalculate D from updated balances before updating price_scale.
+                    self.recalculate_d()?;
                     let mask = U256::from(2).pow(U256::from(128)) - U256::from(1);
-                    let price_scale_0 = event.packed_price_scale & mask; // low bits
-                    let price_scale_1 = event.packed_price_scale >> 128; // high bits
+                    let price_scale_0 = event.packed_price_scale & mask;
+                    let price_scale_1 = event.packed_price_scale >> 128;
                     self.price_scale = Some(vec![price_scale_0, price_scale_1]);
-                    // D not recalculated locally - trigger async sync to fetch from chain
                     self.update_spot_prices();
                     return Ok(SyncAction::AsyncUpdate);
                 } else if topic0 == ICurveTriCryptoEvent::RemoveLiquidity::SIGNATURE_HASH {
-                    // TriCrypto NG 专用事件 - uint256[3] token_amounts
                     let event = ICurveTriCryptoEvent::RemoveLiquidity::decode_log(&log.inner)?;
                     for (i, &amount) in event.token_amounts.iter().enumerate() {
                         if i < self.balances.len() {
                             self.balances[i] = self.balances[i].saturating_sub(amount);
                         }
                     }
+                    self.recalculate_d()?;
                     tracing::info!(
                         target = "amms::curve_ng::sync",
                         pool = ?self.address,
                         token_amounts = ?event.token_amounts,
                         "RemoveLiquidity (TriCrypto)"
                     );
-                    // D not recalculated locally - trigger async sync to fetch from chain
+                    self.update_spot_prices();
                     return Ok(SyncAction::AsyncUpdate);
                 } else if topic0 == ICurveTriCryptoEvent::RemoveLiquidityOne::SIGNATURE_HASH {
                     // TriCrypto NG 专用事件 - coin_index 是 uint256
@@ -717,6 +723,7 @@ impl AutomatedMarketMaker for CurveNGPool {
                             .checked_sub(event.coin_amount)
                             .ok_or(AMMError::Msg("Balance underflow".into()))?;
                     }
+                    self.recalculate_d()?;
                     tracing::info!(
                         target = "amms::curve_ng::sync",
                         pool = ?self.address,
@@ -724,7 +731,7 @@ impl AutomatedMarketMaker for CurveNGPool {
                         coin_amount = ?event.coin_amount,
                         "RemoveLiquidityOne (TriCrypto)"
                     );
-                    // D not recalculated locally - trigger async sync to fetch from chain
+                    self.update_spot_prices();
                     return Ok(SyncAction::AsyncUpdate);
                 } else if topic0 == ICurveTriCryptoEvent::NewParameters::SIGNATURE_HASH {
                     // TriCrypto NG 专用事件
