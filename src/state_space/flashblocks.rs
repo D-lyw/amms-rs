@@ -90,6 +90,8 @@ struct FlashblockDiff<'a> {
 struct FlashblockBase<'a> {
     #[serde(default, borrow)]
     block_number: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    timestamp: Option<Cow<'a, str>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -243,6 +245,13 @@ impl<N, P> StateSpaceManager<N, P> {
             return (out, None, decode_fail, decode_failed_addresses);
         };
 
+        // Extract block timestamp from base.timestamp (hex-encoded, only in index-0)
+        let block_timestamp = fb
+            .base
+            .as_ref()
+            .and_then(|base| base.timestamp.as_deref())
+            .and_then(Self::parse_hex_u64);
+
         let Some(metadata) = fb.metadata.as_ref() else {
             return (
                 out,
@@ -354,7 +363,7 @@ impl<N, P> StateSpaceManager<N, P> {
                     },
                     block_hash: None,
                     block_number: Some(block_number),
-                    block_timestamp: None,
+                    block_timestamp,
                     transaction_hash: tx_hash_parsed,
                     transaction_index: Some(transaction_index),
                     log_index: Some(log_idx as u64),

@@ -1,6 +1,7 @@
 use alloy::network::Network;
 use alloy::primitives::{Address, B256, U256};
 use alloy::providers::Provider;
+use alloy::sol;
 use alloy::sol_types::SolValue;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -9,6 +10,9 @@ use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tracing::{error, info};
 
+use crate::amms::aerodrome_slipstream::pool::{
+    DynamicFeeConfig, FeeModuleGlobals, GetAerodromeSlipstreamFeeConfigBatchRequest,
+};
 use crate::amms::amm::{AutomatedMarketMaker, AMM};
 use crate::amms::balancer_v2::BalancerV2Pool;
 use crate::amms::balancer_v3::BalancerV3Pool;
@@ -17,6 +21,7 @@ use crate::amms::fluid_dex::{
     DexReservesResolver, FluidDexT1, FluidLiquidity, TokenLimitData, FLUID_DEX_RESOLVER,
 };
 use crate::amms::uniswap_v3::GetUniswapV3PoolStaticMetaBatchRequest;
+use crate::amms::aerodrome_slipstream::pool::FEE_MODULE_GLOBALS;
 use crate::state_space::StateSpace;
 
 const STARTUP_JITTER_PCT: u128 = 15;
@@ -395,6 +400,130 @@ pub async fn start_slipstream_fee_sync_task<N, P>(
                 updated_count
             );
         }
+    }
+}
+
+// ── FeeModule reader interface ──
+sol! {
+    #[sol(rpc)]
+    contract IDynamicFeeModuleReader {
+        function dynamicFeeConfig(address pool) external view returns (uint24 baseFee, uint24 feeCap, uint64 scalingFactor, bool initialFeeEnabled, uint24 initialFee);
+        function defaultScalingFactor() external view returns (uint256);
+        function defaultFeeCap() external view returns (uint256);
+        function secondsAgo() external view returns (uint32);
+    }
+}
+
+/// Periodically refreshes DynamicFeeConfig and global FeeModule parameters
+/// for all Slipstream pools.
+///
+/// These parameters (scalingFactor, feeCap, initialFee, etc.) are changed by
+/// governance operations which emit events we don't fully subscribe to.
+/// This low-frequency task acts as a safety net to keep fee config in sync.
+///
+/// Note: `pool.fee` and `observations` are maintained in real-time via event-driven
+/// sync and do NOT require periodic refresh.
+pub async fn start_slipstream_fee_config_sync_task<N, P>(
+    state: Arc<RwLock<StateSpace>>,
+    provider: P,
+    interval: Duration,
+    fee_module_addresses: Vec<Address>,
+) where
+    N: Network,
+    P: Provider<N> + Clone + 'static,
+{
+    const BATCH_SIZE: usize = 100;
+
+    let mut next_sleep = startup_delay_with_jitter(interval, "slipstream_fee_config");
+    loop {
+        sleep(next_sleep).await;
+        next_sleep = interval;
+
+        // 1. Collect all Slipstream pool addresses
+        let pool_list: Vec<Address> = {
+            let read_guard = state.read().await;
+            read_guard
+                .state
+                .values()
+                .filter_map(|amm| match amm.as_ref() {
+                    AMM::AerodromeSlipstreamPool(pool) => Some(pool.address),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        if pool_list.is_empty() {
+            continue;
+        }
+
+        // 2. Refresh global FeeModule parameters (from first available FeeModule)
+        if let Some(&fm_addr) = fee_module_addresses.first() {
+            let fee_module = IDynamicFeeModuleReader::new(fm_addr, provider.clone());
+            let globals = FeeModuleGlobals {
+                default_scaling_factor: match fee_module.defaultScalingFactor().call().await {
+                    Ok(v) => v.to::<u64>(),
+                    Err(_) => 0,
+                },
+                default_fee_cap: match fee_module.defaultFeeCap().call().await {
+                    Ok(v) => v.to::<u32>(),
+                    Err(_) => 50_000,
+                },
+                seconds_ago: match fee_module.secondsAgo().call().await {
+                    Ok(v) => v,
+                    Err(_) => 600,
+                },
+            };
+            if let Ok(mut g) = FEE_MODULE_GLOBALS.lock() {
+                *g = globals;
+            }
+        }
+
+        // 3. Batch-process pools: refresh dynamicFeeConfig via batch contract
+        for chunk in pool_list.chunks(BATCH_SIZE) {
+            let batch_result = GetAerodromeSlipstreamFeeConfigBatchRequest::deploy_builder(
+                provider.clone(),
+                chunk.to_vec(),
+            )
+            .call_raw()
+            .await;
+
+            match batch_result {
+                Ok(data) => {
+                    use alloy::sol_types::SolType;
+                    type FeeConfigDataArray = sol!( (address, address, uint24, uint24, uint64, bool, uint24)[] );
+                    if let Ok(decoded) = FeeConfigDataArray::abi_decode(&data) {
+                        let mut write_guard = state.write().await;
+                        for (i, fcd) in decoded.iter().enumerate() {
+                            if i >= chunk.len() { break; }
+                            let pool_addr = chunk[i];
+                            if fcd.1 != Address::ZERO { // feeModule != Address::ZERO
+                                if let Some(amm) = write_guard.get_mut_cow(&pool_addr) {
+                                    if let AMM::AerodromeSlipstreamPool(pool) = amm {
+                                        pool.dynamic_fee_config = DynamicFeeConfig {
+                                            base_fee: fcd.2.to::<u32>(),
+                                            fee_cap: fcd.3.to::<u32>(),
+                                            scaling_factor: fcd.4,
+                                            initial_fee_enabled: fcd.5,
+                                            initial_fee: fcd.6.to::<u32>(),
+                                        };
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        error!("Slipstream fee config sync: batch decode failed");
+                    }
+                }
+                Err(e) => {
+                    error!("Slipstream fee config sync: batch call failed: {:?}", e);
+                }
+            }
+        }
+
+        info!(
+            "Slipstream fee config sync: refreshed {} pools",
+            pool_list.len()
+        );
     }
 }
 

@@ -12,7 +12,7 @@ use alloy::{
 use amms::{
     amms::{
         aerodrome_slipstream::{
-            AerodromeSlipstreamPool, ICustomFeeModule, BASE_SLIPSTREAM_FACTORY,
+            AerodromeSlipstreamPool, ICLPool, ICLPoolFactory, ICustomFeeModule,
         },
         aerodrome_v2::AerodromeV2Pool,
         amm::{AutomatedMarketMaker, AMM},
@@ -50,13 +50,6 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 
 const BASE_CHAIN_ID: u64 = 8453;
 
-sol! {
-    #[derive(Debug)]
-    #[sol(rpc)]
-    interface ICLFactoryReader {
-        function swapFeeModule() external view returns (address);
-    }
-}
 
 #[derive(Debug, Deserialize)]
 struct PoolRecord {
@@ -409,16 +402,34 @@ fn load_amms_from_graph(path: &str, pool_limit: Option<usize>) -> eyre::Result<V
     Ok(amms)
 }
 
-async fn resolve_slipstream_fee_module<P, N>(provider: &P) -> Option<Address>
+async fn resolve_slipstream_fee_modules<P, N>(provider: &P, amms: &[AMM]) -> Vec<Address>
 where
     P: Provider<N> + Clone,
     N: alloy::network::Network,
 {
-    let factory = ICLFactoryReader::new(BASE_SLIPSTREAM_FACTORY, provider.clone());
-    match factory.swapFeeModule().call().await {
-        Ok(addr) if addr != Address::ZERO => Some(addr),
-        _ => None,
+    let mut fee_modules = std::collections::HashSet::new();
+    let mut factory_cache: std::collections::HashMap<Address, Address> = std::collections::HashMap::new();
+
+    for amm in amms {
+        let AMM::AerodromeSlipstreamPool(p) = amm else { continue };
+        let factory_addr = match ICLPool::new(p.address, provider.clone()).factory().call().await {
+            Ok(addr) if addr != Address::ZERO => addr,
+            _ => continue,
+        };
+        let fm_addr = if let Some(&cached) = factory_cache.get(&factory_addr) {
+            cached
+        } else {
+            let fm = ICLPoolFactory::new(factory_addr, provider.clone())
+                .swapFeeModule().call().await
+                .unwrap_or(Address::ZERO);
+            factory_cache.insert(factory_addr, fm);
+            fm
+        };
+        if fm_addr != Address::ZERO {
+            fee_modules.insert(fm_addr);
+        }
     }
+    fee_modules.into_iter().collect()
 }
 
 async fn build_local_log_matcher<P, N>(provider: &P, amms: &[AMM], chain_id: u64) -> LocalLogMatcher
@@ -498,8 +509,11 @@ where
     }
 
     if has_slipstream_pool && chain_id == BASE_CHAIN_ID {
-        if let Some(fee_module) = resolve_slipstream_fee_module(provider).await {
-            topic_addresses.insert(fee_module);
+        let fee_modules = resolve_slipstream_fee_modules(provider, amms).await;
+        for fm in &fee_modules {
+            topic_addresses.insert(*fm);
+        }
+        if !fee_modules.is_empty() {
             topic_signatures.insert(ICustomFeeModule::CustomFeeSet::SIGNATURE_HASH);
         }
     }

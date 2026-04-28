@@ -13,10 +13,7 @@ use crate::amms::amm::{SyncAction, AMM};
 use crate::amms::error::AMMError;
 use crate::amms::factory::Factory;
 use crate::amms::fluid_dex::get_liquidity_layer;
-use crate::amms::{
-    aerodrome_slipstream::{ICustomFeeModule, BASE_SLIPSTREAM_FACTORY},
-    balancer_v2, balancer_v3, ekubo,
-};
+use crate::amms::{aerodrome_slipstream::ICustomFeeModule, balancer_v2, balancer_v3, ekubo};
 use crate::state_space::hooks::HookHandle;
 use crate::state_space::hooks::HookRegistry;
 use crate::state_space::hooks::SnapshotConfig;
@@ -617,21 +614,38 @@ impl<N, P> StateSpaceManager<N, P> {
 
         if !needs_resync.is_empty() || !needs_async_update.is_empty() {
             let mut queue = pending_sync_queue.lock().await;
-            for address in needs_resync {
+            for address in &needs_resync {
                 queue.enqueue(
-                    address,
+                    *address,
                     PendingSyncAction::Resync,
                     block_num,
                     PendingSyncReason::Resync,
                 );
             }
-            for address in needs_async_update {
+            for address in &needs_async_update {
                 queue.enqueue(
-                    address,
+                    *address,
                     PendingSyncAction::AsyncUpdate,
                     block_num,
                     PendingSyncReason::AsyncUpdate,
                 );
+            }
+            drop(queue);
+
+            // Immediately drain AsyncUpdate tasks, which are lightweight RPC
+            // refreshes. On Ethereum this runs after each complete block sync;
+            // on Base it runs per flashblock slice, naturally gated by
+            // required_block ≤ canonical_head.
+            if !needs_async_update.is_empty() {
+                let _ = Self::drain_pending_sync_queue(
+                    _provider,
+                    state,
+                    pending_sync_queue,
+                    canonical_head,
+                    false,
+                    needs_async_update.len(),
+                )
+                .await;
             }
         }
 
@@ -850,9 +864,26 @@ impl<N, P> StateSpaceManager<N, P> {
         drop(guard);
 
         if has_slipstream_pool && chain_id == BASE_CHAIN_ID {
-            let fee_module = Self::resolve_slipstream_fee_module(provider).await?;
-            topic_addresses.insert(fee_module);
-            topic_signatures.insert(ICustomFeeModule::CustomFeeSet::SIGNATURE_HASH);
+            // Collect all Slipstream pool addresses for dynamic FeeModule resolution
+            let slipstream_addrs: Vec<Address> = {
+                let guard = state.read().await;
+                guard
+                    .state
+                    .values()
+                    .filter_map(|amm| match amm.as_ref() {
+                        AMM::AerodromeSlipstreamPool(p) => Some(p.address),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            let fee_modules =
+                Self::resolve_slipstream_fee_modules(&slipstream_addrs, provider).await;
+            for fm in &fee_modules {
+                topic_addresses.insert(*fm);
+            }
+            if !fee_modules.is_empty() {
+                topic_signatures.insert(ICustomFeeModule::CustomFeeSet::SIGNATURE_HASH);
+            }
         }
 
         let mut chunks = Vec::new();
@@ -888,21 +919,43 @@ impl<N, P> StateSpaceManager<N, P> {
         Ok(chunks)
     }
 
-    async fn resolve_slipstream_fee_module(provider: &P) -> Result<Address, StateSpaceError>
+    /// Resolve all unique FeeModule addresses from loaded Slipstream pools.
+    /// Each pool may have a different factory, so we collect all unique factory → FeeModule mappings.
+    async fn resolve_slipstream_fee_modules(pool_addrs: &[Address], provider: &P) -> Vec<Address>
     where
         P: Provider<N> + Clone,
         N: Network,
     {
-        let factory = ICLFactoryReader::new(BASE_SLIPSTREAM_FACTORY, provider.clone());
-        match factory.swapFeeModule().call().await {
-            Ok(addr) if addr != Address::ZERO => Ok(addr),
-            Ok(_) => Err(StateSpaceError::AMMError(AMMError::Msg(
-                "Slipstream FeeModule address resolved to zero address".to_string(),
-            ))),
-            Err(e) => Err(StateSpaceError::AMMError(AMMError::Msg(format!(
-                "Failed to fetch Slipstream FeeModule address: {e}"
-            )))),
+        let mut fee_modules = std::collections::HashSet::new();
+        let mut factory_cache: std::collections::HashMap<Address, Address> =
+            std::collections::HashMap::new();
+
+        use crate::amms::aerodrome_slipstream::ICLPool;
+        for &pool_addr in pool_addrs {
+            let factory_addr = match ICLPool::new(pool_addr, provider.clone())
+                .factory()
+                .call()
+                .await
+            {
+                Ok(addr) if addr != Address::ZERO => addr,
+                _ => continue,
+            };
+            let fm_addr = if let Some(&cached) = factory_cache.get(&factory_addr) {
+                cached
+            } else {
+                let fm = ICLFactoryReader::new(factory_addr, provider.clone())
+                    .swapFeeModule()
+                    .call()
+                    .await
+                    .unwrap_or(Address::ZERO);
+                factory_cache.insert(factory_addr, fm);
+                fm
+            };
+            if fm_addr != Address::ZERO {
+                fee_modules.insert(fm_addr);
+            }
         }
+        fee_modules.into_iter().collect()
     }
 
     fn bloom_maybe_has_relevant_logs(bloom: &Bloom, chunk: &LogQueryChunk) -> bool {
@@ -1351,13 +1404,67 @@ where
             ));
         }
 
-        // Slipstream fee: always sync at configured interval (default 100s).
-        tokio::spawn(sync_services::start_slipstream_fee_sync_task(
-            state_space.clone(),
-            self.provider.clone(),
-            self.slipstream_fee_sync_interval
-                .unwrap_or(Duration::from_secs(100)),
-        ));
+        // Slipstream fee config sync: low-frequency task to refresh DynamicFeeConfig and
+        // FeeModuleGlobals (governance changes we don't fully subscribe to via events).
+        // Dynamically resolve FeeModule addresses from loaded pools.
+        let slipstream_fee_modules: Vec<Address> = {
+            let slipstream_addrs: Vec<Address> = {
+                let guard = state_space.read().await;
+                guard
+                    .state
+                    .values()
+                    .filter_map(|amm| match amm.as_ref() {
+                        AMM::AerodromeSlipstreamPool(p) => Some(p.address),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            StateSpaceManager::<N, P>::resolve_slipstream_fee_modules(
+                &slipstream_addrs,
+                &self.provider,
+            )
+            .await
+        };
+
+        if !slipstream_fee_modules.is_empty() {
+            // Eagerly seed FEE_MODULE_GLOBALS before any event processing.
+            if let Some(&first_fm) = slipstream_fee_modules.first() {
+                use crate::state_space::sync_services::IDynamicFeeModuleReader;
+                let reader = IDynamicFeeModuleReader::new(first_fm, self.provider.clone());
+                let (sf, fc, sa) = (
+                    reader.defaultScalingFactor().call().await,
+                    reader.defaultFeeCap().call().await,
+                    reader.secondsAgo().call().await,
+                );
+                let globals = crate::amms::aerodrome_slipstream::pool::FeeModuleGlobals {
+                    default_scaling_factor: sf.ok().map(|v| v.to::<u64>()).unwrap_or(0),
+                    default_fee_cap: fc.ok().map(|v| v.to::<u32>()).unwrap_or(50_000),
+                    seconds_ago: sa.ok().unwrap_or(600),
+                };
+                if let Ok(mut g) =
+                    crate::amms::aerodrome_slipstream::pool::FEE_MODULE_GLOBALS.lock()
+                {
+                    *g = globals;
+                }
+                info!("Slipstream FeeModule globals seeded: scaling_factor={}, fee_cap={}, seconds_ago={}",
+                    globals.default_scaling_factor, globals.default_fee_cap, globals.seconds_ago);
+            }
+
+            // Spawn low-frequency fee config sync task (default 910s).
+            let provider_clone = self.provider.clone();
+            let state_clone = state_space.clone();
+            let fee_config_interval = self
+                .slipstream_fee_sync_interval
+                .unwrap_or(Duration::from_secs(910));
+            tokio::spawn(sync_services::start_slipstream_fee_config_sync_task(
+                state_clone,
+                provider_clone,
+                fee_config_interval,
+                slipstream_fee_modules,
+            ));
+        } else {
+            error!("No Slipstream FeeModule found from loaded pools; fee config sync disabled");
+        }
 
         // Curve NG StableSwap pools: stored_rates for rebasing tokens & D value sync
         if let Some(interval) = self.curve_sync_interval.or(non_event_interval) {

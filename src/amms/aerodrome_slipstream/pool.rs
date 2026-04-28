@@ -26,6 +26,17 @@ use alloy::{
     sol_types::{SolCall, SolEvent, SolValue},
     transports::BoxFuture,
 };
+
+const MULTICALL3_ADDRESS: Address = address!("cA11bde05977b3631167028862bE2a173976CA11");
+sol! {
+    #[sol(rpc)]
+    interface IMulticall3 {
+        struct Call3 { address target; bool allowFailure; bytes callData; }
+        struct Result { bool success; bytes returnData; }
+        function aggregate3(Call3[] calldata calls) external payable returns (Result[] memory returnData);
+    }
+    function observations(uint256 index) external view returns (uint32 blockTimestamp, int56 tickCumulative, uint160 secondsPerLiquidityCumulativeX128, bool initialized);
+}
 use futures::{stream::FuturesUnordered, StreamExt};
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use std::collections::HashMap;
@@ -44,10 +55,13 @@ use rug::ops::Pow;
 use rug::Float;
 use uniswap_v3_math::tick_math::{MAX_SQRT_RATIO, MAX_TICK, MIN_SQRT_RATIO, MIN_TICK};
 
-pub const BASE_SLIPSTREAM_FACTORY: Address = address!("5e7BB104d84c7CB9B682AaC2F3d509f5F406809A");
 const SLIPSTREAM_BATCH_RETRY_ATTEMPTS: u8 = 3;
 const SLIPSTREAM_BATCH_RETRY_BASE_DELAY_MS: u64 = 400;
 const SLIPSTREAM_INTER_BATCH_SLEEP_MS: u64 = 700;
+const ZERO_FEE_INDICATOR: u32 = 420;
+const SCALING_PRECISION: u64 = 1_000_000;
+const MIN_SECONDS_AGO: u32 = 2;
+const DEFAULT_SECONDS_AGO: u32 = 600;
 
 fn slipstream_retry_delay(attempt: u8) -> Duration {
     let exp = attempt.saturating_sub(1).min(5);
@@ -72,6 +86,29 @@ sol! {
         function fee() external view returns (uint24);
         function token0() external view returns (address);
         function token1() external view returns (address);
+        function factory() external view returns (address);
+    }
+
+    #[derive(Debug)]
+    #[sol(rpc)]
+    contract ICLPoolWithObserve {
+        function observe(uint32[] calldata secondsAgos) external view returns (int56[] memory tickCumulatives, uint160[] memory secondsPerLiquidityCumulativeX128s);
+    }
+
+    #[derive(Debug)]
+    #[sol(rpc)]
+    contract IDynamicFeeModuleReader {
+        function dynamicFeeConfig(address pool) external view returns (uint24 baseFee, uint24 feeCap, uint64 scalingFactor, bool initialFeeEnabled, uint24 initialFee);
+        function defaultScalingFactor() external view returns (uint256);
+        function defaultFeeCap() external view returns (uint256);
+        function secondsAgo() external view returns (uint32);
+    }
+
+    #[derive(Debug)]
+    #[sol(rpc)]
+    contract ICLPoolFull {
+        function slot0() external view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, bool unlocked);
+        function observations(uint256 index) external view returns (uint32 blockTimestamp, int56 tickCumulative, uint160 secondsPerLiquidityCumulativeX128, bool initialized);
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -149,6 +186,12 @@ sol! {
     "src/amms/abi/GetAerodromeSlipstreamPoolTickDataBatchRequest.json",
 }
 
+sol! {
+    #[sol(rpc)]
+    GetAerodromeSlipstreamFeeConfigBatchRequest,
+    "src/amms/abi/GetAerodromeSlipstreamFeeConfigBatchRequest.json",
+}
+
 /// Aerodrome Slipstream specific errors
 #[derive(Error, Debug)]
 pub enum AerodromeSlipstreamError {
@@ -212,6 +255,10 @@ pub struct AerodromeSlipstreamPool {
     /// Cached price of token B in terms of token A
     #[serde(default)]
     pub token_b_price: f64,
+    #[serde(default)]
+    pub observations_cache: ObservationsCache,
+    #[serde(default)]
+    pub dynamic_fee_config: DynamicFeeConfig,
 }
 
 /// Tick information for concentrated liquidity
@@ -233,6 +280,106 @@ impl TickInfo {
             liquidity_net,
             initialized,
         }
+    }
+}
+
+// ── Fee computation types ──
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct Observation {
+    pub block_timestamp: u32,
+    pub tick_cumulative: i128,
+    pub initialized: bool,
+}
+impl Default for Observation {
+    fn default() -> Self { Self { block_timestamp: 1, tick_cumulative: 0, initialized: false } }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ObservationsCache {
+    pub observations: Vec<Observation>,
+    pub index: u16,
+    pub cardinality: u16,
+    pub cardinality_next: u16,
+    pub last_write_block: u64,
+    pub seeded: bool,
+    pub tc_ago: i128,
+}
+impl Default for ObservationsCache {
+    fn default() -> Self { Self { observations: Vec::new(), index: 0, cardinality: 0, cardinality_next: 0, last_write_block: 0, seeded: false, tc_ago: 0 } }
+}
+
+impl ObservationsCache {
+    pub fn last(&self) -> Option<&Observation> {
+        if self.cardinality == 0 { return None; }
+        self.observations.get(self.index as usize)
+    }
+    pub fn write(&mut self, block_timestamp: u32, tick: i32, block_number: u64) -> bool {
+        if !self.seeded || self.cardinality == 0 { return false; }
+        if let Some(last) = self.last() { if last.block_timestamp == block_timestamp { return false; } } else { return false; }
+        let last = *self.last().unwrap();
+        if block_timestamp <= last.block_timestamp { return false; }
+        let delta = block_timestamp - last.block_timestamp;
+        let new_cumulative = last.tick_cumulative.wrapping_add((tick as i128) * (delta as i128));
+        
+        self.index = (self.index + 1) % self.cardinality;
+        if self.observations.len() <= self.index as usize {
+            self.observations.resize(self.cardinality as usize, Observation::default());
+        }
+        self.observations[self.index as usize] = Observation { block_timestamp, tick_cumulative: new_cumulative, initialized: true };
+        self.last_write_block = block_number;
+        true
+    }
+    pub fn seed_from_observations_batch(&mut self, mut observations: Vec<Observation>, index: u16, cardinality: u16) {
+        if observations.len() < cardinality as usize {
+            observations.resize(cardinality as usize, Observation::default());
+        }
+        self.observations = observations;
+        self.index = index;
+        self.cardinality = cardinality.max(1);
+        self.cardinality_next = cardinality.max(1);
+        self.last_write_block = 0;
+        self.seeded = true;
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+pub struct DynamicFeeConfig {
+    pub base_fee: u32,
+    pub fee_cap: u32,
+    pub scaling_factor: u64,
+    pub initial_fee_enabled: bool,
+    pub initial_fee: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FeeModuleGlobals {
+    pub default_scaling_factor: u64,
+    pub default_fee_cap: u32,
+    pub seconds_ago: u32,
+}
+impl Default for FeeModuleGlobals {
+    fn default() -> Self { Self { default_scaling_factor: 0, default_fee_cap: 50_000, seconds_ago: DEFAULT_SECONDS_AGO } }
+}
+
+use std::sync::LazyLock;
+use std::sync::Mutex;
+pub static FEE_MODULE_GLOBALS: LazyLock<Mutex<FeeModuleGlobals>> = LazyLock::new(|| Mutex::new(FeeModuleGlobals::default()));
+pub fn get_fee_module_globals() -> FeeModuleGlobals {
+    match FEE_MODULE_GLOBALS.lock() { Ok(guard) => *guard, Err(_) => FeeModuleGlobals::default() }
+}
+
+/// Static fallback for factory.tickSpacingToFee() when baseFee is 0.
+/// These match CLFactory deployment defaults. Note: on-chain this is a dynamic
+/// mapping that can be updated via enableTickSpacing(), so these may drift.
+fn tick_spacing_to_default_fee(tick_spacing: i32) -> u32 {
+    match tick_spacing {
+        1 => 100,      // TICK_SPACING_STABLE
+        50 => 500,     // TICK_SPACING_LOW
+        100 => 500,    // TICK_SPACING_MEDIUM
+        200 => 3_000,  // TICK_SPACING_HIGH
+        2000 => 10_000, // TICK_SPACING_VOLATILE
+        _ => 3_000,
     }
 }
 
@@ -264,6 +411,109 @@ impl AerodromeSlipstreamPool {
             address,
             ..Default::default()
         }
+    }
+
+    pub fn compute_fee(&self, block_timestamp: u32) -> u32 {
+        if !self.observations_cache.seeded { return self.fee; }
+        let dfc = &self.dynamic_fee_config;
+        let globals = get_fee_module_globals();
+        if dfc.base_fee == ZERO_FEE_INDICATOR { return 0; }
+        let base_fee = if dfc.base_fee != 0 { dfc.base_fee as u64 } else { tick_spacing_to_default_fee(self.tick_spacing) as u64 };
+        if dfc.initial_fee_enabled {
+            let last_obs_ts = self.observations_cache.last().map(|o| o.block_timestamp);
+            if last_obs_ts != Some(block_timestamp) {
+                if dfc.initial_fee == 0 { return base_fee as u32; }
+                if dfc.initial_fee == ZERO_FEE_INDICATOR { return 0; }
+                return dfc.initial_fee;
+            }
+        }
+        let (scaling_factor, fee_cap) = if dfc.scaling_factor != 0 {
+            (dfc.scaling_factor as u64, dfc.fee_cap as u64)
+        } else {
+            (globals.default_scaling_factor, globals.default_fee_cap as u64)
+        };
+        
+        if (self.observations_cache.cardinality as u32) < globals.seconds_ago / MIN_SECONDS_AGO {
+            return base_fee as u32;
+        }
+
+        if !self.observations_cache.seeded { return base_fee as u32; }
+        match self.compute_twap_tick(block_timestamp, globals.seconds_ago) {
+            Ok(twap_tick) => {
+                let tick_delta = (self.tick as i64 - twap_tick as i64).unsigned_abs();
+                let dynamic_fee = (tick_delta as u128 * scaling_factor as u128 / SCALING_PRECISION as u128) as u64;
+                (base_fee + dynamic_fee).min(fee_cap) as u32
+            }
+            Err(_) => base_fee as u32,
+        }
+    }
+
+    pub fn compute_twap_tick(&self, block_timestamp: u32, seconds_ago: u32) -> Result<i32, AMMError> {
+        let obs = &self.observations_cache;
+        if !obs.seeded || obs.observations.is_empty() { return Ok(self.tick); }
+        let last_entry = obs.last().ok_or_else(|| AMMError::Msg("no obs".into()))?;
+        let (cumulative_now, _ts_now) = if last_entry.block_timestamp >= block_timestamp {
+            (last_entry.tick_cumulative, last_entry.block_timestamp)
+        } else {
+            let delta = block_timestamp - last_entry.block_timestamp;
+            (last_entry.tick_cumulative.wrapping_add((self.tick as i128) * (delta as i128)), block_timestamp)
+        };
+        let target_ts = block_timestamp.saturating_sub(seconds_ago);
+        let (ago_cumulative, _) = self.find_cumulative_at(target_ts)?;
+        let cumulative_delta = cumulative_now.wrapping_sub(ago_cumulative);
+        Ok((cumulative_delta / seconds_ago as i128) as i32)
+    }
+
+    fn find_cumulative_at(&self, target_ts: u32) -> Result<(i128, u32), AMMError> {
+        let entries = &self.observations_cache.observations;
+        let card = self.observations_cache.cardinality as usize;
+        if card == 0 || entries.is_empty() { return Err(AMMError::Msg("empty".into())); }
+
+        let newest = self.observations_cache.last().unwrap();
+        if target_ts >= newest.block_timestamp {
+            // Extrapolate forward using current tick, matching contract's transform() in getSurroundingObservations
+            let delta = (target_ts - newest.block_timestamp) as i128;
+            return Ok((newest.tick_cumulative.wrapping_add((self.tick as i128) * delta), target_ts));
+        }
+
+        let mut idx = self.observations_cache.index as usize;
+        let mut oldest_valid: Option<&Observation> = None;
+
+        for _ in 0..card {
+            if idx >= entries.len() {
+                idx = if idx == 0 { card - 1 } else { idx - 1 };
+                continue;
+            }
+            let entry = &entries[idx];
+
+            if entry.initialized {
+                if oldest_valid.is_none() || entry.block_timestamp < oldest_valid.unwrap().block_timestamp {
+                    oldest_valid = Some(entry);
+                }
+            }
+
+            if entry.initialized && entry.block_timestamp <= target_ts {
+                let next_idx = (idx + 1) % card;
+                if next_idx < entries.len() {
+                    let next = &entries[next_idx];
+                    if next.initialized && next.block_timestamp > entry.block_timestamp && target_ts > entry.block_timestamp {
+                        let dt = next.block_timestamp - entry.block_timestamp;
+                        let frac = (target_ts - entry.block_timestamp) as i128;
+                        let interp = entry.tick_cumulative.wrapping_add((next.tick_cumulative.wrapping_sub(entry.tick_cumulative)) / dt as i128 * frac);
+                        return Ok((interp, target_ts));
+                    }
+                }
+                return Ok((entry.tick_cumulative, target_ts));
+            }
+            if idx == 0 { idx = card - 1; } else { idx -= 1; }
+        }
+
+        if let Some(oldest) = oldest_valid {
+            if target_ts < oldest.block_timestamp {
+                return Err(AMMError::Msg("target too old".into()));
+            }
+        }
+        Err(AMMError::Msg("not found".into()))
     }
 }
 
@@ -332,6 +582,18 @@ impl AutomatedMarketMaker for AerodromeSlipstreamPool {
                     );
                 }
 
+                // Observation write + fee recompute BEFORE updating tick (contract uses pre-swap tick)
+                let pre_tick = self.tick;
+                let new_blk = log.block_number.unwrap_or(0) > self.observations_cache.last_write_block;
+                if tick_after != pre_tick && new_blk {
+                    if let Some(bt) = log.block_timestamp {
+                        self.observations_cache.write(bt as u32, pre_tick, log.block_number.unwrap_or(0));
+                    }
+                }
+                if let Some(bt) = log.block_timestamp {
+                    self.fee = self.compute_fee(bt as u32);
+                }
+
                 self.sqrt_price = swap_event.sqrtPriceX96.to();
                 self.liquidity = swap_event.liquidity;
                 self.tick = tick_after;
@@ -352,16 +614,29 @@ impl AutomatedMarketMaker for AerodromeSlipstreamPool {
                     sqrt_price = ?self.sqrt_price,
                     liquidity = ?self.liquidity,
                     tick = ?self.tick,
+                    fee = ?self.fee,
                     "Swap"
                 );
             }
             ICLPoolEvents::Mint::SIGNATURE_HASH => {
                 let mint_event = ICLPoolEvents::Mint::decode_log(log.as_ref())?;
+                if mint_event.amount != 0 {
+                    let tu: i32 = mint_event.tickUpper.unchecked_into();
+                    let nb = log.block_number.unwrap_or(0) > self.observations_cache.last_write_block;
+                    if self.tick < tu && nb {
+                        if let Some(bt) = log.block_timestamp {
+                            self.observations_cache.write(bt as u32, self.tick, log.block_number.unwrap_or(0));
+                        }
+                    }
+                }
                 self.modify_position(
                     mint_event.tickLower.unchecked_into(),
                     mint_event.tickUpper.unchecked_into(),
                     mint_event.amount as i128,
                 )?;
+                if let Some(bt) = log.block_timestamp {
+                    self.fee = self.compute_fee(bt as u32);
+                }
 
                 tracing::info!(
                     target: "amms::aerodrome_slipstream::sync",
@@ -370,16 +645,29 @@ impl AutomatedMarketMaker for AerodromeSlipstreamPool {
                     sqrt_price = ?self.sqrt_price,
                     liquidity = ?self.liquidity,
                     tick = ?self.tick,
+                    fee = ?self.fee,
                     "Mint"
                 );
             }
             ICLPoolEvents::Burn::SIGNATURE_HASH => {
                 let burn_event = ICLPoolEvents::Burn::decode_log(log.as_ref())?;
+                if burn_event.amount != 0 {
+                    let tu: i32 = burn_event.tickUpper.unchecked_into();
+                    let nb = log.block_number.unwrap_or(0) > self.observations_cache.last_write_block;
+                    if self.tick < tu && nb {
+                        if let Some(bt) = log.block_timestamp {
+                            self.observations_cache.write(bt as u32, self.tick, log.block_number.unwrap_or(0));
+                        }
+                    }
+                }
                 self.modify_position(
                     burn_event.tickLower.unchecked_into(),
                     burn_event.tickUpper.unchecked_into(),
                     -(burn_event.amount as i128),
                 )?;
+                if let Some(bt) = log.block_timestamp {
+                    self.fee = self.compute_fee(bt as u32);
+                }
 
                 tracing::info!(
                     target: "amms::aerodrome_slipstream::sync",
@@ -388,6 +676,7 @@ impl AutomatedMarketMaker for AerodromeSlipstreamPool {
                     sqrt_price = ?self.sqrt_price,
                     liquidity = ?self.liquidity,
                     tick = ?self.tick,
+                    fee = ?self.fee,
                     "Burn"
                 );
             }
@@ -1028,6 +1317,80 @@ impl AutomatedMarketMaker for AerodromeSlipstreamPool {
         let AMM::AerodromeSlipstreamPool(mut pool_struct) = pool[0].to_owned() else {
             unreachable!()
         };
+
+        // ── DynamicFeeConfig ──
+        let fact = ICLPool::new(pool_struct.address, provider.clone())
+            .factory().block(block_number).call().await
+            .map_err(|e| AMMError::Msg(format!("factory fetch failed: {:?}", e)))?;
+        let fm = ICLPoolFactory::new(fact, provider.clone())
+            .swapFeeModule().block(block_number).call().await
+            .map_err(|e| AMMError::Msg(format!("swapFeeModule fetch failed: {:?}", e)))?;
+        if fm != Address::ZERO {
+            let dfc = IDynamicFeeModuleReader::new(fm, provider.clone())
+                .dynamicFeeConfig(pool_struct.address).block(block_number).call().await
+                .map_err(|e| AMMError::Msg(format!("dynamicFeeConfig fetch failed: {:?}", e)))?;
+            pool_struct.dynamic_fee_config = DynamicFeeConfig {
+                base_fee: dfc.baseFee.to::<u32>(),
+                fee_cap: dfc.feeCap.to::<u32>(),
+                scaling_factor: dfc.scalingFactor,
+                initial_fee_enabled: dfc.initialFeeEnabled,
+                initial_fee: dfc.initialFee.to::<u32>(),
+            };
+        }
+
+        // ── Observations via Multicall3 ──
+        let s0 = ICLPoolFull::new(pool_struct.address, provider.clone())
+            .slot0().block(block_number).call().await
+            .map_err(|e| AMMError::Msg(format!("slot0 fetch failed: {:?}", e)))?;
+        let card = s0.observationCardinality;
+        let ridx = s0.observationIndex;
+        let count = (card as u16).min(1500);
+
+        let mc3 = IMulticall3::new(MULTICALL3_ADDRESS, provider.clone());
+        let mut mc_calls: Vec<IMulticall3::Call3> = Vec::new();
+        let mut mc_indices: Vec<usize> = Vec::new();
+        for j in 0..count {
+            let sidx = ((ridx as u64 + card as u64 - j as u64) % card as u64) as usize;
+            let cd = ICLPoolFull::observationsCall { index: U256::from(sidx) }.abi_encode();
+            mc_calls.push(IMulticall3::Call3 {
+                target: pool_struct.address,
+                allowFailure: true,
+                callData: cd.into(),
+            });
+            mc_indices.push(sidx);
+        }
+
+        if !mc_calls.is_empty() {
+            let results = mc3.aggregate3(mc_calls).block(block_number).call().await
+                .map_err(|e| AMMError::Msg(format!("Multicall3 aggregate3 failed: {:?}", e)))?;
+            let mut obs_vec = vec![Observation::default(); card as usize];
+            let mut max_ts = 0u32;
+            let mut best_idx = 0u16;
+            for (i, res) in results.iter().enumerate() {
+                if i >= mc_indices.len() { break; }
+                let sidx = mc_indices[i];
+                if !res.returnData.is_empty() {
+                    if let Ok(dec) = <ICLPoolFull::observationsCall as SolCall>::abi_decode_returns(&res.returnData) {
+                        if dec.initialized && dec.blockTimestamp != 0 {
+                            let tc: i128 = dec.tickCumulative.unchecked_into::<i64>() as i128;
+                            let obs = Observation {
+                                block_timestamp: dec.blockTimestamp,
+                                tick_cumulative: tc,
+                                initialized: true,
+                            };
+                            if sidx < obs_vec.len() {
+                                obs_vec[sidx] = obs;
+                            }
+                            if dec.blockTimestamp > max_ts {
+                                max_ts = dec.blockTimestamp;
+                                best_idx = sidx as u16;
+                            }
+                        }
+                    }
+                }
+            }
+            pool_struct.observations_cache.seed_from_observations_batch(obs_vec, best_idx, card);
+        }
 
         if let Ok(price) =
             pool_struct.calculate_price(pool_struct.token_a.address, pool_struct.token_b.address)
@@ -1772,7 +2135,6 @@ impl AerodromeSlipstreamFactory {
                         addresses_clone,
                     )
                     .call_raw()
-                    .block(block_number)
                     .await?,
                 ))
             }));
@@ -1829,6 +2191,138 @@ impl AerodromeSlipstreamFactory {
             .await
             .map_err(AMMError::from)?;
         sleep(Duration::from_millis(SLIPSTREAM_INTER_BATCH_SLEEP_MS)).await;
+
+        let pool_addrs: Vec<Address> = amms.iter().map(|a| a.address()).collect();
+
+
+        // Batch-fetch factory + swapFeeModule + dynamicFeeConfig via batch contract
+        {
+            let batch_result = GetAerodromeSlipstreamFeeConfigBatchRequest::deploy_builder(
+                provider.clone(),
+                pool_addrs.clone(),
+            )
+            .block(block_number)
+            .call_raw()
+            .await;
+
+            match batch_result {
+                Ok(data) => {
+                    use alloy::sol_types::SolType;
+                    type FeeConfigDataArray = sol!( (address, address, uint24, uint24, uint64, bool, uint24)[] );
+                    if let Ok(decoded) = FeeConfigDataArray::abi_decode(&data) {
+                        for (i, fcd) in decoded.iter().enumerate() {
+                            if i >= amms.len() { break; }
+                            let AMM::AerodromeSlipstreamPool(ref mut p) = amms[i] else { continue; };
+                            // fcd: (factory, feeModule, baseFee, feeCap, scalingFactor, initialFeeEnabled, initialFee)
+                            if fcd.1 != Address::ZERO {
+                                p.dynamic_fee_config = DynamicFeeConfig {
+                                    base_fee: fcd.2.to::<u32>(),
+                                    fee_cap: fcd.3.to::<u32>(),
+                                    scaling_factor: fcd.4,
+                                    initial_fee_enabled: fcd.5,
+                                    initial_fee: fcd.6.to::<u32>(),
+                                };
+                            }
+                        }
+                        tracing::info!("Batch FeeConfig: decoded {} entries", decoded.len());
+                    } else {
+                        tracing::warn!("FeeConfig batch decode failed, falling back to per-pool RPC");
+                        for amm in amms.iter_mut() {
+                            let AMM::AerodromeSlipstreamPool(ref mut p) = amm else { continue; };
+                            if let Ok(fact) = ICLPool::new(p.address, provider.clone()).factory().block(block_number).call().await {
+                                if let Ok(fm) = ICLPoolFactory::new(fact, provider.clone()).swapFeeModule().block(block_number).call().await {
+                                    if fm != Address::ZERO {
+                                        if let Ok(dfc) = IDynamicFeeModuleReader::new(fm, provider.clone()).dynamicFeeConfig(p.address).block(block_number).call().await {
+                                            p.dynamic_fee_config = DynamicFeeConfig { base_fee: dfc.baseFee.to::<u32>(), fee_cap: dfc.feeCap.to::<u32>(), scaling_factor: dfc.scalingFactor, initial_fee_enabled: dfc.initialFeeEnabled, initial_fee: dfc.initialFee.to::<u32>() };
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("FeeConfig batch call failed: {:?}, falling back to per-pool RPC", e);
+                    for amm in amms.iter_mut() {
+                        let AMM::AerodromeSlipstreamPool(ref mut p) = amm else { continue; };
+                        if let Ok(fact) = ICLPool::new(p.address, provider.clone()).factory().block(block_number).call().await {
+                            if let Ok(fm) = ICLPoolFactory::new(fact, provider.clone()).swapFeeModule().block(block_number).call().await {
+                                if fm != Address::ZERO {
+                                    if let Ok(dfc) = IDynamicFeeModuleReader::new(fm, provider.clone()).dynamicFeeConfig(p.address).block(block_number).call().await {
+                                        p.dynamic_fee_config = DynamicFeeConfig { base_fee: dfc.baseFee.to::<u32>(), fee_cap: dfc.feeCap.to::<u32>(), scaling_factor: dfc.scalingFactor, initial_fee_enabled: dfc.initialFeeEnabled, initial_fee: dfc.initialFee.to::<u32>() };
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Multicall3: batch observations(i) for all pools.
+        let mc3 = IMulticall3::new(MULTICALL3_ADDRESS, provider.clone());
+        for chunk_addrs in pool_addrs.chunks(5) {
+            let mut mc_calls: Vec<IMulticall3::Call3> = Vec::new();
+            let mut mc_meta: Vec<(Address, usize, u16)> = Vec::new(); // addr, sidx, card
+
+            for &addr in chunk_addrs {
+                let s0 = ICLPoolFull::new(addr, provider.clone()).slot0().block(block_number).call().await
+                    .map_err(|e| AMMError::Msg(format!("slot0 fetch failed for pool {}: {:?}", addr, e)))?;
+                let card = s0.observationCardinality;
+                let ridx = s0.observationIndex;
+                let count = (card as u16).min(1500);
+                for j in 0..count {
+                    let sidx = ((ridx as u64 + card as u64 - j as u64) % card as u64) as usize;
+                    let cd = ICLPoolFull::observationsCall { index: U256::from(sidx) }.abi_encode();
+                    mc_calls.push(IMulticall3::Call3 { target: addr, allowFailure: true, callData: cd.into() });
+                    mc_meta.push((addr, sidx, card));
+                }
+            }
+
+            if !mc_calls.is_empty() {
+                let results = mc3.aggregate3(mc_calls).block(block_number).call().await
+                    .map_err(|e| AMMError::Msg(format!("Multicall3 aggregate3 failed: {:?}", e)))?;
+                use std::collections::HashMap;
+                let mut pool_obs: HashMap<Address, (u16, Vec<Observation>)> = HashMap::new();
+                for (i, res) in results.iter().enumerate() {
+                    if i >= mc_meta.len() { break; }
+                    let (addr, sidx, card) = mc_meta[i];
+                    if !res.returnData.is_empty() {
+                        if let Ok(dec) = <ICLPoolFull::observationsCall as SolCall>::abi_decode_returns(&res.returnData) {
+                            if dec.initialized && dec.blockTimestamp != 0 {
+                                let tc: i128 = dec.tickCumulative.unchecked_into::<i64>() as i128;
+                                let obs = Observation { block_timestamp: dec.blockTimestamp, tick_cumulative: tc, initialized: true };
+                                
+                                let entry = pool_obs.entry(addr).or_insert_with(|| {
+                                    let mut v = Vec::with_capacity(card as usize);
+                                    v.resize(card as usize, Observation::default());
+                                    (card, v)
+                                });
+                                if sidx < entry.1.len() {
+                                    entry.1[sidx] = obs;
+                                }
+                            }
+                        }
+                    }
+                }
+                    
+                    for (addr, (card, obs)) in pool_obs {
+                        if let Some(amm) = amms.iter_mut().find(|a| a.address() == addr) {
+                            if let AMM::AerodromeSlipstreamPool(ref mut p) = amm {
+                                let mut max_ts = 0;
+                                let mut best_idx = 0;
+                                for (i, o) in obs.iter().enumerate() {
+                                    if o.initialized && o.block_timestamp > max_ts {
+                                        max_ts = o.block_timestamp;
+                                        best_idx = i as u16;
+                                    }
+                                }
+                                p.observations_cache.seed_from_observations_batch(obs, best_idx, card);
+                            }
+                        }
+                    }
+            }
+            sleep(Duration::from_millis(SLIPSTREAM_INTER_BATCH_SLEEP_MS)).await;
+        }
 
         let (structurally_valid, structurally_invalid): (Vec<_>, Vec<_>) =
             amms.into_iter().partition(|amm| {
