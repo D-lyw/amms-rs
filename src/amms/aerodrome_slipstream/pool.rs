@@ -58,6 +58,8 @@ use uniswap_v3_math::tick_math::{MAX_SQRT_RATIO, MAX_TICK, MIN_SQRT_RATIO, MIN_T
 const SLIPSTREAM_BATCH_RETRY_ATTEMPTS: u8 = 3;
 const SLIPSTREAM_BATCH_RETRY_BASE_DELAY_MS: u64 = 400;
 const SLIPSTREAM_INTER_BATCH_SLEEP_MS: u64 = 700;
+// Keep constructor-return payload under EVM code-size limit during deploy_builder().call_raw().
+const SLIPSTREAM_FEE_CONFIG_BATCH_STEP: usize = 40;
 const ZERO_FEE_INDICATOR: u32 = 420;
 const SCALING_PRECISION: u64 = 1_000_000;
 const MIN_SECONDS_AGO: u32 = 2;
@@ -2195,67 +2197,132 @@ impl AerodromeSlipstreamFactory {
         let pool_addrs: Vec<Address> = amms.iter().map(|a| a.address()).collect();
 
 
-        // Batch-fetch factory + swapFeeModule + dynamicFeeConfig via batch contract
+        // Batch-fetch factory + swapFeeModule + dynamicFeeConfig via batch contract.
+        // Chunk to avoid constructor return payload exceeding EVM code size limit.
         {
-            let batch_result = GetAerodromeSlipstreamFeeConfigBatchRequest::deploy_builder(
-                provider.clone(),
-                pool_addrs.clone(),
-            )
-            .block(block_number)
-            .call_raw()
-            .await;
+            use alloy::sol_types::SolType;
+            type FeeConfigDataArray = sol!((address, address, uint24, uint24, uint64, bool, uint24)[]);
 
-            match batch_result {
-                Ok(data) => {
-                    use alloy::sol_types::SolType;
-                    type FeeConfigDataArray = sol!( (address, address, uint24, uint24, uint64, bool, uint24)[] );
-                    if let Ok(decoded) = FeeConfigDataArray::abi_decode(&data) {
-                        for (i, fcd) in decoded.iter().enumerate() {
-                            if i >= amms.len() { break; }
-                            let AMM::AerodromeSlipstreamPool(ref mut p) = amms[i] else { continue; };
-                            // fcd: (factory, feeModule, baseFee, feeCap, scalingFactor, initialFeeEnabled, initialFee)
-                            if fcd.1 != Address::ZERO {
-                                p.dynamic_fee_config = DynamicFeeConfig {
-                                    base_fee: fcd.2.to::<u32>(),
-                                    fee_cap: fcd.3.to::<u32>(),
-                                    scaling_factor: fcd.4,
-                                    initial_fee_enabled: fcd.5,
-                                    initial_fee: fcd.6.to::<u32>(),
-                                };
-                            }
-                        }
-                        tracing::info!("Batch FeeConfig: decoded {} entries", decoded.len());
-                    } else {
-                        tracing::warn!("FeeConfig batch decode failed, falling back to per-pool RPC");
-                        for amm in amms.iter_mut() {
-                            let AMM::AerodromeSlipstreamPool(ref mut p) = amm else { continue; };
-                            if let Ok(fact) = ICLPool::new(p.address, provider.clone()).factory().block(block_number).call().await {
-                                if let Ok(fm) = ICLPoolFactory::new(fact, provider.clone()).swapFeeModule().block(block_number).call().await {
-                                    if fm != Address::ZERO {
-                                        if let Ok(dfc) = IDynamicFeeModuleReader::new(fm, provider.clone()).dynamicFeeConfig(p.address).block(block_number).call().await {
-                                            p.dynamic_fee_config = DynamicFeeConfig { base_fee: dfc.baseFee.to::<u32>(), fee_cap: dfc.feeCap.to::<u32>(), scaling_factor: dfc.scalingFactor, initial_fee_enabled: dfc.initialFeeEnabled, initial_fee: dfc.initialFee.to::<u32>() };
-                                        }
+            let addr_to_idx: HashMap<Address, usize> = amms
+                .iter()
+                .enumerate()
+                .map(|(idx, amm)| (amm.address(), idx))
+                .collect();
+
+            for chunk in pool_addrs.chunks(SLIPSTREAM_FEE_CONFIG_BATCH_STEP) {
+                let chunk_addrs = chunk.to_vec();
+                let mut need_fallback = false;
+
+                match GetAerodromeSlipstreamFeeConfigBatchRequest::deploy_builder(
+                    provider.clone(),
+                    chunk_addrs.clone(),
+                )
+                .block(block_number)
+                .call_raw()
+                .await
+                {
+                    Ok(data) => match FeeConfigDataArray::abi_decode(&data) {
+                        Ok(decoded) => {
+                            if decoded.len() != chunk_addrs.len() {
+                                tracing::warn!(
+                                    target = "amms::aerodrome_slipstream::init_batch",
+                                    expected = chunk_addrs.len(),
+                                    got = decoded.len(),
+                                    "FeeConfig batch length mismatch; using per-pool fallback for this chunk"
+                                );
+                                need_fallback = true;
+                            } else {
+                                for (i, fcd) in decoded.iter().enumerate() {
+                                    if i >= chunk_addrs.len() {
+                                        break;
+                                    }
+                                    let pool_addr = chunk_addrs[i];
+                                    let Some(&amm_idx) = addr_to_idx.get(&pool_addr) else {
+                                        continue;
+                                    };
+                                    let AMM::AerodromeSlipstreamPool(ref mut p) = amms[amm_idx]
+                                    else {
+                                        continue;
+                                    };
+
+                                    // fcd: (factory, feeModule, baseFee, feeCap, scalingFactor, initialFeeEnabled, initialFee)
+                                    if fcd.1 != Address::ZERO {
+                                        p.dynamic_fee_config = DynamicFeeConfig {
+                                            base_fee: fcd.2.to::<u32>(),
+                                            fee_cap: fcd.3.to::<u32>(),
+                                            scaling_factor: fcd.4,
+                                            initial_fee_enabled: fcd.5,
+                                            initial_fee: fcd.6.to::<u32>(),
+                                        };
                                     }
                                 }
                             }
                         }
+                        Err(e) => {
+                            tracing::warn!(
+                                target = "amms::aerodrome_slipstream::init_batch",
+                                error = ?e,
+                                chunk_size = chunk_addrs.len(),
+                                "FeeConfig batch decode failed; using per-pool fallback for this chunk"
+                            );
+                            need_fallback = true;
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!(
+                            target = "amms::aerodrome_slipstream::init_batch",
+                            error = ?e,
+                            chunk_size = chunk_addrs.len(),
+                            "FeeConfig batch call failed; using per-pool fallback for this chunk"
+                        );
+                        need_fallback = true;
                     }
                 }
-                Err(e) => {
-                    tracing::warn!("FeeConfig batch call failed: {:?}, falling back to per-pool RPC", e);
-                    for amm in amms.iter_mut() {
-                        let AMM::AerodromeSlipstreamPool(ref mut p) = amm else { continue; };
-                        if let Ok(fact) = ICLPool::new(p.address, provider.clone()).factory().block(block_number).call().await {
-                            if let Ok(fm) = ICLPoolFactory::new(fact, provider.clone()).swapFeeModule().block(block_number).call().await {
+
+                if need_fallback {
+                    for &pool_addr in chunk {
+                        let Some(&amm_idx) = addr_to_idx.get(&pool_addr) else {
+                            continue;
+                        };
+                        let AMM::AerodromeSlipstreamPool(ref mut p) = amms[amm_idx] else {
+                            continue;
+                        };
+
+                        if let Ok(fact) = ICLPool::new(p.address, provider.clone())
+                            .factory()
+                            .block(block_number)
+                            .call()
+                            .await
+                        {
+                            if let Ok(fm) = ICLPoolFactory::new(fact, provider.clone())
+                                .swapFeeModule()
+                                .block(block_number)
+                                .call()
+                                .await
+                            {
                                 if fm != Address::ZERO {
-                                    if let Ok(dfc) = IDynamicFeeModuleReader::new(fm, provider.clone()).dynamicFeeConfig(p.address).block(block_number).call().await {
-                                        p.dynamic_fee_config = DynamicFeeConfig { base_fee: dfc.baseFee.to::<u32>(), fee_cap: dfc.feeCap.to::<u32>(), scaling_factor: dfc.scalingFactor, initial_fee_enabled: dfc.initialFeeEnabled, initial_fee: dfc.initialFee.to::<u32>() };
+                                    if let Ok(dfc) =
+                                        IDynamicFeeModuleReader::new(fm, provider.clone())
+                                            .dynamicFeeConfig(p.address)
+                                            .block(block_number)
+                                            .call()
+                                            .await
+                                    {
+                                        p.dynamic_fee_config = DynamicFeeConfig {
+                                            base_fee: dfc.baseFee.to::<u32>(),
+                                            fee_cap: dfc.feeCap.to::<u32>(),
+                                            scaling_factor: dfc.scalingFactor,
+                                            initial_fee_enabled: dfc.initialFeeEnabled,
+                                            initial_fee: dfc.initialFee.to::<u32>(),
+                                        };
                                     }
                                 }
                             }
                         }
                     }
                 }
+
+                sleep(Duration::from_millis(SLIPSTREAM_INTER_BATCH_SLEEP_MS)).await;
             }
         }
         // Multicall3: batch observations(i) for all pools.

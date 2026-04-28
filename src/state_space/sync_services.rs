@@ -10,6 +10,7 @@ use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tracing::{error, info};
 
+use crate::amms::aerodrome_slipstream::pool::FEE_MODULE_GLOBALS;
 use crate::amms::aerodrome_slipstream::pool::{
     DynamicFeeConfig, FeeModuleGlobals, GetAerodromeSlipstreamFeeConfigBatchRequest,
 };
@@ -21,7 +22,6 @@ use crate::amms::fluid_dex::{
     DexReservesResolver, FluidDexT1, FluidLiquidity, TokenLimitData, FLUID_DEX_RESOLVER,
 };
 use crate::amms::uniswap_v3::GetUniswapV3PoolStaticMetaBatchRequest;
-use crate::amms::aerodrome_slipstream::pool::FEE_MODULE_GLOBALS;
 use crate::state_space::StateSpace;
 
 const STARTUP_JITTER_PCT: u128 = 15;
@@ -432,7 +432,7 @@ pub async fn start_slipstream_fee_config_sync_task<N, P>(
     N: Network,
     P: Provider<N> + Clone + 'static,
 {
-    const BATCH_SIZE: usize = 100;
+    const BATCH_SIZE: usize = 40;
 
     let mut next_sleep = startup_delay_with_jitter(interval, "slipstream_fee_config");
     loop {
@@ -490,13 +490,17 @@ pub async fn start_slipstream_fee_config_sync_task<N, P>(
             match batch_result {
                 Ok(data) => {
                     use alloy::sol_types::SolType;
-                    type FeeConfigDataArray = sol!( (address, address, uint24, uint24, uint64, bool, uint24)[] );
+                    type FeeConfigDataArray =
+                        sol!( (address, address, uint24, uint24, uint64, bool, uint24)[] );
                     if let Ok(decoded) = FeeConfigDataArray::abi_decode(&data) {
                         let mut write_guard = state.write().await;
                         for (i, fcd) in decoded.iter().enumerate() {
-                            if i >= chunk.len() { break; }
+                            if i >= chunk.len() {
+                                break;
+                            }
                             let pool_addr = chunk[i];
-                            if fcd.1 != Address::ZERO { // feeModule != Address::ZERO
+                            if fcd.1 != Address::ZERO {
+                                // feeModule != Address::ZERO
                                 if let Some(amm) = write_guard.get_mut_cow(&pool_addr) {
                                     if let AMM::AerodromeSlipstreamPool(pool) = amm {
                                         pool.dynamic_fee_config = DynamicFeeConfig {
