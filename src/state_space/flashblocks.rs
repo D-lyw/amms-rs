@@ -225,6 +225,7 @@ impl<N, P> StateSpaceManager<N, P> {
         matcher: &RawLogMatcher,
         dedup_cache: &mut FlashblocksDedupCache,
         parse_cache: &mut FlashblocksParseCache,
+        latest_block_timestamp: &mut Option<(u64, u64)>,
     ) -> (Vec<Log>, Option<u64>, usize, HashSet<Address>) {
         let mut out = Vec::new();
         let mut decode_fail = 0usize;
@@ -245,12 +246,30 @@ impl<N, P> StateSpaceManager<N, P> {
             return (out, None, decode_fail, decode_failed_addresses);
         };
 
-        // Extract block timestamp from base.timestamp (hex-encoded, only in index-0)
-        let block_timestamp = fb
+        // Extract block timestamp from base.timestamp when present (typically index-0),
+        // then reuse/derive a block-level timestamp for following slices.
+        let base_timestamp = fb
             .base
             .as_ref()
             .and_then(|base| base.timestamp.as_deref())
             .and_then(Self::parse_hex_u64);
+        let block_timestamp = if let Some(ts) = base_timestamp {
+            *latest_block_timestamp = Some((block_number, ts));
+            Some(ts)
+        } else {
+            match *latest_block_timestamp {
+                Some((known_block, known_ts)) if block_number == known_block => Some(known_ts),
+                Some((known_block, known_ts)) if block_number > known_block => {
+                    // Fallback: when a newer flashblock arrives without base.timestamp,
+                    // estimate from the last known block timestamp at +2s per block.
+                    let delta_blocks = block_number - known_block;
+                    let estimated_ts = known_ts.saturating_add(delta_blocks.saturating_mul(2));
+                    *latest_block_timestamp = Some((block_number, estimated_ts));
+                    Some(estimated_ts)
+                }
+                _ => None,
+            }
+        };
 
         let Some(metadata) = fb.metadata.as_ref() else {
             return (
@@ -446,6 +465,7 @@ impl<N, P> StateSpaceManager<N, P> {
             let mut dedup_cache = FlashblocksDedupCache::new(FLASHBLOCKS_DEDUP_PAYLOAD_WINDOW);
             let mut parse_cache = FlashblocksParseCache::default();
             let mut flashblocks_decode_buf = Vec::with_capacity(64 * 1024);
+            let mut latest_block_timestamp: Option<(u64, u64)> = None;
 
             loop {
                 match Self::initial_backfill_results(
@@ -534,6 +554,7 @@ impl<N, P> StateSpaceManager<N, P> {
                         &matcher,
                         &mut dedup_cache,
                         &mut parse_cache,
+                        &mut latest_block_timestamp,
                     );
                     let block_num =
                         block_number.unwrap_or_else(|| realtime_head.load(Ordering::Relaxed));
