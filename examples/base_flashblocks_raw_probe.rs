@@ -50,7 +50,6 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 
 const BASE_CHAIN_ID: u64 = 8453;
 
-
 #[derive(Debug, Deserialize)]
 struct PoolRecord {
     #[serde(rename = "type")]
@@ -408,11 +407,18 @@ where
     N: alloy::network::Network,
 {
     let mut fee_modules = std::collections::HashSet::new();
-    let mut factory_cache: std::collections::HashMap<Address, Address> = std::collections::HashMap::new();
+    let mut factory_cache: std::collections::HashMap<Address, Address> =
+        std::collections::HashMap::new();
 
     for amm in amms {
-        let AMM::AerodromeSlipstreamPool(p) = amm else { continue };
-        let factory_addr = match ICLPool::new(p.address, provider.clone()).factory().call().await {
+        let AMM::AerodromeSlipstreamPool(p) = amm else {
+            continue;
+        };
+        let factory_addr = match ICLPool::new(p.address, provider.clone())
+            .factory()
+            .call()
+            .await
+        {
             Ok(addr) if addr != Address::ZERO => addr,
             _ => continue,
         };
@@ -420,7 +426,9 @@ where
             cached
         } else {
             let fm = ICLPoolFactory::new(factory_addr, provider.clone())
-                .swapFeeModule().call().await
+                .swapFeeModule()
+                .call()
+                .await
                 .unwrap_or(Address::ZERO);
             factory_cache.insert(factory_addr, fm);
             fm

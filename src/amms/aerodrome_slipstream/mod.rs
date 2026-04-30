@@ -23,7 +23,6 @@ mod test_sync_drift;
 pub use factory::{get_tick_spacing, AerodromeSlipstreamFactoryConfig};
 pub use pool::{
     AerodromeSlipstreamFactory, AerodromeSlipstreamPool, CurrentState, DynamicFeeConfig,
-    FeeModuleGlobals, ICLPool, ICLPoolEvents, ICLPoolFactory, ICLPoolWithObserve,
-    ICustomFeeModule, Observation, ObservationsCache, StepComputations, TickInfo,
-    FEE_MODULE_GLOBALS,
+    FeeModuleGlobals, ICLPool, ICLPoolEvents, ICLPoolFactory, ICLPoolWithObserve, ICustomFeeModule,
+    Observation, ObservationsCache, StepComputations, TickInfo, FEE_MODULE_GLOBALS,
 };

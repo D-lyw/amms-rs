@@ -73,17 +73,20 @@ async fn get_safe_test_blocks<P: Provider + Clone>(
     steps_behind: &[u64],
 ) -> eyre::Result<Vec<u64>> {
     let current = provider.get_block_number().await?;
-    Ok(steps_behind.iter().map(|s| current.saturating_sub(*s)).collect())
+    Ok(steps_behind
+        .iter()
+        .map(|s| current.saturating_sub(*s))
+        .collect())
 }
 
-async fn run_single_pool_precision_test(
-    pool_spec: &PoolSpec,
-    block: u64,
-) -> eyre::Result<()> {
+async fn run_single_pool_precision_test(pool_spec: &PoolSpec, block: u64) -> eyre::Result<()> {
     let rpc_url = match std::env::var(pool_spec.rpc_env) {
         Ok(url) => url,
         Err(_) => {
-            println!("  ⏭️ Skipping {}: {} not set", pool_spec.name, pool_spec.rpc_env);
+            println!(
+                "  ⏭️ Skipping {}: {} not set",
+                pool_spec.name, pool_spec.rpc_env
+            );
             return Ok(());
         }
     };
@@ -91,10 +94,7 @@ async fn run_single_pool_precision_test(
     let block_id = BlockId::from(block);
 
     // 1. Init pool at historical block
-    println!(
-        "  Initializing {} at block {}...",
-        pool_spec.name, block
-    );
+    println!("  Initializing {} at block {}...", pool_spec.name, block);
     let mut pool = CurveLegacyPool::new(pool_spec.address, pool_spec.pool_type)
         .init(block_id, provider.clone())
         .await?;
@@ -163,7 +163,9 @@ async fn run_single_pool_precision_test(
     if fee_diff_ratio >= 1e-10 {
         eyre::bail!(
             "Fee divergence too large! chain={}, local={}, ratio={}",
-            fee_chain, fee_local, fee_diff_ratio
+            fee_chain,
+            fee_local,
+            fee_diff_ratio
         );
     }
 
@@ -174,11 +176,7 @@ async fn run_single_pool_precision_test(
         let swap_i = 0;
         let swap_j = 1;
 
-        match pool.simulate_swap(
-            pool.coins[swap_i],
-            pool.coins[swap_j],
-            amount_in,
-        ) {
+        match pool.simulate_swap(pool.coins[swap_i], pool.coins[swap_j], amount_in) {
             Ok(local_out) => {
                 let onchain_out: U256 = contract
                     .get_dy(
@@ -215,13 +213,17 @@ async fn run_single_pool_precision_test(
                 if d_diff_ratio >= 1e-10 {
                     eyre::bail!(
                         "D divergence too large! chain={}, local={}, ratio={}",
-                        d_chain_u256, d_local_u256, d_diff_ratio
+                        d_chain_u256,
+                        d_local_u256,
+                        d_diff_ratio
                     );
                 }
                 if swap_diff_ratio >= 1e-6 {
                     eyre::bail!(
                         "Swap divergence too large! chain={}, local={}, ratio={}",
-                        onchain_out, local_out, swap_diff_ratio
+                        onchain_out,
+                        local_out,
+                        swap_diff_ratio
                     );
                 }
             }
@@ -248,7 +250,10 @@ async fn test_curve_legacy_recalculate_precision() -> eyre::Result<()> {
         let rpc_url = match std::env::var(pool_spec.rpc_env) {
             Ok(url) => url,
             Err(_) => {
-                println!("⏭️ Skipping {}: {} not set", pool_spec.name, pool_spec.rpc_env);
+                println!(
+                    "⏭️ Skipping {}: {} not set",
+                    pool_spec.name, pool_spec.rpc_env
+                );
                 continue;
             }
         };
@@ -260,7 +265,10 @@ async fn test_curve_legacy_recalculate_precision() -> eyre::Result<()> {
         {
             Ok(_) => ProviderBuilder::new().connect_http(rpc_url.parse()?),
             Err(e) => {
-                println!("⏭️ Skipping {}: RPC connection failed: {:?}", pool_spec.name, e);
+                println!(
+                    "⏭️ Skipping {}: RPC connection failed: {:?}",
+                    pool_spec.name, e
+                );
                 continue;
             }
         };
@@ -269,17 +277,17 @@ async fn test_curve_legacy_recalculate_precision() -> eyre::Result<()> {
         let blocks = match get_safe_test_blocks(&provider, &[100, 500, 2000]).await {
             Ok(b) => b,
             Err(e) => {
-                println!("⏭️ Skipping {}: cannot fetch blocks: {:?}", pool_spec.name, e);
+                println!(
+                    "⏭️ Skipping {}: cannot fetch blocks: {:?}",
+                    pool_spec.name, e
+                );
                 continue;
             }
         };
         println!("\nTesting {} at blocks: {:?}", pool_spec.name, blocks);
 
         for &block in &blocks {
-            println!(
-                "\n--- {} @ block {} ---",
-                pool_spec.name, block
-            );
+            println!("\n--- {} @ block {} ---", pool_spec.name, block);
             match run_single_pool_precision_test(pool_spec, block).await {
                 Ok(()) => {}
                 Err(e) => {

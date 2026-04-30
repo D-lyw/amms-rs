@@ -36,10 +36,16 @@ sol! {
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
-    let rpc = std::env::var("BASE_RPC_WS").unwrap_or_else(|_|
-        "wss://base-mainnet.core.chainstack.com/fc5f8eef2b27bee75a83ca6ab5a02634".to_string());
-    let provider = ProviderBuilder::new().connect_ws(WsConnect::new(rpc)).await?;
-    let addrs: Vec<Address> = POOLS.iter().map(|s| Address::from_str(s).unwrap()).collect();
+    let rpc = std::env::var("BASE_RPC_WS").unwrap_or_else(|_| {
+        "wss://base-mainnet.core.chainstack.com/fc5f8eef2b27bee75a83ca6ab5a02634".to_string()
+    });
+    let provider = ProviderBuilder::new()
+        .connect_ws(WsConnect::new(rpc))
+        .await?;
+    let addrs: Vec<Address> = POOLS
+        .iter()
+        .map(|s| Address::from_str(s).unwrap())
+        .collect();
     let mc3 = IMulticall3::new(MULTICALL3, provider.clone());
 
     // Step 1: Get slot0 for each pool
@@ -48,7 +54,13 @@ async fn main() -> eyre::Result<()> {
     let mut metas = Vec::new();
     for &addr in &addrs {
         let s0 = IPool::new(addr, provider.clone()).slot0().call().await?;
-        println!("  {}: card={} idx={} [{:?}]", addr, s0._3, s0._2, start.elapsed());
+        println!(
+            "  {}: card={} idx={} [{:?}]",
+            addr,
+            s0._3,
+            s0._2,
+            start.elapsed()
+        );
         metas.push((addr, s0._3, s0._2));
     }
 
@@ -62,8 +74,15 @@ async fn main() -> eyre::Result<()> {
         let count = (card as u16).min(1500);
         for j in 0..count {
             let sidx = (ridx as u64 + card as u64 - j as u64) % card as u64;
-            let calldata = IPool::observationsCall { index: U256::from(sidx) }.abi_encode();
-            calls.push(IMulticall3::Call3 { target: addr, allowFailure: true, callData: calldata.into() });
+            let calldata = IPool::observationsCall {
+                index: U256::from(sidx),
+            }
+            .abi_encode();
+            calls.push(IMulticall3::Call3 {
+                target: addr,
+                allowFailure: true,
+                callData: calldata.into(),
+            });
             call_meta.push((addr, card, ridx, j as usize));
         }
     }
@@ -72,21 +91,37 @@ async fn main() -> eyre::Result<()> {
     match mc3.aggregate3(calls).call().await {
         Ok(results) => {
             println!("  Got {} results in {:?}", results.len(), start.elapsed());
-            let mut pool_obs: std::collections::HashMap<Address, Vec<(u32, i128)>> = std::collections::HashMap::new();
+            let mut pool_obs: std::collections::HashMap<Address, Vec<(u32, i128)>> =
+                std::collections::HashMap::new();
             for (i, res) in results.iter().enumerate() {
-                if i >= call_meta.len() { break; }
-                if res.returnData.is_empty() { continue; }
-                if let Ok(dec) = <IPool::observationsCall as SolCall>::abi_decode_returns(&res.returnData) {
+                if i >= call_meta.len() {
+                    break;
+                }
+                if res.returnData.is_empty() {
+                    continue;
+                }
+                if let Ok(dec) =
+                    <IPool::observationsCall as SolCall>::abi_decode_returns(&res.returnData)
+                {
                     if dec.initialized && dec.blockTimestamp != 0 {
                         let tc: i128 = dec.tickCumulative.unchecked_into::<i64>() as i128;
-                        pool_obs.entry(call_meta[i].0).or_default().push((dec.blockTimestamp, tc));
+                        pool_obs
+                            .entry(call_meta[i].0)
+                            .or_default()
+                            .push((dec.blockTimestamp, tc));
                     }
                 }
             }
             for (addr, obs) in &pool_obs {
-                let min_ts = obs.iter().map(|(ts,_)| *ts).min().unwrap_or(0);
-                let max_ts = obs.iter().map(|(ts,_)| *ts).max().unwrap_or(0);
-                println!("  {}: {} observations, ts_range={}..{}", addr, obs.len(), min_ts, max_ts);
+                let min_ts = obs.iter().map(|(ts, _)| *ts).min().unwrap_or(0);
+                let max_ts = obs.iter().map(|(ts, _)| *ts).max().unwrap_or(0);
+                println!(
+                    "  {}: {} observations, ts_range={}..{}",
+                    addr,
+                    obs.len(),
+                    min_ts,
+                    max_ts
+                );
             }
         }
         Err(e) => println!("  FAILED: {:?}", e),

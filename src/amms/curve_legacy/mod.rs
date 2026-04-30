@@ -1180,15 +1180,44 @@ impl AutomatedMarketMaker for CurveLegacyPool {
         // === Auto-detect pool_type ===
         // Curve Registry 可能同时包含 StableSwap 和 CryptoSwap 池子，
         // 但 Factory 构造时只传入单一 pool_type，导致所有池子被赋予同一类型。
-        // 通过尝试调用 gamma() 来自动检测：CryptoSwap 池有 gamma()，StableSwap 没有。
-        if self.pool_type == CurveLegacyPoolType::StableSwap {
-            if let Ok(gamma_val) = pool.gamma().block(block_number).call().await {
-                tracing::info!(
-                    pool = ?self.address,
-                    gamma = ?gamma_val,
-                    "Auto-detected CryptoSwap pool (gamma() exists), overriding pool_type from StableSwap to CryptoSwap"
-                );
+        // 通过尝试调用 gamma() 自动纠偏：
+        // - gamma() 存在 => CryptoSwap
+        // - gamma() revert/不存在 => StableSwap
+        // 这样可以同时修正 Stable->Crypto 和 Crypto->Stable 的误分类。
+        match pool.gamma().block(block_number).call().await {
+            Ok(gamma_val) => {
+                if self.pool_type != CurveLegacyPoolType::CryptoSwap {
+                    tracing::info!(
+                        pool = ?self.address,
+                        gamma = ?gamma_val,
+                        "Auto-detected CryptoSwap pool (gamma() exists), overriding pool_type to CryptoSwap"
+                    );
+                }
                 self.pool_type = CurveLegacyPoolType::CryptoSwap;
+            }
+            Err(e) => {
+                let err_text = e.to_string().to_ascii_lowercase();
+                let is_revert_like = err_text.contains("execution reverted")
+                    || err_text.contains("reverted")
+                    || err_text.contains("revert");
+
+                if is_revert_like {
+                    if self.pool_type != CurveLegacyPoolType::StableSwap {
+                        tracing::info!(
+                            pool = ?self.address,
+                            error = %e,
+                            "Auto-detected StableSwap pool (gamma() reverted/missing), overriding pool_type to StableSwap"
+                        );
+                    }
+                    self.pool_type = CurveLegacyPoolType::StableSwap;
+                } else {
+                    tracing::warn!(
+                        pool = ?self.address,
+                        error = %e,
+                        pool_type = ?self.pool_type,
+                        "gamma() probe failed with non-revert error, keeping existing pool_type"
+                    );
+                }
             }
         }
 

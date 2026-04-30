@@ -45,8 +45,7 @@ async fn main() -> eyre::Result<()> {
     dotenv::dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -222,12 +221,10 @@ async fn main() -> eyre::Result<()> {
 
         // Extract block_number from metadata or base
         let block_number_from_meta = raw_value["metadata"]["block_number"].as_u64();
-        let block_number_from_base = raw_value["base"]["block_number"]
-            .as_str()
-            .and_then(|s| {
-                let s = s.strip_prefix("0x").unwrap_or(s);
-                u64::from_str_radix(s, 16).ok()
-            });
+        let block_number_from_base = raw_value["base"]["block_number"].as_str().and_then(|s| {
+            let s = s.strip_prefix("0x").unwrap_or(s);
+            u64::from_str_radix(s, 16).ok()
+        });
         let Some(block_number) = block_number_from_meta.or(block_number_from_base) else {
             continue;
         };
@@ -236,12 +233,10 @@ async fn main() -> eyre::Result<()> {
         seen_blocks.entry(block_number).or_default().push(index);
 
         // Extract base.timestamp (present in all messages with "base" field)
-        let fb_timestamp = raw_value["base"]["timestamp"]
-            .as_str()
-            .and_then(|s| {
-                let s = s.strip_prefix("0x").unwrap_or(s);
-                u64::from_str_radix(s, 16).ok()
-            });
+        let fb_timestamp = raw_value["base"]["timestamp"].as_str().and_then(|s| {
+            let s = s.strip_prefix("0x").unwrap_or(s);
+            u64::from_str_radix(s, 16).ok()
+        });
 
         if let Some(ts) = fb_timestamp {
             if index == 0 {
@@ -264,10 +259,8 @@ async fn main() -> eyre::Result<()> {
                     .iter()
                     .find(|pb| pb.block_number == block_number)
                     .or_else(|| {
-                        guard
-                            .results
-                            .get(&block_number)
-                            .map(|_| unreachable!()) // won't happen for current block
+                        guard.results.get(&block_number).map(|_| unreachable!())
+                        // won't happen for current block
                     });
 
                 // Even simpler: just log it
@@ -367,7 +360,10 @@ async fn main() -> eyre::Result<()> {
 
     println!("\n  VERDICT:");
     if mismatched == 0 && matched > 0 {
-        println!("    ✓ base.timestamp == canonical block timestamp ({} blocks)", matched);
+        println!(
+            "    ✓ base.timestamp == canonical block timestamp ({} blocks)",
+            matched
+        );
         println!("    ✓ All flashblock slices within a block share the same timestamp");
     } else if mismatched > 0 {
         println!(
@@ -376,7 +372,11 @@ async fn main() -> eyre::Result<()> {
             matched + mismatched
         );
     } else {
-        println!("    ? Insufficient data ({} pending, {} verified)", guard.pending.len(), guard.results.len());
+        println!(
+            "    ? Insufficient data ({} pending, {} verified)",
+            guard.pending.len(),
+            guard.results.len()
+        );
     }
     println!("========================================");
 

@@ -112,17 +112,20 @@ async fn get_safe_test_blocks<P: Provider + Clone>(
     steps_behind: &[u64],
 ) -> eyre::Result<Vec<u64>> {
     let current = provider.get_block_number().await?;
-    Ok(steps_behind.iter().map(|s| current.saturating_sub(*s)).collect())
+    Ok(steps_behind
+        .iter()
+        .map(|s| current.saturating_sub(*s))
+        .collect())
 }
 
-async fn run_single_pool_precision_test(
-    pool_spec: &PoolSpec,
-    block: u64,
-) -> eyre::Result<()> {
+async fn run_single_pool_precision_test(pool_spec: &PoolSpec, block: u64) -> eyre::Result<()> {
     let rpc_url = match std::env::var(pool_spec.rpc_env) {
         Ok(url) => url,
         Err(_) => {
-            println!("  ⏭️ Skipping {}: {} not set", pool_spec.name, pool_spec.rpc_env);
+            println!(
+                "  ⏭️ Skipping {}: {} not set",
+                pool_spec.name, pool_spec.rpc_env
+            );
             return Ok(());
         }
     };
@@ -148,7 +151,11 @@ async fn run_single_pool_precision_test(
     pool.recalculate_d()?;
     let d_local = pool.d.unwrap_or(U256::ZERO);
 
-    let d_diff = if d_chain > d_local { d_chain - d_local } else { d_local - d_chain };
+    let d_diff = if d_chain > d_local {
+        d_chain - d_local
+    } else {
+        d_local - d_chain
+    };
     let d_diff_ratio = if d_chain.is_zero() {
         0.0
     } else {
@@ -158,13 +165,18 @@ async fn run_single_pool_precision_test(
 
     println!(
         "    D: chain={}, local={}, diff_ratio={:.12}, passed={}",
-        d_chain, d_local, d_diff_ratio, d_diff_ratio < 1e-10
+        d_chain,
+        d_local,
+        d_diff_ratio,
+        d_diff_ratio < 1e-10
     );
 
     if d_diff_ratio >= 1e-10 {
         eyre::bail!(
             "D divergence too large! chain={}, local={}, ratio={}",
-            d_chain, d_local, d_diff_ratio
+            d_chain,
+            d_local,
+            d_diff_ratio
         );
     }
 
@@ -177,12 +189,20 @@ async fn run_single_pool_precision_test(
         match pool.simulate_swap(pool.coins[swap_i], pool.coins[swap_j], amount_in) {
             Ok(local_out) => {
                 let onchain_out: U256 = contract
-                    .get_dy(U256::from(swap_i as u64), U256::from(swap_j as u64), amount_in)
+                    .get_dy(
+                        U256::from(swap_i as u64),
+                        U256::from(swap_j as u64),
+                        amount_in,
+                    )
                     .block(block_id)
                     .call()
                     .await?;
 
-                let swap_diff = if local_out > onchain_out { local_out - onchain_out } else { onchain_out - local_out };
+                let swap_diff = if local_out > onchain_out {
+                    local_out - onchain_out
+                } else {
+                    onchain_out - local_out
+                };
                 let swap_diff_ratio = if onchain_out.is_zero() {
                     0.0
                 } else {
@@ -198,7 +218,9 @@ async fn run_single_pool_precision_test(
                 if swap_diff_ratio >= 1e-6 {
                     eyre::bail!(
                         "Swap divergence too large! chain={}, local={}, ratio={}",
-                        onchain_out, local_out, swap_diff_ratio
+                        onchain_out,
+                        local_out,
+                        swap_diff_ratio
                     );
                 }
             }
@@ -225,7 +247,10 @@ async fn test_curve_ng_recalculate_precision() -> eyre::Result<()> {
         let rpc_url = match std::env::var(pool_spec.rpc_env) {
             Ok(url) => url,
             Err(_) => {
-                println!("⏭️ Skipping {}: {} not set", pool_spec.name, pool_spec.rpc_env);
+                println!(
+                    "⏭️ Skipping {}: {} not set",
+                    pool_spec.name, pool_spec.rpc_env
+                );
                 continue;
             }
         };
@@ -237,7 +262,10 @@ async fn test_curve_ng_recalculate_precision() -> eyre::Result<()> {
         {
             Ok(_) => ProviderBuilder::new().connect_http(rpc_url.parse()?),
             Err(e) => {
-                println!("⏭️ Skipping {}: RPC connection failed: {:?}", pool_spec.name, e);
+                println!(
+                    "⏭️ Skipping {}: RPC connection failed: {:?}",
+                    pool_spec.name, e
+                );
                 continue;
             }
         };
@@ -245,7 +273,10 @@ async fn test_curve_ng_recalculate_precision() -> eyre::Result<()> {
         let blocks = match get_safe_test_blocks(&provider, &[100, 500, 2000]).await {
             Ok(b) => b,
             Err(e) => {
-                println!("⏭️ Skipping {}: cannot fetch blocks: {:?}", pool_spec.name, e);
+                println!(
+                    "⏭️ Skipping {}: cannot fetch blocks: {:?}",
+                    pool_spec.name, e
+                );
                 continue;
             }
         };
@@ -257,8 +288,10 @@ async fn test_curve_ng_recalculate_precision() -> eyre::Result<()> {
                 Ok(()) => {}
                 Err(e) => {
                     let msg = e.to_string();
-                    if msg.contains("not found") || msg.contains("invalid block")
-                        || msg.contains("connection") || msg.contains("send request")
+                    if msg.contains("not found")
+                        || msg.contains("invalid block")
+                        || msg.contains("connection")
+                        || msg.contains("send request")
                     {
                         println!("  ⏭️ Skipping (connection/block issue): {:?}", e);
                         continue;
