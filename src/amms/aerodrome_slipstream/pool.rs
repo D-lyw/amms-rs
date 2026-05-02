@@ -716,7 +716,7 @@ impl AutomatedMarketMaker for AerodromeSlipstreamPool {
                     );
                 }
 
-                // Observation write + fee recompute BEFORE updating tick (contract uses pre-swap tick)
+                // Observation write uses pre-swap tick, matching pool oracle accumulation semantics.
                 let pre_tick = self.tick;
                 let new_blk =
                     log.block_number.unwrap_or(0) > self.observations_cache.last_write_block;
@@ -729,13 +729,13 @@ impl AutomatedMarketMaker for AerodromeSlipstreamPool {
                         );
                     }
                 }
-                if let Some(bt) = log.block_timestamp {
-                    self.fee = self.compute_fee(bt as u32);
-                }
-
                 self.sqrt_price = swap_event.sqrtPriceX96.to();
                 self.liquidity = swap_event.liquidity;
                 self.tick = tick_after;
+                if let Some(bt) = log.block_timestamp {
+                    // Keep cached fee aligned with post-swap pool state (slot0.tick after swap).
+                    self.fee = self.compute_fee(bt as u32);
+                }
 
                 if let Ok(p) = self.calculate_price(self.token_a.address, self.token_b.address) {
                     self.token_a_price = p;

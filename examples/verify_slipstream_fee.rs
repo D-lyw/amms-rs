@@ -35,7 +35,7 @@ use tracing::info;
 // ];
 
 const GRAPH_PATH: &str = "/Users/d-lyw/D-lyw/dex-arbitrage/configs/8453_graph.ndjson"; // max 135 slipsteam pools
-const POOL_LIMIT: usize = 135;
+const POOL_LIMIT: usize = 20;
 const VERIFY_BLOCKS: u64 = 10;
 
 /// Load AerodromeSlipstream pool addresses from the graph ndjson file

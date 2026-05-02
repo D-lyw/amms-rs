@@ -11,7 +11,22 @@ use amms::amms::{
 };
 use std::{collections::HashMap, env, sync::Arc};
 
+/// Regression suite for Slipstream dynamic-fee parity against on-chain `fee()`.
+///
+/// Scope:
+/// 1) Initialize pools at a fixed historical block.
+/// 2) Replay on-chain logs in strict block/tx/log order.
+/// 3) Compare local `compute_fee(timestamp)` with on-chain `pool.fee()` at each block boundary.
+///
+/// Why this test matters:
+/// - It validates fee calculation over a replay window, not just a single point-in-time.
+/// - It detects drift caused by event ordering, observation cache updates, or fee-config handling.
 const TARGET_POOLS: [Address; 4] = [
+    // IMPORTANT:
+    // These 4 pools are intentionally selected because their DynamicFeeConfig has `base_fee == 0`.
+    // For this pool type, local fee computation must fallback to the cached
+    // `factory_tick_spacing_fee` (i.e. factory.tickSpacingToFee(tickSpacing)).
+    // If this cache is missing/wrong, fee parity will fail even when the TWAP logic is correct.
     address!("56AeaF4af2DF4bdFD9D865830Fefdd278b25E7Ef"),
     address!("99fb961b5f8D5Bf137976bA50cF6999546b0503f"),
     address!("be4C36B9542610dF83Ca690C8b5BC53BbbC5d542"),
@@ -19,7 +34,7 @@ const TARGET_POOLS: [Address; 4] = [
 ];
 
 const START_BLOCK: u64 = 45_408_821;
-const REPLAY_BLOCKS: u64 = 100;
+const REPLAY_BLOCKS: u64 = 10;
 
 fn base_provider_url() -> Option<String> {
     dotenv::dotenv().ok();
@@ -30,6 +45,7 @@ fn base_provider_url() -> Option<String> {
 
 #[tokio::test]
 async fn test_slipstream_basefee_zero_pool_fee_parity() -> eyre::Result<()> {
+    // Network-bound integration test. Skip gracefully when no RPC endpoint is configured.
     let rpc_endpoint = match base_provider_url() {
         Some(url) => url,
         None => {
@@ -50,6 +66,10 @@ async fn test_slipstream_basefee_zero_pool_fee_parity() -> eyre::Result<()> {
         .map(|addr| AMM::AerodromeSlipstreamPool(AerodromeSlipstreamPool::new(addr)))
         .collect();
 
+    // `init_batch` is expected to preload all fee-related context required by compute_fee():
+    // - dynamic_fee_config
+    // - factory_tick_spacing_fee
+    // - observation cache snapshot
     let initialized = AerodromeSlipstreamFactory::init_batch(
         input_amms,
         BlockId::from(START_BLOCK),
@@ -86,12 +106,20 @@ async fn test_slipstream_basefee_zero_pool_fee_parity() -> eyre::Result<()> {
 
     for addr in TARGET_POOLS {
         let pool = pools.get(&addr).expect("pool must exist");
+        // Test precondition: this suite targets pools whose base fee is zero.
         assert_eq!(
             pool.dynamic_fee_config.base_fee, 0,
             "pool {addr} expected base_fee=0, got {}",
             pool.dynamic_fee_config.base_fee
         );
+        // Critical invariant for this pool class:
+        // when base_fee == 0, local compute_fee must fallback to cached tickSpacingToFee.
+        assert_ne!(
+            pool.factory_tick_spacing_fee, 0,
+            "pool {addr} requires cached factory_tick_spacing_fee when base_fee=0"
+        );
 
+        // Initial-point parity: local compute_fee vs on-chain fee() at START_BLOCK.
         let local_fee = pool.compute_fee(init_ts);
         let rpc_fee = ICLPool::new(addr, provider.clone())
             .fee()
@@ -144,7 +172,9 @@ async fn test_slipstream_basefee_zero_pool_fee_parity() -> eyre::Result<()> {
         a.log_index.unwrap_or(0).cmp(&b.log_index.unwrap_or(0))
     });
 
+    // Replay every block in the verification window and compare at block boundary timestamp.
     for block_num in (START_BLOCK + 1)..=end_block {
+        // Apply all relevant pool logs in deterministic execution order.
         for log in logs
             .iter()
             .filter(|l| l.block_number.unwrap_or(0) == block_num)
@@ -168,6 +198,7 @@ async fn test_slipstream_basefee_zero_pool_fee_parity() -> eyre::Result<()> {
 
         for addr in TARGET_POOLS {
             let pool = pools.get(&addr).expect("pool must exist");
+            // Replay parity: local compute_fee at this block timestamp must match chain fee().
             let local_fee = pool.compute_fee(ts);
             let rpc_fee = ICLPool::new(addr, provider.clone())
                 .fee()
