@@ -490,8 +490,7 @@ pub async fn start_slipstream_fee_config_sync_task<N, P>(
             match batch_result {
                 Ok(data) => {
                     use alloy::sol_types::SolType;
-                    type FeeConfigDataArray =
-                        sol!( (address, address, uint24, uint24, uint64, bool, uint24)[] );
+                    type FeeConfigDataArray = sol!((address, address, bool, bool, bool, bool, bool, int24, uint24, uint24, uint24, uint64, bool, uint24)[]);
                     if let Ok(decoded) = FeeConfigDataArray::abi_decode(&data) {
                         let mut write_guard = state.write().await;
                         for (i, fcd) in decoded.iter().enumerate() {
@@ -499,16 +498,46 @@ pub async fn start_slipstream_fee_config_sync_task<N, P>(
                                 break;
                             }
                             let pool_addr = chunk[i];
-                            if fcd.1 != Address::ZERO {
-                                // feeModule != Address::ZERO
-                                if let Some(amm) = write_guard.get_mut_cow(&pool_addr) {
-                                    if let AMM::AerodromeSlipstreamPool(pool) = amm {
+                            if let Some(amm) = write_guard.get_mut_cow(&pool_addr) {
+                                if let AMM::AerodromeSlipstreamPool(pool) = amm {
+                                    // Periodic task is best-effort:
+                                    // update only fields explicitly marked successful by batch contract.
+                                    // fcd layout:
+                                    // (factory, feeModule, factoryOk, tickSpacingOk, tickSpacingFeeOk, feeModuleOk, dynamicFeeConfigOk, tickSpacing, tickSpacingFee, baseFee, feeCap, scalingFactor, initialFeeEnabled, initialFee)
+                                    if !fcd.2
+                                        || !fcd.3
+                                        || fcd.0 == Address::ZERO
+                                        || fcd.7.as_i32() == 0
+                                    {
+                                        tracing::warn!(
+                                            target: "state_space::slipstream_fee_config_sync",
+                                            pool = ?pool_addr,
+                                            factory = ?fcd.0,
+                                            tick_spacing = fcd.7.as_i32(),
+                                            "partial fee-context fetch detected; skipping this pool update and preserving cached values"
+                                        );
+                                        continue;
+                                    }
+
+                                    pool.tick_spacing = fcd.7.as_i32();
+                                    if fcd.4 && fcd.8.to::<u32>() != 0 {
+                                        pool.factory_tick_spacing_fee = fcd.8.to::<u32>();
+                                    } else {
+                                        tracing::warn!(
+                                            target: "state_space::slipstream_fee_config_sync",
+                                            pool = ?pool_addr,
+                                            tick_spacing = pool.tick_spacing,
+                                            "tickSpacingToFee missing in this sync round; preserving previous cached mapping"
+                                        );
+                                    }
+                                    if fcd.5 && fcd.6 && fcd.1 != Address::ZERO {
+                                        // feeModule != Address::ZERO
                                         pool.dynamic_fee_config = DynamicFeeConfig {
-                                            base_fee: fcd.2.to::<u32>(),
-                                            fee_cap: fcd.3.to::<u32>(),
-                                            scaling_factor: fcd.4,
-                                            initial_fee_enabled: fcd.5,
-                                            initial_fee: fcd.6.to::<u32>(),
+                                            base_fee: fcd.9.to::<u32>(),
+                                            fee_cap: fcd.10.to::<u32>(),
+                                            scaling_factor: fcd.11,
+                                            initial_fee_enabled: fcd.12,
+                                            initial_fee: fcd.13.to::<u32>(),
                                         };
                                     }
                                 }

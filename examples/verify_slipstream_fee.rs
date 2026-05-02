@@ -34,9 +34,9 @@ use tracing::info;
 //     "0xC200F21EfE67c7F41B81A854c26F9cdA80593065",
 // ];
 
-const GRAPH_PATH: &str = "/Users/d-lyw/D-lyw/dex-arbitrage/configs/8453_graph.ndjson";
-const POOL_LIMIT: usize = 15;
-const VERIFY_BLOCKS: u64 = 30;
+const GRAPH_PATH: &str = "/Users/d-lyw/D-lyw/dex-arbitrage/configs/8453_graph.ndjson"; // max 135 slipsteam pools
+const POOL_LIMIT: usize = 135;
+const VERIFY_BLOCKS: u64 = 10;
 
 /// Load AerodromeSlipstream pool addresses from the graph ndjson file
 fn load_slipstream_pools(path: &str, limit: usize) -> Vec<Address> {
@@ -80,7 +80,7 @@ async fn main() -> eyre::Result<()> {
         pool_addrs.len()
     );
 
-    let start_block: u64 = 45_278_200;
+    let start_block: u64 = 45_408_820;
     let end_block = start_block + VERIFY_BLOCKS;
     info!(
         "Initializing at block {start_block}, verifying blocks {} to {end_block}",

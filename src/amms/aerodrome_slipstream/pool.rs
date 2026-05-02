@@ -150,6 +150,7 @@ sol! {
     #[sol(rpc)]
     contract ICLPoolFactory {
         function swapFeeModule() external view returns (address);
+        function tickSpacingToFee(int24 tickSpacing) external view returns (uint24);
 
         event PoolCreated(
             address indexed token0,
@@ -261,6 +262,9 @@ pub struct AerodromeSlipstreamPool {
     pub observations_cache: ObservationsCache,
     #[serde(default)]
     pub dynamic_fee_config: DynamicFeeConfig,
+    /// Cached on-chain factory.tickSpacingToFee(tickSpacing) used when base_fee == 0
+    #[serde(default)]
+    pub factory_tick_spacing_fee: u32,
 }
 
 /// Tick information for concentrated liquidity
@@ -421,20 +425,6 @@ pub fn get_fee_module_globals() -> FeeModuleGlobals {
     }
 }
 
-/// Static fallback for factory.tickSpacingToFee() when baseFee is 0.
-/// These match CLFactory deployment defaults. Note: on-chain this is a dynamic
-/// mapping that can be updated via enableTickSpacing(), so these may drift.
-fn tick_spacing_to_default_fee(tick_spacing: i32) -> u32 {
-    match tick_spacing {
-        1 => 100,       // TICK_SPACING_STABLE
-        50 => 500,      // TICK_SPACING_LOW
-        100 => 500,     // TICK_SPACING_MEDIUM
-        200 => 3_000,   // TICK_SPACING_HIGH
-        2000 => 10_000, // TICK_SPACING_VOLATILE
-        _ => 3_000,
-    }
-}
-
 /// Current state during swap simulation
 pub struct CurrentState {
     pub amount_specified_remaining: I256,
@@ -465,20 +455,59 @@ impl AerodromeSlipstreamPool {
         }
     }
 
+    /// Off-chain mirror of Slipstream `DynamicSwapFeeModule.getFee(pool)`.
+    ///
+    /// https://github.com/aerodrome-finance/slipstream
+    /// 
+    /// On-chain reference:
+    /// - `contracts/core/fees/DynamicSwapFeeModule.sol::getFee`
+    /// - `contracts/core/fees/DynamicSwapFeeModule.sol::_getDynamicFee`
+    ///
+    /// Execution flow (same branch order as contract):
+    /// 1) `baseFee == ZERO_FEE_INDICATOR` => explicit 0 fee.
+    /// 2) `baseFee != 0` => use `baseFee`; otherwise use factory `tickSpacingToFee`.
+    /// 3) if `initialFeeEnabled` and no observation written in this block yet:
+    ///    - `initialFee == 0` => use base fee
+    ///    - `initialFee == ZERO_FEE_INDICATOR` => 0
+    ///    - otherwise => use `initialFee`
+    /// 4) choose `(scalingFactor, feeCap)`:
+    ///    - pool-level values when `scaling_factor != 0`
+    ///    - module defaults when `scaling_factor == 0`
+    /// 5) if observation cardinality is insufficient for `secondsAgo`, dynamic part is 0.
+    /// 6) dynamic fee = `abs(currentTick - twapTick) * scalingFactor / 1e6`, then cap by `feeCap`.
+    ///
+    /// Intentional off-chain differences:
+    /// - Discount by `discounted[tx.origin]` is not modeled here because local state stores a
+    ///   pool-level canonical fee, while discount is caller-specific on-chain.
     pub fn compute_fee(&self, block_timestamp: u32) -> u32 {
         if !self.observations_cache.seeded {
             return self.fee;
         }
         let dfc = &self.dynamic_fee_config;
         let globals = get_fee_module_globals();
+        // (1) Explicit zero-fee override (`420`).
         if dfc.base_fee == ZERO_FEE_INDICATOR {
             return 0;
         }
+        // (2) Base fee selection:
+        // - custom base fee if set
+        // - otherwise factory tickSpacingToFee mapping (cached at init/sync)
         let base_fee = if dfc.base_fee != 0 {
             dfc.base_fee as u64
+        } else if self.factory_tick_spacing_fee != 0 {
+            self.factory_tick_spacing_fee as u64
         } else {
-            tick_spacing_to_default_fee(self.tick_spacing) as u64
+            tracing::error!(
+                target: "amms::aerodrome_slipstream::compute_fee",
+                address = ?self.address,
+                tick_spacing = self.tick_spacing,
+                "base_fee=0 but factory_tick_spacing_fee is missing; preserving current fee"
+            );
+            return self.fee;
         };
+        // (3) Initial-fee gate:
+        // when enabled and current block has not written an observation yet,
+        // return initial fee branch instead of normal dynamic formula.
         if dfc.initial_fee_enabled {
             let last_obs_ts = self.observations_cache.last().map(|o| o.block_timestamp);
             if last_obs_ts != Some(block_timestamp) {
@@ -491,6 +520,9 @@ impl AerodromeSlipstreamPool {
                 return dfc.initial_fee;
             }
         }
+        // (4) Parameter source:
+        // - pool override if scaling_factor != 0
+        // - module defaults otherwise
         let (scaling_factor, fee_cap) = if dfc.scaling_factor != 0 {
             (dfc.scaling_factor as u64, dfc.fee_cap as u64)
         } else {
@@ -500,6 +532,7 @@ impl AerodromeSlipstreamPool {
             )
         };
 
+        // (5) Match on-chain guard: not enough oracle slots => no dynamic component.
         if (self.observations_cache.cardinality as u32) < globals.seconds_ago / MIN_SECONDS_AGO {
             return base_fee as u32;
         }
@@ -507,6 +540,7 @@ impl AerodromeSlipstreamPool {
         if !self.observations_cache.seeded {
             return base_fee as u32;
         }
+        // (6) Dynamic component from tick delta vs TWAP tick.
         match self.compute_twap_tick(block_timestamp, globals.seconds_ago) {
             Ok(twap_tick) => {
                 let tick_delta = (self.tick as i64 - twap_tick as i64).unsigned_abs();
@@ -1440,6 +1474,21 @@ impl AutomatedMarketMaker for AerodromeSlipstreamPool {
             .call()
             .await
             .map_err(|e| AMMError::Msg(format!("factory fetch failed: {:?}", e)))?;
+        let ts_i24 = Signed::<24, 1>::try_from(pool_struct.tick_spacing).map_err(|_| {
+            AMMError::Msg(format!(
+                "invalid tick_spacing for int24: {}",
+                pool_struct.tick_spacing
+            ))
+        })?;
+        let factory_tick_spacing_fee = ICLPoolFactory::new(fact, provider.clone())
+            .tickSpacingToFee(ts_i24)
+            .block(block_number)
+            .call()
+            .await
+            .map_err(|e| AMMError::Msg(format!("tickSpacingToFee fetch failed: {:?}", e)))?
+            .to::<u32>();
+        pool_struct.factory_tick_spacing_fee = factory_tick_spacing_fee;
+
         let fm = ICLPoolFactory::new(fact, provider.clone())
             .swapFeeModule()
             .block(block_number)
@@ -1460,6 +1509,13 @@ impl AutomatedMarketMaker for AerodromeSlipstreamPool {
                 initial_fee_enabled: dfc.initialFeeEnabled,
                 initial_fee: dfc.initialFee.to::<u32>(),
             };
+        }
+
+        if pool_struct.dynamic_fee_config.base_fee == 0 && pool_struct.factory_tick_spacing_fee == 0
+        {
+            return Err(AMMError::Msg(
+                "base_fee=0 but factory tickSpacingToFee mapping missing".to_string(),
+            ));
         }
 
         // ── Observations via Multicall3 ──
@@ -2334,13 +2390,9 @@ impl AerodromeSlipstreamFactory {
 
         let pool_addrs: Vec<Address> = amms.iter().map(|a| a.address()).collect();
 
-        // Batch-fetch factory + swapFeeModule + dynamicFeeConfig via batch contract.
-        // Chunk to avoid constructor return payload exceeding EVM code size limit.
+        // Strict fee-context fetch for every pool.
+        // Requirement: init/batch_init must fail immediately on partial retrieval failures.
         {
-            use alloy::sol_types::SolType;
-            type FeeConfigDataArray =
-                sol!((address, address, uint24, uint24, uint64, bool, uint24)[]);
-
             let addr_to_idx: HashMap<Address, usize> = amms
                 .iter()
                 .enumerate()
@@ -2348,115 +2400,98 @@ impl AerodromeSlipstreamFactory {
                 .collect();
 
             for chunk in pool_addrs.chunks(SLIPSTREAM_FEE_CONFIG_BATCH_STEP) {
-                let chunk_addrs = chunk.to_vec();
-                let mut need_fallback = false;
+                for &pool_addr in chunk {
+                    let Some(&amm_idx) = addr_to_idx.get(&pool_addr) else {
+                        return Err(AMMError::Msg(format!(
+                            "pool index missing during fee-context init: {}",
+                            pool_addr
+                        )));
+                    };
+                    let AMM::AerodromeSlipstreamPool(ref mut p) = amms[amm_idx] else {
+                        continue;
+                    };
 
-                match GetAerodromeSlipstreamFeeConfigBatchRequest::deploy_builder(
-                    provider.clone(),
-                    chunk_addrs.clone(),
-                )
-                .block(block_number)
-                .call_raw()
-                .await
-                {
-                    Ok(data) => match FeeConfigDataArray::abi_decode(&data) {
-                        Ok(decoded) => {
-                            if decoded.len() != chunk_addrs.len() {
-                                tracing::warn!(
-                                    target = "amms::aerodrome_slipstream::init_batch",
-                                    expected = chunk_addrs.len(),
-                                    got = decoded.len(),
-                                    "FeeConfig batch length mismatch; using per-pool fallback for this chunk"
-                                );
-                                need_fallback = true;
-                            } else {
-                                for (i, fcd) in decoded.iter().enumerate() {
-                                    if i >= chunk_addrs.len() {
-                                        break;
-                                    }
-                                    let pool_addr = chunk_addrs[i];
-                                    let Some(&amm_idx) = addr_to_idx.get(&pool_addr) else {
-                                        continue;
-                                    };
-                                    let AMM::AerodromeSlipstreamPool(ref mut p) = amms[amm_idx]
-                                    else {
-                                        continue;
-                                    };
-
-                                    // fcd: (factory, feeModule, baseFee, feeCap, scalingFactor, initialFeeEnabled, initialFee)
-                                    if fcd.1 != Address::ZERO {
-                                        p.dynamic_fee_config = DynamicFeeConfig {
-                                            base_fee: fcd.2.to::<u32>(),
-                                            fee_cap: fcd.3.to::<u32>(),
-                                            scaling_factor: fcd.4,
-                                            initial_fee_enabled: fcd.5,
-                                            initial_fee: fcd.6.to::<u32>(),
-                                        };
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                target = "amms::aerodrome_slipstream::init_batch",
-                                error = ?e,
-                                chunk_size = chunk_addrs.len(),
-                                "FeeConfig batch decode failed; using per-pool fallback for this chunk"
-                            );
-                            need_fallback = true;
-                        }
-                    },
-                    Err(e) => {
-                        tracing::warn!(
-                            target = "amms::aerodrome_slipstream::init_batch",
-                            error = ?e,
-                            chunk_size = chunk_addrs.len(),
-                            "FeeConfig batch call failed; using per-pool fallback for this chunk"
-                        );
-                        need_fallback = true;
+                    let fact = ICLPool::new(p.address, provider.clone())
+                        .factory()
+                        .block(block_number)
+                        .call()
+                        .await
+                        .map_err(|e| {
+                            AMMError::Msg(format!(
+                                "strict fee-context fetch failed: factory call failed for pool {}: {:?}",
+                                p.address, e
+                            ))
+                        })?;
+                    if fact == Address::ZERO {
+                        return Err(AMMError::Msg(format!(
+                            "strict fee-context fetch failed: factory is zero for pool {}",
+                            p.address
+                        )));
                     }
-                }
 
-                if need_fallback {
-                    for &pool_addr in chunk {
-                        let Some(&amm_idx) = addr_to_idx.get(&pool_addr) else {
-                            continue;
-                        };
-                        let AMM::AerodromeSlipstreamPool(ref mut p) = amms[amm_idx] else {
-                            continue;
-                        };
+                    let ts_i24 = Signed::<24, 1>::try_from(p.tick_spacing).map_err(|_| {
+                        AMMError::Msg(format!(
+                            "strict fee-context fetch failed: invalid tick_spacing {} for pool {}",
+                            p.tick_spacing, p.address
+                        ))
+                    })?;
+                    let ts_fee = ICLPoolFactory::new(fact, provider.clone())
+                        .tickSpacingToFee(ts_i24)
+                        .block(block_number)
+                        .call()
+                        .await
+                        .map_err(|e| {
+                            AMMError::Msg(format!(
+                                "strict fee-context fetch failed: tickSpacingToFee call failed for pool {}: {:?}",
+                                p.address, e
+                            ))
+                        })?
+                        .to::<u32>();
+                    if ts_fee == 0 {
+                        return Err(AMMError::Msg(format!(
+                            "strict fee-context fetch failed: tickSpacingToFee returned 0 for pool {}",
+                            p.address
+                        )));
+                    }
+                    p.factory_tick_spacing_fee = ts_fee;
 
-                        if let Ok(fact) = ICLPool::new(p.address, provider.clone())
-                            .factory()
+                    let fm = ICLPoolFactory::new(fact, provider.clone())
+                        .swapFeeModule()
+                        .block(block_number)
+                        .call()
+                        .await
+                        .map_err(|e| {
+                            AMMError::Msg(format!(
+                                "strict fee-context fetch failed: swapFeeModule call failed for pool {}: {:?}",
+                                p.address, e
+                            ))
+                        })?;
+                    if fm != Address::ZERO {
+                        let dfc = IDynamicFeeModuleReader::new(fm, provider.clone())
+                            .dynamicFeeConfig(p.address)
                             .block(block_number)
                             .call()
                             .await
-                        {
-                            if let Ok(fm) = ICLPoolFactory::new(fact, provider.clone())
-                                .swapFeeModule()
-                                .block(block_number)
-                                .call()
-                                .await
-                            {
-                                if fm != Address::ZERO {
-                                    if let Ok(dfc) =
-                                        IDynamicFeeModuleReader::new(fm, provider.clone())
-                                            .dynamicFeeConfig(p.address)
-                                            .block(block_number)
-                                            .call()
-                                            .await
-                                    {
-                                        p.dynamic_fee_config = DynamicFeeConfig {
-                                            base_fee: dfc.baseFee.to::<u32>(),
-                                            fee_cap: dfc.feeCap.to::<u32>(),
-                                            scaling_factor: dfc.scalingFactor,
-                                            initial_fee_enabled: dfc.initialFeeEnabled,
-                                            initial_fee: dfc.initialFee.to::<u32>(),
-                                        };
-                                    }
-                                }
-                            }
-                        }
+                            .map_err(|e| {
+                                AMMError::Msg(format!(
+                                    "strict fee-context fetch failed: dynamicFeeConfig call failed for pool {}: {:?}",
+                                    p.address, e
+                                ))
+                            })?;
+                        p.dynamic_fee_config = DynamicFeeConfig {
+                            base_fee: dfc.baseFee.to::<u32>(),
+                            fee_cap: dfc.feeCap.to::<u32>(),
+                            scaling_factor: dfc.scalingFactor,
+                            initial_fee_enabled: dfc.initialFeeEnabled,
+                            initial_fee: dfc.initialFee.to::<u32>(),
+                        };
+                    }
+
+                    if p.dynamic_fee_config.base_fee == 0 && p.factory_tick_spacing_fee == 0 {
+                        return Err(AMMError::Msg(format!(
+                            "strict fee-context fetch failed: base_fee=0 and tickSpacingToFee=0 for pool {}",
+                            p.address
+                        )));
                     }
                 }
 
@@ -2465,7 +2500,7 @@ impl AerodromeSlipstreamFactory {
         }
         // Multicall3: batch observations(i) for all pools.
         let mc3 = IMulticall3::new(MULTICALL3_ADDRESS, provider.clone());
-        for chunk_addrs in pool_addrs.chunks(5) {
+        for chunk_addrs in pool_addrs.chunks(3) {
             let mut mc_calls: Vec<IMulticall3::Call3> = Vec::new();
             let mut mc_meta: Vec<(Address, usize, u16)> = Vec::new(); // addr, sidx, card
 
@@ -2565,6 +2600,8 @@ impl AerodromeSlipstreamFactory {
                         && !pool.token_b.address.is_zero()
                         && pool.token_a.decimals > 0
                         && pool.token_b.decimals > 0
+                        && (pool.dynamic_fee_config.base_fee != 0
+                            || pool.factory_tick_spacing_fee != 0)
                 } else {
                     false
                 }
