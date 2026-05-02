@@ -495,9 +495,6 @@ impl AutomatedMarketMaker for CurveLegacyPool {
                     .ok_or(AMMError::Msg("Balance underflow".into()))?;
             }
 
-            // Recalculate D from updated balances BEFORE updating price_scale.
-            self.recalculate_crypto_state()?;
-
             let mask = U256::from(2).pow(U256::from(128)) - U256::from(1);
             // packed_price_scale format: price_scale[1] << 128 | price_scale[0]
             // low 128 bits = price_scale[0], high 128 bits = price_scale[1]
@@ -510,6 +507,9 @@ impl AutomatedMarketMaker for CurveLegacyPool {
                 ]
             };
             self.price_scale = Some(new_price_scale);
+            // Keep post-event state self-consistent:
+            // packed event carries updated price_scale, so D must be recalculated after applying it.
+            self.recalculate_crypto_state()?;
 
             tracing::info!(
                 target = "amms::curve_legacy::sync",
@@ -626,11 +626,6 @@ impl AutomatedMarketMaker for CurveLegacyPool {
                 }
             }
 
-            // Recalculate D from updated balances BEFORE updating price_scale.
-            if self.pool_type == CryptoSwap {
-                self.recalculate_crypto_state()?;
-            }
-
             let mask = U256::from(2).pow(U256::from(128)) - U256::from(1);
             // packed_price_scale format: price_scale[1] << 128 | price_scale[0]
             // low 128 bits = price_scale[0], high 128 bits = price_scale[1]
@@ -643,6 +638,11 @@ impl AutomatedMarketMaker for CurveLegacyPool {
                 ]
             };
             self.price_scale = Some(new_price_scale);
+            if self.pool_type == CryptoSwap {
+                // Keep post-event state self-consistent:
+                // packed event carries updated price_scale, so D must be recalculated after applying it.
+                self.recalculate_crypto_state()?;
+            }
 
             tracing::info!(
                 target = "amms::curve_legacy::sync",

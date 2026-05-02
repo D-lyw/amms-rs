@@ -553,14 +553,12 @@ impl AutomatedMarketMaker for CurveNGPool {
                             .ok_or(AMMError::Msg("Balance underflow".into()))?;
                     }
 
-                    // Recalculate D from updated balances BEFORE updating price_scale.
-                    // This matches the contract's order: D is computed with the current price_scale,
-                    // then price_scale is updated via oracle tweak_price.
-                    self.recalculate_d()?;
-
                     let mask = U256::from(2).pow(U256::from(128)) - U256::from(1);
                     let price_scale = event.packed_price_scale & mask;
                     self.price_scale = Some(vec![price_scale]);
+                    // Keep post-event state self-consistent:
+                    // event carries updated price_scale, so local D must be recalculated after applying it.
+                    self.recalculate_d()?;
 
                     tracing::info!(
                         target = "amms::curve_ng::sync",
@@ -583,11 +581,12 @@ impl AutomatedMarketMaker for CurveNGPool {
                             self.balances[i] = self.balances[i].saturating_add(amount);
                         }
                     }
-                    // Recalculate D from updated balances before updating price_scale.
-                    self.recalculate_d()?;
                     let mask = U256::from(2).pow(U256::from(128)) - U256::from(1);
                     let price_scale = event.packed_price_scale & mask;
                     self.price_scale = Some(vec![price_scale]);
+                    // Keep post-event state self-consistent:
+                    // event carries updated price_scale, so local D must be recalculated after applying it.
+                    self.recalculate_d()?;
                     self.update_spot_prices();
                     return Ok(SyncAction::AsyncUpdate);
                 } else if topic0 == ICurveTwoCryptoEvent::RemoveLiquidity::SIGNATURE_HASH {
@@ -659,14 +658,14 @@ impl AutomatedMarketMaker for CurveNGPool {
                             .ok_or(AMMError::Msg("Balance underflow".into()))?;
                     }
 
-                    // Recalculate D from updated balances BEFORE updating price_scale.
-                    self.recalculate_d()?;
-
                     // packed_price_scale format: price_scale[1] << 128 | price_scale[0]
                     let mask = U256::from(2).pow(U256::from(128)) - U256::from(1);
                     let price_scale_0 = event.packed_price_scale & mask;
                     let price_scale_1 = event.packed_price_scale >> 128;
                     self.price_scale = Some(vec![price_scale_0, price_scale_1]);
+                    // Keep post-event state self-consistent:
+                    // event carries updated price_scale, so local D must be recalculated after applying it.
+                    self.recalculate_d()?;
 
                     tracing::info!(
                         target = "amms::curve_ng::sync",
@@ -690,12 +689,13 @@ impl AutomatedMarketMaker for CurveNGPool {
                             self.balances[i] = self.balances[i].saturating_add(amount);
                         }
                     }
-                    // Recalculate D from updated balances before updating price_scale.
-                    self.recalculate_d()?;
                     let mask = U256::from(2).pow(U256::from(128)) - U256::from(1);
                     let price_scale_0 = event.packed_price_scale & mask;
                     let price_scale_1 = event.packed_price_scale >> 128;
                     self.price_scale = Some(vec![price_scale_0, price_scale_1]);
+                    // Keep post-event state self-consistent:
+                    // event carries updated price_scale, so local D must be recalculated after applying it.
+                    self.recalculate_d()?;
                     self.update_spot_prices();
                     return Ok(SyncAction::AsyncUpdate);
                 } else if topic0 == ICurveTriCryptoEvent::RemoveLiquidity::SIGNATURE_HASH {
@@ -1274,6 +1274,30 @@ impl CurveNGPool {
         Ok(xp)
     }
 
+    fn compute_cryptoswap_d(
+        &self,
+        amp: U256,
+        gamma: U256,
+        xp: &[U256],
+    ) -> Result<U256, &'static str> {
+        if self.pool_type == CurveNGPoolType::TwoCrypto {
+            if xp.len() < 2 {
+                return Err("compute_cryptoswap_d: xp length < 2");
+            }
+
+            if self.twocrypto_variant == CurveNGTwoCryptoVariant::PeripheryV210d {
+                math::twocrypto_v210d::stableswap_newton_d(amp, [xp[0], xp[1]])
+                    .map_err(|_| "compute_cryptoswap_d: twocrypto_v210d newton_d failed")
+            } else {
+                math::cryptoswap::twocrypto_newton_d(amp, gamma, [xp[0], xp[1]], U256::ZERO)
+                    .map_err(|_| "compute_cryptoswap_d: twocrypto newton_d failed")
+            }
+        } else {
+            math::cryptoswap::newton_d(amp, gamma, xp)
+                .map_err(|_| "compute_cryptoswap_d: cryptoswap newton_d failed")
+        }
+    }
+
     /// Recalculate D value after balance changes using newton_d
     /// Should be called after sync() updates balances for CryptoSwap pools
     pub fn recalculate_d(&mut self) -> Result<(), AMMError> {
@@ -1300,18 +1324,7 @@ impl CurveNGPool {
         // The theoretical `A * N^N` scaling is likely handled internally or optimized out in the ported math.
         let ann = amp;
 
-        let d_result = if self.pool_type == CurveNGPoolType::TwoCrypto
-            && self.twocrypto_variant == CurveNGTwoCryptoVariant::PeripheryV210d
-        {
-            if xp.len() < 2 {
-                Err("recalculate_d: xp length < 2")
-            } else {
-                math::twocrypto_v210d::stableswap_newton_d(ann, [xp[0], xp[1]])
-                    .map_err(|_| "recalculate_d: twocrypto_v210d newton_d failed")
-            }
-        } else {
-            math::cryptoswap::newton_d(ann, gamma, &xp)
-        };
+        let d_result = self.compute_cryptoswap_d(ann, gamma, &xp);
 
         match d_result {
             Ok(new_d) => {
@@ -1396,12 +1409,12 @@ impl CurveNGPool {
             if let Some(chain_d) = self.d {
                 chain_d
             } else {
-                let x2 = [xp[0], xp[1]];
-                math::cryptoswap::twocrypto_newton_d(amp, gamma, x2, U256::ZERO)
+                self.compute_cryptoswap_d(amp, gamma, &xp)
                     .map_err(|e| AMMError::Msg(e.into()))?
             }
         } else {
-            math::cryptoswap::newton_d(amp, gamma, &xp).map_err(|e| AMMError::Msg(e.into()))?
+            self.compute_cryptoswap_d(amp, gamma, &xp)
+                .map_err(|e| AMMError::Msg(e.into()))?
         };
 
         // 链上安全检查: assert _D > 10**17 - 1 and _D < 10**15 * 10**18 + 1

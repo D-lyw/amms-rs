@@ -458,7 +458,7 @@ impl AerodromeSlipstreamPool {
     /// Off-chain mirror of Slipstream `DynamicSwapFeeModule.getFee(pool)`.
     ///
     /// https://github.com/aerodrome-finance/slipstream
-    /// 
+    ///
     /// On-chain reference:
     /// - `contracts/core/fees/DynamicSwapFeeModule.sol::getFee`
     /// - `contracts/core/fees/DynamicSwapFeeModule.sol::_getDynamicFee`

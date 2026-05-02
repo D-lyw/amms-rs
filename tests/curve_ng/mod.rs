@@ -1,3 +1,4 @@
+mod base_forensics;
 mod consistency_smoke;
 mod event_sync;
 mod exact_out;
