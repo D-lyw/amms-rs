@@ -13,7 +13,10 @@ use crate::amms::amm::{SyncAction, AMM};
 use crate::amms::error::AMMError;
 use crate::amms::factory::Factory;
 use crate::amms::fluid_dex::get_liquidity_layer;
-use crate::amms::{aerodrome_slipstream::ICustomFeeModule, balancer_v2, balancer_v3, ekubo};
+use crate::amms::{
+    aerodrome_slipstream::ICustomFeeModule, algebra_integral::IDynamicFeeManager, balancer_v2,
+    balancer_v3, ekubo,
+};
 use crate::state_space::hooks::HookHandle;
 use crate::state_space::hooks::HookRegistry;
 use crate::state_space::hooks::SnapshotConfig;
@@ -853,6 +856,15 @@ impl<N, P> StateSpaceManager<N, P> {
                         topic_addresses.insert(amm.address());
                     }
                 }
+                AMM::AlgebraIntegralPool(p) => {
+                    if has_events {
+                        topic_addresses.insert(amm.address());
+                        // FeeConfiguration is emitted by the plugin contract.
+                        if !p.plugin.is_zero() {
+                            topic_addresses.insert(p.plugin);
+                        }
+                    }
+                }
                 _ => {
                     if has_events {
                         topic_addresses.insert(amm.address());
@@ -1545,6 +1557,27 @@ impl StateSpace {
         }
     }
 
+    fn resolve_algebra_plugin_event_pools(
+        &self,
+        log_address: Address,
+        topics: &[FixedBytes<32>],
+    ) -> Vec<Address> {
+        if topics.is_empty() {
+            return vec![];
+        }
+        if topics[0] != IDynamicFeeManager::FeeConfiguration::SIGNATURE_HASH {
+            return vec![];
+        }
+
+        self.state
+            .iter()
+            .filter_map(|(pool_address, amm)| match amm.as_ref() {
+                AMM::AlgebraIntegralPool(p) if p.plugin == log_address => Some(*pool_address),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub fn sync(
         &mut self,
         logs: &[Log],
@@ -1593,52 +1626,49 @@ impl StateSpace {
             let address = log.address();
             let direct_hit = self.state.contains_key(&address);
 
-            let target_address = if direct_hit {
-                Some(address)
+            let mut target_addresses: Vec<Address> = Vec::new();
+            if direct_hit {
+                target_addresses.push(address);
             } else if log.topics().len() >= 2 {
                 if Some(address) == get_liquidity_layer(self.chain_id) {
                     let pool_address = Address::from_word(log.topics()[1]);
-                    match self.state.get(&pool_address).map(Arc::as_ref) {
-                        Some(AMM::FluidDexPool(_)) => Some(pool_address),
-                        _ => None,
+                    if matches!(self.state.get(&pool_address).map(Arc::as_ref), Some(AMM::FluidDexPool(_)))
+                    {
+                        target_addresses.push(pool_address);
                     }
                 } else if Some(address) == balancer_v2::get_vault_address(self.chain_id) {
                     // Balancer V2: poolId is in topics[1]
                     // The first 20 bytes of poolId is the pool address, which is used as the key in StateSpace
                     let pool_id = log.topics()[1];
                     let pool_address = Address::from_slice(&pool_id.as_slice()[0..20]);
-
-                    match self.state.get(&pool_address).map(Arc::as_ref) {
-                        Some(AMM::BalancerV2Pool(p)) if p.pool_id == pool_id => Some(pool_address),
-                        _ => None,
+                    if matches!(
+                        self.state.get(&pool_address).map(Arc::as_ref),
+                        Some(AMM::BalancerV2Pool(p)) if p.pool_id == pool_id
+                    ) {
+                        target_addresses.push(pool_address);
                     }
                 } else if Some(address) == balancer_v3::get_vault_address(self.chain_id) {
                     // Balancer V3: pool address is in topics[1]
                     let pool_address = Address::from_word(log.topics()[1]);
                     if self.state.contains_key(&pool_address) {
-                        Some(pool_address)
-                    } else {
-                        None
+                        target_addresses.push(pool_address);
                     }
-                } else if let Some(pool_address) =
-                    self.resolve_slipstream_fee_event_pool(log.topics())
-                {
-                    Some(pool_address)
+                } else if let Some(pool_address) = self.resolve_slipstream_fee_event_pool(log.topics()) {
+                    target_addresses.push(pool_address);
                 } else {
                     let pool_id = log.topics()[1];
                     let virtual_address = Address::from_slice(&pool_id.as_slice()[0..20]);
                     match self.state.get(&virtual_address).map(Arc::as_ref) {
                         Some(AMM::UniswapV4Pool(p)) if p.manager_address == address => {
-                            Some(virtual_address)
+                            target_addresses.push(virtual_address)
                         }
                         Some(AMM::PancakeInfinityPool(p)) if p.manager_address == address => {
-                            Some(virtual_address)
+                            target_addresses.push(virtual_address)
                         }
-                        _ => None,
+                        _ => {}
                     }
                 }
-            } else if log.topics().is_empty()
-                && Some(address) == ekubo::get_core_address(self.chain_id)
+            } else if log.topics().is_empty() && Some(address) == ekubo::get_core_address(self.chain_id)
             {
                 // Ekubo Log0 events: no topics, pool_id is at data[20..52]
                 let data = log.data().data.as_ref();
@@ -1647,49 +1677,59 @@ impl StateSpace {
                     // Ekubo uses the first 20 bytes of pool_id as the virtual address key in StateSpace
                     let virtual_address = Address::from_slice(&pool_id.as_slice()[0..20]);
 
-                    match self.state.get(&virtual_address).map(Arc::as_ref) {
-                        Some(AMM::EkuboPool(p)) if p.pool_id == pool_id => Some(virtual_address),
-                        _ => None,
+                    if matches!(
+                        self.state.get(&virtual_address).map(Arc::as_ref),
+                        Some(AMM::EkuboPool(p)) if p.pool_id == pool_id
+                    ) {
+                        target_addresses.push(virtual_address);
                     }
-                } else {
-                    None
                 }
-            } else {
-                None
-            };
+            }
 
-            let Some(target_address) = target_address else {
-                continue;
-            };
+            for pool_address in self.resolve_algebra_plugin_event_pools(address, log.topics()) {
+                if !target_addresses.contains(&pool_address) {
+                    target_addresses.push(pool_address);
+                }
+            }
 
-            let Some(amm) = self.get_mut_cow(&target_address) else {
-                continue;
-            };
-
-            // 如果 log 区块小于已同步区块，跳过（幂等性）
-            if log_block_number < amm.last_synced_block() {
+            if target_addresses.is_empty() {
                 continue;
             }
 
-            match amm.sync(log) {
-                Ok(action) => {
-                    amm.set_last_synced_block(log_block_number);
-                    affected_amms.insert(target_address);
+            for target_address in target_addresses {
+                let Some(amm) = self.get_mut_cow(&target_address) else {
+                    continue;
+                };
 
-                    match action {
-                        SyncAction::None => {}
-                        SyncAction::AsyncUpdate => {
-                            needs_async_update.insert(target_address);
+                // 如果 log 区块小于已同步区块，跳过（幂等性）
+                if log_block_number < amm.last_synced_block() {
+                    continue;
+                }
+
+                match amm.sync(log) {
+                    Ok(action) => {
+                        amm.set_last_synced_block(log_block_number);
+                        affected_amms.insert(target_address);
+
+                        match action {
+                            SyncAction::None => {}
+                            SyncAction::AsyncUpdate => {
+                                needs_async_update.insert(target_address);
+                            }
+                            SyncAction::Resync => {
+                                needs_resync.insert(target_address);
+                            }
                         }
-                        SyncAction::Resync => {
+                    }
+
+                    Err(e) => {
+                        error!(target: "state_space::sync", ?address, ?log_block_number, "Failed to sync AMM with log: {}", e);
+                        if let Some(tx_hash) = log.transaction_hash {
+                            error!(target: "state_space::sync", ?target_address, ?tx_hash, "Marking AMM for resync after sync error");
+                        } else {
                             needs_resync.insert(target_address);
                         }
                     }
-                }
-
-                Err(e) => {
-                    error!(target: "state_space::sync", ?address, ?log_block_number, "Failed to sync AMM with log: {}", e);
-                    needs_resync.insert(target_address);
                 }
             }
         }
@@ -1737,7 +1777,7 @@ impl From<StateSpace> for SerializableStateSpace {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::amms::uniswap_v2::UniswapV2Pool;
+    use crate::amms::{algebra_integral::AlgebraIntegralPool, uniswap_v2::UniswapV2Pool};
     use alloy::primitives::{address, FixedBytes};
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
@@ -1833,6 +1873,51 @@ mod tests {
         ];
 
         assert_eq!(state.resolve_slipstream_fee_event_pool(&topics), None);
+    }
+
+    #[test]
+    fn algebra_fee_config_event_routes_to_all_pools_for_plugin() {
+        let plugin = address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let pool1 = address!("1111111111111111111111111111111111111111");
+        let pool2 = address!("2222222222222222222222222222222222222222");
+        let pool_other = address!("3333333333333333333333333333333333333333");
+        let other_plugin = address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+
+        let mut state = StateSpace::default();
+        let mut algebra_1 = AlgebraIntegralPool::new(pool1);
+        algebra_1.plugin = plugin;
+        state.insert_amm(AMM::AlgebraIntegralPool(algebra_1));
+
+        let mut algebra_2 = AlgebraIntegralPool::new(pool2);
+        algebra_2.plugin = plugin;
+        state.insert_amm(AMM::AlgebraIntegralPool(algebra_2));
+
+        let mut algebra_3 = AlgebraIntegralPool::new(pool_other);
+        algebra_3.plugin = other_plugin;
+        state.insert_amm(AMM::AlgebraIntegralPool(algebra_3));
+
+        let topics = vec![IDynamicFeeManager::FeeConfiguration::SIGNATURE_HASH];
+        let mut routed = state.resolve_algebra_plugin_event_pools(plugin, &topics);
+        routed.sort_unstable();
+
+        assert_eq!(routed, vec![pool1, pool2]);
+    }
+
+    #[test]
+    fn algebra_non_fee_event_does_not_route_from_plugin() {
+        let plugin = address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let pool = address!("1111111111111111111111111111111111111111");
+        let mut state = StateSpace::default();
+        let mut algebra = AlgebraIntegralPool::new(pool);
+        algebra.plugin = plugin;
+        state.insert_amm(AMM::AlgebraIntegralPool(algebra));
+
+        let topics = vec![ICustomFeeModule::CustomFeeSet::SIGNATURE_HASH];
+        assert!(
+            state
+                .resolve_algebra_plugin_event_pools(plugin, &topics)
+                .is_empty()
+        );
     }
 
     #[test]

@@ -39,6 +39,11 @@ const TARGET_CONTRACTS: &[&str] = &[
     "GetAerodromeSlipstreamFeeConfigBatchRequest",
     // PancakeV3
     "GetPancakeV3PoolSlot0BatchRequest",
+    // Algebra Integral
+    "GetAlgebraPoolStaticMetaBatchRequest",
+    "GetAlgebraPoolStateBatchRequest",
+    "GetAlgebraPoolTickTableBatchRequest",
+    "GetAlgebraPoolTickDataBatchRequest",
 ];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

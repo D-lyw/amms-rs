@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod aerodrome_slipstream;
 pub mod aerodrome_v2;
+pub mod algebra_integral;
 pub mod amm;
 pub mod balancer_v2;
 pub mod balancer_v3;

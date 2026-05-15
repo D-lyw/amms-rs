@@ -1,5 +1,6 @@
 use crate::amms::aerodrome_slipstream::AerodromeSlipstreamFactory;
 use crate::amms::aerodrome_v2::AerodromeV2Factory;
+use crate::amms::algebra_integral::AlgebraIntegralFactory;
 use crate::amms::curve_legacy::factory::CurveLegacyFactory;
 use crate::amms::curve_ng::factory::CurveNGFactory;
 use crate::amms::ekubo::EkuboFactory;
@@ -131,6 +132,9 @@ impl Variant {
                 CurveLegacyFactory::init_batch::<N, _>(amms, to_block, provider).await
             }
             Variant::EkuboPool => EkuboFactory::init_batch::<N, _>(amms, to_block, provider).await,
+            Variant::AlgebraIntegralPool => {
+                AlgebraIntegralFactory::init_batch::<N, _>(amms, to_block, provider).await
+            }
             Variant::AerodromeV2Pool => {
                 AerodromeV2Factory::init_batch::<N, _>(amms, to_block, provider).await
             }
@@ -201,6 +205,9 @@ impl Variant {
             }
             Variant::EkuboPool => {
                 EkuboFactory::sync_all_pools::<N, _>(amms, to_block, provider).await
+            }
+            Variant::AlgebraIntegralPool => {
+                AlgebraIntegralFactory::sync_all_pools::<N, _>(amms, to_block, provider).await
             }
             Variant::AerodromeV2Pool => {
                 AerodromeV2Factory::sync_all_pools::<N, _>(amms, to_block, provider).await
@@ -317,6 +324,7 @@ factory!(
     SushiV2Factory,
     FluidDexFactory,
     CurveLegacyFactory,
+    AlgebraIntegralFactory,
     AerodromeV2Factory,
     AerodromeSlipstreamFactory
 );
