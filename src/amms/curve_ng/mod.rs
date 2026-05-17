@@ -439,7 +439,9 @@ impl AutomatedMarketMaker for CurveNGPool {
                     let i = event.sold_id as usize;
                     let j = event.bought_id as usize;
                     let admin_fee_out = self
-                        .stableswap_estimate_admin_fee_from_event_tokens_bought(event.tokens_bought);
+                        .stableswap_estimate_admin_fee_from_event_tokens_bought(
+                            event.tokens_bought,
+                        );
 
                     if i < self.balances.len() {
                         self.balances[i] += event.tokens_sold;
@@ -468,6 +470,7 @@ impl AutomatedMarketMaker for CurveNGPool {
                     );
 
                     self.update_spot_prices();
+                    return Ok(SyncAction::AsyncUpdate);
                 } else if topic0 == ICurveNGPool::AddLiquidity::SIGNATURE_HASH {
                     let event = ICurveNGPool::AddLiquidity::decode_log(&log.inner)?;
                     for (i, &amount) in event.token_amounts.iter().enumerate() {
@@ -481,6 +484,7 @@ impl AutomatedMarketMaker for CurveNGPool {
                         token_amounts = ?event.token_amounts,
                         "AddLiquidity (StableSwap)"
                     );
+                    return Ok(SyncAction::AsyncUpdate);
                 } else if topic0 == ICurveNGPool::RemoveLiquidity::SIGNATURE_HASH {
                     let event = ICurveNGPool::RemoveLiquidity::decode_log(&log.inner)?;
                     for (i, &amount) in event.token_amounts.iter().enumerate() {
@@ -494,6 +498,7 @@ impl AutomatedMarketMaker for CurveNGPool {
                         token_amounts = ?event.token_amounts,
                         "RemoveLiquidity (StableSwap)"
                     );
+                    return Ok(SyncAction::AsyncUpdate);
                 } else if topic0 == ICurveNGPool::RemoveLiquidityOne::SIGNATURE_HASH {
                     let event = ICurveNGPool::RemoveLiquidityOne::decode_log(&log.inner)?;
                     let i = event.token_id as usize;
@@ -509,6 +514,7 @@ impl AutomatedMarketMaker for CurveNGPool {
                         coin_amount = ?event.coin_amount,
                         "RemoveLiquidityOne (StableSwap)"
                     );
+                    return Ok(SyncAction::AsyncUpdate);
                 } else if topic0 == ICurveNGPool::ClaimAdminFees::SIGNATURE_HASH {
                     // ClaimAdminFees 事件仅包含一个总数 amount，未指明是哪个代币
                     // 但对于 StableSwap NG，通常是逐个代币触发，或者需要 Resync
@@ -960,6 +966,7 @@ impl AutomatedMarketMaker for CurveNGPool {
                 if let Ok(rates) = stable_pool.stored_rates().call().await {
                     if rates.len() == self.n_coins as usize {
                         self.rates = rates;
+                        self.update_spot_prices();
                     }
                 }
             }

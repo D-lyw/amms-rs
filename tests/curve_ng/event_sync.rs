@@ -7,12 +7,22 @@ use alloy::{
 };
 use amms::amms::{
     amm::{AutomatedMarketMaker, SyncAction},
-    curve_ng::{CurveNGPool, CurveNGPoolType, CurveNGTwoCryptoVariant, ICurveTwoCryptoEvent},
+    curve_ng::{
+        CurveNGPool, CurveNGPoolType, CurveNGTwoCryptoVariant, ICurveNGPool, ICurveTwoCryptoEvent,
+    },
 };
 use eyre::Result;
-use std::str::FromStr;
+use std::{env, str::FromStr};
 
 use crate::common::rpc::provider_url;
+
+fn base_provider_url() -> Option<String> {
+    dotenv::dotenv().ok();
+    env::var("BASE_PROVIDER")
+        .or_else(|_| env::var("BASE_RPC_URL"))
+        .or_else(|_| env::var("BASE_MAINNET_RPC_URL"))
+        .ok()
+}
 
 #[tokio::test]
 async fn test_ng_twocrypto_event_sync_flow_consistency() -> Result<()> {
@@ -25,6 +35,10 @@ async fn test_ng_twocrypto_event_sync_flow_consistency() -> Result<()> {
     };
 
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    if let Err(e) = provider.get_block_number().await {
+        println!("Skipping test: Ethereum RPC unavailable ({e})");
+        return Ok(());
+    }
 
     let cases = [
         (
@@ -41,7 +55,13 @@ async fn test_ng_twocrypto_event_sync_flow_consistency() -> Result<()> {
 
     for (label, addr_str, expected_variant) in cases {
         let addr = Address::from_str(addr_str)?;
-        let latest = provider.get_block_number().await?;
+        let latest = match provider.get_block_number().await {
+            Ok(v) => v,
+            Err(e) => {
+                println!("[{label}] skipping: Ethereum RPC unavailable ({e})");
+                return Ok(());
+            }
+        };
         let from = latest.saturating_sub(10_000);
 
         let mut pool = CurveNGPool::new(addr, CurveNGPoolType::TwoCrypto)
@@ -131,6 +151,92 @@ async fn test_ng_twocrypto_event_sync_flow_consistency() -> Result<()> {
                 label
             );
         }
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_ng_stableswap_events_return_async_update() -> Result<()> {
+    let rpc_url = match base_provider_url() {
+        Some(url) => url,
+        None => {
+            println!("Skipping test: BASE_PROVIDER or BASE_RPC_URL not set");
+            return Ok(());
+        }
+    };
+
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    let latest = match provider.get_block_number().await {
+        Ok(v) => v,
+        Err(e) => {
+            println!("Skipping test: Base RPC unavailable ({e})");
+            return Ok(());
+        }
+    };
+    let addr = Address::from_str("ae07db17dEbde8391c6ea3a6990eBdD9E4939494")?;
+    let from_block = 45_000_000u64;
+
+    let cases = [
+        ("TokenExchange", ICurveNGPool::TokenExchange::SIGNATURE_HASH),
+        ("AddLiquidity", ICurveNGPool::AddLiquidity::SIGNATURE_HASH),
+        (
+            "RemoveLiquidity",
+            ICurveNGPool::RemoveLiquidity::SIGNATURE_HASH,
+        ),
+        (
+            "RemoveLiquidityOne",
+            ICurveNGPool::RemoveLiquidityOne::SIGNATURE_HASH,
+        ),
+    ];
+
+    for (label, sig) in cases {
+        let mut logs = provider
+            .get_logs(
+                &Filter::new()
+                    .address(addr)
+                    .event_signature(vec![sig])
+                    .from_block(from_block)
+                    .to_block(latest),
+            )
+            .await?;
+        assert!(
+            !logs.is_empty(),
+            "[StableSwap {}] no logs found for pool {} in window {}..{}",
+            label,
+            addr,
+            from_block,
+            latest
+        );
+
+        logs.sort_by(|a, b| {
+            let a_bn = a.block_number.unwrap_or(0);
+            let b_bn = b.block_number.unwrap_or(0);
+            if a_bn != b_bn {
+                return a_bn.cmp(&b_bn);
+            }
+            let a_tx = a.transaction_index.unwrap_or(0);
+            let b_tx = b.transaction_index.unwrap_or(0);
+            if a_tx != b_tx {
+                return a_tx.cmp(&b_tx);
+            }
+            a.log_index.unwrap_or(0).cmp(&b.log_index.unwrap_or(0))
+        });
+        let log = logs.last().expect("log exists").clone();
+        let block = log.block_number.unwrap_or_default();
+        let init_block = block.saturating_sub(1);
+
+        let mut pool = CurveNGPool::new(addr, CurveNGPoolType::StableSwap)
+            .init(BlockId::from(init_block), provider.clone())
+            .await?;
+        let action = pool.sync(&log)?;
+        assert_eq!(
+            action,
+            SyncAction::AsyncUpdate,
+            "[StableSwap {}] unexpected action at block {}",
+            label,
+            block
+        );
     }
 
     Ok(())

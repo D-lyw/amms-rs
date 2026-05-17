@@ -1,6 +1,7 @@
 use super::{StateSpace, StateSpaceManager};
 use crate::amms::aerodrome_slipstream::pool::GetAerodromeSlipstreamProbeBatchRequest;
 use crate::amms::amm::{AutomatedMarketMaker, SyncAction, AMM};
+use crate::amms::curve_ng::ICurveNGStableSwap;
 use crate::amms::error::AMMError;
 use crate::amms::pancake_v3::GetPancakeV3PoolSlot0BatchRequest;
 use crate::amms::uniswap_v3::GetUniswapV3PoolSlot0BatchRequest;
@@ -37,19 +38,50 @@ struct ClProbeSnapshot {
     fee: Option<u32>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CurveNGStableProbeSnapshot {
+    balances: Vec<U256>,
+    rates: Vec<U256>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DriftProbeKind {
     V3Like,
     Slipstream,
+    CurveNGStable,
 }
 
 impl DriftProbeKind {
     fn next(self) -> Self {
         match self {
             DriftProbeKind::V3Like => DriftProbeKind::Slipstream,
-            DriftProbeKind::Slipstream => DriftProbeKind::V3Like,
+            DriftProbeKind::Slipstream => DriftProbeKind::CurveNGStable,
+            DriftProbeKind::CurveNGStable => DriftProbeKind::V3Like,
         }
     }
+}
+
+fn classify_curve_ng_stable_drift(
+    local: &CurveNGStableProbeSnapshot,
+    remote: &CurveNGStableProbeSnapshot,
+) -> Option<PendingSyncAction> {
+    if local == remote {
+        return None;
+    }
+    if local.balances != remote.balances {
+        return Some(PendingSyncAction::Resync);
+    }
+    if local.rates != remote.rates {
+        return Some(PendingSyncAction::AsyncUpdate);
+    }
+    None
+}
+
+fn should_skip_async_apply(
+    existing_last_synced_block: u64,
+    snapshot_last_synced_block: u64,
+) -> bool {
+    existing_last_synced_block > snapshot_last_synced_block
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -114,6 +146,7 @@ pub(super) struct PendingSyncQueue {
 
 enum PendingExecutionOutcome {
     Applied,
+    SkippedStale,
     MissingPool,
 }
 
@@ -429,15 +462,22 @@ impl<N, P> StateSpaceManager<N, P> {
 
         match task.action {
             PendingSyncAction::AsyncUpdate => {
+                let snapshot_last_synced_block = local_amm.last_synced_block();
                 // AsyncUpdate: no last_synced_block guard.
                 // RPC availability is already guaranteed by claim_due_filtered's
                 // required_block ≤ canonical_head check at pop time.
                 // On Ethereum this is always safe (canonical == realtime).
-                // On Base, insert_amm may briefly overwrite flashblock data
-                // from N+2, but the next event ~200ms later corrects it.
                 local_amm.update::<N, _>(provider.clone()).await?;
                 local_amm.set_last_synced_block(target_block);
                 let mut guard = state.write().await;
+                if let Some(existing) = guard.get(&address) {
+                    if should_skip_async_apply(
+                        existing.last_synced_block(),
+                        snapshot_last_synced_block,
+                    ) {
+                        return Ok(PendingExecutionOutcome::SkippedStale);
+                    }
+                }
                 guard.insert_amm(local_amm);
                 Ok(PendingExecutionOutcome::Applied)
             }
@@ -507,6 +547,20 @@ impl<N, P> StateSpaceManager<N, P> {
                         first_seen_ms = task.first_seen_at.elapsed().as_millis(),
                         target_block = canonical,
                         "Pending sync task applied"
+                    );
+                    pending_sync_queue
+                        .lock()
+                        .await
+                        .complete_success(address, canonical);
+                }
+                Ok(PendingExecutionOutcome::SkippedStale) => {
+                    info!(
+                        ?address,
+                        action = ?task.action,
+                        reason = ?task.reason,
+                        first_seen_ms = task.first_seen_at.elapsed().as_millis(),
+                        target_block = canonical,
+                        "Pending sync task skipped due to newer local state"
                     );
                     pending_sync_queue
                         .lock()
@@ -638,6 +692,72 @@ impl<N, P> StateSpaceManager<N, P> {
             }),
             _ => None,
         }
+    }
+
+    fn local_curve_ng_stable_probe_snapshot(
+        amm: &AMM,
+    ) -> Option<(CurveNGStableProbeSnapshot, usize)> {
+        match amm {
+            AMM::CurveNGPool(pool) if pool.pool_type.is_stable() && pool.n_coins > 0 => Some((
+                CurveNGStableProbeSnapshot {
+                    balances: pool.balances.clone(),
+                    rates: pool.rates.clone(),
+                },
+                pool.n_coins as usize,
+            )),
+            _ => None,
+        }
+    }
+
+    async fn fetch_curve_ng_stable_probe_snapshots(
+        provider: &P,
+        targets: &[(Address, usize)],
+        block: u64,
+    ) -> Result<HashMap<Address, CurveNGStableProbeSnapshot>, AMMError>
+    where
+        P: Provider<N> + Clone,
+        N: Network,
+    {
+        let mut snapshots = HashMap::with_capacity(targets.len());
+        let block = BlockId::from(block);
+
+        for (address, n_coins) in targets {
+            let contract = ICurveNGStableSwap::new(*address, provider.clone());
+            let rates = match contract.stored_rates().block(block).call().await {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(?address, "CurveNG stable probe stored_rates failed: {}", e);
+                    continue;
+                }
+            };
+
+            let mut balances = Vec::with_capacity(*n_coins);
+            let mut ok = true;
+            for i in 0..*n_coins {
+                match contract.balances(i as i128).block(block).call().await {
+                    Ok(v) => balances.push(v),
+                    Err(e) => {
+                        warn!(
+                            ?address,
+                            coin_index = i,
+                            "CurveNG stable probe balances({}) failed: {}",
+                            i,
+                            e
+                        );
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+
+            if !ok {
+                continue;
+            }
+
+            snapshots.insert(*address, CurveNGStableProbeSnapshot { balances, rates });
+        }
+
+        Ok(snapshots)
     }
 
     async fn fetch_v3_probe_snapshots_batch(
@@ -925,10 +1045,26 @@ impl<N, P> StateSpaceManager<N, P> {
         let mut last_probe_at: HashMap<Address, Instant> = HashMap::new();
         let mut cached_v3_addresses: Vec<Address> = Vec::new();
         let mut cached_slipstream_addresses: Vec<Address> = Vec::new();
+        let mut cached_curve_ng_stable_addresses: Vec<Address> = Vec::new();
         let mut v3_cursor: usize = 0;
         let mut slipstream_cursor: usize = 0;
+        let mut curve_ng_stable_cursor: usize = 0;
         let mut active_kind = DriftProbeKind::V3Like;
         let mut last_cache_refresh: Option<Instant> = None;
+
+        enum DueProbe {
+            Cl {
+                address: Address,
+                local: ClProbeSnapshot,
+                is_pancake: bool,
+                kind: DriftProbeKind,
+            },
+            CurveNGStable {
+                address: Address,
+                local: CurveNGStableProbeSnapshot,
+                n_coins: usize,
+            },
+        }
 
         loop {
             sleep(scan_tick).await;
@@ -943,27 +1079,39 @@ impl<N, P> StateSpaceManager<N, P> {
                 .map(|t| now.saturating_duration_since(t) >= DRIFT_CANDIDATE_CACHE_TTL)
                 .unwrap_or(true);
             if cache_stale
-                || (cached_v3_addresses.is_empty() && cached_slipstream_addresses.is_empty())
+                || (cached_v3_addresses.is_empty()
+                    && cached_slipstream_addresses.is_empty()
+                    && cached_curve_ng_stable_addresses.is_empty())
             {
                 let guard = state.read().await;
                 cached_v3_addresses.clear();
                 cached_slipstream_addresses.clear();
+                cached_curve_ng_stable_addresses.clear();
                 for (addr, amm) in &guard.state {
                     match amm.as_ref() {
                         AMM::UniswapV3Pool(_) | AMM::PancakeV3Pool(_) => {
                             cached_v3_addresses.push(*addr)
                         }
                         AMM::AerodromeSlipstreamPool(_) => cached_slipstream_addresses.push(*addr),
+                        AMM::CurveNGPool(pool)
+                            if pool.pool_type.is_stable() && pool.n_coins > 0 =>
+                        {
+                            cached_curve_ng_stable_addresses.push(*addr)
+                        }
                         _ => {}
                     }
                 }
                 cached_v3_addresses.sort_unstable();
                 cached_slipstream_addresses.sort_unstable();
+                cached_curve_ng_stable_addresses.sort_unstable();
                 if v3_cursor >= cached_v3_addresses.len() {
                     v3_cursor = 0;
                 }
                 if slipstream_cursor >= cached_slipstream_addresses.len() {
                     slipstream_cursor = 0;
+                }
+                if curve_ng_stable_cursor >= cached_curve_ng_stable_addresses.len() {
+                    curve_ng_stable_cursor = 0;
                 }
                 last_cache_refresh = Some(now);
             }
@@ -972,28 +1120,33 @@ impl<N, P> StateSpaceManager<N, P> {
             let mut selected_addresses = match selected_kind {
                 DriftProbeKind::V3Like => &cached_v3_addresses,
                 DriftProbeKind::Slipstream => &cached_slipstream_addresses,
+                DriftProbeKind::CurveNGStable => &cached_curve_ng_stable_addresses,
             };
-            if selected_addresses.is_empty() {
+            let mut attempts = 0;
+            while selected_addresses.is_empty() && attempts < 3 {
                 selected_kind = selected_kind.next();
                 selected_addresses = match selected_kind {
                     DriftProbeKind::V3Like => &cached_v3_addresses,
                     DriftProbeKind::Slipstream => &cached_slipstream_addresses,
+                    DriftProbeKind::CurveNGStable => &cached_curve_ng_stable_addresses,
                 };
-                if selected_addresses.is_empty() {
-                    continue;
-                }
+                attempts += 1;
+            }
+            if selected_addresses.is_empty() {
+                continue;
             }
             active_kind = selected_kind.next();
 
             let cursor = match selected_kind {
                 DriftProbeKind::V3Like => &mut v3_cursor,
                 DriftProbeKind::Slipstream => &mut slipstream_cursor,
+                DriftProbeKind::CurveNGStable => &mut curve_ng_stable_cursor,
             };
             if *cursor >= selected_addresses.len() {
                 *cursor = 0;
             }
 
-            let mut due = Vec::new();
+            let mut due: Vec<DueProbe> = Vec::new();
             let guard = state.read().await;
             for offset in 0..selected_addresses.len() {
                 if due.len() >= DRIFT_MAX_POOLS_PER_TICK {
@@ -1008,13 +1161,39 @@ impl<N, P> StateSpaceManager<N, P> {
                 let kind = match amm_ref {
                     AMM::UniswapV3Pool(_) | AMM::PancakeV3Pool(_) => DriftProbeKind::V3Like,
                     AMM::AerodromeSlipstreamPool(_) => DriftProbeKind::Slipstream,
+                    AMM::CurveNGPool(pool) if pool.pool_type.is_stable() && pool.n_coins > 0 => {
+                        DriftProbeKind::CurveNGStable
+                    }
                     _ => continue,
                 };
                 if kind != selected_kind {
                     continue;
                 }
-                let Some(local) = Self::local_cl_probe_snapshot(amm_ref) else {
-                    continue;
+                let local = match selected_kind {
+                    DriftProbeKind::CurveNGStable => {
+                        let Some((snapshot, n_coins)) =
+                            Self::local_curve_ng_stable_probe_snapshot(amm_ref)
+                        else {
+                            continue;
+                        };
+                        DueProbe::CurveNGStable {
+                            address,
+                            local: snapshot,
+                            n_coins,
+                        }
+                    }
+                    DriftProbeKind::V3Like | DriftProbeKind::Slipstream => {
+                        let Some(snapshot) = Self::local_cl_probe_snapshot(amm_ref) else {
+                            continue;
+                        };
+                        let is_pancake = matches!(amm_ref, AMM::PancakeV3Pool(_));
+                        DueProbe::Cl {
+                            address,
+                            local: snapshot,
+                            is_pancake,
+                            kind: selected_kind,
+                        }
+                    }
                 };
                 let last_synced_block = amm_ref.last_synced_block();
 
@@ -1039,8 +1218,7 @@ impl<N, P> StateSpaceManager<N, P> {
                 }
 
                 last_probe_at.insert(address, now);
-                let is_pancake = matches!(amm_ref, AMM::PancakeV3Pool(_));
-                due.push((address, kind, local, is_pancake));
+                due.push(local);
             }
             if !selected_addresses.is_empty() {
                 // Round-robin advance within the selected probe type.
@@ -1053,141 +1231,195 @@ impl<N, P> StateSpaceManager<N, P> {
                 continue;
             }
 
-            let mut remote_by_address: HashMap<Address, ClProbeSnapshot> = HashMap::new();
-
-            let v3_due: Vec<Address> = due
-                .iter()
-                .filter_map(|(address, kind, _, is_pancake)| {
-                    if *kind == DriftProbeKind::V3Like && !*is_pancake {
-                        Some(*address)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            if !v3_due.is_empty() {
-                match Self::fetch_v3_probe_snapshots_batch(&provider, &v3_due, canonical).await {
-                    Ok(map) => remote_by_address.extend(map),
-                    Err(e) => {
-                        let failed_addresses =
-                            Self::diagnose_v3_probe_failures(&provider, &v3_due, canonical).await;
-                        let sample: Vec<_> = failed_addresses
-                            .iter()
-                            .take(8)
-                            .map(|a| format!("{a:#x}"))
-                            .collect();
-                        warn!(
-                            count = v3_due.len(),
-                            failed_count = failed_addresses.len(),
-                            failed_sample = ?sample,
-                            "V3 drift probe batch failed: {}",
-                            e
-                        );
-                    }
-                }
-            }
-
-            let pancake_due: Vec<Address> = due
-                .iter()
-                .filter_map(|(address, kind, _, is_pancake)| {
-                    if *kind == DriftProbeKind::V3Like && *is_pancake {
-                        Some(*address)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            if !pancake_due.is_empty() {
-                match Self::fetch_pancake_probe_snapshots_batch(&provider, &pancake_due, canonical)
-                    .await
-                {
-                    Ok(map) => remote_by_address.extend(map),
-                    Err(e) => {
-                        warn!(
-                            count = pancake_due.len(),
-                            "Pancake V3 drift probe batch failed: {}", e
-                        );
-                    }
-                }
-            }
-
-            let slipstream_due: Vec<Address> = due
-                .iter()
-                .filter_map(|(address, kind, _, _)| {
-                    if *kind == DriftProbeKind::Slipstream {
-                        Some(*address)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            if !slipstream_due.is_empty() {
-                match Self::fetch_slipstream_probe_snapshots_batch(
-                    &provider,
-                    &slipstream_due,
-                    canonical,
-                )
-                .await
-                {
-                    Ok(map) => remote_by_address.extend(map),
-                    Err(e) => {
-                        let failed_addresses = Self::diagnose_slipstream_probe_failures(
-                            &provider,
-                            &slipstream_due,
-                            canonical,
-                        )
-                        .await;
-                        let sample: Vec<_> = failed_addresses
-                            .iter()
-                            .take(8)
-                            .map(|a| format!("{a:#x}"))
-                            .collect();
-                        warn!(
-                            count = slipstream_due.len(),
-                            failed_count = failed_addresses.len(),
-                            failed_sample = ?sample,
-                            "Slipstream drift probe batch failed: {}",
-                            e
-                        );
-                    }
+            let mut cl_due = Vec::new();
+            let mut curve_due = Vec::new();
+            for item in due {
+                match item {
+                    DueProbe::Cl {
+                        address,
+                        local,
+                        is_pancake,
+                        kind,
+                    } => cl_due.push((address, local, is_pancake, kind)),
+                    DueProbe::CurveNGStable {
+                        address,
+                        local,
+                        n_coins,
+                    } => curve_due.push((address, local, n_coins)),
                 }
             }
 
             let mut enqueue_resync = Vec::new();
-            for (address, _, local, _) in due {
-                let Some(remote) = remote_by_address.get(&address).copied() else {
-                    continue;
-                };
+            let mut enqueue_async = Vec::new();
 
-                // Don't probe reads at canonical block, so local == remote means
-                // chain state matches. A single mismatch is definitive.
-                if local == remote {
-                    continue;
+            if !cl_due.is_empty() {
+                let mut remote_by_address: HashMap<Address, ClProbeSnapshot> = HashMap::new();
+
+                let v3_due: Vec<Address> = cl_due
+                    .iter()
+                    .filter_map(|(address, _, is_pancake, kind)| {
+                        if *kind == DriftProbeKind::V3Like && !*is_pancake {
+                            Some(*address)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if !v3_due.is_empty() {
+                    match Self::fetch_v3_probe_snapshots_batch(&provider, &v3_due, canonical).await
+                    {
+                        Ok(map) => remote_by_address.extend(map),
+                        Err(e) => {
+                            let failed_addresses =
+                                Self::diagnose_v3_probe_failures(&provider, &v3_due, canonical)
+                                    .await;
+                            let sample: Vec<_> = failed_addresses
+                                .iter()
+                                .take(8)
+                                .map(|a| format!("{a:#x}"))
+                                .collect();
+                            warn!(
+                                count = v3_due.len(),
+                                failed_count = failed_addresses.len(),
+                                failed_sample = ?sample,
+                                "V3 drift probe batch failed: {}",
+                                e
+                            );
+                        }
+                    }
                 }
 
-                // Fee-only diff: get_mut_cow in-place, no Resync needed.
-                let fee_only = local.sqrt_price == remote.sqrt_price
-                    && local.tick == remote.tick
-                    && local.liquidity == remote.liquidity
-                    && local.fee != remote.fee;
+                let pancake_due: Vec<Address> = cl_due
+                    .iter()
+                    .filter_map(|(address, _, is_pancake, kind)| {
+                        if *kind == DriftProbeKind::V3Like && *is_pancake {
+                            Some(*address)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if !pancake_due.is_empty() {
+                    match Self::fetch_pancake_probe_snapshots_batch(
+                        &provider,
+                        &pancake_due,
+                        canonical,
+                    )
+                    .await
+                    {
+                        Ok(map) => remote_by_address.extend(map),
+                        Err(e) => {
+                            warn!(
+                                count = pancake_due.len(),
+                                "Pancake V3 drift probe batch failed: {}", e
+                            );
+                        }
+                    }
+                }
 
-                if fee_only {
-                    if let Some(remote_fee) = remote.fee {
-                        let mut guard = state.write().await;
-                        if let Some(amm) = guard.get_mut_cow(&address) {
-                            if let AMM::AerodromeSlipstreamPool(p) = amm {
-                                p.fee = remote_fee;
+                let slipstream_due: Vec<Address> = cl_due
+                    .iter()
+                    .filter_map(|(address, _, _, kind)| {
+                        if *kind == DriftProbeKind::Slipstream {
+                            Some(*address)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if !slipstream_due.is_empty() {
+                    match Self::fetch_slipstream_probe_snapshots_batch(
+                        &provider,
+                        &slipstream_due,
+                        canonical,
+                    )
+                    .await
+                    {
+                        Ok(map) => remote_by_address.extend(map),
+                        Err(e) => {
+                            let failed_addresses = Self::diagnose_slipstream_probe_failures(
+                                &provider,
+                                &slipstream_due,
+                                canonical,
+                            )
+                            .await;
+                            let sample: Vec<_> = failed_addresses
+                                .iter()
+                                .take(8)
+                                .map(|a| format!("{a:#x}"))
+                                .collect();
+                            warn!(
+                                count = slipstream_due.len(),
+                                failed_count = failed_addresses.len(),
+                                failed_sample = ?sample,
+                                "Slipstream drift probe batch failed: {}",
+                                e
+                            );
+                        }
+                    }
+                }
+
+                for (address, local, _, _) in cl_due {
+                    let Some(remote) = remote_by_address.get(&address).copied() else {
+                        continue;
+                    };
+
+                    if local == remote {
+                        continue;
+                    }
+
+                    let fee_only = local.sqrt_price == remote.sqrt_price
+                        && local.tick == remote.tick
+                        && local.liquidity == remote.liquidity
+                        && local.fee != remote.fee;
+
+                    if fee_only {
+                        if let Some(remote_fee) = remote.fee {
+                            let mut guard = state.write().await;
+                            if let Some(amm) = guard.get_mut_cow(&address) {
+                                if let AMM::AerodromeSlipstreamPool(p) = amm {
+                                    p.fee = remote_fee;
+                                }
+                            }
+                        }
+                        continue;
+                    }
+
+                    enqueue_resync.push(address);
+                }
+            }
+
+            if !curve_due.is_empty() {
+                let targets: Vec<(Address, usize)> = curve_due
+                    .iter()
+                    .map(|(address, _, n_coins)| (*address, *n_coins))
+                    .collect();
+
+                match Self::fetch_curve_ng_stable_probe_snapshots(&provider, &targets, canonical)
+                    .await
+                {
+                    Ok(remote_by_address) => {
+                        for (address, local, _) in curve_due {
+                            let Some(remote) = remote_by_address.get(&address) else {
+                                continue;
+                            };
+                            match classify_curve_ng_stable_drift(&local, remote) {
+                                Some(PendingSyncAction::Resync) => enqueue_resync.push(address),
+                                Some(PendingSyncAction::AsyncUpdate) => enqueue_async.push(address),
+                                None => {}
                             }
                         }
                     }
-                    continue;
+                    Err(e) => {
+                        warn!(
+                            count = targets.len(),
+                            "CurveNG stable drift probe batch failed: {}", e
+                        );
+                    }
                 }
-
-                // sqrt_price/tick/liquidity mismatch — possibly corrupted state.
-                enqueue_resync.push(address);
             }
 
-            if !enqueue_resync.is_empty() {
+            if !enqueue_resync.is_empty() || !enqueue_async.is_empty() {
                 let mut queue = pending_sync_queue.lock().await;
                 for address in enqueue_resync {
                     queue.enqueue(
@@ -1197,7 +1429,88 @@ impl<N, P> StateSpaceManager<N, P> {
                         PendingSyncReason::DriftProbe,
                     );
                 }
+                for address in enqueue_async {
+                    queue.enqueue(
+                        address,
+                        PendingSyncAction::AsyncUpdate,
+                        canonical,
+                        PendingSyncReason::DriftProbe,
+                    );
+                }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::primitives::address;
+
+    #[test]
+    fn test_curve_ng_stable_drift_classification() {
+        let base = CurveNGStableProbeSnapshot {
+            balances: vec![U256::from(100u64), U256::from(200u64)],
+            rates: vec![
+                U256::from(1_000_000_000_000_000_000u128),
+                U256::from(2_000_000_000_000_000_000u128),
+            ],
+        };
+
+        let no_diff = base.clone();
+        assert_eq!(classify_curve_ng_stable_drift(&base, &no_diff), None);
+
+        let rate_diff = CurveNGStableProbeSnapshot {
+            balances: base.balances.clone(),
+            rates: vec![
+                U256::from(1_000_000_000_000_000_001u128),
+                U256::from(2_000_000_000_000_000_000u128),
+            ],
+        };
+        assert_eq!(
+            classify_curve_ng_stable_drift(&base, &rate_diff),
+            Some(PendingSyncAction::AsyncUpdate)
+        );
+
+        let balance_diff = CurveNGStableProbeSnapshot {
+            balances: vec![U256::from(101u64), U256::from(200u64)],
+            rates: base.rates.clone(),
+        };
+        assert_eq!(
+            classify_curve_ng_stable_drift(&base, &balance_diff),
+            Some(PendingSyncAction::Resync)
+        );
+    }
+
+    #[test]
+    fn test_should_skip_async_apply_when_local_is_newer() {
+        assert!(should_skip_async_apply(101, 100));
+        assert!(!should_skip_async_apply(100, 100));
+        assert!(!should_skip_async_apply(99, 100));
+    }
+
+    #[test]
+    fn test_pending_queue_keeps_canonical_gate() {
+        let mut queue = PendingSyncQueue::default();
+        let addr = address!("00000000000000000000000000000000000000aa");
+        queue.enqueue(
+            addr,
+            PendingSyncAction::AsyncUpdate,
+            120,
+            PendingSyncReason::AsyncUpdate,
+        );
+
+        let none_due = queue.claim_due_non_coverage(119);
+        assert!(
+            none_due.is_empty(),
+            "task must remain blocked before canonical"
+        );
+
+        let due = queue.claim_due_non_coverage(120);
+        assert_eq!(
+            due.len(),
+            1,
+            "task should be claimable at canonical boundary"
+        );
     }
 }
