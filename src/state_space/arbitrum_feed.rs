@@ -249,10 +249,21 @@ impl<N, P> StateSpaceManager<N, P> {
                 .await
                 {
                     Ok(results) => {
+                        // Catch-up stage: apply state updates only; do not emit tradable updates downstream.
+                        let mut non_empty_batches = 0usize;
+                        let mut affected_pools = 0usize;
                         for affected in results {
                             if !affected.is_empty() {
-                                yield Ok(affected);
+                                non_empty_batches += 1;
+                                affected_pools += affected.len();
                             }
+                        }
+                        if non_empty_batches > 0 {
+                            info!(
+                                non_empty_batches,
+                                affected_pools,
+                                "Initial catch-up completed (updates suppressed during catch-up stage)"
+                            );
                         }
                     }
                     Err(e) => {

@@ -24,3 +24,4 @@ contracts/src/flattened/
 *.idea/
 
 .algebra-*
+.curve-*

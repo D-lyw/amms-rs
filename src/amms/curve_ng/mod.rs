@@ -438,19 +438,18 @@ impl AutomatedMarketMaker for CurveNGPool {
                     let event = ICurveNGPool::TokenExchange::decode_log(&log.inner)?;
                     let i = event.sold_id as usize;
                     let j = event.bought_id as usize;
+                    let admin_fee_out = self
+                        .stableswap_estimate_admin_fee_from_event_tokens_bought(event.tokens_bought);
 
                     if i < self.balances.len() {
                         self.balances[i] += event.tokens_sold;
                     }
                     if j < self.balances.len() {
-                        // 1. 基础扣除：用户买走的金额
-                        //    Sync logic: `balances` in our struct tracks the contract's `balances(i)`.
-                        //    Curve contracts include unclaimed Admin Fees in `balances(i)`.
-                        //    Therefore, we should ONLY subtract `tokens_bought`.
-                        //    We should NOT subtract `admin_fee` unless we are tracking `effective_balances`.
-                        //    But `init` fetches `balances()` (Total), so `sync` must also track Total.
-                        //    Deducting admin_fee here would cause `balances[j]` to drift lower than chain `balances(j)`.
-                        let amount_out = event.tokens_bought;
+                        // Chain `balances(i)` for StableSwap-NG is net of admin_balances.
+                        // So on TokenExchange we must deduct BOTH:
+                        //   1) user payout (`tokens_bought`)
+                        //   2) admin fee accrued on output coin (derived from pool fee model)
+                        let amount_out = event.tokens_bought + admin_fee_out;
 
                         self.balances[j] = self.balances[j]
                             .checked_sub(amount_out)
@@ -464,6 +463,7 @@ impl AutomatedMarketMaker for CurveNGPool {
                         bought_id = j,
                         tokens_sold = ?event.tokens_sold,
                         tokens_bought = ?event.tokens_bought,
+                        admin_fee_out = ?admin_fee_out,
                         "TokenExchange (StableSwap)"
                     );
 
@@ -1567,8 +1567,25 @@ impl CurveNGPool {
         )
     }
 
-    /// StableSwap 交换模拟
-    fn simulate_stableswap(&self, i: usize, j: usize, dx: U256) -> Result<U256, AMMError> {
+    fn stableswap_estimate_admin_fee_from_event_tokens_bought(&self, tokens_bought: U256) -> U256 {
+        let fee_denominator = U256::from(10).pow(U256::from(10));
+        if self.fee.is_zero() || self.admin_fee.is_zero() || self.fee >= fee_denominator {
+            return U256::ZERO;
+        }
+
+        // event.tokens_bought is net user output (post swap-fee).
+        // Reconstruct an approximate gross output and take admin share of the fee leg.
+        let gross_out = tokens_bought * fee_denominator / (fee_denominator - self.fee);
+        let fee_out = gross_out.saturating_sub(tokens_bought);
+        fee_out * self.admin_fee / fee_denominator
+    }
+
+    fn stableswap_exchange_amounts(
+        &self,
+        i: usize,
+        j: usize,
+        dx: U256,
+    ) -> Result<(U256, U256), AMMError> {
         let amp = self
             .amp
             .ok_or(AMMError::Msg("A parameter not set".into()))?;
@@ -1663,8 +1680,10 @@ impl CurveNGPool {
         }
 
         // Apply fee
-        let fee_amount = dy_raw * final_fee / U256::from(10).pow(U256::from(10));
+        let fee_denominator = U256::from(10).pow(U256::from(10));
+        let fee_amount = dy_raw * final_fee / fee_denominator;
         let scaled_dy = dy_raw - fee_amount;
+        let admin_fee_scaled = fee_amount * self.admin_fee / fee_denominator;
 
         // 反标准化输出
         // 链上合约公式: return (dy - fee) * PRECISION / rates[j]
@@ -1672,7 +1691,14 @@ impl CurveNGPool {
             return Err(AMMError::Msg("rates[j] is zero".into()));
         }
         let dy = scaled_dy * precision / effective_rates[j];
+        let admin_fee_out = admin_fee_scaled * precision / effective_rates[j];
 
+        Ok((dy, admin_fee_out))
+    }
+
+    /// StableSwap 交换模拟
+    fn simulate_stableswap(&self, i: usize, j: usize, dx: U256) -> Result<U256, AMMError> {
+        let (dy, _) = self.stableswap_exchange_amounts(i, j, dx)?;
         Ok(dy)
     }
 
