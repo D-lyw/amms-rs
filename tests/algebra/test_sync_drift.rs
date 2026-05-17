@@ -12,7 +12,7 @@ use alloy::{
 
 use amms::amms::{
     algebra_integral::{AlgebraIntegralFactory, AlgebraIntegralPool, IAlgebraPool},
-    amm::{AutomatedMarketMaker, AMM, SyncAction},
+    amm::{AutomatedMarketMaker, SyncAction, AMM},
 };
 
 sol! {
@@ -256,7 +256,12 @@ async fn run_replay_drift_for_pool<P: Provider + Clone>(
                     )
                     .await;
                     if let Err(msg) = block_fee {
-                        return Err(eyre::eyre!("[{}] checkpoint dynamic fee drift at block {}: {}", label, prev_block, msg));
+                        return Err(eyre::eyre!(
+                            "[{}] checkpoint dynamic fee drift at block {}: {}",
+                            label,
+                            prev_block,
+                            msg
+                        ));
                     }
                 }
 
@@ -328,15 +333,16 @@ async fn run_replay_drift_for_pool<P: Provider + Clone>(
 
             // Dynamic fee check at post-loop checkpoint.
             if !local.plugin.is_zero() && local.timepoints.is_some() {
-                if let Err(msg) = check_dynamic_fee_at_block(
-                    &*provider,
-                    &local,
-                    label,
-                    BlockId::from(prev_block),
-                )
-                .await
+                if let Err(msg) =
+                    check_dynamic_fee_at_block(&*provider, &local, label, BlockId::from(prev_block))
+                        .await
                 {
-                    return Err(eyre::eyre!("[{}] checkpoint dynamic fee drift at block {}: {}", label, prev_block, msg));
+                    return Err(eyre::eyre!(
+                        "[{}] checkpoint dynamic fee drift at block {}: {}",
+                        label,
+                        prev_block,
+                        msg
+                    ));
                 }
             }
         }
@@ -366,21 +372,26 @@ async fn run_replay_drift_for_pool<P: Provider + Clone>(
 
     // Terminal dynamic fee check.
     if !local.plugin.is_zero() && local.timepoints.is_some() {
-        if let Err(msg) = check_dynamic_fee_at_block(
-            &*provider,
-            &local,
-            label,
-            BlockId::from(to_block),
-        )
-        .await
+        if let Err(msg) =
+            check_dynamic_fee_at_block(&*provider, &local, label, BlockId::from(to_block)).await
         {
-            return Err(eyre::eyre!("[{}] terminal dynamic fee drift at {}: {}", label, to_block, msg));
+            return Err(eyre::eyre!(
+                "[{}] terminal dynamic fee drift at {}: {}",
+                label,
+                to_block,
+                msg
+            ));
         }
     }
 
     println!(
         "[{}] final match at block {}: tick={} sqrtPrice={} liquidity={} fee={}",
-        label, to_block, local.inner.tick, local.inner.sqrt_price, local.inner.liquidity, local.last_fee
+        label,
+        to_block,
+        local.inner.tick,
+        local.inner.sqrt_price,
+        local.inner.liquidity,
+        local.last_fee
     );
 
     Ok(())
@@ -401,11 +412,20 @@ async fn test_sync_drift_real_pools() -> eyre::Result<()> {
     // Batch-init all pools in chunks (avoids batch-contract gas limits).
     let init_block = BlockId::from(ALGEBRA_DRIFT_FROM_BLOCK.saturating_sub(1));
     let cases = algebra_cases();
-    let batch: Vec<AMM> = cases.iter().map(|c| AMM::AlgebraIntegralPool(AlgebraIntegralPool::new(c.pool))).collect();
+    let batch: Vec<AMM> = cases
+        .iter()
+        .map(|c| AMM::AlgebraIntegralPool(AlgebraIntegralPool::new(c.pool)))
+        .collect();
     let mut pool_map: HashMap<Address, AlgebraIntegralPool> = HashMap::new();
     for chunk in batch.chunks(5) {
         for attempt in 0..3 {
-            match AlgebraIntegralFactory::init_batch::<Ethereum, _>(chunk.to_vec(), init_block, provider.clone()).await {
+            match AlgebraIntegralFactory::init_batch::<Ethereum, _>(
+                chunk.to_vec(),
+                init_block,
+                provider.clone(),
+            )
+            .await
+            {
                 Ok(initialized) => {
                     for amm in initialized {
                         if let AMM::AlgebraIntegralPool(p) = amm {

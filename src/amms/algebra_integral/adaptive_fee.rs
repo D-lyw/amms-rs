@@ -7,7 +7,6 @@
 ///   fee = baseFee + sigmoid1(volatility/15) + sigmoid2(volatility/15)
 ///
 /// where sigmoid(x) = α / (1 + e^((β-x)/γ))
-
 use alloy::primitives::U256;
 
 use super::AlgebraFeeConfig;
@@ -35,8 +34,9 @@ pub fn get_fee(volatility: u64, config: &AlgebraFeeConfig) -> u16 {
     // Solidity: volatility /= 15 (normalize for 15 sec interval)
     let normalized_vol = volatility / 15;
 
-    let sum_of_sigmoids = sigmoid_uint64(normalized_vol, config.gamma1, config.alpha1, config.beta1)
-        + sigmoid_uint64(normalized_vol, config.gamma2, config.alpha2, config.beta2);
+    let sum_of_sigmoids =
+        sigmoid_uint64(normalized_vol, config.gamma1, config.alpha1, config.beta1)
+            + sigmoid_uint64(normalized_vol, config.gamma2, config.alpha2, config.beta2);
 
     let result = u64::from(config.base_fee) + sum_of_sigmoids;
 
@@ -100,7 +100,9 @@ fn exp_xg4(x: u64, g: u16, g_highest_degree: u64) -> u64 {
     // 0.5-step adjustment: if remainder >= g/2, scale closest_value by e^0.5
     if x_rem >= u64::from(g) / 2 {
         x_rem -= u64::from(g) / 2;
-        closest_value = (U256::from(closest_value) * U256::from(E_POW_HALF_TIMES_1E20) / U256::from(E20)).to::<u128>();
+        closest_value = (U256::from(closest_value) * U256::from(E_POW_HALF_TIMES_1E20)
+            / U256::from(E20))
+        .to::<u128>();
     }
 
     // Taylor series of e^(x/g) * g^4 around 0 (x_rem/g <= 0.5)
@@ -186,15 +188,21 @@ mod tests {
         let cfg = initial_fee_configuration();
         let low = get_fee(0, &cfg);
         let high = get_fee(5_000_000, &cfg);
-        assert!(high >= low, "fee should not decrease with higher volatility");
+        assert!(
+            high >= low,
+            "fee should not decrease with higher volatility"
+        );
     }
 
     #[test]
     fn test_get_fee_bounded() {
         let cfg = AlgebraFeeConfig {
-            alpha1: 5000, alpha2: 5000,
-            beta1: 1000, beta2: 100_000,
-            gamma1: 10, gamma2: 100,
+            alpha1: 5000,
+            alpha2: 5000,
+            beta1: 1000,
+            beta2: 100_000,
+            gamma1: 10,
+            gamma2: 100,
             base_fee: 1000,
         };
         let maximum = u64::from(cfg.base_fee) + u64::from(cfg.alpha1) + u64::from(cfg.alpha2);

@@ -1,5 +1,7 @@
 mod base_forensics;
 mod base_init_window_drift;
+mod base_init_window_rate_drift;
+mod base_live_window_rate_drift;
 mod consistency_smoke;
 mod event_sync;
 mod exact_out;

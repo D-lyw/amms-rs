@@ -48,8 +48,16 @@ async fn chain_balances_at_block<P: Provider + Clone>(
     block: u64,
 ) -> Result<[U256; 2]> {
     let c = ICurveNGPool::new(pool, provider.clone());
-    let b0 = c.balances(U256::from(0u8)).block(BlockId::from(block)).call().await?;
-    let b1 = c.balances(U256::from(1u8)).block(BlockId::from(block)).call().await?;
+    let b0 = c
+        .balances(U256::from(0u8))
+        .block(BlockId::from(block))
+        .call()
+        .await?;
+    let b1 = c
+        .balances(U256::from(1u8))
+        .block(BlockId::from(block))
+        .call()
+        .await?;
     Ok([b0, b1])
 }
 
@@ -85,7 +93,9 @@ async fn test_curve_ng_base_init_window_drift_regression() -> Result<()> {
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
 
     let range_override = env_u64("CURVE_NG_BASE_DRIFT_RANGE");
-    let check_interval = env_u64("CURVE_NG_BASE_DRIFT_CHECK_INTERVAL").unwrap_or(1).max(1);
+    let check_interval = env_u64("CURVE_NG_BASE_DRIFT_CHECK_INTERVAL")
+        .unwrap_or(1)
+        .max(1);
     let tol = env_u64("CURVE_NG_BASE_DRIFT_TOL")
         .map(U256::from)
         .unwrap_or_else(|| U256::from(100u64));

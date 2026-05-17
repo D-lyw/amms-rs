@@ -1632,8 +1632,10 @@ impl StateSpace {
             } else if log.topics().len() >= 2 {
                 if Some(address) == get_liquidity_layer(self.chain_id) {
                     let pool_address = Address::from_word(log.topics()[1]);
-                    if matches!(self.state.get(&pool_address).map(Arc::as_ref), Some(AMM::FluidDexPool(_)))
-                    {
+                    if matches!(
+                        self.state.get(&pool_address).map(Arc::as_ref),
+                        Some(AMM::FluidDexPool(_))
+                    ) {
                         target_addresses.push(pool_address);
                     }
                 } else if Some(address) == balancer_v2::get_vault_address(self.chain_id) {
@@ -1653,7 +1655,9 @@ impl StateSpace {
                     if self.state.contains_key(&pool_address) {
                         target_addresses.push(pool_address);
                     }
-                } else if let Some(pool_address) = self.resolve_slipstream_fee_event_pool(log.topics()) {
+                } else if let Some(pool_address) =
+                    self.resolve_slipstream_fee_event_pool(log.topics())
+                {
                     target_addresses.push(pool_address);
                 } else {
                     let pool_id = log.topics()[1];
@@ -1668,7 +1672,8 @@ impl StateSpace {
                         _ => {}
                     }
                 }
-            } else if log.topics().is_empty() && Some(address) == ekubo::get_core_address(self.chain_id)
+            } else if log.topics().is_empty()
+                && Some(address) == ekubo::get_core_address(self.chain_id)
             {
                 // Ekubo Log0 events: no topics, pool_id is at data[20..52]
                 let data = log.data().data.as_ref();
@@ -1913,11 +1918,9 @@ mod tests {
         state.insert_amm(AMM::AlgebraIntegralPool(algebra));
 
         let topics = vec![ICustomFeeModule::CustomFeeSet::SIGNATURE_HASH];
-        assert!(
-            state
-                .resolve_algebra_plugin_event_pools(plugin, &topics)
-                .is_empty()
-        );
+        assert!(state
+            .resolve_algebra_plugin_event_pools(plugin, &topics)
+            .is_empty());
     }
 
     #[test]

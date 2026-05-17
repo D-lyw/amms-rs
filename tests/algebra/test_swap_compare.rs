@@ -716,13 +716,22 @@ async fn test_compute_fee_matches_chain() -> eyre::Result<()> {
 
     // Batch-init pools in small chunks to avoid batch-contract gas limits.
     let cases = algebra_cases();
-    let batch: Vec<AMM> = cases.iter().map(|c| AMM::AlgebraIntegralPool(AlgebraIntegralPool::new(c.pool))).collect();
+    let batch: Vec<AMM> = cases
+        .iter()
+        .map(|c| AMM::AlgebraIntegralPool(AlgebraIntegralPool::new(c.pool)))
+        .collect();
     const BATCH_CHUNK: usize = 5;
     let mut pools: HashMap<Address, AlgebraIntegralPool> = HashMap::new();
     for chunk in batch.chunks(BATCH_CHUNK) {
         let chunk_vec = chunk.to_vec();
         for attempt in 0..3 {
-            match AlgebraIntegralFactory::init_batch::<Ethereum, _>(chunk_vec.clone(), block, provider.clone()).await {
+            match AlgebraIntegralFactory::init_batch::<Ethereum, _>(
+                chunk_vec.clone(),
+                block,
+                provider.clone(),
+            )
+            .await
+            {
                 Ok(initialized) => {
                     for amm in initialized {
                         if let AMM::AlgebraIntegralPool(p) = amm {
@@ -733,7 +742,10 @@ async fn test_compute_fee_matches_chain() -> eyre::Result<()> {
                 }
                 Err(e) => {
                     if attempt == 2 {
-                        return Err(eyre::eyre!("batch init chunk failed after retries: {:?}", e));
+                        return Err(eyre::eyre!(
+                            "batch init chunk failed after retries: {:?}",
+                            e
+                        ));
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
                 }

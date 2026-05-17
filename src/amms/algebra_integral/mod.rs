@@ -254,7 +254,8 @@ sol! {
     }
 }
 
-const MULTICALL3_ADDRESS: alloy::primitives::Address = alloy::primitives::address!("cA11bde05977b3631167028862bE2a173976CA11");
+const MULTICALL3_ADDRESS: alloy::primitives::Address =
+    alloy::primitives::address!("cA11bde05977b3631167028862bE2a173976CA11");
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Hash, PartialEq, Eq)]
 pub struct AlgebraIntegralFactory {
@@ -954,11 +955,15 @@ impl AlgebraIntegralFactory {
         // Refresh fee mode (plugin was set by sync_state_batch above) and
         // seed fee config + timepoints for dynamic-fee pools.
         for amm in &mut out {
-            let AMM::AlgebraIntegralPool(pool) = amm else { continue };
+            let AMM::AlgebraIntegralPool(pool) = amm else {
+                continue;
+            };
             pool.refresh_fee_mode();
             if pool.is_dynamic_fee_enabled() && !pool.plugin.is_zero() {
-                pool.seed_fee_config::<N, _>(block_number, provider.clone()).await;
-                pool.seed_timepoints::<N, _>(block_number, provider.clone()).await;
+                pool.seed_fee_config::<N, _>(block_number, provider.clone())
+                    .await;
+                pool.seed_timepoints::<N, _>(block_number, provider.clone())
+                    .await;
             }
         }
 
@@ -1004,10 +1009,14 @@ impl AlgebraIntegralFactory {
 
         // Re-seed fee config + timepoints for dynamic-fee pools.
         for amm in &mut pools {
-            let AMM::AlgebraIntegralPool(pool) = amm else { continue };
+            let AMM::AlgebraIntegralPool(pool) = amm else {
+                continue;
+            };
             if pool.is_dynamic_fee_enabled() && !pool.plugin.is_zero() {
-                pool.seed_fee_config::<N, _>(block_number, provider.clone()).await;
-                pool.seed_timepoints::<N, _>(block_number, provider.clone()).await;
+                pool.seed_fee_config::<N, _>(block_number, provider.clone())
+                    .await;
+                pool.seed_timepoints::<N, _>(block_number, provider.clone())
+                    .await;
             }
         }
 
@@ -1386,12 +1395,7 @@ impl AlgebraIntegralPool {
                 });
             }
 
-            let results = match mc3
-                .aggregate3(mc_calls)
-                .block(block_number)
-                .call()
-                .await
-            {
+            let results = match mc3.aggregate3(mc_calls).block(block_number).call().await {
                 Ok(r) => r,
                 Err(_) => return,
             };
@@ -1416,7 +1420,8 @@ impl AlgebraIntegralPool {
                         initialized: true,
                         block_timestamp: dec.blockTimestamp,
                         tick_cumulative: dec.tickCumulative.unchecked_into::<i64>(),
-                        volatility_cumulative: u128::try_from(dec.volatilityCumulative).unwrap_or(0),
+                        volatility_cumulative: u128::try_from(dec.volatilityCumulative)
+                            .unwrap_or(0),
                         tick: dec.tick.as_i32(),
                         average_tick: dec.averageTick.as_i32(),
                         window_start_index: dec.windowStartIndex,
@@ -1769,16 +1774,22 @@ impl AutomatedMarketMaker for AlgebraIntegralPool {
         )
         .await?;
 
-        AlgebraIntegralFactory::sync_tick_data_for_pool::<N, _>(&mut self, block_number, provider.clone())
-            .await?;
+        AlgebraIntegralFactory::sync_tick_data_for_pool::<N, _>(
+            &mut self,
+            block_number,
+            provider.clone(),
+        )
+        .await?;
 
         self.refresh_prices();
         self.refresh_fee_mode();
 
         // Seed fee config + timepoints from plugin if dynamic fee is enabled.
         if self.is_dynamic_fee_enabled() && !self.plugin.is_zero() {
-            self.seed_fee_config::<N, _>(block_number, provider.clone()).await;
-            self.seed_timepoints::<N, _>(block_number, provider.clone()).await;
+            self.seed_fee_config::<N, _>(block_number, provider.clone())
+                .await;
+            self.seed_timepoints::<N, _>(block_number, provider.clone())
+                .await;
         }
 
         Ok(self)

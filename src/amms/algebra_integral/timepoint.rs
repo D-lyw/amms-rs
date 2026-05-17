@@ -66,7 +66,11 @@ const fn card_u32(card: u16) -> u32 {
 impl TimepointCache {
     /// Create a new empty cache that has not yet been seeded.
     pub fn empty() -> Self {
-        Self { timepoints: vec![None; UINT16_MODULO as usize], index: 0, cardinality: 0 }
+        Self {
+            timepoints: vec![None; UINT16_MODULO as usize],
+            index: 0,
+            cardinality: 0,
+        }
     }
 
     /// Seed from a batch of timepoints fetched on-chain.
@@ -131,11 +135,7 @@ impl TimepointCache {
     /// Compute the average volatility over the last `WINDOW` (1 day).
     ///
     /// Mirrors `VolatilityOracle.getAverageVolatility()`.
-    pub fn get_average_volatility(
-        &self,
-        current_time: u32,
-        tick: i32,
-    ) -> Option<u64> {
+    pub fn get_average_volatility(&self, current_time: u32, tick: i32) -> Option<u64> {
         let last = self.last()?;
         let last_index = self.index;
         let oldest_idx = self.oldest_index()?;
@@ -145,17 +145,24 @@ impl TimepointCache {
         let last_cumulative_vol = if time_at_last {
             last.volatility_cumulative
         } else {
-            self.get_volatility_cumulative_at(current_time, 0, tick, last_index, oldest_idx)? as u128
+            self.get_volatility_cumulative_at(current_time, 0, tick, last_index, oldest_idx)?
+                as u128
         };
 
-        if lte_considering_overflow(oldest.block_timestamp, current_time.wrapping_sub(WINDOW), current_time) {
+        if lte_considering_overflow(
+            oldest.block_timestamp,
+            current_time.wrapping_sub(WINDOW),
+            current_time,
+        ) {
             // Oldest timepoint is earlier than 24 hours ago → normal case.
             let cumulative_at_start = if time_at_last {
                 // Interpolate between windowStartIndex and windowStartIndex+1.
                 let ws = last.window_start_index as usize;
                 let tp_ws = self.timepoints[ws].as_ref()?;
                 let tp_ws_next = self.timepoints[ws.wrapping_add(1)].as_ref()?;
-                let ts_delta = tp_ws_next.block_timestamp.wrapping_sub(tp_ws.block_timestamp);
+                let ts_delta = tp_ws_next
+                    .block_timestamp
+                    .wrapping_sub(tp_ws.block_timestamp);
                 let target = current_time.wrapping_sub(WINDOW);
                 let target_delta = target.wrapping_sub(tp_ws.block_timestamp);
                 if ts_delta == 0 {
@@ -167,7 +174,13 @@ impl TimepointCache {
                             / u128::from(ts_delta)
                 }
             } else {
-                self.get_volatility_cumulative_at(current_time, WINDOW, tick, last_index, oldest_idx)? as u128
+                self.get_volatility_cumulative_at(
+                    current_time,
+                    WINDOW,
+                    tick,
+                    last_index,
+                    oldest_idx,
+                )? as u128
             };
 
             let diff = last_cumulative_vol.saturating_sub(cumulative_at_start);
@@ -176,7 +189,9 @@ impl TimepointCache {
             // Not enough data → extrapolate from oldest timepoint.
             let unbiased = if current_time != oldest.block_timestamp {
                 let mut d = current_time.wrapping_sub(oldest.block_timestamp);
-                if d > 1 { d -= 1; }
+                if d > 1 {
+                    d -= 1;
+                }
                 d
             } else {
                 1
@@ -228,13 +243,7 @@ impl TimepointCache {
             window_start_idx
         };
 
-        let new_tp = create_new_timepoint(
-            *last,
-            block_timestamp,
-            tick,
-            avg_tick,
-            window_start_idx,
-        );
+        let new_tp = create_new_timepoint(*last, block_timestamp, tick, avg_tick, window_start_idx);
 
         if card_u32(self.cardinality) < UINT16_MODULO {
             self.cardinality += 1;
@@ -244,8 +253,7 @@ impl TimepointCache {
         self.timepoints[next_idx as usize] = Some(new_tp);
 
         // After wrapping, advance oldest index.
-        if oldest == next_idx {
-        }
+        if oldest == next_idx {}
 
         Some(())
     }
@@ -294,7 +302,11 @@ impl TimepointCache {
         let current_tick_cumulative = last_tick_cumulative
             + i64::from(tick) * i64::from(current_time.wrapping_sub(last_timestamp));
 
-        if !lte_considering_overflow(oldest_timestamp, current_time.wrapping_sub(WINDOW), current_time) {
+        if !lte_considering_overflow(
+            oldest_timestamp,
+            current_time.wrapping_sub(WINDOW),
+            current_time,
+        ) {
             // Oldest is newer than WINDOW ago.
             let delta = current_time.wrapping_sub(oldest_timestamp);
             if delta == 0 {
@@ -304,19 +316,18 @@ impl TimepointCache {
             return Some((avg, u32::from(oldest_index)));
         }
 
-        if lte_considering_overflow(last_timestamp, current_time.wrapping_sub(WINDOW), current_time) {
+        if lte_considering_overflow(
+            last_timestamp,
+            current_time.wrapping_sub(WINDOW),
+            current_time,
+        ) {
             // Last timepoint is older or equal than WINDOW ago.
             return Some((i64::from(tick), u32::from(last_index)));
         }
 
         // Search between oldest and last timepoints.
-        let (tick_cumulative_at_start, window_start_idx) = self.get_tick_cumulative_at(
-            current_time,
-            WINDOW,
-            tick,
-            last_index,
-            oldest_index,
-        )?;
+        let (tick_cumulative_at_start, window_start_idx) =
+            self.get_tick_cumulative_at(current_time, WINDOW, tick, last_index, oldest_index)?;
 
         let avg = (current_tick_cumulative - tick_cumulative_at_start) / i64::from(WINDOW);
         Some((avg, window_start_idx))
@@ -344,7 +355,10 @@ impl TimepointCache {
         if same_point {
             // Target is newer than last timepoint.
             let delta = target.wrapping_sub(ts_before);
-            return Some((tc_before + i64::from(tick) * i64::from(delta), index_before_or_at));
+            return Some((
+                tc_before + i64::from(tick) * i64::from(delta),
+                index_before_or_at,
+            ));
         }
 
         let ts_after = at_or_after.block_timestamp;
@@ -433,9 +447,7 @@ impl TimepointCache {
         let window_start_index = last_tp.window_start_index;
 
         // Target is newer than last timepoint.
-        if target == current_time
-            || lte_considering_overflow(last_tp_ts, target, current_time)
-        {
+        if target == current_time || lte_considering_overflow(last_tp_ts, target, current_time) {
             return Some((last_tp, last_tp, true, u32::from(last_index)));
         }
 
@@ -468,7 +480,8 @@ impl TimepointCache {
         // Binary search.
         let result_idx = self.binary_search(current_time, target, lo, hi, true)?;
         let before = self.timepoints[(result_idx % u32::from(UINT16_MODULO)) as usize].as_ref()?;
-        let after = self.timepoints[((result_idx + 1) % u32::from(UINT16_MODULO)) as usize].as_ref()?;
+        let after =
+            self.timepoints[((result_idx + 1) % u32::from(UINT16_MODULO)) as usize].as_ref()?;
         Some((before, after, false, result_idx))
     }
 
@@ -497,7 +510,8 @@ impl TimepointCache {
 
             if lte_considering_overflow(tp.block_timestamp, target, current_time) {
                 // Before or at target.
-                let next_tp = self.timepoints[((idx + 1) % u32::from(UINT16_MODULO)) as usize].as_ref()?;
+                let next_tp =
+                    self.timepoints[((idx + 1) % u32::from(UINT16_MODULO)) as usize].as_ref()?;
                 if next_tp.initialized
                     && lte_considering_overflow(target, next_tp.block_timestamp, current_time)
                 {
@@ -570,8 +584,8 @@ pub fn volatility_on_range(
     let avg_tick1 = i128::from(avg_tick1);
 
     // (k - p) = (tick1-tick0) - (avgTick1-avgTick0)
-    let k = (tick1 - tick0) - (avg_tick1 - avg_tick0);  // (k-p) * dt
-    let b = (tick0 - avg_tick0) * dt;                    // (b-q) * dt
+    let k = (tick1 - tick0) - (avg_tick1 - avg_tick0); // (k-p) * dt
+    let b = (tick0 - avg_tick0) * dt; // (b-q) * dt
 
     let sum_of_sequence = dt * (dt + 1); // sumOfSequence * 2
     let sum_of_squares = sum_of_sequence * (2 * dt + 1); // sumOfSquares * 6
