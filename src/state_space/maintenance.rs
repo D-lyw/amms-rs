@@ -510,6 +510,9 @@ impl<N, P> StateSpaceManager<N, P> {
             || msg.contains("header not found")
             || msg.contains("requested to block")
             || msg.contains("invalid block range")
+            // Some RPC backends surface transient getLogs failures as -32603 Internal error.
+            || msg.contains("error code -32603")
+            || msg.contains("internal error")
     }
 
     pub(super) async fn drain_pending_sync_queue(

@@ -111,6 +111,9 @@ impl<N, P> StateSpaceManager<N, P> {
             || msg.contains("header not found")
             || msg.contains("requested to block")
             || msg.contains("invalid block range")
+            // Some RPC backends surface transient getLogs failures as -32603 Internal error.
+            || msg.contains("error code -32603")
+            || msg.contains("internal error")
     }
 
     async fn drive_arbitrum_feed_progress(
@@ -457,6 +460,17 @@ mod tests {
         assert!(
             StateSpaceManager::<(), ()>::is_temporarily_unreadable_block_error(&err),
             "invalid block range params should trigger fast retry path"
+        );
+    }
+
+    #[test]
+    fn rpc_internal_error_is_treated_as_temporarily_unreadable() {
+        let err = StateSpaceError::AMMError(crate::amms::error::AMMError::Msg(
+            "server returned an error response: error code -32603: Internal error".to_string(),
+        ));
+        assert!(
+            StateSpaceManager::<(), ()>::is_temporarily_unreadable_block_error(&err),
+            "rpc internal errors should trigger fast retry path"
         );
     }
 }
