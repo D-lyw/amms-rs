@@ -225,10 +225,46 @@ impl PendingSyncQueue {
     pub(super) fn claim_due_non_coverage(
         &mut self,
         canonical_head: u64,
+        max_items: usize,
     ) -> Vec<(Address, PendingSyncTask)> {
-        self.claim_due_filtered(canonical_head, usize::MAX, |task| {
+        self.claim_due_filtered(canonical_head, max_items, |task| {
             task.reason != PendingSyncReason::MaintenanceCoverage
         })
+    }
+
+    pub(super) fn claim_due_non_coverage_for_addresses(
+        &mut self,
+        canonical_head: u64,
+        max_items: usize,
+        addresses: &HashSet<Address>,
+    ) -> Vec<(Address, PendingSyncTask)> {
+        let now = Instant::now();
+        let mut due: Vec<(Address, PendingSyncTask)> = self
+            .tasks
+            .iter()
+            .filter(|(addr, task)| {
+                addresses.contains(*addr)
+                    && !self.in_flight.iter().any(|in_flight| in_flight == *addr)
+                    && task.required_block <= canonical_head
+                    && task.next_retry_at <= now
+                    && task.reason != PendingSyncReason::MaintenanceCoverage
+            })
+            .map(|(addr, task)| (*addr, task.clone()))
+            .collect();
+
+        due.sort_by_key(|(_, task)| {
+            (
+                Reverse(task.action.priority()),
+                task.first_seen_at,
+                Reverse(task.required_block),
+            )
+        });
+        due.truncate(max_items);
+        for (addr, _) in &due {
+            self.in_flight.insert(*addr);
+        }
+
+        due
     }
 
     pub(super) fn claim_due_coverage(
@@ -537,9 +573,56 @@ impl<N, P> StateSpaceManager<N, P> {
             if coverage_only {
                 queue.claim_due_coverage(canonical, max_items)
             } else {
-                queue.claim_due_non_coverage(canonical)
+                queue.claim_due_non_coverage(canonical, max_items)
             }
         };
+        Self::execute_due_tasks(provider, state, pending_sync_queue, canonical, due_tasks).await;
+
+        Ok(())
+    }
+
+    pub(super) async fn drain_pending_sync_queue_for_addresses(
+        provider: &P,
+        state: &Arc<RwLock<StateSpace>>,
+        pending_sync_queue: &Arc<Mutex<PendingSyncQueue>>,
+        canonical_head: &Arc<AtomicU64>,
+        addresses: &[Address],
+        max_items: usize,
+    ) -> Result<(), StateSpaceError>
+    where
+        P: Provider<N> + Clone,
+        N: Network,
+    {
+        if addresses.is_empty() || max_items == 0 {
+            return Ok(());
+        }
+
+        let canonical = canonical_head.load(Ordering::Relaxed);
+        if canonical == 0 {
+            return Ok(());
+        }
+
+        let addresses: HashSet<Address> = addresses.iter().copied().collect();
+        let due_tasks = {
+            let mut queue = pending_sync_queue.lock().await;
+            queue.claim_due_non_coverage_for_addresses(canonical, max_items, &addresses)
+        };
+
+        Self::execute_due_tasks(provider, state, pending_sync_queue, canonical, due_tasks).await;
+
+        Ok(())
+    }
+
+    async fn execute_due_tasks(
+        provider: &P,
+        state: &Arc<RwLock<StateSpace>>,
+        pending_sync_queue: &Arc<Mutex<PendingSyncQueue>>,
+        canonical: u64,
+        due_tasks: Vec<(Address, PendingSyncTask)>,
+    ) where
+        P: Provider<N> + Clone,
+        N: Network,
+    {
         for (address, task) in due_tasks {
             match Self::execute_pending_task(provider, state, address, &task, canonical).await {
                 Ok(PendingExecutionOutcome::Applied) => {
@@ -588,8 +671,6 @@ impl<N, P> StateSpaceManager<N, P> {
                 }
             }
         }
-
-        Ok(())
     }
 
     pub(super) async fn run_pending_sync_worker(
@@ -1503,13 +1584,13 @@ mod tests {
             PendingSyncReason::AsyncUpdate,
         );
 
-        let none_due = queue.claim_due_non_coverage(119);
+        let none_due = queue.claim_due_non_coverage(119, usize::MAX);
         assert!(
             none_due.is_empty(),
             "task must remain blocked before canonical"
         );
 
-        let due = queue.claim_due_non_coverage(120);
+        let due = queue.claim_due_non_coverage(120, usize::MAX);
         assert_eq!(
             due.len(),
             1,

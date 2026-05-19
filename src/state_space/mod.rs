@@ -640,12 +640,12 @@ impl<N, P> StateSpaceManager<N, P> {
             // on Base it runs per flashblock slice, naturally gated by
             // required_block ≤ canonical_head.
             if !needs_async_update.is_empty() {
-                let _ = Self::drain_pending_sync_queue(
+                let _ = Self::drain_pending_sync_queue_for_addresses(
                     _provider,
                     state,
                     pending_sync_queue,
                     canonical_head,
-                    false,
+                    &needs_async_update,
                     needs_async_update.len(),
                 )
                 .await;

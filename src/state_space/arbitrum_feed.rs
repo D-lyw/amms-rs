@@ -5,6 +5,7 @@ use super::{
 use alloy::network::Network;
 use alloy::primitives::Address;
 use alloy::providers::Provider;
+use alloy::rpc::types::Filter;
 use async_stream::stream;
 use futures::{SinkExt, Stream, StreamExt};
 use serde_json::Value;
@@ -19,7 +20,9 @@ pub(crate) const ARBITRUM_FEED_WS_URL: &str = "wss://arb1-feed.arbitrum.io/feed"
 pub(crate) const ARBITRUM_ONE_L2_OFFSET: u64 = 22_207_817;
 pub(crate) const ARBITRUM_FEED_SAFETY_BLOCKS: u64 = 1;
 pub(crate) const ARBITRUM_FEED_RETRY_BASE_MS: u64 = 50;
-pub(crate) const ARBITRUM_FEED_RETRY_MAX_MS: u64 = 500;
+pub(crate) const ARBITRUM_FEED_RETRY_MAX_MS: u64 = 1_000;
+const ARBITRUM_FEED_ALERT_RETRY_THRESHOLD: u32 = 8;
+const ARBITRUM_FEED_ALERT_RETRY_EVERY: u32 = 20;
 pub(crate) const ARBITRUM_FEED_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Debug)]
@@ -49,7 +52,7 @@ impl UnreadableBlockRetryState {
 }
 
 fn unreadable_retry_delay(retry_attempt: u32) -> Duration {
-    let shift = retry_attempt.min(4);
+    let shift = retry_attempt.min(5);
     let multiplier = 1u64 << shift;
     let delay_ms = ARBITRUM_FEED_RETRY_BASE_MS
         .saturating_mul(multiplier)
@@ -120,7 +123,7 @@ impl<N, P> StateSpaceManager<N, P> {
         provider: &P,
         state: &Arc<RwLock<StateSpace>>,
         hooks: &HookRegistry<Vec<Address>>,
-        query_chunks: &[LogQueryChunk],
+        _query_chunks: &[LogQueryChunk],
         realtime_head: &Arc<AtomicU64>,
         canonical_head: &Arc<AtomicU64>,
         pending_sync_queue: &Arc<Mutex<PendingSyncQueue>>,
@@ -152,18 +155,14 @@ impl<N, P> StateSpaceManager<N, P> {
                 }
             }
 
-            let logs = match Self::collect_logs_for_chunks(
-                provider,
-                query_chunks,
-                next_block_to_sync,
-                next_block_to_sync,
-                None,
-            )
-            .await
-            {
+            let filter = Filter::new()
+                .from_block(next_block_to_sync)
+                .to_block(next_block_to_sync);
+            let logs = match provider.get_logs(&filter).await {
                 Ok(logs) => logs,
                 Err(e) => {
-                    if Self::is_temporarily_unreadable_block_error(&e) {
+                    let state_err = StateSpaceError::from(e);
+                    if Self::is_temporarily_unreadable_block_error(&state_err) {
                         let next = match unreadable_block.take() {
                             Some(cur) if cur.block == next_block_to_sync => cur.bump(),
                             _ => UnreadableBlockRetryState::new(next_block_to_sync),
@@ -178,10 +177,27 @@ impl<N, P> StateSpaceManager<N, P> {
                             safety_blocks = ARBITRUM_FEED_SAFETY_BLOCKS,
                             "Arbitrum feed block not readable yet; scheduling retry"
                         );
+                        if next.retry_attempt >= ARBITRUM_FEED_ALERT_RETRY_THRESHOLD
+                            && ((next.retry_attempt - ARBITRUM_FEED_ALERT_RETRY_THRESHOLD)
+                                % ARBITRUM_FEED_ALERT_RETRY_EVERY
+                                == 0)
+                        {
+                            error!(
+                                alert = "arbitrum_feed_block_retry_stuck",
+                                unreadable_block = next.block,
+                                retry_attempt = next.retry_attempt,
+                                retry_delay_ms = unreadable_retry_delay(next.retry_attempt).as_millis(),
+                                realtime_head = synced_head,
+                                raw_feed_head,
+                                candidate_l2_head,
+                                safety_blocks = ARBITRUM_FEED_SAFETY_BLOCKS,
+                                "ALERT: Arbitrum feed block repeatedly unreadable; fast-retry still failing"
+                            );
+                        }
                         *unreadable_block = Some(next);
                         break;
                     }
-                    return Err(e);
+                    return Err(state_err);
                 }
             };
 
@@ -425,13 +441,14 @@ mod tests {
     }
 
     #[test]
-    fn unreadable_retry_backoff_caps_at_500ms() {
+    fn unreadable_retry_backoff_caps_at_1000ms() {
         assert_eq!(unreadable_retry_delay(0), Duration::from_millis(50));
         assert_eq!(unreadable_retry_delay(1), Duration::from_millis(100));
         assert_eq!(unreadable_retry_delay(2), Duration::from_millis(200));
         assert_eq!(unreadable_retry_delay(3), Duration::from_millis(400));
-        assert_eq!(unreadable_retry_delay(4), Duration::from_millis(500));
-        assert_eq!(unreadable_retry_delay(8), Duration::from_millis(500));
+        assert_eq!(unreadable_retry_delay(4), Duration::from_millis(800));
+        assert_eq!(unreadable_retry_delay(5), Duration::from_millis(1000));
+        assert_eq!(unreadable_retry_delay(8), Duration::from_millis(1000));
     }
 
     #[test]

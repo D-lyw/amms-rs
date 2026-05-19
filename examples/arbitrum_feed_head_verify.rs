@@ -11,7 +11,7 @@ use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 const DEFAULT_FEED_WS: &str = "wss://arb1-feed.arbitrum.io/feed";
 const ARB1_GENESIS_OFFSET: u64 = 22_207_817;
 const RETRY_BASE_MS: u64 = 50;
-const RETRY_MAX_MS: u64 = 500;
+const RETRY_MAX_MS: u64 = 1_000;
 
 fn parse_u64(v: &Value) -> Option<u64> {
     match v {
