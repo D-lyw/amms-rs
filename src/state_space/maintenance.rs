@@ -1,7 +1,7 @@
 use super::{StateSpace, StateSpaceManager};
 use crate::amms::aerodrome_slipstream::pool::GetAerodromeSlipstreamProbeBatchRequest;
 use crate::amms::amm::{AutomatedMarketMaker, SyncAction, AMM};
-use crate::amms::curve_ng::ICurveNGStableSwap;
+use crate::amms::curve_ng::{ICurveNGPool, ICurveNGStableSwap};
 use crate::amms::error::AMMError;
 use crate::amms::pancake_v3::GetPancakeV3PoolSlot0BatchRequest;
 use crate::amms::uniswap_v3::GetUniswapV3PoolSlot0BatchRequest;
@@ -806,8 +806,9 @@ impl<N, P> StateSpaceManager<N, P> {
         let block = BlockId::from(block);
 
         for (address, n_coins) in targets {
-            let contract = ICurveNGStableSwap::new(*address, provider.clone());
-            let rates = match contract.stored_rates().block(block).call().await {
+            let stable_contract = ICurveNGStableSwap::new(*address, provider.clone());
+            let pool_contract = ICurveNGPool::new(*address, provider.clone());
+            let rates = match stable_contract.stored_rates().block(block).call().await {
                 Ok(r) => r,
                 Err(e) => {
                     warn!(?address, "CurveNG stable probe stored_rates failed: {}", e);
@@ -818,7 +819,7 @@ impl<N, P> StateSpaceManager<N, P> {
             let mut balances = Vec::with_capacity(*n_coins);
             let mut ok = true;
             for i in 0..*n_coins {
-                match contract.balances(i as i128).block(block).call().await {
+                match pool_contract.balances(U256::from(i)).block(block).call().await {
                     Ok(v) => balances.push(v),
                     Err(e) => {
                         warn!(
