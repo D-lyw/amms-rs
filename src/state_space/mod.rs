@@ -61,6 +61,12 @@ pub enum RealtimeSyncSource {
     ArbitrumSequencerFeed,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PoolRefreshAction {
+    AsyncUpdate,
+    Resync,
+}
+
 #[derive(Clone)]
 pub struct StateSpaceManager<N, P> {
     pub state: Arc<RwLock<StateSpace>>,
@@ -229,6 +235,50 @@ enum SelectedRealtimeSource {
 }
 
 impl<N, P> StateSpaceManager<N, P> {
+    /// Request internal pending-sync refreshes for specific pools.
+    ///
+    /// This only enqueues tasks into the internal pending queue; execution still
+    /// follows canonical-head gating, in-flight dedup, retry/backoff, and workers.
+    pub async fn request_pool_refreshes<I>(&self, addresses: I, action: PoolRefreshAction) -> usize
+    where
+        I: IntoIterator<Item = Address>,
+        P: Provider<N> + Clone,
+        N: Network,
+    {
+        let required_block = self.canonical_head.load(Ordering::Relaxed);
+        let (pending_action, reason) = match action {
+            PoolRefreshAction::AsyncUpdate => (PendingSyncAction::AsyncUpdate, PendingSyncReason::AsyncUpdate),
+            PoolRefreshAction::Resync => (PendingSyncAction::Resync, PendingSyncReason::Resync),
+        };
+
+        let unique: HashSet<Address> = addresses.into_iter().collect();
+        if unique.is_empty() {
+            return 0;
+        }
+
+        {
+            let mut queue = self.pending_sync_queue.lock().await;
+            for address in &unique {
+                queue.enqueue(*address, pending_action, required_block, reason);
+            }
+        }
+
+        if matches!(action, PoolRefreshAction::AsyncUpdate) {
+            let targets: Vec<Address> = unique.iter().copied().collect();
+            let _ = Self::drain_pending_sync_queue_for_addresses(
+                &self.provider,
+                &self.state,
+                &self.pending_sync_queue,
+                &self.canonical_head,
+                &targets,
+                targets.len(),
+            )
+            .await;
+        }
+
+        unique.len()
+    }
+
     /// Registers a hook to be called on every state change.
     pub async fn register_hook(&self, hook: StateHook<Vec<Address>>) -> HookHandle<Vec<Address>> {
         self.hooks.register(hook).await
