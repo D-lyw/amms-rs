@@ -19,9 +19,11 @@ interface ICurveNGPool {
     function A() external view returns (uint256);
     function fee() external view returns (uint256);
     function admin_fee() external view returns (uint256);
+    function offpeg_fee_multiplier() external view returns (uint256);
     
     // StableSwap-NG: stored_rates() for rebasing tokens
     function stored_rates() external view returns (uint256[] memory);
+    function get_dy(uint256 i, uint256 j, uint256 dx) external view returns (uint256);
     
     // CryptoSwap methods
     function D() external view returns (uint256);
@@ -34,6 +36,7 @@ interface ICurveNGPool {
 interface ICurveNGStableSwap {
     function coins(int128 i) external view returns (address);
     function balances(int128 i) external view returns (uint256);
+    function get_dy(int128 i, int128 j, uint256 dx) external view returns (uint256);
 }
 
 interface ICurveTwoCrypto {
@@ -69,6 +72,17 @@ contract GetCurveNGPoolDataBatchRequest {
         uint256[] priceScale;
         // StableSwap-NG: stored_rates for rebasing tokens
         uint256[] rates;
+        // Capability profile
+        bool supportsStoredRates;
+        bool supportsOffpegFeeMultiplier;
+        // 0=Unknown, 1=Uint256, 2=Int128
+        uint8 coinsIndexSignature;
+        uint8 balancesIndexSignature;
+        uint8 getDyIndexSignature;
+        // capability schema version
+        uint8 capabilityVersion;
+        // Stable offpeg fee multiplier value when available
+        uint256 offpegFeeMultiplier;
     }
 
     constructor(PoolInput[] memory inputs) {
@@ -80,6 +94,7 @@ contract GetCurveNGPoolDataBatchRequest {
             
             data.poolAddress = input.pool;
             data.poolType = input.poolType;
+            data.capabilityVersion = 1;
 
             ICurveNGPool pool = ICurveNGPool(input.pool);
 
@@ -89,6 +104,9 @@ contract GetCurveNGPoolDataBatchRequest {
             uint8[] memory tempDecimals = new uint8[](8);
             uint8 nCoins = 0;
             bool useInt128 = false;
+            data.coinsIndexSignature = 0;
+            data.balancesIndexSignature = 0;
+            data.getDyIndexSignature = 0;
 
             for (uint256 j = 0; j < 8; j++) {
                 address coin = address(0);
@@ -97,6 +115,9 @@ contract GetCurveNGPoolDataBatchRequest {
                 if (!useInt128) {
                     try pool.coins(j) returns (address c) {
                         coin = c;
+                        if (data.coinsIndexSignature == 0) {
+                            data.coinsIndexSignature = 1; // Uint256
+                        }
                     } catch {
                         // If failed at index 0, it might be an int128 pool
                         if (j == 0 && input.poolType == 0) {
@@ -112,6 +133,9 @@ contract GetCurveNGPoolDataBatchRequest {
                     // Try int128
                     try ICurveNGStableSwap(input.pool).coins(int128(int256(j))) returns (address c) {
                         coin = c;
+                        if (data.coinsIndexSignature == 0) {
+                            data.coinsIndexSignature = 2; // Int128
+                        }
                     } catch {
                         break;
                     }
@@ -126,10 +150,16 @@ contract GetCurveNGPoolDataBatchRequest {
                 if (!useInt128) {
                     try pool.balances(j) returns (uint256 balance) {
                         tempBalances[j] = balance;
+                        if (data.balancesIndexSignature == 0) {
+                            data.balancesIndexSignature = 1; // Uint256
+                        }
                     } catch {}
                 } else {
                      try ICurveNGStableSwap(input.pool).balances(int128(int256(j))) returns (uint256 balance) {
                         tempBalances[j] = balance;
+                        if (data.balancesIndexSignature == 0) {
+                            data.balancesIndexSignature = 2; // Int128
+                        }
                     } catch {}
                 }
 
@@ -192,11 +222,32 @@ contract GetCurveNGPoolDataBatchRequest {
             if (input.poolType == 0) {
                 try ICurveNGPool(input.pool).stored_rates() returns (uint256[] memory rs) {
                     data.rates = rs;
+                    data.supportsStoredRates = true;
                 } catch {
                     // Default to 1e18 for each coin
                     data.rates = new uint256[](nCoins);
                     for (uint256 k = 0; k < nCoins; k++) {
                         data.rates[k] = 1e18;
+                    }
+                    data.supportsStoredRates = false;
+                }
+
+                try ICurveNGPool(input.pool).offpeg_fee_multiplier() returns (uint256 m) {
+                    data.offpegFeeMultiplier = m;
+                    data.supportsOffpegFeeMultiplier = true;
+                } catch {
+                    data.supportsOffpegFeeMultiplier = false;
+                }
+
+                if (nCoins > 1) {
+                    try ICurveNGStableSwap(input.pool).get_dy(0, 1, 1) returns (uint256) {
+                        data.getDyIndexSignature = 2; // Int128
+                    } catch {
+                        try ICurveNGPool(input.pool).get_dy(0, 1, 1) returns (uint256) {
+                            data.getDyIndexSignature = 1; // Uint256
+                        } catch {
+                            data.getDyIndexSignature = 0;
+                        }
                     }
                 }
             } else {
@@ -205,6 +256,9 @@ contract GetCurveNGPoolDataBatchRequest {
                 for (uint256 k = 0; k < nCoins; k++) {
                     data.rates[k] = 1e18;
                 }
+                data.supportsStoredRates = false;
+                data.supportsOffpegFeeMultiplier = false;
+                data.getDyIndexSignature = 1; // uint256
             }
 
             results[i] = data;
