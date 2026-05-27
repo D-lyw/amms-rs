@@ -650,3 +650,28 @@ impl CurveNGFactory {
         Self::init_batch(amms, block, provider).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_decode_index_signature() {
+        assert_eq!(
+            CurveNGFactory::decode_index_signature(0),
+            CurveIndexSignature::Unknown
+        );
+        assert_eq!(
+            CurveNGFactory::decode_index_signature(1),
+            CurveIndexSignature::Uint256
+        );
+        assert_eq!(
+            CurveNGFactory::decode_index_signature(2),
+            CurveIndexSignature::Int128
+        );
+        assert_eq!(
+            CurveNGFactory::decode_index_signature(255),
+            CurveIndexSignature::Unknown
+        );
+    }
+}

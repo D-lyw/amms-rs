@@ -658,6 +658,7 @@ pub async fn start_curve_rate_sync_task<N, P>(
                 let stable_pool = ICurveNGStableSwap::new(*addr, provider.clone());
                 let ng_pool = ICurveNGPool::new(*addr, provider.clone());
 
+                // Capability-driven refresh: skip methods already known to be unsupported.
                 let rates_res = match target {
                     StableSyncTarget::NG {
                         supports_stored_rates: true,

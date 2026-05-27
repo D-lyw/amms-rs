@@ -193,3 +193,24 @@ impl CurveNGPool {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::primitives::address;
+
+    #[test]
+    fn test_new_pool_capability_defaults() {
+        let pool = CurveNGPool::new(
+            address!("0000000000000000000000000000000000000001"),
+            CurveNGPoolType::StableSwap,
+        );
+
+        assert!(pool.supports_stored_rates);
+        assert!(pool.supports_offpeg_fee_multiplier);
+        assert_eq!(pool.coins_index_signature, CurveIndexSignature::Unknown);
+        assert_eq!(pool.balances_index_signature, CurveIndexSignature::Unknown);
+        assert_eq!(pool.get_dy_index_signature, CurveIndexSignature::Unknown);
+        assert_eq!(pool.capability_version, 0);
+    }
+}

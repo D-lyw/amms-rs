@@ -71,6 +71,7 @@ fn classify_curve_ng_stable_drift(
     if local.balances != remote.balances {
         return Some(PendingSyncAction::Resync);
     }
+    // Capability-driven rule: only compare rates when both sides explicitly expose rates.
     if let (Some(local_rates), Some(remote_rates)) = (&local.rates, &remote.rates) {
         if local_rates != remote_rates {
             return Some(PendingSyncAction::AsyncUpdate);
@@ -1583,6 +1584,16 @@ mod tests {
         let no_diff = base.clone();
         assert_eq!(classify_curve_ng_stable_drift(&base, &no_diff), None);
 
+        let remote_without_rates = CurveNGStableProbeSnapshot {
+            balances: base.balances.clone(),
+            rates: None,
+        };
+        // If one side does not expose rates, we intentionally skip rate drift classification.
+        assert_eq!(
+            classify_curve_ng_stable_drift(&base, &remote_without_rates),
+            None
+        );
+
         let rate_diff = CurveNGStableProbeSnapshot {
             balances: base.balances.clone(),
             rates: Some(vec![
@@ -1593,6 +1604,15 @@ mod tests {
         assert_eq!(
             classify_curve_ng_stable_drift(&base, &rate_diff),
             Some(PendingSyncAction::AsyncUpdate)
+        );
+
+        let both_without_rates = CurveNGStableProbeSnapshot {
+            balances: base.balances.clone(),
+            rates: None,
+        };
+        assert_eq!(
+            classify_curve_ng_stable_drift(&both_without_rates, &remote_without_rates),
+            None
         );
 
         let balance_diff = CurveNGStableProbeSnapshot {
