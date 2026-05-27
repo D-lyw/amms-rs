@@ -804,6 +804,7 @@ impl<N, P> StateSpaceManager<N, P> {
     {
         let mut snapshots = HashMap::with_capacity(targets.len());
         let block = BlockId::from(block);
+        let default_rate = U256::from(10).pow(U256::from(18));
 
         for (address, n_coins) in targets {
             let stable_contract = ICurveNGStableSwap::new(*address, provider.clone());
@@ -811,8 +812,15 @@ impl<N, P> StateSpaceManager<N, P> {
             let rates = match stable_contract.stored_rates().block(block).call().await {
                 Ok(r) => r,
                 Err(e) => {
-                    warn!(?address, "CurveNG stable probe stored_rates failed: {}", e);
-                    continue;
+                    let msg = e.to_string();
+                    if msg.contains("execution reverted") {
+                        // Some Curve Stable pools do not expose stored_rates().
+                        // Fall back to 1e18 rates so balance drift probing can still run.
+                        vec![default_rate; *n_coins]
+                    } else {
+                        warn!(?address, "CurveNG stable probe stored_rates failed: {}", e);
+                        continue;
+                    }
                 }
             };
 
