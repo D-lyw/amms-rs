@@ -3,7 +3,7 @@
 //! 负责发现和初始化 Curve NG 协议的池子。
 
 use super::{
-    types::{CurveNGPool, CurveNGPoolType, CurveNGTwoCryptoVariant},
+    types::{CurveIndexSignature, CurveNGPool, CurveNGPoolType, CurveNGTwoCryptoVariant},
     AMMError,
 };
 use crate::amms::amm::{AutomatedMarketMaker, AMM};
@@ -70,6 +70,88 @@ pub struct CurveNGFactory {
 }
 
 impl CurveNGFactory {
+    fn is_revert_error<E: std::fmt::Display>(err: &E) -> bool {
+        err.to_string().contains("execution reverted")
+    }
+
+    async fn probe_stable_pool_capabilities<N, P>(
+        provider: P,
+        pool_addr: Address,
+        block: BlockId,
+    ) -> (
+        Address,
+        bool,
+        bool,
+        CurveIndexSignature,
+        CurveIndexSignature,
+        CurveIndexSignature,
+        Option<U256>,
+    )
+    where
+        N: Network,
+        P: Provider<N> + Clone,
+    {
+        let ng = crate::amms::curve_ng::ICurveNGPool::new(pool_addr, provider.clone());
+        let stable = crate::amms::curve_ng::ICurveNGStableSwap::new(pool_addr, provider);
+
+        let stored_rates_res = stable.stored_rates().block(block).call().await;
+        let offpeg_res = ng.offpeg_fee_multiplier().block(block).call().await;
+
+        let balances_u_res = ng.balances(U256::ZERO).block(block).call().await;
+        let balances_i_res = stable.balances(0).block(block).call().await;
+        let balances_sig = if balances_u_res.is_ok() {
+            CurveIndexSignature::Uint256
+        } else if balances_i_res.is_ok() {
+            CurveIndexSignature::Int128
+        } else {
+            CurveIndexSignature::Unknown
+        };
+
+        let coins_u_res = ng.coins(U256::ZERO).block(block).call().await;
+        let coins_i_res = stable.coins(0).block(block).call().await;
+        let coins_sig = if coins_u_res.is_ok() {
+            CurveIndexSignature::Uint256
+        } else if coins_i_res.is_ok() {
+            CurveIndexSignature::Int128
+        } else {
+            CurveIndexSignature::Unknown
+        };
+
+        // For get_dy probing use (0,1,1). Some pools may revert due runtime checks; Unknown is acceptable.
+        let get_dy_u_res = ng
+            .get_dy(U256::ZERO, U256::from(1u8), U256::from(1u8))
+            .block(block)
+            .call()
+            .await;
+        let get_dy_i_res = stable.get_dy(0, 1, U256::from(1u8)).block(block).call().await;
+        let get_dy_sig = if get_dy_u_res.is_ok() {
+            CurveIndexSignature::Uint256
+        } else if get_dy_i_res.is_ok() {
+            CurveIndexSignature::Int128
+        } else {
+            CurveIndexSignature::Unknown
+        };
+
+        let supports_stored_rates = match &stored_rates_res {
+            Ok(_) => true,
+            Err(e) => !Self::is_revert_error(e),
+        };
+        let supports_offpeg = match &offpeg_res {
+            Ok(_) => true,
+            Err(e) => !Self::is_revert_error(e),
+        };
+
+        (
+            pool_addr,
+            supports_stored_rates,
+            supports_offpeg,
+            coins_sig,
+            balances_sig,
+            get_dy_sig,
+            offpeg_res.ok(),
+        )
+    }
+
     /// 创建新的 CurveNG Factory 实例
     pub fn new(address: Address, pool_type: CurveNGPoolType, creation_block: u64) -> Self {
         Self {
@@ -360,7 +442,9 @@ impl CurveNGFactory {
         }
 
         // ---------------------------------------------------------
-        // 补充步骤: 为 StableSwap NG 池获取 offpeg_fee_multiplier
+        // 稳定池能力探测（一次性）：
+        // - stored_rates / offpeg_fee_multiplier 支持性
+        // - coins / balances / get_dy 的索引签名类型
         // ---------------------------------------------------------
         let mut stable_ng_pools = Vec::new();
         for amm in amms_map.values() {
@@ -375,38 +459,38 @@ impl CurveNGFactory {
             tracing::info!(
                 target: "curve_ng::init_batch",
                 count = stable_ng_pools.len(),
-                "Fetching offpeg_fee_multiplier for StableSwap NG pools"
+                "Probing capabilities for StableSwap NG pools"
             );
 
             let mut tasks = FuturesUnordered::new();
             for pool_addr in stable_ng_pools {
                 let provider = provider.clone();
-                tasks.push(async move {
-                    let contract = crate::amms::curve_ng::ICurveNGPool::new(pool_addr, provider);
-                    let multiplier = contract.offpeg_fee_multiplier().call().block(block).await;
-                    (pool_addr, multiplier)
-                });
+                tasks.push(Self::probe_stable_pool_capabilities::<N, _>(
+                    provider, pool_addr, block,
+                ));
             }
 
-            while let Some((pool_addr, res)) = tasks.next().await {
-                if let Ok(multiplier_val) = res {
-                    if let Some(AMM::CurveNGPool(pool)) = amms_map.get_mut(&pool_addr) {
-                        pool.offpeg_fee_multiplier = multiplier_val;
-                        tracing::debug!(
-                            target: "curve_ng::init_batch",
-                            pool = ?pool_addr,
-                            multiplier = ?multiplier_val,
-                            "Updated offpeg_fee_multiplier"
-                        );
+            while let Some((
+                pool_addr,
+                supports_stored_rates,
+                supports_offpeg,
+                coins_sig,
+                balances_sig,
+                get_dy_sig,
+                offpeg_multiplier,
+            )) = tasks.next().await
+            {
+                if let Some(AMM::CurveNGPool(pool)) = amms_map.get_mut(&pool_addr) {
+                    pool.supports_stored_rates = supports_stored_rates;
+                    pool.supports_offpeg_fee_multiplier = supports_offpeg;
+                    pool.coins_index_signature = coins_sig;
+                    pool.balances_index_signature = balances_sig;
+                    pool.get_dy_index_signature = get_dy_sig;
+                    pool.capability_version = 1;
+
+                    if let Some(multiplier) = offpeg_multiplier {
+                        pool.offpeg_fee_multiplier = multiplier;
                     }
-                } else {
-                    // 失败通常意味着该池子没有此方法 (可能是旧版本或伪装的 NG)
-                    // 默认为 0 即可
-                    tracing::debug!(
-                        target: "curve_ng::init_batch",
-                        pool = ?pool_addr,
-                        "Failed to fetch offpeg_fee_multiplier (defaulting to 0)"
-                    );
                 }
             }
         }
@@ -515,6 +599,47 @@ impl CurveNGFactory {
 
                     // 单独重试间隔
                     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                }
+            }
+        }
+
+        // Retry 之后补齐一次能力探测，确保单池重试成功的 Stable 池也有完整能力画像
+        let mut stable_without_cap = Vec::new();
+        for amm in amms_map.values() {
+            if let AMM::CurveNGPool(pool) = amm {
+                if pool.pool_type.is_stable() && pool.capability_version == 0 {
+                    stable_without_cap.push(pool.address);
+                }
+            }
+        }
+        if !stable_without_cap.is_empty() {
+            let mut tasks = FuturesUnordered::new();
+            for pool_addr in stable_without_cap {
+                let provider = provider.clone();
+                tasks.push(Self::probe_stable_pool_capabilities::<N, _>(
+                    provider, pool_addr, block,
+                ));
+            }
+            while let Some((
+                pool_addr,
+                supports_stored_rates,
+                supports_offpeg,
+                coins_sig,
+                balances_sig,
+                get_dy_sig,
+                offpeg_multiplier,
+            )) = tasks.next().await
+            {
+                if let Some(AMM::CurveNGPool(pool)) = amms_map.get_mut(&pool_addr) {
+                    pool.supports_stored_rates = supports_stored_rates;
+                    pool.supports_offpeg_fee_multiplier = supports_offpeg;
+                    pool.coins_index_signature = coins_sig;
+                    pool.balances_index_signature = balances_sig;
+                    pool.get_dy_index_signature = get_dy_sig;
+                    pool.capability_version = 1;
+                    if let Some(multiplier) = offpeg_multiplier {
+                        pool.offpeg_fee_multiplier = multiplier;
+                    }
                 }
             }
         }

@@ -629,50 +629,85 @@ pub async fn start_curve_rate_sync_task<N, P>(
 
             // A.2 Fetch and Update
             for addr in &stable_targets {
+                enum StableSyncTarget {
+                    NG {
+                        supports_stored_rates: bool,
+                        supports_offpeg: bool,
+                    },
+                    Legacy,
+                    Other,
+                }
+                let target = {
+                    let read_guard = state.read().await;
+                    match read_guard.state.get(addr).map(|a| a.as_ref()) {
+                        Some(AMM::CurveNGPool(pool)) => StableSyncTarget::NG {
+                            supports_stored_rates: pool.supports_stored_rates,
+                            supports_offpeg: pool.supports_offpeg_fee_multiplier,
+                        },
+                        Some(AMM::CurveLegacyPool(_)) => StableSyncTarget::Legacy,
+                        _ => StableSyncTarget::Other,
+                    }
+                };
+                if matches!(target, StableSyncTarget::Other) {
+                    continue;
+                }
+
                 // We use ICurveNGStableSwap interface here because it includes `stored_rates()`.
                 // This method signature is compatible with Legacy pools that implement it.
                 // We also need ICurveNG for offpeg_fee_multiplier
                 let stable_pool = ICurveNGStableSwap::new(*addr, provider.clone());
                 let ng_pool = ICurveNGPool::new(*addr, provider.clone());
 
-                // Best-effort fetch. Many Legacy pools (like 3pool) will revert here, which is expected.
-                // For NG pools, we try to fetch both stored_rates and offpeg_fee_multiplier
-                let rates_res = stable_pool.stored_rates().call().await;
-                // Try fetching multiplier (only exists on NG)
-                let multiplier_res = ng_pool.offpeg_fee_multiplier().call().await;
+                let rates_res = match target {
+                    StableSyncTarget::NG {
+                        supports_stored_rates: true,
+                        ..
+                    }
+                    | StableSyncTarget::Legacy => stable_pool.stored_rates().call().await.ok(),
+                    _ => None,
+                };
+                let multiplier_res = match target {
+                    StableSyncTarget::NG {
+                        supports_offpeg: true,
+                        ..
+                    } => ng_pool.offpeg_fee_multiplier().call().await.ok(),
+                    _ => None,
+                };
 
-                if let Ok(rates) = rates_res {
-                    let mut write_guard = state.write().await;
-                    if let Some(amm) = write_guard.get_mut_cow(addr) {
-                        let success = match amm {
-                            AMM::CurveNGPool(pool) => {
-                                let mut updated = false;
+                let mut write_guard = state.write().await;
+                if let Some(amm) = write_guard.get_mut_cow(addr) {
+                    let success = match amm {
+                        AMM::CurveNGPool(pool) => {
+                            let mut updated = false;
+                            if let Some(rates) = rates_res.clone() {
                                 if rates.len() == pool.n_coins as usize {
                                     pool.rates = rates;
                                     updated = true;
                                 }
-
-                                // Update multiplier if fetched successfully
-                                if let Ok(m) = multiplier_res {
-                                    pool.offpeg_fee_multiplier = m;
-                                    updated = true;
-                                }
-                                updated
                             }
-                            AMM::CurveLegacyPool(pool) => {
+                            if let Some(m) = multiplier_res {
+                                pool.offpeg_fee_multiplier = m;
+                                updated = true;
+                            }
+                            updated
+                        }
+                        AMM::CurveLegacyPool(pool) => {
+                            if let Some(rates) = rates_res {
                                 if rates.len() == pool.n_coins as usize {
                                     pool.rates = rates;
                                     true
                                 } else {
                                     false
                                 }
+                            } else {
+                                false
                             }
-                            _ => false,
-                        };
-
-                        if success {
-                            updated_count += 1;
                         }
+                        _ => false,
+                    };
+
+                    if success {
+                        updated_count += 1;
                     }
                 }
             }

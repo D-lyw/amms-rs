@@ -3,6 +3,10 @@
 use alloy::primitives::{Address, U256};
 use serde::{Deserialize, Serialize};
 
+fn default_true() -> bool {
+    true
+}
+
 /// Curve NG 池类型枚举
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CurveNGPoolType {
@@ -37,6 +41,15 @@ pub enum CurveNGTwoCryptoVariant {
     PeripheryV210d,
 }
 
+/// Curve NG 索引参数签名类型（用于 coins/balances/get_dy）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum CurveIndexSignature {
+    #[default]
+    Unknown,
+    Uint256,
+    Int128,
+}
+
 /// Curve NG 池状态
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CurveNGPool {
@@ -67,6 +80,24 @@ pub struct CurveNGPool {
     pub admin_fee: U256,
     /// 动态费率乘数 (Off-peg fee multiplier)
     pub offpeg_fee_multiplier: U256,
+    /// 是否支持 stored_rates()（初始化能力探测结果）
+    #[serde(default = "default_true")]
+    pub supports_stored_rates: bool,
+    /// 是否支持 offpeg_fee_multiplier()（初始化能力探测结果）
+    #[serde(default = "default_true")]
+    pub supports_offpeg_fee_multiplier: bool,
+    /// coins() 索引签名
+    #[serde(default)]
+    pub coins_index_signature: CurveIndexSignature,
+    /// balances() 索引签名
+    #[serde(default)]
+    pub balances_index_signature: CurveIndexSignature,
+    /// get_dy() 索引签名
+    #[serde(default)]
+    pub get_dy_index_signature: CurveIndexSignature,
+    /// 能力模型版本号，0 表示旧快照未探测
+    #[serde(default)]
+    pub capability_version: u8,
 
     // === CryptoSwap 额外参数 ===
     /// 价格缩放因子 (CryptoSwap)
@@ -133,6 +164,12 @@ impl CurveNGPool {
             fee: U256::ZERO,
             admin_fee: U256::ZERO,
             offpeg_fee_multiplier: U256::ZERO,
+            supports_stored_rates: true,
+            supports_offpeg_fee_multiplier: true,
+            coins_index_signature: CurveIndexSignature::Unknown,
+            balances_index_signature: CurveIndexSignature::Unknown,
+            get_dy_index_signature: CurveIndexSignature::Unknown,
+            capability_version: 0,
             price_scale: None,
             price_oracle: None,
             last_prices: None,

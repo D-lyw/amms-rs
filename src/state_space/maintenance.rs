@@ -1,7 +1,7 @@
 use super::{StateSpace, StateSpaceManager};
 use crate::amms::aerodrome_slipstream::pool::GetAerodromeSlipstreamProbeBatchRequest;
 use crate::amms::amm::{AutomatedMarketMaker, SyncAction, AMM};
-use crate::amms::curve_ng::{ICurveNGPool, ICurveNGStableSwap};
+use crate::amms::curve_ng::{CurveIndexSignature, ICurveNGPool, ICurveNGStableSwap};
 use crate::amms::error::AMMError;
 use crate::amms::pancake_v3::GetPancakeV3PoolSlot0BatchRequest;
 use crate::amms::uniswap_v3::GetUniswapV3PoolSlot0BatchRequest;
@@ -41,7 +41,7 @@ struct ClProbeSnapshot {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CurveNGStableProbeSnapshot {
     balances: Vec<U256>,
-    rates: Vec<U256>,
+    rates: Option<Vec<U256>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,8 +71,10 @@ fn classify_curve_ng_stable_drift(
     if local.balances != remote.balances {
         return Some(PendingSyncAction::Resync);
     }
-    if local.rates != remote.rates {
-        return Some(PendingSyncAction::AsyncUpdate);
+    if let (Some(local_rates), Some(remote_rates)) = (&local.rates, &remote.rates) {
+        if local_rates != remote_rates {
+            return Some(PendingSyncAction::AsyncUpdate);
+        }
     }
     None
 }
@@ -780,14 +782,20 @@ impl<N, P> StateSpaceManager<N, P> {
 
     fn local_curve_ng_stable_probe_snapshot(
         amm: &AMM,
-    ) -> Option<(CurveNGStableProbeSnapshot, usize)> {
+    ) -> Option<(CurveNGStableProbeSnapshot, usize, bool, CurveIndexSignature)> {
         match amm {
             AMM::CurveNGPool(pool) if pool.pool_type.is_stable() && pool.n_coins > 0 => Some((
                 CurveNGStableProbeSnapshot {
                     balances: pool.balances.clone(),
-                    rates: pool.rates.clone(),
+                    rates: if pool.supports_stored_rates {
+                        Some(pool.rates.clone())
+                    } else {
+                        None
+                    },
                 },
                 pool.n_coins as usize,
+                pool.supports_stored_rates,
+                pool.balances_index_signature,
             )),
             _ => None,
         }
@@ -795,7 +803,7 @@ impl<N, P> StateSpaceManager<N, P> {
 
     async fn fetch_curve_ng_stable_probe_snapshots(
         provider: &P,
-        targets: &[(Address, usize)],
+        targets: &[(Address, usize, bool, CurveIndexSignature)],
         block: u64,
     ) -> Result<HashMap<Address, CurveNGStableProbeSnapshot>, AMMError>
     where
@@ -804,30 +812,44 @@ impl<N, P> StateSpaceManager<N, P> {
     {
         let mut snapshots = HashMap::with_capacity(targets.len());
         let block = BlockId::from(block);
-        let default_rate = U256::from(10).pow(U256::from(18));
-
-        for (address, n_coins) in targets {
+        for (address, n_coins, supports_stored_rates, balance_sig) in targets {
             let stable_contract = ICurveNGStableSwap::new(*address, provider.clone());
             let pool_contract = ICurveNGPool::new(*address, provider.clone());
-            let rates = match stable_contract.stored_rates().block(block).call().await {
-                Ok(r) => r,
-                Err(e) => {
-                    let msg = e.to_string();
-                    if msg.contains("execution reverted") {
-                        // Some Curve Stable pools do not expose stored_rates().
-                        // Fall back to 1e18 rates so balance drift probing can still run.
-                        vec![default_rate; *n_coins]
-                    } else {
-                        warn!(?address, "CurveNG stable probe stored_rates failed: {}", e);
-                        continue;
+            let rates = if *supports_stored_rates {
+                match stable_contract.stored_rates().block(block).call().await {
+                    Ok(r) => Some(r),
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if msg.contains("execution reverted") {
+                            None
+                        } else {
+                            warn!(?address, "CurveNG stable probe stored_rates failed: {}", e);
+                            continue;
+                        }
                     }
                 }
+            } else {
+                None
             };
 
             let mut balances = Vec::with_capacity(*n_coins);
             let mut ok = true;
             for i in 0..*n_coins {
-                match pool_contract.balances(U256::from(i)).block(block).call().await {
+                let balance_result = match balance_sig {
+                    CurveIndexSignature::Uint256 => {
+                        pool_contract.balances(U256::from(i)).block(block).call().await
+                    }
+                    CurveIndexSignature::Int128 => {
+                        stable_contract.balances(i as i128).block(block).call().await
+                    }
+                    CurveIndexSignature::Unknown => {
+                        match pool_contract.balances(U256::from(i)).block(block).call().await {
+                            Ok(v) => Ok(v),
+                            Err(_) => stable_contract.balances(i as i128).block(block).call().await,
+                        }
+                    }
+                };
+                match balance_result {
                     Ok(v) => balances.push(v),
                     Err(e) => {
                         warn!(
@@ -1145,7 +1167,7 @@ impl<N, P> StateSpaceManager<N, P> {
         let mut active_kind = DriftProbeKind::V3Like;
         let mut last_cache_refresh: Option<Instant> = None;
 
-        enum DueProbe {
+            enum DueProbe {
             Cl {
                 address: Address,
                 local: ClProbeSnapshot,
@@ -1156,6 +1178,8 @@ impl<N, P> StateSpaceManager<N, P> {
                 address: Address,
                 local: CurveNGStableProbeSnapshot,
                 n_coins: usize,
+                supports_stored_rates: bool,
+                balances_sig: CurveIndexSignature,
             },
         }
 
@@ -1264,7 +1288,7 @@ impl<N, P> StateSpaceManager<N, P> {
                 }
                 let local = match selected_kind {
                     DriftProbeKind::CurveNGStable => {
-                        let Some((snapshot, n_coins)) =
+                        let Some((snapshot, n_coins, supports_stored_rates, balances_sig)) =
                             Self::local_curve_ng_stable_probe_snapshot(amm_ref)
                         else {
                             continue;
@@ -1273,6 +1297,8 @@ impl<N, P> StateSpaceManager<N, P> {
                             address,
                             local: snapshot,
                             n_coins,
+                            supports_stored_rates,
+                            balances_sig,
                         }
                     }
                     DriftProbeKind::V3Like | DriftProbeKind::Slipstream => {
@@ -1338,7 +1364,9 @@ impl<N, P> StateSpaceManager<N, P> {
                         address,
                         local,
                         n_coins,
-                    } => curve_due.push((address, local, n_coins)),
+                        supports_stored_rates,
+                        balances_sig,
+                    } => curve_due.push((address, local, n_coins, supports_stored_rates, balances_sig)),
                 }
             }
 
@@ -1483,16 +1511,18 @@ impl<N, P> StateSpaceManager<N, P> {
             }
 
             if !curve_due.is_empty() {
-                let targets: Vec<(Address, usize)> = curve_due
+                let targets: Vec<(Address, usize, bool, CurveIndexSignature)> = curve_due
                     .iter()
-                    .map(|(address, _, n_coins)| (*address, *n_coins))
+                    .map(|(address, _, n_coins, supports_stored_rates, balances_sig)| {
+                        (*address, *n_coins, *supports_stored_rates, *balances_sig)
+                    })
                     .collect();
 
                 match Self::fetch_curve_ng_stable_probe_snapshots(&provider, &targets, canonical)
                     .await
                 {
                     Ok(remote_by_address) => {
-                        for (address, local, _) in curve_due {
+                        for (address, local, _, _, _) in curve_due {
                             let Some(remote) = remote_by_address.get(&address) else {
                                 continue;
                             };
@@ -1544,10 +1574,10 @@ mod tests {
     fn test_curve_ng_stable_drift_classification() {
         let base = CurveNGStableProbeSnapshot {
             balances: vec![U256::from(100u64), U256::from(200u64)],
-            rates: vec![
+            rates: Some(vec![
                 U256::from(1_000_000_000_000_000_000u128),
                 U256::from(2_000_000_000_000_000_000u128),
-            ],
+            ]),
         };
 
         let no_diff = base.clone();
@@ -1555,10 +1585,10 @@ mod tests {
 
         let rate_diff = CurveNGStableProbeSnapshot {
             balances: base.balances.clone(),
-            rates: vec![
+            rates: Some(vec![
                 U256::from(1_000_000_000_000_000_001u128),
                 U256::from(2_000_000_000_000_000_000u128),
-            ],
+            ]),
         };
         assert_eq!(
             classify_curve_ng_stable_drift(&base, &rate_diff),

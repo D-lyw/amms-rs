@@ -45,7 +45,7 @@ pub mod math;
 pub mod types;
 
 pub use factory::CurveNGFactory;
-pub use types::{CurveNGPool, CurveNGPoolType, CurveNGTwoCryptoVariant};
+pub use types::{CurveIndexSignature, CurveNGPool, CurveNGPoolType, CurveNGTwoCryptoVariant};
 
 // Curve NG 池合约 ABI (简化版)
 pub mod contracts {
@@ -961,13 +961,45 @@ impl AutomatedMarketMaker for CurveNGPool {
 
         match self.pool_type {
             CurveNGPoolType::StableSwap => {
-                // StableSwap only needs stored_rates - single call, no batching needed
+                // StableSwap periodic refresh by capability profile.
                 let stable_pool = ICurveNGStableSwap::new(self.address, provider.clone());
-                if let Ok(rates) = stable_pool.stored_rates().call().await {
-                    if rates.len() == self.n_coins as usize {
-                        self.rates = rates;
-                        self.update_spot_prices();
+                let ng_pool = ICurveNGPool::new(self.address, provider.clone());
+                let mut updated = false;
+
+                if self.supports_stored_rates {
+                    match stable_pool.stored_rates().call().await {
+                        Ok(rates) => {
+                            if rates.len() == self.n_coins as usize {
+                                self.rates = rates;
+                                updated = true;
+                            }
+                        }
+                        Err(e) => {
+                            if e.to_string().contains("execution reverted") {
+                                self.supports_stored_rates = false;
+                                self.capability_version = self.capability_version.max(1);
+                            }
+                        }
                     }
+                }
+
+                if self.supports_offpeg_fee_multiplier {
+                    match ng_pool.offpeg_fee_multiplier().call().await {
+                        Ok(m) => {
+                            self.offpeg_fee_multiplier = m;
+                            updated = true;
+                        }
+                        Err(e) => {
+                            if e.to_string().contains("execution reverted") {
+                                self.supports_offpeg_fee_multiplier = false;
+                                self.capability_version = self.capability_version.max(1);
+                            }
+                        }
+                    }
+                }
+
+                if updated {
+                    self.update_spot_prices();
                 }
             }
             CurveNGPoolType::TwoCrypto => {
