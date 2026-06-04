@@ -60,6 +60,8 @@ const SLIPSTREAM_BATCH_RETRY_BASE_DELAY_MS: u64 = 400;
 const SLIPSTREAM_INTER_BATCH_SLEEP_MS: u64 = 700;
 // Keep constructor-return payload under EVM code-size limit during deploy_builder().call_raw().
 const SLIPSTREAM_FEE_CONFIG_BATCH_STEP: usize = 40;
+// Keep Multicall3 aggregate3 observation batches comfortably below Base's RPC gas ceiling.
+const SLIPSTREAM_OBSERVATIONS_MULTICALL_STEP: usize = 384;
 const ZERO_FEE_INDICATOR: u32 = 420;
 const SCALING_PRECISION: u64 = 1_000_000;
 const MIN_SECONDS_AGO: u32 = 2;
@@ -2499,97 +2501,120 @@ impl AerodromeSlipstreamFactory {
             }
         }
         // Multicall3: batch observations(i) for all pools.
+        // Split by total observation calls, not pool count, because high-cardinality pools can
+        // exceed Base RPC gas limits even in very small pool groups.
         let mc3 = IMulticall3::new(MULTICALL3_ADDRESS, provider.clone());
-        for chunk_addrs in pool_addrs.chunks(3) {
-            let mut mc_calls: Vec<IMulticall3::Call3> = Vec::new();
-            let mut mc_meta: Vec<(Address, usize, u16)> = Vec::new(); // addr, sidx, card
+        let mut pool_obs: HashMap<Address, (u16, Vec<Observation>)> = HashMap::new();
+        let mut mc_calls: Vec<IMulticall3::Call3> = Vec::new();
+        let mut mc_meta: Vec<(Address, usize, u16)> = Vec::new(); // addr, sidx, card
 
-            for &addr in chunk_addrs {
-                let s0 = ICLPoolFull::new(addr, provider.clone())
-                    .slot0()
-                    .block(block_number)
-                    .call()
-                    .await
-                    .map_err(|e| {
-                        AMMError::Msg(format!("slot0 fetch failed for pool {}: {:?}", addr, e))
-                    })?;
-                let card = s0.observationCardinality;
-                let ridx = s0.observationIndex;
-                let count = (card as u16).min(1500);
-                for j in 0..count {
-                    let sidx = ((ridx as u64 + card as u64 - j as u64) % card as u64) as usize;
-                    let cd = ICLPoolFull::observationsCall {
-                        index: U256::from(sidx),
-                    }
-                    .abi_encode();
-                    mc_calls.push(IMulticall3::Call3 {
-                        target: addr,
-                        allowFailure: true,
-                        callData: cd.into(),
-                    });
-                    mc_meta.push((addr, sidx, card));
-                }
+        async fn flush_observation_batch<N, P>(
+            mc3: &IMulticall3::IMulticall3Instance<P, N>,
+            block_number: BlockId,
+            mc_calls: &mut Vec<IMulticall3::Call3>,
+            mc_meta: &mut Vec<(Address, usize, u16)>,
+            pool_obs: &mut HashMap<Address, (u16, Vec<Observation>)>,
+        ) -> Result<(), AMMError>
+        where
+            N: Network,
+            P: Provider<N> + Clone,
+        {
+            if mc_calls.is_empty() {
+                return Ok(());
             }
 
-            if !mc_calls.is_empty() {
-                let results = mc3
-                    .aggregate3(mc_calls)
-                    .block(block_number)
-                    .call()
-                    .await
-                    .map_err(|e| AMMError::Msg(format!("Multicall3 aggregate3 failed: {:?}", e)))?;
-                use std::collections::HashMap;
-                let mut pool_obs: HashMap<Address, (u16, Vec<Observation>)> = HashMap::new();
-                for (i, res) in results.iter().enumerate() {
-                    if i >= mc_meta.len() {
-                        break;
-                    }
-                    let (addr, sidx, card) = mc_meta[i];
-                    if !res.returnData.is_empty() {
-                        if let Ok(dec) =
-                            <ICLPoolFull::observationsCall as SolCall>::abi_decode_returns(
-                                &res.returnData,
-                            )
-                        {
-                            if dec.initialized && dec.blockTimestamp != 0 {
-                                let tc: i128 = dec.tickCumulative.unchecked_into::<i64>() as i128;
-                                let obs = Observation {
-                                    block_timestamp: dec.blockTimestamp,
-                                    tick_cumulative: tc,
-                                    initialized: true,
-                                };
+            let calls = std::mem::take(mc_calls);
+            let meta = std::mem::take(mc_meta);
+            let results = mc3
+                .aggregate3(calls)
+                .block(block_number)
+                .call()
+                .await
+                .map_err(|e| AMMError::Msg(format!("Multicall3 aggregate3 failed: {:?}", e)))?;
 
-                                let entry = pool_obs.entry(addr).or_insert_with(|| {
-                                    let mut v = Vec::with_capacity(card as usize);
-                                    v.resize(card as usize, Observation::default());
-                                    (card, v)
-                                });
-                                if sidx < entry.1.len() {
-                                    entry.1[sidx] = obs;
-                                }
+            for (i, res) in results.iter().enumerate() {
+                if i >= meta.len() {
+                    break;
+                }
+                let (addr, sidx, card) = meta[i];
+                if !res.returnData.is_empty() {
+                    if let Ok(dec) =
+                        <ICLPoolFull::observationsCall as SolCall>::abi_decode_returns(
+                            &res.returnData,
+                        )
+                    {
+                        if dec.initialized && dec.blockTimestamp != 0 {
+                            let tc: i128 = dec.tickCumulative.unchecked_into::<i64>() as i128;
+                            let obs = Observation {
+                                block_timestamp: dec.blockTimestamp,
+                                tick_cumulative: tc,
+                                initialized: true,
+                            };
+
+                            let entry = pool_obs.entry(addr).or_insert_with(|| {
+                                let mut v = Vec::with_capacity(card as usize);
+                                v.resize(card as usize, Observation::default());
+                                (card, v)
+                            });
+                            if sidx < entry.1.len() {
+                                entry.1[sidx] = obs;
                             }
                         }
                     }
                 }
-
-                for (addr, (card, obs)) in pool_obs {
-                    if let Some(amm) = amms.iter_mut().find(|a| a.address() == addr) {
-                        if let AMM::AerodromeSlipstreamPool(ref mut p) = amm {
-                            let mut max_ts = 0;
-                            let mut best_idx = 0;
-                            for (i, o) in obs.iter().enumerate() {
-                                if o.initialized && o.block_timestamp > max_ts {
-                                    max_ts = o.block_timestamp;
-                                    best_idx = i as u16;
-                                }
-                            }
-                            p.observations_cache
-                                .seed_from_observations_batch(obs, best_idx, card);
-                        }
-                    }
-                }
             }
+
             sleep(Duration::from_millis(SLIPSTREAM_INTER_BATCH_SLEEP_MS)).await;
+            Ok(())
+        }
+
+        for &addr in &pool_addrs {
+            let s0 = ICLPoolFull::new(addr, provider.clone())
+                .slot0()
+                .block(block_number)
+                .call()
+                .await
+                .map_err(|e| AMMError::Msg(format!("slot0 fetch failed for pool {}: {:?}", addr, e)))?;
+            let card = s0.observationCardinality;
+            let ridx = s0.observationIndex;
+            let count = (card as u16).min(1500);
+            for j in 0..count {
+                if mc_calls.len() >= SLIPSTREAM_OBSERVATIONS_MULTICALL_STEP {
+                    flush_observation_batch(&mc3, block_number, &mut mc_calls, &mut mc_meta, &mut pool_obs)
+                        .await?;
+                }
+
+                let sidx = ((ridx as u64 + card as u64 - j as u64) % card as u64) as usize;
+                let cd = ICLPoolFull::observationsCall {
+                    index: U256::from(sidx),
+                }
+                .abi_encode();
+                mc_calls.push(IMulticall3::Call3 {
+                    target: addr,
+                    allowFailure: true,
+                    callData: cd.into(),
+                });
+                mc_meta.push((addr, sidx, card));
+            }
+        }
+        flush_observation_batch(&mc3, block_number, &mut mc_calls, &mut mc_meta, &mut pool_obs)
+            .await?;
+
+        for (addr, (card, obs)) in pool_obs {
+            if let Some(amm) = amms.iter_mut().find(|a| a.address() == addr) {
+                if let AMM::AerodromeSlipstreamPool(ref mut p) = amm {
+                    let mut max_ts = 0;
+                    let mut best_idx = 0;
+                    for (i, o) in obs.iter().enumerate() {
+                        if o.initialized && o.block_timestamp > max_ts {
+                            max_ts = o.block_timestamp;
+                            best_idx = i as u16;
+                        }
+                    }
+                    p.observations_cache
+                        .seed_from_observations_batch(obs, best_idx, card);
+                }
+            }
         }
 
         let (structurally_valid, structurally_invalid): (Vec<_>, Vec<_>) =
