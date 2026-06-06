@@ -427,7 +427,6 @@ impl AutomatedMarketMaker for RocketPoolConverter {
         self.deposit_pool_balance = balance;
         self.deposit_fee_rate = fee;
         self.redeemable_eth = redeemable;
-        self.redeemable_eth = redeemable;
         self.recompute_state();
         self.refresh_prices()?;
         Ok(())
