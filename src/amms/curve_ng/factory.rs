@@ -124,7 +124,7 @@ impl CurveNGFactory {
         // 2. 分批次获取池子地址，严格控制 RPS
         let mut pools = Vec::new();
         // 降低批量大小以减少并发压力
-        let batch_size = 20;
+        let batch_size = 5;
         let mut start_index = 0;
 
         while start_index < count_u64 {
@@ -218,7 +218,7 @@ impl CurveNGFactory {
 
         // 减小批次大小以避免 Gas Limit 或 Contract Size 限制
         // 调试模式：设置为 1 以验证逻辑正确性
-        let step = 20;
+        let step = 5;
         // 使用 pool_chunks 保存 (address, pool_type) 元组，而不是直接引用 AMM
         // 这样可以避免对 amms 的引用，允许后续将其 move 给 amms_map
         let pool_chunks = amms
