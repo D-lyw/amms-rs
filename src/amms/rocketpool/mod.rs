@@ -96,6 +96,7 @@ sol! {
         }
         function aggregate3(Call3[] calldata calls) external payable returns (Result[] memory returnData);
     }
+
 }
 
 // ── SolCall function signatures for Multicall3 ──────────────────────────
@@ -106,6 +107,7 @@ sol! {
     function getExcessBalance() external view returns (uint256);
     function getMaximumDepositAmount() external view returns (uint256);
     function getBalance() external view returns (uint256);
+    function getDepositFee() external view returns (uint256);
 }
 
 #[derive(Error, Debug)]
@@ -153,6 +155,8 @@ pub struct RocketPoolConverter {
     pub deposit_pool_balance: U256,
     /// Current excess ETH (RocketDepositPool).
     pub excess_balance: U256,
+    /// Deposit fee rate in WAD (1e18 = 100 %), from `RocketDAOProtocolSettingsDeposit.getDepositFee()`.
+    pub deposit_fee_rate: u128,
     pub token_0_price: f64,
     pub token_1_price: f64,
 }
@@ -367,7 +371,7 @@ impl AutomatedMarketMaker for RocketPoolConverter {
             .call()
             .await?;
 
-        let (total_eth, reth_supply, excess, max_deposit, balance) =
+        let (total_eth, reth_supply, excess, max_deposit, balance, fee) =
             Self::fetch_all(block_number, provider, self.token_0, self.network_balances_address, self.address).await?;
 
         self.token_1 = NATIVE_ETH_PLACEHOLDER;
@@ -378,6 +382,7 @@ impl AutomatedMarketMaker for RocketPoolConverter {
         self.excess_balance = excess;
         self.maximum_deposit_amount = max_deposit;
         self.deposit_pool_balance = balance;
+        self.deposit_fee_rate = fee;
         self.recompute_state();
         self.refresh_prices()?;
 
@@ -386,8 +391,7 @@ impl AutomatedMarketMaker for RocketPoolConverter {
             address = ?self.address,
             exchange_rate = ?self.exchange_rate,
             total_collateral = ?self.total_collateral,
-            total_eth_balance = ?self.total_eth_balance,
-            reth_supply = ?self.reth_supply,
+            deposit_fee_rate = self.deposit_fee_rate,
             maximum_deposit_amount = ?self.maximum_deposit_amount,
             "Rocket Pool converter initialized"
         );
@@ -401,7 +405,7 @@ impl AutomatedMarketMaker for RocketPoolConverter {
         N: Network,
         P: Provider<N> + Clone,
     {
-        let (total_eth, reth_supply, excess, max_deposit, balance) =
+        let (total_eth, reth_supply, excess, max_deposit, balance, fee) =
             Self::fetch_all(BlockId::default(), provider, self.token_0, self.network_balances_address, self.address).await?;
 
         self.total_eth_balance = total_eth;
@@ -409,6 +413,7 @@ impl AutomatedMarketMaker for RocketPoolConverter {
         self.excess_balance = excess;
         self.maximum_deposit_amount = max_deposit;
         self.deposit_pool_balance = balance;
+        self.deposit_fee_rate = fee;
         self.recompute_state();
         self.refresh_prices()?;
         Ok(())
@@ -466,7 +471,7 @@ impl RocketPoolConverter {
         reth: Address,
         network_balances: Address,
         deposit_pool: Address,
-    ) -> Result<(U256, U256, U256, U256, U256), AMMError>
+    ) -> Result<(U256, U256, U256, U256, U256, u128), AMMError>
     where
         N: Network,
         P: Provider<N> + Clone,
@@ -499,6 +504,11 @@ impl RocketPoolConverter {
                 allowFailure: false,
                 callData: getBalanceCall {}.abi_encode().into(),
             },
+            IMulticall3::Call3 {
+                target: addresses::ROCKET_SETTINGS_DEPOSIT,
+                allowFailure: true,
+                callData: getDepositFeeCall {}.abi_encode().into(),
+            },
         ];
 
         let results = multicall
@@ -507,20 +517,25 @@ impl RocketPoolConverter {
             .call()
             .await?;
 
-        // results is Vec<Result>, each Result has {success, returnData}
-        let total_eth = <getTotalETHBalanceCall as SolCall>::abi_decode_returns(
-            &results[0].returnData,
-        )?;
-        let supply = <totalSupplyCall as SolCall>::abi_decode_returns(&results[1].returnData)?;
-        let excess = <getExcessBalanceCall as SolCall>::abi_decode_returns(
-            &results[2].returnData,
-        )?;
-        let max_deposit = <getMaximumDepositAmountCall as SolCall>::abi_decode_returns(
-            &results[3].returnData,
-        )?;
-        let balance = <getBalanceCall as SolCall>::abi_decode_returns(&results[4].returnData)?;
+        let total_eth =
+            <getTotalETHBalanceCall as SolCall>::abi_decode_returns(&results[0].returnData)?;
+        let supply =
+            <totalSupplyCall as SolCall>::abi_decode_returns(&results[1].returnData)?;
+        let excess =
+            <getExcessBalanceCall as SolCall>::abi_decode_returns(&results[2].returnData)?;
+        let max_deposit =
+            <getMaximumDepositAmountCall as SolCall>::abi_decode_returns(&results[3].returnData)?;
+        let balance =
+            <getBalanceCall as SolCall>::abi_decode_returns(&results[4].returnData)?;
+        // Fee call: use 0 if the call failed OR returned empty data
+        // (wrong address, non-existent function, or RPC incompatibility).
+        let fee_raw: U256 = if results[5].success && results[5].returnData.len() >= 32 {
+            <getDepositFeeCall as SolCall>::abi_decode_returns(&results[5].returnData)?
+        } else {
+            U256::ZERO
+        };
 
-        Ok((total_eth, supply, excess, max_deposit, balance))
+        Ok((total_eth, supply, excess, max_deposit, balance, fee_raw.to()))
     }
 
     // ------------------------------------------------------------------
@@ -577,31 +592,69 @@ impl RocketPoolConverter {
             / U256::from(WAD))
     }
 
+    /// ETH → rETH: deducts the protocol deposit fee.
+    ///
+    /// On-chain: `depositNet = amount_in - amount_in * getDepositFee() / 1e18`,
+    /// then rETH is minted based on `depositNet`.
     pub fn eth_to_reth(&self, amount_in: U256) -> Result<U256, AMMError> {
         if self.exchange_rate.is_zero() {
             return Err(RocketPoolError::DivisionByZero.into());
         }
-        Ok(amount_in
+        // depositNet = amount_in * (WAD - fee) / WAD
+        let deposit_net = if self.deposit_fee_rate == 0 {
+            amount_in
+        } else if self.deposit_fee_rate >= WAD as u128 {
+            return Err(RocketPoolError::DivisionByZero.into());
+        } else {
+            amount_in
+                .checked_mul(U256::from(WAD - self.deposit_fee_rate as u128))
+                .ok_or(AMMError::ArithmeticError)?
+                / U256::from(WAD)
+        };
+        // rETH = depositNet * WAD / exchange_rate
+        deposit_net
             .checked_mul(U256::from(WAD))
             .ok_or(AMMError::ArithmeticError)?
-            / self.exchange_rate)
+            .checked_div(self.exchange_rate)
+            .ok_or(AMMError::ArithmeticError)
+            .map_err(|_| AMMError::DivisionByZero)
     }
 
+    /// Exact-output: required ETH input for a target rETH output.
+    /// Grosses up the deposit_net by the fee rate.
     pub fn eth_to_reth_input(&self, amount_out: U256) -> Result<U256, AMMError> {
         if self.exchange_rate.is_zero() {
             return Err(RocketPoolError::DivisionByZero.into());
         }
+        // deposit_net = ceil(amount_out * exchange_rate / WAD)
         let numerator = amount_out
             .checked_mul(self.exchange_rate)
             .ok_or(AMMError::ArithmeticError)?;
         let wad = U256::from(WAD);
-        let mut amount_in = numerator / wad;
+        let mut deposit_net = numerator / wad;
         if numerator % wad != U256::ZERO {
-            amount_in = amount_in
+            deposit_net = deposit_net
                 .checked_add(U256::from(1u64))
                 .ok_or(AMMError::ArithmeticError)?;
         }
-        Ok(amount_in)
+        // Gross up: amount_in = ceil(deposit_net * WAD / (WAD - fee))
+        if self.deposit_fee_rate == 0 {
+            Ok(deposit_net)
+        } else if self.deposit_fee_rate >= WAD as u128 {
+            Err(RocketPoolError::DivisionByZero.into())
+        } else {
+            let denominator = U256::from(WAD - self.deposit_fee_rate as u128);
+            let num2 = deposit_net
+                .checked_mul(U256::from(WAD))
+                .ok_or(AMMError::ArithmeticError)?;
+            let mut amount_in = num2 / denominator;
+            if num2 % denominator != U256::ZERO {
+                amount_in = amount_in
+                    .checked_add(U256::from(1u64))
+                    .ok_or(AMMError::ArithmeticError)?;
+            }
+            Ok(amount_in)
+        }
     }
 
     pub fn reth_to_eth_input(&self, amount_out: U256) -> Result<U256, AMMError> {
@@ -710,6 +763,11 @@ pub mod addresses {
         address!("ce15294273cfb9d9b628f4d61636623decdf4fdc");
     pub const ROCKET_NETWORK_BALANCES: Address =
         address!("07FCaBCbe4ff0d80c2b1eb42855C0131b6cba2F4");
+    /// RocketDAOProtocolSettingsDeposit address on mainnet.
+    /// Resolved from RocketStorage by keccak256("contract.addressrocketDAOProtocolSettingsDeposit").
+    /// Returns the deposit fee rate via `getDepositFee()` (percentage in WAD, 1e18 = 100 %).
+    pub const ROCKET_SETTINGS_DEPOSIT: Address =
+        address!("ac2245BE4C2C1E9752499Bcd34861B761d62fC27");
 }
 
 #[cfg(test)]
@@ -756,14 +814,37 @@ mod tests {
         converter.total_collateral = U256::from(100u128) * U256::from(WAD);
         converter.maximum_deposit_amount = U256::from(100u128) * U256::from(WAD);
         converter.exchange_rate = U256::from(1_150_000_000_000_000_000u128);
+        converter.deposit_fee_rate = 0;
         converter.refresh_prices().unwrap();
 
         let amount_in = U256::from(WAD);
         let amount_out = converter
             .simulate_swap(converter.token_1, converter.token_0, amount_in)
             .unwrap();
-        // 1 ETH / 1.15 = 0.869565217391304347 rETH
+        // 1 ETH / 1.15 = 0.869565217391304347 rETH (fee = 0)
         assert_eq!(amount_out, U256::from(869_565_217_391_304_347u128));
+    }
+
+    #[test]
+    fn test_eth_to_reth_with_fee() {
+        let mut converter = test_converter();
+        converter.total_eth_balance = U256::from(115u128) * U256::from(WAD);
+        converter.reth_supply = U256::from(100u128) * U256::from(WAD);
+        converter.excess_balance = U256::from(15u128) * U256::from(WAD);
+        converter.total_collateral = U256::from(100u128) * U256::from(WAD);
+        converter.maximum_deposit_amount = U256::from(100u128) * U256::from(WAD);
+        converter.exchange_rate = U256::from(1_150_000_000_000_000_000u128);
+        converter.deposit_fee_rate = 5_000_000_000_000_000; // 0.5 % (0.005 * 1e18)
+        converter.refresh_prices().unwrap();
+
+        let amount_in = U256::from(WAD); // 1 ETH gross
+        let amount_out = converter
+            .simulate_swap(converter.token_1, converter.token_0, amount_in)
+            .unwrap();
+
+        // deposit_net = 1 ETH * (1 - 0.005) = 0.995 ETH
+        // reth = 0.995e18 * 1e18 / 1.15e18 = 0.995e18 / 1.15 = 865217391304347826
+        assert_eq!(amount_out, U256::from(865_217_391_304_347_826u128));
     }
 
     #[test]
@@ -844,6 +925,7 @@ mod tests {
         converter.total_collateral = U256::from(100u128) * U256::from(WAD);
         converter.maximum_deposit_amount = U256::from(100u128) * U256::from(WAD);
         converter.exchange_rate = U256::from(1_150_000_000_000_000_000u128);
+        converter.deposit_fee_rate = 0;
         converter.refresh_prices().unwrap();
 
         let target_out = U256::from(WAD);
@@ -949,6 +1031,7 @@ mod tests {
         converter.maximum_deposit_amount = U256::from(100u128) * U256::from(WAD);
         converter.deposit_pool_balance = U256::from(50u128) * U256::from(WAD);
         converter.exchange_rate = U256::from(1_150_000_000_000_000_000u128);
+        converter.deposit_fee_rate = 0;
         converter.refresh_prices().unwrap();
 
         // rETH → ETH

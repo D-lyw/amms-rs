@@ -60,6 +60,12 @@ sol! {
         function getBalance() external view returns (uint256);
         function getExcessBalance() external view returns (uint256);
     }
+
+    #[derive(Debug, PartialEq, Eq)]
+    #[sol(rpc)]
+    contract IRocketDAOProtocolSettingsDeposit {
+        function getDepositFee() external view returns (uint256);
+    }
 }
 
 /// Helper: try an eth_call, return `None` on revert (best-effort cross-ref).
@@ -70,6 +76,17 @@ macro_rules! try_call {
             Err(_) => None,
         }
     }};
+}
+
+/// Compute eth_to_reth(amount) locally with fee deduction.
+fn eth_to_reth_with_fee(amount: U256, rate: U256, fee_rate: u128) -> U256 {
+    let wad = U256::from(1_000_000_000_000_000_000u128);
+    let deposit_net = if fee_rate == 0 {
+        amount
+    } else {
+        amount * U256::from(wad.to::<u128>() - fee_rate) / wad
+    };
+    deposit_net * wad / rate
 }
 
 // ── Test ─────────────────────────────────────────────────────────────────
@@ -104,6 +121,8 @@ async fn test_rocketpool_mainnet_fork() -> Result<()> {
         IRocketNetworkBalances::new(addresses::ROCKET_NETWORK_BALANCES, provider.clone());
     let deposit =
         IRocketDepositPool::new(addresses::ROCKET_DEPOSIT_POOL, provider.clone());
+    let settings =
+        IRocketDAOProtocolSettingsDeposit::new(addresses::ROCKET_SETTINGS_DEPOSIT, provider.clone());
 
     // ── Phase 2: Raw-field parity (best-effort, skip reverts) ────────────
 
@@ -146,6 +165,15 @@ async fn test_rocketpool_mainnet_fork() -> Result<()> {
         );
     }
 
+    // deposit_fee_rate  (RocketDAOProtocolSettingsDeposit)
+    if let Some(onchain) = try_call!(settings.getDepositFee().block(block_id).call()) {
+        let onchain_u128: u128 = onchain.to();
+        assert_eq!(
+            converter.deposit_fee_rate, onchain_u128,
+            "deposit_fee_rate mismatch (on-chain={onchain_u128})"
+        );
+    }
+
     // ── Phase 3: Self-consistency (no chain calls) ───────────────────────
 
     // 3a. total_collateral = total_eth_balance - excess_balance
@@ -180,17 +208,23 @@ async fn test_rocketpool_mainnet_fork() -> Result<()> {
         );
     }
 
-    // 3d. eth_to_reth(WAD) * exchange_rate ≈ WAD  (reciprocal property)
+    // 3d. eth_to_reth(WAD) now accounts for deposit fee.
+    //     Forward: reth = deposit_net * WAD / rate  (deposit_net = WAD - fee)
+    //     Round-trip: reth * rate / WAD = WAD - fee  (with ≤ 3 wei floor error)
     if !converter.exchange_rate.is_zero() {
         let one_eth = U256::from(1_000_000_000_000_000_000u128);
+        let wad = one_eth;
         let reth_out = converter.eth_to_reth(one_eth).unwrap();
-        // reth_out * exchange_rate / WAD ≈ 1 (may be 1 wei off due to floor)
-        let round_trip = reth_out * converter.exchange_rate / one_eth;
-        // Double floor division can lose up to ~2 wei; relax tolerance.
-        let delta = one_eth.saturating_sub(round_trip);
+        let expected_deposit_net = if converter.deposit_fee_rate == 0 {
+            one_eth
+        } else {
+            one_eth * U256::from(wad.to::<u128>() - converter.deposit_fee_rate) / wad
+        };
+        let round_trip = reth_out * converter.exchange_rate / wad;
+        let delta = expected_deposit_net.saturating_sub(round_trip);
         assert!(
             delta <= U256::from(3u64),
-            "eth_to_reth(WAD) reciprocal property violated: round_trip={round_trip}, expected≈{one_eth}, delta={delta}"
+            "eth_to_reth(WAD) reciprocal property violated: deposit_net={expected_deposit_net}, round_trip={round_trip}, delta={delta}"
         );
     }
 
@@ -253,18 +287,20 @@ async fn test_rocketpool_mainnet_fork() -> Result<()> {
             .simulate_swap(NATIVE_ETH_PLACEHOLDER, addresses::RETH, amount_in)
             .unwrap_or(U256::ZERO);
 
-        // Verify against own formula: amount_in * WAD / exchange_rate
+        // Verify against fee-corrected formula:
+        // deposit_net = amount_in * (WAD - fee) / WAD
+        // reth = deposit_net * WAD / exchange_rate
         if !converter.exchange_rate.is_zero() {
-            let expected = amount_in * U256::from(1_000_000_000_000_000_000u128)
-                / converter.exchange_rate;
+            let expected = eth_to_reth_with_fee(
+                amount_in,
+                converter.exchange_rate,
+                converter.deposit_fee_rate,
+            );
             assert_eq!(
                 local_out, expected,
-                "eth_to_reth({amount_in}) deviates from exchange_rate formula"
+                "eth_to_reth({amount_in}) deviates from fee-corrected formula"
             );
         }
-
-        // NOTE: on-chain `getRethValue()` is intentionally NOT used for
-        // cross-reference (same reason as rETH→ETH above).
     }
 
     // ── Phase 5: Exact-out property checks (no chain calls) ──────────────
