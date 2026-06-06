@@ -95,6 +95,7 @@ sol! {
             bytes returnData;
         }
         function aggregate3(Call3[] calldata calls) external payable returns (Result[] memory returnData);
+        function getEthBalance(address addr) external view returns (uint256 balance);
     }
 
 }
@@ -108,6 +109,7 @@ sol! {
     function getMaximumDepositAmount() external view returns (uint256);
     function getBalance() external view returns (uint256);
     function getDepositFee() external view returns (uint256);
+    function getEthBalance(address) external view returns (uint256);
 }
 
 #[derive(Error, Debug)]
@@ -155,6 +157,9 @@ pub struct RocketPoolConverter {
     pub deposit_pool_balance: U256,
     /// Current excess ETH (RocketDepositPool).
     pub excess_balance: U256,
+    /// rETH contract ETH balance — actual ETH available for redemptions.
+    /// Fetched via Multicall3's `getEthBalance(reth_address)`.
+    pub redeemable_eth: U256,
     /// Deposit fee rate in WAD (1e18 = 100 %), from `RocketDAOProtocolSettingsDeposit.getDepositFee()`.
     pub deposit_fee_rate: u128,
     pub token_0_price: f64,
@@ -205,7 +210,7 @@ impl AutomatedMarketMaker for RocketPoolConverter {
 
     fn has_sufficient_liquidity(&self) -> bool {
         let min_threshold = U256::from(100_000_000_000_000_000u128); // 0.1 ETH
-        self.total_collateral >= min_threshold || self.maximum_deposit_amount >= min_threshold
+        self.redeemable_eth >= min_threshold || self.maximum_deposit_amount >= min_threshold
     }
 
     fn decimals(&self, token: Address) -> u8 {
@@ -250,7 +255,7 @@ impl AutomatedMarketMaker for RocketPoolConverter {
 
         if base_token == self.token_0 {
             let amount_out = self.reth_to_eth(amount_in)?;
-            if amount_out > self.total_collateral {
+            if amount_out > self.redeemable_eth {
                 return Err(RocketPoolError::InsufficientCollateral.into());
             }
             return Ok(amount_out);
@@ -273,7 +278,8 @@ impl AutomatedMarketMaker for RocketPoolConverter {
         amount_in: U256,
     ) -> Result<U256, AMMError> {
         let amount_out = self.simulate_swap(base_token, quote_token, amount_in)?;
-        if base_token == self.token_0 {
+        let redeemed = base_token == self.token_0;
+        if redeemed {
             self.total_eth_balance = self
                 .total_eth_balance
                 .checked_sub(amount_out)
@@ -286,13 +292,17 @@ impl AutomatedMarketMaker for RocketPoolConverter {
                 .total_collateral
                 .checked_sub(amount_out)
                 .ok_or(AMMError::ArithmeticError)?;
+            self.redeemable_eth = self
+                .redeemable_eth
+                .checked_sub(amount_out)
+                .ok_or(AMMError::ArithmeticError)?;
             self.deposit_pool_balance = self.deposit_pool_balance.saturating_sub(amount_out);
             self.excess_balance = self.excess_balance.saturating_sub(amount_out);
             self.maximum_deposit_amount = self
                 .maximum_deposit_amount
                 .checked_add(amount_out)
                 .ok_or(AMMError::ArithmeticError)?;
-        } else if base_token == self.token_1 {
+        } else {
             self.total_eth_balance = self
                 .total_eth_balance
                 .checked_add(amount_in)
@@ -305,6 +315,10 @@ impl AutomatedMarketMaker for RocketPoolConverter {
                 .total_collateral
                 .checked_add(amount_in)
                 .ok_or(AMMError::ArithmeticError)?;
+            self.redeemable_eth = self
+                .redeemable_eth
+                .checked_add(amount_in)
+                .ok_or(AMMError::ArithmeticError)?;
             self.deposit_pool_balance = self
                 .deposit_pool_balance
                 .checked_add(amount_in)
@@ -315,9 +329,6 @@ impl AutomatedMarketMaker for RocketPoolConverter {
                 .ok_or(AMMError::ArithmeticError)?;
             self.maximum_deposit_amount = self.maximum_deposit_amount.saturating_sub(amount_in);
         }
-        // Recompute exchange_rate from the directly-mutated total_collateral
-        // and reth_supply (NOT from total_eth - excess, which would be
-        // incorrect when excess and total_eth are both decremented).
         self.exchange_rate = if self.reth_supply.is_zero() || self.total_collateral.is_zero() {
             U256::from(WAD)
         } else {
@@ -341,7 +352,7 @@ impl AutomatedMarketMaker for RocketPoolConverter {
         }
 
         if base_token == self.token_0 {
-            if amount_out > self.total_collateral {
+            if amount_out > self.redeemable_eth {
                 return Err(RocketPoolError::InsufficientCollateral.into());
             }
             return self.reth_to_eth_input(amount_out);
@@ -371,7 +382,7 @@ impl AutomatedMarketMaker for RocketPoolConverter {
             .call()
             .await?;
 
-        let (total_eth, reth_supply, excess, max_deposit, balance, fee) =
+        let (total_eth, reth_supply, excess, max_deposit, balance, fee, redeemable) =
             Self::fetch_all(block_number, provider, self.token_0, self.network_balances_address, self.address).await?;
 
         self.token_1 = NATIVE_ETH_PLACEHOLDER;
@@ -383,6 +394,7 @@ impl AutomatedMarketMaker for RocketPoolConverter {
         self.maximum_deposit_amount = max_deposit;
         self.deposit_pool_balance = balance;
         self.deposit_fee_rate = fee;
+        self.redeemable_eth = redeemable;
         self.recompute_state();
         self.refresh_prices()?;
 
@@ -405,7 +417,7 @@ impl AutomatedMarketMaker for RocketPoolConverter {
         N: Network,
         P: Provider<N> + Clone,
     {
-        let (total_eth, reth_supply, excess, max_deposit, balance, fee) =
+        let (total_eth, reth_supply, excess, max_deposit, balance, fee, redeemable) =
             Self::fetch_all(BlockId::default(), provider, self.token_0, self.network_balances_address, self.address).await?;
 
         self.total_eth_balance = total_eth;
@@ -414,6 +426,8 @@ impl AutomatedMarketMaker for RocketPoolConverter {
         self.maximum_deposit_amount = max_deposit;
         self.deposit_pool_balance = balance;
         self.deposit_fee_rate = fee;
+        self.redeemable_eth = redeemable;
+        self.redeemable_eth = redeemable;
         self.recompute_state();
         self.refresh_prices()?;
         Ok(())
@@ -471,7 +485,7 @@ impl RocketPoolConverter {
         reth: Address,
         network_balances: Address,
         deposit_pool: Address,
-    ) -> Result<(U256, U256, U256, U256, U256, u128), AMMError>
+    ) -> Result<(U256, U256, U256, U256, U256, u128, U256), AMMError>
     where
         N: Network,
         P: Provider<N> + Clone,
@@ -509,6 +523,12 @@ impl RocketPoolConverter {
                 allowFailure: true,
                 callData: getDepositFeeCall {}.abi_encode().into(),
             },
+            // rETH contract ETH balance — actual redemption capacity.
+            IMulticall3::Call3 {
+                target: MULTICALL3_ADDRESS,
+                allowFailure: false,
+                callData: getEthBalanceCall(reth).abi_encode().into(),
+            },
         ];
 
         let results = multicall
@@ -534,8 +554,10 @@ impl RocketPoolConverter {
         } else {
             U256::ZERO
         };
+        let redeemable =
+            <getEthBalanceCall as SolCall>::abi_decode_returns(&results[6].returnData)?;
 
-        Ok((total_eth, supply, excess, max_deposit, balance, fee_raw.to()))
+        Ok((total_eth, supply, excess, max_deposit, balance, fee_raw.to(), redeemable))
     }
 
     // ------------------------------------------------------------------
@@ -794,6 +816,7 @@ mod tests {
         converter.excess_balance = U256::from(15u128) * U256::from(WAD);
         converter.total_collateral = U256::from(100u128) * U256::from(WAD); // 115-15
         converter.maximum_deposit_amount = U256::from(100u128) * U256::from(WAD);
+        converter.redeemable_eth = U256::from(100u128) * U256::from(WAD);
         converter.exchange_rate = U256::from(1_150_000_000_000_000_000u128);
         converter.refresh_prices().unwrap();
 
@@ -813,6 +836,7 @@ mod tests {
         converter.excess_balance = U256::from(15u128) * U256::from(WAD);
         converter.total_collateral = U256::from(100u128) * U256::from(WAD);
         converter.maximum_deposit_amount = U256::from(100u128) * U256::from(WAD);
+        converter.redeemable_eth = U256::from(115u128) * U256::from(WAD);
         converter.exchange_rate = U256::from(1_150_000_000_000_000_000u128);
         converter.deposit_fee_rate = 0;
         converter.refresh_prices().unwrap();
@@ -855,6 +879,7 @@ mod tests {
         converter.excess_balance = U256::from(114u128) * U256::from(WAD);
         converter.total_collateral = U256::from(WAD); // 115-114 = 1 ETH
         converter.maximum_deposit_amount = U256::from(100u128) * U256::from(WAD);
+        converter.redeemable_eth = U256::from(WAD); // only 1 ETH redeemable
         converter.exchange_rate = U256::from(1_150_000_000_000_000_000u128);
         converter.refresh_prices().unwrap();
 
@@ -901,6 +926,7 @@ mod tests {
         converter.excess_balance = U256::ZERO;
         converter.total_collateral = U256::from(100u128) * U256::from(WAD);
         converter.maximum_deposit_amount = U256::from(100u128) * U256::from(WAD);
+        converter.redeemable_eth = U256::from(100u128) * U256::from(WAD);
         converter.exchange_rate = U256::from(1_100_000_000_000_000_000u128);
         converter.refresh_prices().unwrap();
 
@@ -924,6 +950,7 @@ mod tests {
         converter.excess_balance = U256::from(15u128) * U256::from(WAD);
         converter.total_collateral = U256::from(100u128) * U256::from(WAD);
         converter.maximum_deposit_amount = U256::from(100u128) * U256::from(WAD);
+        converter.redeemable_eth = U256::from(115u128) * U256::from(WAD);
         converter.exchange_rate = U256::from(1_150_000_000_000_000_000u128);
         converter.deposit_fee_rate = 0;
         converter.refresh_prices().unwrap();
@@ -1030,6 +1057,7 @@ mod tests {
         converter.total_collateral = U256::from(115u128) * U256::from(WAD);
         converter.maximum_deposit_amount = U256::from(100u128) * U256::from(WAD);
         converter.deposit_pool_balance = U256::from(50u128) * U256::from(WAD);
+        converter.redeemable_eth = U256::from(115u128) * U256::from(WAD);
         converter.exchange_rate = U256::from(1_150_000_000_000_000_000u128);
         converter.deposit_fee_rate = 0;
         converter.refresh_prices().unwrap();

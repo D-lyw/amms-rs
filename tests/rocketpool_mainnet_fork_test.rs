@@ -235,7 +235,7 @@ async fn test_rocketpool_mainnet_fork() -> Result<()> {
     // 3f. has_sufficient_liquidity matches threshold
     let min_threshold = U256::from(100_000_000_000_000_000u128);
     let expected_liquid =
-        converter.total_collateral >= min_threshold
+        converter.redeemable_eth >= min_threshold
             || converter.maximum_deposit_amount >= min_threshold;
     assert_eq!(
         converter.has_sufficient_liquidity(),
@@ -255,6 +255,19 @@ async fn test_rocketpool_mainnet_fork() -> Result<()> {
 
     // 4a. rETH → ETH
     for &amount_in in &test_amounts {
+        // Skip if not enough redeemable ETH for this swap
+        if converter.redeemable_eth.is_zero() {
+            break;
+        }
+        let expected_out = if converter.exchange_rate.is_zero() {
+            U256::ZERO
+        } else {
+            amount_in * converter.exchange_rate / U256::from(1_000_000_000_000_000_000u128)
+        };
+        if expected_out > converter.redeemable_eth {
+            continue;
+        }
+
         let local_out = converter
             .simulate_swap(addresses::RETH, NATIVE_ETH_PLACEHOLDER, amount_in)
             .unwrap_or(U256::ZERO);
@@ -307,11 +320,11 @@ async fn test_rocketpool_mainnet_fork() -> Result<()> {
 
     // 5a. rETH→ETH exact-out: ceil property
     for &target_out in &test_amounts {
-        if target_out > converter.total_collateral {
-            continue;
-        }
-        if converter.total_collateral.is_zero() {
+        if converter.redeemable_eth.is_zero() {
             break;
+        }
+        if target_out > converter.redeemable_eth {
+            continue;
         }
         if converter.exchange_rate.is_zero() {
             continue;
@@ -388,31 +401,36 @@ async fn test_rocketpool_mainnet_fork() -> Result<()> {
     // ── Phase 6: simulate_swap_mut sanity ────────────────────────────────
 
     if converter.exchange_rate.is_zero()
-        || converter.total_collateral.is_zero()
-        || converter.maximum_deposit_amount.is_zero()
+        || (converter.redeemable_eth.is_zero() && converter.maximum_deposit_amount.is_zero())
     {
         // Not enough state to mutate meaningfully — skip.
     } else {
         let mut clone = converter.clone();
-        let amount = U256::from(1_000_000_000_000_000_000u128); // 1 unit
 
-        // rETH → ETH mut
-        let out = clone
-            .simulate_swap_mut(clone.token_0, clone.token_1, amount)
-            .unwrap();
-        assert!(
-            !out.is_zero() || converter.total_collateral.is_zero(),
-            "swap_mut rETH→ETH returned zero but collateral is non-zero"
-        );
+        // rETH → ETH mut — use a safe amount within redeemable_eth
+        if !converter.redeemable_eth.is_zero() {
+            let wad = U256::from(1_000_000_000_000_000_000u128);
+            let safe_reth = converter.redeemable_eth * wad / converter.exchange_rate;
+            let amount = safe_reth.min(U256::from(1_000_000_000_000_000_000u128));
+            if !amount.is_zero() {
+                let out = clone
+                    .simulate_swap_mut(clone.token_0, clone.token_1, amount)
+                    .unwrap();
+                assert!(!out.is_zero(), "swap_mut rETH→ETH returned zero");
+            }
+        }
 
         // ETH → rETH mut
-        let out2 = clone
-            .simulate_swap_mut(clone.token_1, clone.token_0, amount)
-            .unwrap();
-        assert!(
-            !out2.is_zero() || converter.maximum_deposit_amount.is_zero(),
-            "swap_mut ETH→rETH returned zero but deposit capacity is non-zero"
-        );
+        if !converter.maximum_deposit_amount.is_zero() {
+            let amount = U256::from(1_000_000_000_000_000_000u128);
+            let out2 = clone
+                .simulate_swap_mut(clone.token_1, clone.token_0, amount)
+                .unwrap_or(U256::ZERO);
+            assert!(
+                !out2.is_zero(),
+                "swap_mut ETH→rETH returned zero"
+            );
+        }
     }
 
     Ok(())
