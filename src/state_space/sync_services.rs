@@ -21,6 +21,7 @@ use crate::amms::curve_ng::{ICurveNGPool, ICurveNGStableSwap};
 use crate::amms::fluid_dex::{
     DexReservesResolver, FluidDexT1, FluidLiquidity, TokenLimitData, FLUID_DEX_RESOLVER,
 };
+use crate::amms::rocketpool::RocketPoolConverter;
 use crate::amms::uniswap_v3::GetUniswapV3PoolStaticMetaBatchRequest;
 use crate::state_space::StateSpace;
 
@@ -1053,6 +1054,65 @@ pub async fn start_fluid_dex_limits_sync_task<N, P>(
                 "Updated limits and centerPrice for {} Fluid DEX pools",
                 updated_count
             );
+        }
+    }
+}
+
+/// Periodically refreshes Rocket Pool redemption state.
+///
+/// Rocket Pool redemption capacity depends on protocol accounting plus deposit
+/// pool excess balance, so relying on pool-local logs is not sufficient.
+pub async fn start_rocketpool_sync_task<N, P>(
+    state: Arc<RwLock<StateSpace>>,
+    provider: P,
+    interval: Duration,
+) where
+    N: Network,
+    P: Provider<N> + Clone + 'static,
+{
+    let mut next_sleep = startup_delay_with_jitter(interval, "rocketpool");
+    loop {
+        sleep(next_sleep).await;
+        next_sleep = interval;
+
+        let mut target_pools: Vec<RocketPoolConverter> = {
+            let read_guard = state.read().await;
+            read_guard
+                .state
+                .values()
+                .filter_map(|amm| match amm.as_ref() {
+                    AMM::RocketPoolConverter(pool) => Some(pool.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        if target_pools.is_empty() {
+            continue;
+        }
+
+        info!(
+            "Updating redemption state for {} Rocket Pool converters",
+            target_pools.len()
+        );
+
+        for pool in &mut target_pools {
+            if let Err(e) = pool.update::<N, P>(provider.clone()).await {
+                error!(
+                    address = ?pool.address,
+                    error = ?e,
+                    "Failed to update Rocket Pool converter"
+                );
+            }
+        }
+
+        let mut write_guard = state.write().await;
+        for pool in target_pools {
+            if let Some(existing_amm) = write_guard.get_mut_cow(&pool.address) {
+                if let AMM::RocketPoolConverter(existing_pool) = existing_amm {
+                    *existing_pool = pool;
+                }
+            }
         }
     }
 }

@@ -1,6 +1,7 @@
 use crate::amms::{
     aerodrome_slipstream::pool::AerodromeSlipstreamError, balancer_v3::BalancerV3Error,
-    pancake_infinity::PancakeInfinityError, uniswap_v4::UniswapV4Error,
+    pancake_infinity::PancakeInfinityError, rocketpool::RocketPoolError,
+    uniswap_v4::UniswapV4Error,
 };
 
 use super::{erc_4626::ERC4626VaultError, uniswap_v2::UniswapV2Error, uniswap_v3::UniswapV3Error};
@@ -31,6 +32,8 @@ pub enum AMMError {
     BalancerV3Error(#[from] BalancerV3Error),
     #[error(transparent)]
     ERC4626VaultError(#[from] ERC4626VaultError),
+    #[error(transparent)]
+    RocketPoolError(#[from] RocketPoolError),
     #[error(transparent)]
     AerodromeSlipstreamError(#[from] AerodromeSlipstreamError),
     #[error(transparent)]

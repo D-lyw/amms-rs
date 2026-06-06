@@ -107,6 +107,7 @@ where
                     AMM::AlgebraIntegralPool(_) => 2, // Algebra Integral uses concentrated liquidity
                     AMM::AerodromeV2Pool(_) => 1,     // Aerodrome V2 uses x*y=k like V2
                     AMM::AerodromeSlipstreamPool(_) => 2, // Aerodrome Slipstream uses CL like V3
+                    AMM::RocketPoolConverter(_) => 0, // Protocol redemption edge, skip in pool value filter
                     AMM::SkyConverter(_) => 0, // SKY converters use fixed rates, skip in value filter
                 };
 

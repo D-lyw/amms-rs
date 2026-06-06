@@ -1464,6 +1464,11 @@ where
                 self.provider.clone(),
                 interval,
             ));
+            tokio::spawn(sync_services::start_rocketpool_sync_task(
+                state_space.clone(),
+                self.provider.clone(),
+                interval,
+            ));
         }
 
         // Slipstream fee config sync: low-frequency task to refresh DynamicFeeConfig and

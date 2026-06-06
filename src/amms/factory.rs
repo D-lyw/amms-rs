@@ -9,6 +9,7 @@ use crate::amms::fluid_dex::FluidDexFactory;
 use crate::amms::pancake_infinity::factory::PancakeInfinityFactory;
 use crate::amms::pancake_v2::PancakeV2Factory;
 use crate::amms::pancake_v3::PancakeV3Factory;
+use crate::amms::rocketpool::RocketPoolConverter;
 use crate::amms::sky::SkyConverter;
 use crate::amms::sushi_v2::SushiV2Factory;
 use crate::amms::uniswap_v4::UniswapV4Factory;
@@ -141,6 +142,9 @@ impl Variant {
             Variant::AerodromeSlipstreamPool => {
                 AerodromeSlipstreamFactory::init_batch::<N, _>(amms, to_block, provider).await
             }
+            Variant::RocketPoolConverter => {
+                RocketPoolConverter::init_batch::<N, _>(amms, to_block, provider).await
+            }
             Variant::SkyConverter => {
                 SkyConverter::init_batch::<N, _>(amms, to_block, provider).await
             }
@@ -214,6 +218,9 @@ impl Variant {
             }
             Variant::AerodromeSlipstreamPool => {
                 AerodromeSlipstreamFactory::sync_all_pools::<N, _>(amms, to_block, provider).await
+            }
+            Variant::RocketPoolConverter => {
+                RocketPoolConverter::init_batch::<N, _>(amms, to_block, provider).await
             }
             Variant::SkyConverter => {
                 SkyConverter::init_batch::<N, _>(amms, to_block, provider).await
