@@ -3,6 +3,7 @@ pub mod discovery;
 pub mod error;
 pub mod filters;
 mod flashblocks;
+mod xlayer_flashblocks;
 pub mod hooks;
 mod maintenance;
 pub mod sync_services;
@@ -58,6 +59,13 @@ pub enum RealtimeSyncSource {
     // newHeads + per-block get_logs pull mode.
     WsLogs,
     BaseFlashblocksRaw,
+    /// Xlayer flashblocks 流式同步（OP Stack 乐观架构）。
+    ///
+    /// 与 Base flashblocks 的区别:
+    /// - 消息格式不同（完整区块头 vs 精简结构）
+    /// - 纯 JSON 传输（无需 Brotli）
+    /// - receipt 无 transactionIndex，用累计计数器推导
+    XlayerFlashblocksRaw,
     ArbitrumSequencerFeed,
 }
 
@@ -90,7 +98,21 @@ const LOG_ADDRESS_CHUNK_SIZE: usize = 200;
 const BASE_CHAIN_ID: u64 = 8453;
 const ARBITRUM_CHAIN_ID: u64 = 42161;
 const ETHEREUM_MAINNET_CHAIN_ID: u64 = 1;
+const XLAYER_CHAIN_ID: u64 = 196;
 const BASE_FLASHBLOCKS_RAW_WS_URL: &str = "wss://mainnet.flashblocks.base.org/ws";
+/// Xlayer Flashblocks WebSocket 端点。
+///
+/// 端点说明（由用户调研确认）:
+/// - wss://ws.xlayer.tech/flashblocks    新加坡 (AWS CloudFront)，默认值
+/// - wss://xlayerws.okx.com/flashblocks  加拿大 (Cloudflare CDN)
+///
+/// 两个端点服务 Local 不完全一致，建议根据部署地理位置就近选择。
+/// 可通过环境变量 XLAYER_FLASHBLOCKS_WS 覆盖默认值。
+///
+/// 测试网:
+/// - wss://testws.xlayer.tech/flashblocks
+/// - wss://xlayertestws.okx.com/flashblocks
+const XLAYER_FLASHBLOCKS_RAW_WS_URL: &str = "wss://ws.xlayer.tech/flashblocks";
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const STREAM_RECONNECT_DELAY: Duration = Duration::from_secs(2);
 const APPLIED_LOG_DEDUP_CAPACITY: usize = 300_000;
@@ -101,6 +123,7 @@ const DEFAULT_DRIFT_PROBE_INTERVAL: Duration = Duration::from_secs(120);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LogSource {
     RealtimeFlashblock,
+    XlayerFlashblock,
     ArbitrumFeedPull,
     CanonicalReconcile,
     NewHeadsPull,
@@ -231,6 +254,7 @@ impl LogQueryChunk {
 enum SelectedRealtimeSource {
     NewHeadsPull,
     BaseFlashblocksRaw,
+    XlayerFlashblocksPull,
     ArbitrumFeedPull,
 }
 
@@ -302,8 +326,10 @@ impl<N, P> StateSpaceManager<N, P> {
             return Ok(());
         }
 
-        if chain_id == BASE_CHAIN_ID
-            && matches!(selected, SelectedRealtimeSource::BaseFlashblocksRaw)
+        if (chain_id == BASE_CHAIN_ID
+            && matches!(selected, SelectedRealtimeSource::BaseFlashblocksRaw))
+            || (chain_id == XLAYER_CHAIN_ID
+                && matches!(selected, SelectedRealtimeSource::XlayerFlashblocksPull))
         {
             let provider = self.provider.clone();
             let state = self.state.clone();
@@ -325,7 +351,9 @@ impl<N, P> StateSpaceManager<N, P> {
 
         if matches!(
             selected,
-            SelectedRealtimeSource::BaseFlashblocksRaw | SelectedRealtimeSource::ArbitrumFeedPull
+            SelectedRealtimeSource::BaseFlashblocksRaw
+                | SelectedRealtimeSource::XlayerFlashblocksPull
+                | SelectedRealtimeSource::ArbitrumFeedPull
         ) {
             let provider = self.provider.clone();
             let state = self.state.clone();
@@ -452,6 +480,26 @@ impl<N, P> StateSpaceManager<N, P> {
                     applied_log_dedup,
                     query_chunks,
                     chain_id,
+                    BASE_FLASHBLOCKS_RAW_WS_URL,
+                )))
+            }
+            SelectedRealtimeSource::XlayerFlashblocksPull => {
+                info!(
+                    "Starting Xlayer flashblocks sync (chain_id={}, ws_url={}, {} query chunks)",
+                    chain_id,
+                    XLAYER_FLASHBLOCKS_RAW_WS_URL,
+                    query_chunks.len()
+                );
+                Ok(Box::pin(Self::subscribe_xlayer_flashblocks_stream(
+                    provider,
+                    state,
+                    hooks,
+                    realtime_head,
+                    canonical_head,
+                    pending_sync_queue,
+                    applied_log_dedup,
+                    query_chunks,
+                    chain_id,
                 )))
             }
             SelectedRealtimeSource::ArbitrumFeedPull => {
@@ -484,6 +532,8 @@ impl<N, P> StateSpaceManager<N, P> {
             RealtimeSyncSource::Auto => {
                 if chain_id == BASE_CHAIN_ID {
                     SelectedRealtimeSource::BaseFlashblocksRaw
+                } else if chain_id == XLAYER_CHAIN_ID {
+                    SelectedRealtimeSource::XlayerFlashblocksPull
                 } else if chain_id == ARBITRUM_CHAIN_ID {
                     SelectedRealtimeSource::ArbitrumFeedPull
                 } else {
@@ -492,6 +542,9 @@ impl<N, P> StateSpaceManager<N, P> {
             }
             RealtimeSyncSource::WsLogs => SelectedRealtimeSource::NewHeadsPull,
             RealtimeSyncSource::BaseFlashblocksRaw => SelectedRealtimeSource::BaseFlashblocksRaw,
+            RealtimeSyncSource::XlayerFlashblocksRaw => {
+                SelectedRealtimeSource::XlayerFlashblocksPull
+            }
             RealtimeSyncSource::ArbitrumSequencerFeed => SelectedRealtimeSource::ArbitrumFeedPull,
         }
     }
@@ -1042,6 +1095,7 @@ impl<N, P> StateSpaceManager<N, P> {
         match chain_id {
             ARBITRUM_CHAIN_ID => 200,
             BASE_CHAIN_ID => 100,
+            XLAYER_CHAIN_ID => 100,
             ETHEREUM_MAINNET_CHAIN_ID => 50,
             _ => 50,
         }
@@ -1900,6 +1954,7 @@ mod tests {
             200
         );
         assert_eq!(StateSpaceManager::<(), ()>::backfill_window_size(8453), 100);
+        assert_eq!(StateSpaceManager::<(), ()>::backfill_window_size(196), 100);
         assert_eq!(StateSpaceManager::<(), ()>::backfill_window_size(1), 50);
         assert_eq!(StateSpaceManager::<(), ()>::backfill_window_size(10), 50);
     }

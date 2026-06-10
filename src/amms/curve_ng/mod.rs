@@ -398,6 +398,7 @@ impl AutomatedMarketMaker for CurveNGPool {
             43114, // Avalanche
             100,   // Gnosis
             42220, // Celo
+            196,   // X Layer
         ])
     }
 

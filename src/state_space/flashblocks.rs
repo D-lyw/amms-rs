@@ -3,7 +3,7 @@ use super::{
     StateSpace, StateSpaceError, StateSpaceManager,
 };
 use crate::state_space::{
-    BASE_FLASHBLOCKS_RAW_WS_URL, STREAM_IDLE_TIMEOUT, STREAM_RECONNECT_DELAY,
+    STREAM_IDLE_TIMEOUT, STREAM_RECONNECT_DELAY,
 };
 use alloy::network::Network;
 use alloy::primitives::{Address, Bytes, FixedBytes, LogData, B256};
@@ -454,6 +454,7 @@ impl<N, P> StateSpaceManager<N, P> {
         applied_log_dedup: Arc<Mutex<AppliedLogDedupCache>>,
         query_chunks: Vec<LogQueryChunk>,
         chain_id: u64,
+        ws_url: &'static str,
     ) -> impl Stream<Item = Result<Vec<Address>, StateSpaceError>> + Send
     where
         P: Provider<N> + Clone + 'static,
@@ -505,7 +506,7 @@ impl<N, P> StateSpaceManager<N, P> {
                     }
                 }
 
-                let connect = connect_async(BASE_FLASHBLOCKS_RAW_WS_URL).await;
+                let connect = connect_async(ws_url).await;
                 let (mut socket, _) = match connect {
                     Ok(v) => v,
                     Err(e) => {
