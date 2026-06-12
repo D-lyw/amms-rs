@@ -43,12 +43,10 @@ use thiserror::Error;
 use tracing::info;
 
 const WAD: u128 = 1_000_000_000_000_000_000u128;
-pub const NATIVE_ETH_PLACEHOLDER: Address =
-    address!("EeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE");
+pub const NATIVE_ETH_PLACEHOLDER: Address = address!("EeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE");
 
 /// Multicall3 is deployed at the same address on all major chains.
-const MULTICALL3_ADDRESS: Address =
-    address!("cA11bde05977b3631167028862bE2a173976CA11");
+const MULTICALL3_ADDRESS: Address = address!("cA11bde05977b3631167028862bE2a173976CA11");
 
 sol! {
     /// Minimal rETH token interface — only ERC20 standard methods.
@@ -383,7 +381,14 @@ impl AutomatedMarketMaker for RocketPoolConverter {
             .await?;
 
         let (total_eth, reth_supply, excess, max_deposit, balance, fee, redeemable) =
-            Self::fetch_all(block_number, provider, self.token_0, self.network_balances_address, self.address).await?;
+            Self::fetch_all(
+                block_number,
+                provider,
+                self.token_0,
+                self.network_balances_address,
+                self.address,
+            )
+            .await?;
 
         self.token_1 = NATIVE_ETH_PLACEHOLDER;
         self.token_0_decimals = decimals;
@@ -418,7 +423,14 @@ impl AutomatedMarketMaker for RocketPoolConverter {
         P: Provider<N> + Clone,
     {
         let (total_eth, reth_supply, excess, max_deposit, balance, fee, redeemable) =
-            Self::fetch_all(BlockId::default(), provider, self.token_0, self.network_balances_address, self.address).await?;
+            Self::fetch_all(
+                BlockId::default(),
+                provider,
+                self.token_0,
+                self.network_balances_address,
+                self.address,
+            )
+            .await?;
 
         self.total_eth_balance = total_eth;
         self.reth_supply = reth_supply;
@@ -538,14 +550,11 @@ impl RocketPoolConverter {
 
         let total_eth =
             <getTotalETHBalanceCall as SolCall>::abi_decode_returns(&results[0].returnData)?;
-        let supply =
-            <totalSupplyCall as SolCall>::abi_decode_returns(&results[1].returnData)?;
-        let excess =
-            <getExcessBalanceCall as SolCall>::abi_decode_returns(&results[2].returnData)?;
+        let supply = <totalSupplyCall as SolCall>::abi_decode_returns(&results[1].returnData)?;
+        let excess = <getExcessBalanceCall as SolCall>::abi_decode_returns(&results[2].returnData)?;
         let max_deposit =
             <getMaximumDepositAmountCall as SolCall>::abi_decode_returns(&results[3].returnData)?;
-        let balance =
-            <getBalanceCall as SolCall>::abi_decode_returns(&results[4].returnData)?;
+        let balance = <getBalanceCall as SolCall>::abi_decode_returns(&results[4].returnData)?;
         // Fee call: use 0 if the call failed OR returned empty data
         // (wrong address, non-existent function, or RPC incompatibility).
         let fee_raw: U256 = if results[5].success && results[5].returnData.len() >= 32 {
@@ -556,7 +565,15 @@ impl RocketPoolConverter {
         let redeemable =
             <getEthBalanceCall as SolCall>::abi_decode_returns(&results[6].returnData)?;
 
-        Ok((total_eth, supply, excess, max_deposit, balance, fee_raw.to(), redeemable))
+        Ok((
+            total_eth,
+            supply,
+            excess,
+            max_deposit,
+            balance,
+            fee_raw.to(),
+            redeemable,
+        ))
     }
 
     // ------------------------------------------------------------------
@@ -780,8 +797,7 @@ pub mod addresses {
     use alloy::primitives::{address, Address};
 
     pub const RETH: Address = address!("ae78736Cd615f374D3085123A210448E74Fc6393");
-    pub const ROCKET_DEPOSIT_POOL: Address =
-        address!("ce15294273cfb9d9b628f4d61636623decdf4fdc");
+    pub const ROCKET_DEPOSIT_POOL: Address = address!("ce15294273cfb9d9b628f4d61636623decdf4fdc");
     pub const ROCKET_NETWORK_BALANCES: Address =
         address!("07FCaBCbe4ff0d80c2b1eb42855C0131b6cba2F4");
     /// RocketDAOProtocolSettingsDeposit address on mainnet.
@@ -1094,8 +1110,14 @@ mod tests {
         assert!(converter.has_token(converter.token_1));
         assert!(!converter.has_token(Address::ZERO));
 
-        assert_eq!(converter.get_other_token(converter.token_0), Some(converter.token_1));
-        assert_eq!(converter.get_other_token(converter.token_1), Some(converter.token_0));
+        assert_eq!(
+            converter.get_other_token(converter.token_0),
+            Some(converter.token_1)
+        );
+        assert_eq!(
+            converter.get_other_token(converter.token_1),
+            Some(converter.token_0)
+        );
         assert_eq!(converter.get_other_token(Address::ZERO), None);
     }
 }

@@ -80,6 +80,14 @@ pub struct CurveNGPool {
     pub admin_fee: U256,
     /// 动态费率乘数 (Off-peg fee multiplier)
     pub offpeg_fee_multiplier: U256,
+    /// Ramp A: initial precise A (includes A_PRECISION)
+    pub initial_a_precise: Option<U256>,
+    /// Ramp A: future precise A (includes A_PRECISION)
+    pub future_a_precise: Option<U256>,
+    /// Ramp A: initial timestamp
+    pub initial_a_time: Option<U256>,
+    /// Ramp A: future timestamp
+    pub future_a_time: Option<U256>,
     /// 是否支持 stored_rates()（初始化能力探测结果）
     #[serde(default = "default_true")]
     pub supports_stored_rates: bool,
@@ -164,6 +172,10 @@ impl CurveNGPool {
             fee: U256::ZERO,
             admin_fee: U256::ZERO,
             offpeg_fee_multiplier: U256::ZERO,
+            initial_a_precise: None,
+            future_a_precise: None,
+            initial_a_time: None,
+            future_a_time: None,
             supports_stored_rates: true,
             supports_offpeg_fee_multiplier: true,
             coins_index_signature: CurveIndexSignature::Unknown,

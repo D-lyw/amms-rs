@@ -70,12 +70,9 @@ fn print_value_preview(label: &str, v: &serde_json::Value, max_depth: usize) {
                             format!("[{}{}]", items.join(", "), more)
                         }
                     }
-                    serde_json::Value::Object(_) if max_depth == 0 => {
-                        "{\"…\"}".to_string()
-                    }
+                    serde_json::Value::Object(_) if max_depth == 0 => "{\"…\"}".to_string(),
                     serde_json::Value::Object(inner) => {
-                        let fields: Vec<String> =
-                            inner.keys().take(8).map(|k| k.clone()).collect();
+                        let fields: Vec<String> = inner.keys().take(8).map(|k| k.clone()).collect();
                         let more = if inner.len() > 8 { ", …" } else { "" };
                         format!("{{{}}}{}", fields.join(", "), more)
                     }
@@ -119,7 +116,11 @@ fn analyze_metadata(meta: &serde_json::Value) {
 
                 // 查看前 3 个收据的结构
                 for (i, (tx_hash, receipt)) in rcpts.iter().take(3).enumerate() {
-                    println!("    receipt[{}] tx={}", i, &tx_hash[..16.min(tx_hash.len())]);
+                    println!(
+                        "    receipt[{}] tx={}",
+                        i,
+                        &tx_hash[..16.min(tx_hash.len())]
+                    );
 
                     match receipt {
                         serde_json::Value::Object(fields) => {
@@ -131,12 +132,19 @@ fn analyze_metadata(meta: &serde_json::Value) {
                                                 println!("      logs: [{} items]", logs.len());
                                                 // 打印第一个日志的结构
                                                 if let Some(first_log) = logs.first() {
-                                                    print_value_preview("      log[0]", first_log, 1);
+                                                    print_value_preview(
+                                                        "      log[0]",
+                                                        first_log,
+                                                        1,
+                                                    );
                                                 }
                                             }
                                             other => {
-                                                println!("      logs: {other} (not an array, type={})",
-                                                    serde_json::value::to_value(other).map(|v| format!("{v}")).unwrap_or_default()
+                                                println!(
+                                                    "      logs: {other} (not an array, type={})",
+                                                    serde_json::value::to_value(other)
+                                                        .map(|v| format!("{v}"))
+                                                        .unwrap_or_default()
                                                 );
                                             }
                                         }
@@ -146,13 +154,17 @@ fn analyze_metadata(meta: &serde_json::Value) {
                                     }
                                     _ => {
                                         let preview = match fv {
-                                            serde_json::Value::String(s)
-                                                if s.len() > 60 =>
-                                            {
+                                            serde_json::Value::String(s) if s.len() > 60 => {
                                                 format!("\"{}...\"", &s[..60])
                                             }
                                             serde_json::Value::Object(o) => {
-                                                format!("{{{}}}", o.keys().cloned().collect::<Vec<_>>().join(", "))
+                                                format!(
+                                                    "{{{}}}",
+                                                    o.keys()
+                                                        .cloned()
+                                                        .collect::<Vec<_>>()
+                                                        .join(", ")
+                                                )
                                             }
                                             other => format!("{other}"),
                                         };
@@ -172,18 +184,24 @@ fn analyze_metadata(meta: &serde_json::Value) {
             }
             "new_account_balances" => {
                 if let Some(balances) = v.as_object() {
-                    println!("  metadata.new_account_balances: {} accounts", balances.len());
+                    println!(
+                        "  metadata.new_account_balances: {} accounts",
+                        balances.len()
+                    );
                 } else {
                     println!("  metadata.new_account_balances: {v}");
                 }
             }
             _ => {
-                println!("  metadata.{k}: (len={})", match v {
-                    serde_json::Value::String(s) => s.len(),
-                    serde_json::Value::Array(a) => a.len(),
-                    serde_json::Value::Object(o) => o.len(),
-                    _ => 0,
-                });
+                println!(
+                    "  metadata.{k}: (len={})",
+                    match v {
+                        serde_json::Value::String(s) => s.len(),
+                        serde_json::Value::Array(a) => a.len(),
+                        serde_json::Value::Object(o) => o.len(),
+                        _ => 0,
+                    }
+                );
             }
         }
     }
@@ -211,7 +229,12 @@ fn analyze_diff(diff: &serde_json::Value) {
                     println!("  diff.transactions: [{} txs]", txs.len());
                     for (i, tx) in txs.iter().enumerate().take(3) {
                         let s = tx.as_str().unwrap_or("");
-                        println!("    tx[{}]: {}... ({} hex chars)", i, &s[..20.min(s.len())], s.len());
+                        println!(
+                            "    tx[{}]: {}... ({} hex chars)",
+                            i,
+                            &s[..20.min(s.len())],
+                            s.len()
+                        );
                     }
                     if txs.len() > 3 {
                         println!("    ... and {} more", txs.len() - 3);
@@ -261,7 +284,10 @@ fn analyze_base(base: &serde_json::Value) {
             serde_json::Value::Number(n) => println!("  base.{k}: {n}"),
             serde_json::Value::Array(a) => println!("  base.{k}: [{} items]", a.len()),
             serde_json::Value::Object(o) => {
-                println!("  base.{k}: {{{}}}", o.keys().cloned().collect::<Vec<_>>().join(", "));
+                println!(
+                    "  base.{k}: {{{}}}",
+                    o.keys().cloned().collect::<Vec<_>>().join(", ")
+                );
             }
             serde_json::Value::Bool(b) => println!("  base.{k}: {b}"),
             serde_json::Value::Null => println!("  base.{k}: null"),
@@ -440,7 +466,9 @@ async fn main() -> eyre::Result<()> {
                         if raw_messages <= dump_first {
                             println!("[probe] msg#{raw_messages} ({msg_type}, {} bytes): JSON parse fail after Brotli: {e2}", payload.len());
                             // 打印原始内容前 200 字节帮助调试
-                            let preview = String::from_utf8_lossy(&decompressed[..decompressed.len().min(200)]);
+                            let preview = String::from_utf8_lossy(
+                                &decompressed[..decompressed.len().min(200)],
+                            );
                             println!("  decompressed preview: {preview}");
                         }
                         continue;
@@ -531,10 +559,22 @@ async fn main() -> eyre::Result<()> {
     // 计算百分位
     msg_intervals_ms.sort_unstable();
     msg_sizes.sort_unstable();
-    let p50_iv = msg_intervals_ms.get((msg_intervals_ms.len() as f64 * 0.5) as usize).copied().unwrap_or(0);
-    let p95_iv = msg_intervals_ms.get((msg_intervals_ms.len() as f64 * 0.95) as usize).copied().unwrap_or(0);
-    let p50_sz = msg_sizes.get((msg_sizes.len() as f64 * 0.5) as usize).copied().unwrap_or(0);
-    let p95_sz = msg_sizes.get((msg_sizes.len() as f64 * 0.95) as usize).copied().unwrap_or(0);
+    let p50_iv = msg_intervals_ms
+        .get((msg_intervals_ms.len() as f64 * 0.5) as usize)
+        .copied()
+        .unwrap_or(0);
+    let p95_iv = msg_intervals_ms
+        .get((msg_intervals_ms.len() as f64 * 0.95) as usize)
+        .copied()
+        .unwrap_or(0);
+    let p50_sz = msg_sizes
+        .get((msg_sizes.len() as f64 * 0.5) as usize)
+        .copied()
+        .unwrap_or(0);
+    let p95_sz = msg_sizes
+        .get((msg_sizes.len() as f64 * 0.95) as usize)
+        .copied()
+        .unwrap_or(0);
 
     println!("\n\n==============================================");
     println!("=== Xlayer Flashblocks Probe Final Report ===");
@@ -543,7 +583,10 @@ async fn main() -> eyre::Result<()> {
     println!("raw_messages:       {}", raw_messages);
     println!("parse_success:      {}", parse_success);
     println!("parse_fail:         {}", parse_fail);
-    println!("messages_per_sec:   {:.2}", parse_success as f64 / elapsed_s);
+    println!(
+        "messages_per_sec:   {:.2}",
+        parse_success as f64 / elapsed_s
+    );
     println!("msg_interval_p50:   {}ms", p50_iv);
     println!("msg_interval_p95:   {}ms", p95_iv);
     println!("msg_size_p50:       {} bytes", p50_sz);

@@ -44,7 +44,7 @@ pub mod factory;
 pub mod math;
 pub mod types;
 
-pub use factory::CurveNGFactory;
+pub use factory::{CurveNGFactory, GetCurveNGStableSwapRuntimeDataBatchRequest, StableSwapRuntimeData};
 pub use types::{CurveIndexSignature, CurveNGPool, CurveNGPoolType, CurveNGTwoCryptoVariant};
 
 // Curve NG 池合约 ABI (简化版)
@@ -106,10 +106,36 @@ pub mod contracts {
             address indexed provider,
             int128 token_id,
             uint256 token_amount,
-            uint256 coin_amount
+            uint256 coin_amount,
+            uint256 token_supply
+        );
+
+        event RemoveLiquidityImbalance(
+            address indexed provider,
+            uint256[] token_amounts,
+            uint256[] fees,
+            uint256 invariant,
+            uint256 token_supply
         );
 
         event ClaimAdminFees(address indexed admin, uint256 amount);
+
+        event ApplyNewFee(
+            uint256 fee,
+            uint256 offpeg_fee_multiplier
+        );
+
+        event RampA(
+            uint256 old_A,
+            uint256 new_A,
+            uint256 initial_time,
+            uint256 future_time
+        );
+
+        event StopRampA(
+            uint256 A,
+            uint256 t
+        );
 
         event NewParameters(
             uint256 mid_fee,
@@ -274,6 +300,7 @@ sol! {
         function coins(int128 i) external view returns (address);
         function balances(int128 i) external view returns (uint256);
         function get_dy(int128 i, int128 j, uint256 dx) external view returns (uint256);
+        function A_precise() external view returns (uint256);
         // stored_rates for rebasing tokens (weETH, stETH, etc.)
         function stored_rates() external view returns (uint256[]);
     }
@@ -409,6 +436,10 @@ impl AutomatedMarketMaker for CurveNGPool {
                 ICurveNGPool::AddLiquidity::SIGNATURE_HASH,
                 ICurveNGPool::RemoveLiquidity::SIGNATURE_HASH,
                 ICurveNGPool::RemoveLiquidityOne::SIGNATURE_HASH,
+                ICurveNGPool::RemoveLiquidityImbalance::SIGNATURE_HASH,
+                ICurveNGPool::ApplyNewFee::SIGNATURE_HASH,
+                ICurveNGPool::RampA::SIGNATURE_HASH,
+                ICurveNGPool::StopRampA::SIGNATURE_HASH,
                 ICurveNGPool::ClaimAdminFees::SIGNATURE_HASH,
                 ICurveNGPool::NewParameters::SIGNATURE_HASH,
             ],
@@ -439,19 +470,28 @@ impl AutomatedMarketMaker for CurveNGPool {
                     let event = ICurveNGPool::TokenExchange::decode_log(&log.inner)?;
                     let i = event.sold_id as usize;
                     let j = event.bought_id as usize;
-                    let admin_fee_out = self
-                        .stableswap_estimate_admin_fee_from_event_tokens_bought(
-                            event.tokens_bought,
+                    let (sim_dy, admin_fee_out) =
+                        self.stableswap_exchange_amounts(i, j, event.tokens_sold)?;
+                    if Self::abs_diff(sim_dy, event.tokens_bought) > U256::from(1u8) {
+                        tracing::warn!(
+                            target = "amms::curve_ng::sync",
+                            pool = ?self.address,
+                            sold_id = i,
+                            bought_id = j,
+                            tokens_sold = ?event.tokens_sold,
+                            event_tokens_bought = ?event.tokens_bought,
+                            simulated_tokens_bought = ?sim_dy,
+                            "TokenExchange (StableSwap) mismatch - triggering Resync"
                         );
+                        return Ok(SyncAction::Resync);
+                    }
 
                     if i < self.balances.len() {
                         self.balances[i] += event.tokens_sold;
                     }
                     if j < self.balances.len() {
-                        // Chain `balances(i)` for StableSwap-NG is net of admin_balances.
-                        // So on TokenExchange we must deduct BOTH:
-                        //   1) user payout (`tokens_bought`)
-                        //   2) admin fee accrued on output coin (derived from pool fee model)
+                        // balances(i) is net of admin_balances, so deduct
+                        // both user payout and admin-fee share on the out coin.
                         let amount_out = event.tokens_bought + admin_fee_out;
 
                         self.balances[j] = self.balances[j]
@@ -476,7 +516,11 @@ impl AutomatedMarketMaker for CurveNGPool {
                     let event = ICurveNGPool::AddLiquidity::decode_log(&log.inner)?;
                     for (i, &amount) in event.token_amounts.iter().enumerate() {
                         if i < self.balances.len() {
-                            self.balances[i] = self.balances[i].saturating_add(amount);
+                            let fee = event.fees.get(i).copied().unwrap_or(U256::ZERO);
+                            let admin_share = self.stableswap_admin_share(fee);
+                            self.balances[i] = self.balances[i]
+                                .saturating_add(amount)
+                                .saturating_sub(admin_share);
                         }
                     }
                     tracing::info!(
@@ -485,6 +529,7 @@ impl AutomatedMarketMaker for CurveNGPool {
                         token_amounts = ?event.token_amounts,
                         "AddLiquidity (StableSwap)"
                     );
+                    self.update_spot_prices();
                     return Ok(SyncAction::AsyncUpdate);
                 } else if topic0 == ICurveNGPool::RemoveLiquidity::SIGNATURE_HASH {
                     let event = ICurveNGPool::RemoveLiquidity::decode_log(&log.inner)?;
@@ -499,22 +544,37 @@ impl AutomatedMarketMaker for CurveNGPool {
                         token_amounts = ?event.token_amounts,
                         "RemoveLiquidity (StableSwap)"
                     );
+                    self.update_spot_prices();
                     return Ok(SyncAction::AsyncUpdate);
                 } else if topic0 == ICurveNGPool::RemoveLiquidityOne::SIGNATURE_HASH {
                     let event = ICurveNGPool::RemoveLiquidityOne::decode_log(&log.inner)?;
-                    let i = event.token_id as usize;
-                    if i < self.balances.len() {
-                        self.balances[i] = self.balances[i]
-                            .checked_sub(event.coin_amount)
-                            .ok_or(AMMError::Msg("Balance underflow".into()))?;
+                    tracing::info!(
+                        target = "amms::curve_ng::sync",
+                        pool = ?self.address,
+                        token_id = event.token_id as usize,
+                        coin_amount = ?event.coin_amount,
+                        "RemoveLiquidityOne (StableSwap) - Triggering Resync"
+                    );
+                    return Ok(SyncAction::Resync);
+                } else if topic0 == ICurveNGPool::RemoveLiquidityImbalance::SIGNATURE_HASH {
+                    let event = ICurveNGPool::RemoveLiquidityImbalance::decode_log(&log.inner)?;
+                    for (i, &amount) in event.token_amounts.iter().enumerate() {
+                        if i < self.balances.len() {
+                            let fee = event.fees.get(i).copied().unwrap_or(U256::ZERO);
+                            let admin_share = self.stableswap_admin_share(fee);
+                            self.balances[i] = self.balances[i]
+                                .checked_sub(amount.saturating_add(admin_share))
+                                .ok_or(AMMError::Msg("Balance underflow".into()))?;
+                        }
                     }
                     tracing::info!(
                         target = "amms::curve_ng::sync",
                         pool = ?self.address,
-                        token_id = i,
-                        coin_amount = ?event.coin_amount,
-                        "RemoveLiquidityOne (StableSwap)"
+                        token_amounts = ?event.token_amounts,
+                        fees = ?event.fees,
+                        "RemoveLiquidityImbalance (StableSwap)"
                     );
+                    self.update_spot_prices();
                     return Ok(SyncAction::AsyncUpdate);
                 } else if topic0 == ICurveNGPool::ClaimAdminFees::SIGNATURE_HASH {
                     // ClaimAdminFees 事件仅包含一个总数 amount，未指明是哪个代币
@@ -529,6 +589,50 @@ impl AutomatedMarketMaker for CurveNGPool {
                         "ClaimAdminFees (StableSwap) - Triggering Resync"
                     );
                     return Ok(SyncAction::Resync);
+                } else if topic0 == ICurveNGPool::ApplyNewFee::SIGNATURE_HASH {
+                    let event = ICurveNGPool::ApplyNewFee::decode_log(&log.inner)?;
+                    self.fee = event.fee;
+                    self.offpeg_fee_multiplier = event.offpeg_fee_multiplier;
+                    tracing::info!(
+                        target = "amms::curve_ng::sync",
+                        pool = ?self.address,
+                        new_fee = ?self.fee,
+                        new_offpeg_fee_multiplier = ?self.offpeg_fee_multiplier,
+                        "ApplyNewFee (StableSwap)"
+                    );
+                    self.update_spot_prices();
+                } else if topic0 == ICurveNGPool::RampA::SIGNATURE_HASH {
+                    let event = ICurveNGPool::RampA::decode_log(&log.inner)?;
+                    self.initial_a_precise = Some(event.old_A);
+                    self.future_a_precise = Some(event.new_A);
+                    self.initial_a_time = Some(event.initial_time);
+                    self.future_a_time = Some(event.future_time);
+                    self.amp = Some(event.old_A / math::stableswap::A_PRECISION);
+                    tracing::info!(
+                        target = "amms::curve_ng::sync",
+                        pool = ?self.address,
+                        old_a = ?event.old_A,
+                        new_a = ?event.new_A,
+                        initial_time = ?event.initial_time,
+                        future_time = ?event.future_time,
+                        "RampA (StableSwap)"
+                    );
+                    self.update_spot_prices();
+                } else if topic0 == ICurveNGPool::StopRampA::SIGNATURE_HASH {
+                    let event = ICurveNGPool::StopRampA::decode_log(&log.inner)?;
+                    self.initial_a_precise = Some(event.A);
+                    self.future_a_precise = Some(event.A);
+                    self.initial_a_time = Some(event.t);
+                    self.future_a_time = Some(event.t);
+                    self.amp = Some(event.A / math::stableswap::A_PRECISION);
+                    tracing::info!(
+                        target = "amms::curve_ng::sync",
+                        pool = ?self.address,
+                        a = ?event.A,
+                        t = ?event.t,
+                        "StopRampA (StableSwap)"
+                    );
+                    self.update_spot_prices();
                 } else if topic0 == ICurveNGPool::NewParameters::SIGNATURE_HASH {
                     // 费率更新 (StableSwap NG 也有可能调整费率)
                     let event = ICurveNGPool::NewParameters::decode_log(&log.inner)?;
@@ -543,6 +647,7 @@ impl AutomatedMarketMaker for CurveNGPool {
                         new_offpeg_fee_multiplier = ?self.offpeg_fee_multiplier,
                         "NewParameters (StableSwap)"
                     );
+                    self.update_spot_prices();
                 }
             }
             CurveNGPoolType::TwoCrypto => {
@@ -962,46 +1067,13 @@ impl AutomatedMarketMaker for CurveNGPool {
 
         match self.pool_type {
             CurveNGPoolType::StableSwap => {
-                // StableSwap periodic refresh by capability profile.
-                let stable_pool = ICurveNGStableSwap::new(self.address, provider.clone());
-                let ng_pool = ICurveNGPool::new(self.address, provider.clone());
-                let mut updated = false;
-
-                if self.supports_stored_rates {
-                    match stable_pool.stored_rates().call().await {
-                        Ok(rates) => {
-                            if rates.len() == self.n_coins as usize {
-                                self.rates = rates;
-                                updated = true;
-                            }
-                        }
-                        Err(e) => {
-                            if e.to_string().contains("execution reverted") {
-                                self.supports_stored_rates = false;
-                                self.capability_version = self.capability_version.max(1);
-                            }
-                        }
-                    }
-                }
-
-                if self.supports_offpeg_fee_multiplier {
-                    match ng_pool.offpeg_fee_multiplier().call().await {
-                        Ok(m) => {
-                            self.offpeg_fee_multiplier = m;
-                            updated = true;
-                        }
-                        Err(e) => {
-                            if e.to_string().contains("execution reverted") {
-                                self.supports_offpeg_fee_multiplier = false;
-                                self.capability_version = self.capability_version.max(1);
-                            }
-                        }
-                    }
-                }
-
-                if updated {
-                    self.update_spot_prices();
-                }
+                let block = BlockId::from(provider.get_block_number().await?);
+                CurveNGFactory::refresh_runtime_data_batch::<N, _>(
+                    std::slice::from_mut(self),
+                    block,
+                    provider.clone(),
+                )
+                .await?;
             }
             CurveNGPoolType::TwoCrypto => {
                 // TwoCrypto: 2 balances + 1 price_scale + 1 D + 2 ramp timestamps = 6 calls
@@ -1607,17 +1679,20 @@ impl CurveNGPool {
         )
     }
 
-    fn stableswap_estimate_admin_fee_from_event_tokens_bought(&self, tokens_bought: U256) -> U256 {
+    fn abs_diff(a: U256, b: U256) -> U256 {
+        if a >= b {
+            a - b
+        } else {
+            b - a
+        }
+    }
+
+    fn stableswap_admin_share(&self, fee_amount: U256) -> U256 {
         let fee_denominator = U256::from(10).pow(U256::from(10));
-        if self.fee.is_zero() || self.admin_fee.is_zero() || self.fee >= fee_denominator {
+        if self.admin_fee.is_zero() {
             return U256::ZERO;
         }
-
-        // event.tokens_bought is net user output (post swap-fee).
-        // Reconstruct an approximate gross output and take admin share of the fee leg.
-        let gross_out = tokens_bought * fee_denominator / (fee_denominator - self.fee);
-        let fee_out = gross_out.saturating_sub(tokens_bought);
-        fee_out * self.admin_fee / fee_denominator
+        fee_amount * self.admin_fee / fee_denominator
     }
 
     fn stableswap_exchange_amounts(

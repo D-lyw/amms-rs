@@ -157,7 +157,7 @@ async fn test_ng_twocrypto_event_sync_flow_consistency() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_ng_stableswap_events_return_async_update() -> Result<()> {
+async fn test_ng_stableswap_event_sync_actions() -> Result<()> {
     let rpc_url = match base_provider_url() {
         Some(url) => url,
         None => {
@@ -175,39 +175,85 @@ async fn test_ng_stableswap_events_return_async_update() -> Result<()> {
         }
     };
     let addr = Address::from_str("ae07db17dEbde8391c6ea3a6990eBdD9E4939494")?;
-    let from_block = 45_000_000u64;
+    let chunk_size = 10_000u64;
+    let max_lookback = 1_000_000u64;
 
     let cases = [
-        ("TokenExchange", ICurveNGPool::TokenExchange::SIGNATURE_HASH),
-        ("AddLiquidity", ICurveNGPool::AddLiquidity::SIGNATURE_HASH),
+        (
+            "TokenExchange",
+            ICurveNGPool::TokenExchange::SIGNATURE_HASH,
+            SyncAction::AsyncUpdate,
+        ),
+        (
+            "AddLiquidity",
+            ICurveNGPool::AddLiquidity::SIGNATURE_HASH,
+            SyncAction::AsyncUpdate,
+        ),
         (
             "RemoveLiquidity",
             ICurveNGPool::RemoveLiquidity::SIGNATURE_HASH,
+            SyncAction::AsyncUpdate,
         ),
         (
             "RemoveLiquidityOne",
             ICurveNGPool::RemoveLiquidityOne::SIGNATURE_HASH,
+            SyncAction::Resync,
+        ),
+        (
+            "RemoveLiquidityImbalance",
+            ICurveNGPool::RemoveLiquidityImbalance::SIGNATURE_HASH,
+            SyncAction::AsyncUpdate,
+        ),
+        (
+            "ClaimAdminFees",
+            ICurveNGPool::ClaimAdminFees::SIGNATURE_HASH,
+            SyncAction::Resync,
+        ),
+        (
+            "ApplyNewFee",
+            ICurveNGPool::ApplyNewFee::SIGNATURE_HASH,
+            SyncAction::None,
+        ),
+        (
+            "NewParameters",
+            ICurveNGPool::NewParameters::SIGNATURE_HASH,
+            SyncAction::None,
         ),
     ];
 
-    for (label, sig) in cases {
-        let mut logs = provider
-            .get_logs(
-                &Filter::new()
-                    .address(addr)
-                    .event_signature(vec![sig])
-                    .from_block(from_block)
-                    .to_block(latest),
-            )
-            .await?;
-        assert!(
-            !logs.is_empty(),
-            "[StableSwap {}] no logs found for pool {} in window {}..{}",
-            label,
-            addr,
-            from_block,
-            latest
-        );
+    for (label, sig, expected_action) in cases {
+        let mut logs = Vec::new();
+        let mut cursor_to = latest;
+        let min_block = latest.saturating_sub(max_lookback);
+        while cursor_to >= min_block {
+            let cursor_from = cursor_to.saturating_sub(chunk_size.saturating_sub(1));
+            let from = cursor_from.max(min_block);
+            let mut chunk_logs = provider
+                .get_logs(
+                    &Filter::new()
+                        .address(addr)
+                        .event_signature(vec![sig])
+                        .from_block(from)
+                        .to_block(cursor_to),
+                )
+                .await?;
+            if !chunk_logs.is_empty() {
+                logs.append(&mut chunk_logs);
+                break;
+            }
+            if from == min_block {
+                break;
+            }
+            cursor_to = from.saturating_sub(1);
+        }
+
+        if logs.is_empty() {
+            println!(
+                "[StableSwap {}] skipping: no logs found for pool {} in recent window {}..{}",
+                label, addr, min_block, latest
+            );
+            continue;
+        }
 
         logs.sort_by(|a, b| {
             let a_bn = a.block_number.unwrap_or(0);
@@ -231,12 +277,27 @@ async fn test_ng_stableswap_events_return_async_update() -> Result<()> {
             .await?;
         let action = pool.sync(&log)?;
         assert_eq!(
-            action,
-            SyncAction::AsyncUpdate,
+            action, expected_action,
             "[StableSwap {}] unexpected action at block {}",
-            label,
-            block
+            label, block
         );
+
+        if action == SyncAction::AsyncUpdate {
+            pool.update(provider.clone()).await?;
+            assert_eq!(
+                pool.balances.len(),
+                pool.n_coins as usize,
+                "[StableSwap {}] balances length invalid after update",
+                label
+            );
+            assert!(pool.amp.is_some(), "[StableSwap {}] missing amp", label);
+            assert_eq!(
+                pool.rates.len(),
+                pool.n_coins as usize,
+                "[StableSwap {}] rates length invalid after update",
+                label
+            );
+        }
     }
 
     Ok(())

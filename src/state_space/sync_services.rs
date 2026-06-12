@@ -1,3 +1,4 @@
+use alloy::eips::BlockId;
 use alloy::network::Network;
 use alloy::primitives::{Address, B256, U256};
 use alloy::providers::Provider;
@@ -17,7 +18,7 @@ use crate::amms::aerodrome_slipstream::pool::{
 use crate::amms::amm::{AutomatedMarketMaker, AMM};
 use crate::amms::balancer_v2::BalancerV2Pool;
 use crate::amms::balancer_v3::BalancerV3Pool;
-use crate::amms::curve_ng::{ICurveNGPool, ICurveNGStableSwap};
+use crate::amms::curve_ng::{CurveNGFactory, ICurveNGStableSwap};
 use crate::amms::fluid_dex::{
     DexReservesResolver, FluidDexT1, FluidLiquidity, TokenLimitData, FLUID_DEX_RESOLVER,
 };
@@ -561,13 +562,13 @@ pub async fn start_slipstream_fee_config_sync_task<N, P>(
     }
 }
 
-/// Periodically updates stored_rates, D, and price_scale for Curve pools (NG and Legacy).
+/// Periodically updates non-event runtime data for Curve pools (NG and Legacy).
 ///
 /// This task handles two main categories of updates:
-/// 1. `stored_rates` for StableSwap pools:
-///    - Curve NG StableSwap pools (always).
-///    - Curve Legacy StableSwap pools (if they involve lending/rebasing tokens).
-/// 2. `price_scale` for CryptoSwap pools:
+/// 1. StableSwap runtime data:
+///    - Curve NG StableSwap pools: balances/amp/fee/admin_fee/stored_rates/offpeg multiplier.
+///    - Curve Legacy StableSwap pools: stored_rates for lending/rebasing variants.
+/// 2. `price_scale` and related runtime data for CryptoSwap pools:
 ///    - Curve NG and Legacy CryptoSwap pools (TwoCrypto, TriCrypto).
 ///
 /// This is necessary because these values change dynamically (e.g., via interest accumulation or internal oracle updates)
@@ -586,137 +587,99 @@ pub async fn start_curve_rate_sync_task<N, P>(
         next_sleep = interval;
 
         // =========================================================================
-        // Task A: Sync `stored_rates` for StableSwap Pools
+        // Task A: Sync StableSwap runtime data
         // =========================================================================
 
         // A.1 Collect target pools (StableSwap only)
-        // We target both NG and Legacy pools because both can have `stored_rates`.
-        let stable_targets: Vec<Address> = {
+        // We target both NG and Legacy pools because both can drift outside events.
+        let (mut ng_stable_pools, legacy_stable_targets): (Vec<_>, Vec<_>) = {
             let read_guard = state.read().await;
-            read_guard
-                .state
-                .values()
-                .filter_map(|amm| match amm.as_ref() {
-                    AMM::CurveNGPool(pool) => {
-                        if pool.pool_type.is_stable() && pool.n_coins > 0 {
-                            Some(pool.address)
-                        } else {
-                            None
-                        }
+            let mut ng = Vec::new();
+            let mut legacy = Vec::new();
+
+            for amm in read_guard.state.values() {
+                match amm.as_ref() {
+                    AMM::CurveNGPool(pool) if pool.pool_type.is_stable() && pool.n_coins > 0 => {
+                        ng.push(pool.clone());
                     }
-                    AMM::CurveLegacyPool(pool) => {
-                        // Legacy StableSwap pools might use stored_rates (e.g., sBTC, cTokens)
+                    AMM::CurveLegacyPool(pool)
                         if pool.pool_type
                             == crate::amms::curve_legacy::CurveLegacyPoolType::StableSwap
-                            && pool.n_coins > 0
-                        {
-                            Some(pool.address)
-                        } else {
-                            None
-                        }
+                            && pool.n_coins > 0 =>
+                    {
+                        legacy.push(pool.address);
                     }
-                    _ => None,
-                })
-                .collect()
+                    _ => {}
+                }
+            }
+
+            (ng, legacy)
         };
 
-        if !stable_targets.is_empty() {
+        let stable_target_count = ng_stable_pools.len() + legacy_stable_targets.len();
+        if stable_target_count > 0 {
             info!(
-                "Syncing stored_rates for {} Curve StableSwap pools (NG & Legacy)",
-                stable_targets.len()
+                "Syncing StableSwap runtime data for {} Curve pools (NG & Legacy)",
+                stable_target_count
             );
 
             let mut updated_count = 0;
 
-            // A.2 Fetch and Update
-            for addr in &stable_targets {
-                enum StableSyncTarget {
-                    NG {
-                        supports_stored_rates: bool,
-                        supports_offpeg: bool,
-                    },
-                    Legacy,
-                    Other,
-                }
-                let target = {
-                    let read_guard = state.read().await;
-                    match read_guard.state.get(addr).map(|a| a.as_ref()) {
-                        Some(AMM::CurveNGPool(pool)) => StableSyncTarget::NG {
-                            supports_stored_rates: pool.supports_stored_rates,
-                            supports_offpeg: pool.supports_offpeg_fee_multiplier,
-                        },
-                        Some(AMM::CurveLegacyPool(_)) => StableSyncTarget::Legacy,
-                        _ => StableSyncTarget::Other,
+            if !ng_stable_pools.is_empty() {
+                match provider.get_block_number().await {
+                    Ok(fetch_block) => {
+                        let block_id = BlockId::from(fetch_block);
+                        if let Err(e) = CurveNGFactory::refresh_runtime_data_batch::<N, _>(
+                            &mut ng_stable_pools,
+                            block_id,
+                            provider.clone(),
+                        )
+                        .await
+                        {
+                            error!(
+                                "Curve NG stable runtime refresh(batch-contract) failed: block={}, err={:?}",
+                                fetch_block, e
+                            );
+                        } else {
+                            let mut write_guard = state.write().await;
+                            for mut pool in ng_stable_pools.drain(..) {
+                                if let Some(existing) = write_guard.get(&pool.address) {
+                                    if existing.last_synced_block() > fetch_block {
+                                        continue;
+                                    }
+                                }
+                                pool.set_last_synced_block(fetch_block);
+                                write_guard.insert_amm(AMM::CurveNGPool(pool));
+                                updated_count += 1;
+                            }
+                        }
                     }
-                };
-                if matches!(target, StableSyncTarget::Other) {
-                    continue;
-                }
-
-                // We use ICurveNGStableSwap interface here because it includes `stored_rates()`.
-                // This method signature is compatible with Legacy pools that implement it.
-                // We also need ICurveNG for offpeg_fee_multiplier
-                let stable_pool = ICurveNGStableSwap::new(*addr, provider.clone());
-                let ng_pool = ICurveNGPool::new(*addr, provider.clone());
-
-                // Capability-driven refresh: skip methods already known to be unsupported.
-                let rates_res = match target {
-                    StableSyncTarget::NG {
-                        supports_stored_rates: true,
-                        ..
+                    Err(e) => {
+                        error!(
+                            "Failed to fetch block number for Curve NG stable refresh: {:?}",
+                            e
+                        );
                     }
-                    | StableSyncTarget::Legacy => stable_pool.stored_rates().call().await.ok(),
-                    _ => None,
-                };
-                let multiplier_res = match target {
-                    StableSyncTarget::NG {
-                        supports_offpeg: true,
-                        ..
-                    } => ng_pool.offpeg_fee_multiplier().call().await.ok(),
-                    _ => None,
-                };
+                }
+            }
 
+            for addr in legacy_stable_targets {
+                let stable_pool = ICurveNGStableSwap::new(addr, provider.clone());
+                let rates_res = stable_pool.stored_rates().call().await.ok();
                 let mut write_guard = state.write().await;
-                if let Some(amm) = write_guard.get_mut_cow(addr) {
-                    let success = match amm {
-                        AMM::CurveNGPool(pool) => {
-                            let mut updated = false;
-                            if let Some(rates) = rates_res.clone() {
-                                if rates.len() == pool.n_coins as usize {
-                                    pool.rates = rates;
-                                    updated = true;
-                                }
-                            }
-                            if let Some(m) = multiplier_res {
-                                pool.offpeg_fee_multiplier = m;
-                                updated = true;
-                            }
-                            updated
+                if let Some(AMM::CurveLegacyPool(pool)) = write_guard.get_mut_cow(&addr) {
+                    if let Some(rates) = rates_res {
+                        if rates.len() == pool.n_coins as usize {
+                            pool.rates = rates;
+                            updated_count += 1;
                         }
-                        AMM::CurveLegacyPool(pool) => {
-                            if let Some(rates) = rates_res {
-                                if rates.len() == pool.n_coins as usize {
-                                    pool.rates = rates;
-                                    true
-                                } else {
-                                    false
-                                }
-                            } else {
-                                false
-                            }
-                        }
-                        _ => false,
-                    };
-
-                    if success {
-                        updated_count += 1;
                     }
                 }
             }
 
             if updated_count > 0 {
                 info!(
-                    "Updated stored_rates/multiplier for {} Curve pools",
+                    "Updated StableSwap runtime data for {} Curve pools",
                     updated_count
                 );
             }

@@ -25,6 +25,7 @@ const TARGET_CONTRACTS: &[&str] = &[
     "GetUniswapV3PoolStaticMetaBatchRequest",
     // Curve
     "GetCurveNGPoolDataBatchRequest",
+    "GetCurveNGStableSwapRuntimeDataBatchRequest",
     "GetCurveLegacyPoolDataBatchRequest",
     // Ekubo
     "GetEkuboPoolStateBatchRequest",

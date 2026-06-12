@@ -2538,11 +2538,9 @@ impl AerodromeSlipstreamFactory {
                 }
                 let (addr, sidx, card) = meta[i];
                 if !res.returnData.is_empty() {
-                    if let Ok(dec) =
-                        <ICLPoolFull::observationsCall as SolCall>::abi_decode_returns(
-                            &res.returnData,
-                        )
-                    {
+                    if let Ok(dec) = <ICLPoolFull::observationsCall as SolCall>::abi_decode_returns(
+                        &res.returnData,
+                    ) {
                         if dec.initialized && dec.blockTimestamp != 0 {
                             let tc: i128 = dec.tickCumulative.unchecked_into::<i64>() as i128;
                             let obs = Observation {
@@ -2574,14 +2572,22 @@ impl AerodromeSlipstreamFactory {
                 .block(block_number)
                 .call()
                 .await
-                .map_err(|e| AMMError::Msg(format!("slot0 fetch failed for pool {}: {:?}", addr, e)))?;
+                .map_err(|e| {
+                    AMMError::Msg(format!("slot0 fetch failed for pool {}: {:?}", addr, e))
+                })?;
             let card = s0.observationCardinality;
             let ridx = s0.observationIndex;
             let count = (card as u16).min(1500);
             for j in 0..count {
                 if mc_calls.len() >= SLIPSTREAM_OBSERVATIONS_MULTICALL_STEP {
-                    flush_observation_batch(&mc3, block_number, &mut mc_calls, &mut mc_meta, &mut pool_obs)
-                        .await?;
+                    flush_observation_batch(
+                        &mc3,
+                        block_number,
+                        &mut mc_calls,
+                        &mut mc_meta,
+                        &mut pool_obs,
+                    )
+                    .await?;
                 }
 
                 let sidx = ((ridx as u64 + card as u64 - j as u64) % card as u64) as usize;
@@ -2597,8 +2603,14 @@ impl AerodromeSlipstreamFactory {
                 mc_meta.push((addr, sidx, card));
             }
         }
-        flush_observation_batch(&mc3, block_number, &mut mc_calls, &mut mc_meta, &mut pool_obs)
-            .await?;
+        flush_observation_batch(
+            &mc3,
+            block_number,
+            &mut mc_calls,
+            &mut mc_meta,
+            &mut pool_obs,
+        )
+        .await?;
 
         for (addr, (card, obs)) in pool_obs {
             if let Some(amm) = amms.iter_mut().find(|a| a.address() == addr) {

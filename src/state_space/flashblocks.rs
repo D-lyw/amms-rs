@@ -2,9 +2,7 @@ use super::{
     AppliedLogDedupCache, HookRegistry, LogQueryChunk, LogSource, PendingSyncQueue, QueryMode,
     StateSpace, StateSpaceError, StateSpaceManager,
 };
-use crate::state_space::{
-    STREAM_IDLE_TIMEOUT, STREAM_RECONNECT_DELAY,
-};
+use crate::state_space::{STREAM_IDLE_TIMEOUT, STREAM_RECONNECT_DELAY};
 use alloy::network::Network;
 use alloy::primitives::{Address, Bytes, FixedBytes, LogData, B256};
 use alloy::providers::Provider;

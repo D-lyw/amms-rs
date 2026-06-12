@@ -3,11 +3,11 @@ pub mod discovery;
 pub mod error;
 pub mod filters;
 mod flashblocks;
-mod xlayer_flashblocks;
 pub mod hooks;
 mod maintenance;
 pub mod sync_services;
 mod ws_logs;
+mod xlayer_flashblocks;
 
 use crate::amms::amm::AutomatedMarketMaker;
 use crate::amms::amm::{SyncAction, AMM};
@@ -271,7 +271,10 @@ impl<N, P> StateSpaceManager<N, P> {
     {
         let required_block = self.canonical_head.load(Ordering::Relaxed);
         let (pending_action, reason) = match action {
-            PoolRefreshAction::AsyncUpdate => (PendingSyncAction::AsyncUpdate, PendingSyncReason::AsyncUpdate),
+            PoolRefreshAction::AsyncUpdate => (
+                PendingSyncAction::AsyncUpdate,
+                PendingSyncReason::AsyncUpdate,
+            ),
             PoolRefreshAction::Resync => (PendingSyncAction::Resync, PendingSyncReason::Resync),
         };
 
@@ -1587,7 +1590,7 @@ where
             error!("No Slipstream FeeModule found from loaded pools; fee config sync disabled");
         }
 
-        // Curve NG StableSwap pools: stored_rates for rebasing tokens & D value sync
+        // Curve pools: StableSwap runtime refresh plus CryptoSwap oracle/runtime refresh
         if let Some(interval) = self.curve_sync_interval.or(non_event_interval) {
             tokio::spawn(sync_services::start_curve_rate_sync_task(
                 state_space.clone(),

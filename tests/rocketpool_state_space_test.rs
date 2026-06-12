@@ -7,10 +7,7 @@
 
 mod common;
 
-use alloy::{
-    primitives::U256,
-    providers::ProviderBuilder,
-};
+use alloy::{primitives::U256, providers::ProviderBuilder};
 use amms::amms::{
     amm::AMM,
     rocketpool::{addresses, RocketPoolConverter, NATIVE_ETH_PLACEHOLDER},

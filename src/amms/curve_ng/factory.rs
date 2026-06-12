@@ -62,6 +62,28 @@ sol!(
     "src/amms/abi/GetCurveNGPoolDataBatchRequest.json"
 );
 
+sol!(
+    #[allow(missing_docs)]
+    #[sol(rpc)]
+    GetCurveNGStableSwapRuntimeDataBatchRequest,
+    "src/amms/abi/GetCurveNGStableSwapRuntimeDataBatchRequest.json"
+);
+
+sol! {
+    #[derive(Debug)]
+    struct StableSwapRuntimeData {
+        address poolAddress;
+        uint256[] balances;
+        uint256 amp;
+        uint256 fee;
+        uint256 adminFee;
+        uint256[] rates;
+        bool supportsStoredRates;
+        bool supportsOffpegFeeMultiplier;
+        uint256 offpegFeeMultiplier;
+    }
+}
+
 // 从 JSON 生成的模块导入 PoolInput 类型
 pub use GetCurveNGPoolDataBatchRequest::PoolInput;
 
@@ -77,12 +99,124 @@ pub struct CurveNGFactory {
 }
 
 impl CurveNGFactory {
+    fn pool_type_to_u8(pool_type: CurveNGPoolType) -> u8 {
+        match pool_type {
+            CurveNGPoolType::StableSwap => 0,
+            CurveNGPoolType::TwoCrypto => 1,
+            CurveNGPoolType::TriCrypto => 2,
+        }
+    }
+
     fn decode_index_signature(sig: u8) -> CurveIndexSignature {
         match sig {
             1 => CurveIndexSignature::Uint256,
             2 => CurveIndexSignature::Int128,
             _ => CurveIndexSignature::Unknown,
         }
+    }
+
+    fn default_rates_from_decimals(decimals: &[u8]) -> Vec<U256> {
+        decimals
+            .iter()
+            .map(|d| {
+                let precision = U256::from(10).pow(U256::from(18u8.saturating_sub(*d)));
+                U256::from(10).pow(U256::from(18)) * precision
+            })
+            .collect()
+    }
+
+    fn apply_pool_data(pool: &mut CurveNGPool, data: &PoolData) {
+        pool.n_coins = data.nCoins;
+        pool.coins = data.coins.clone();
+        pool.balances = data.balances.clone();
+        pool.decimals = data.decimals.clone();
+        pool.rates = if !data.rates.is_empty() {
+            data.rates.clone()
+        } else {
+            Self::default_rates_from_decimals(&data.decimals)
+        };
+
+        pool.amp = if data.amp > U256::ZERO {
+            Some(data.amp)
+        } else {
+            None
+        };
+        pool.fee = data.fee;
+        pool.admin_fee = data.adminFee;
+        pool.supports_stored_rates = data.supportsStoredRates;
+        pool.supports_offpeg_fee_multiplier = data.supportsOffpegFeeMultiplier;
+        pool.coins_index_signature = Self::decode_index_signature(data.coinsIndexSignature);
+        pool.balances_index_signature = Self::decode_index_signature(data.balancesIndexSignature);
+        pool.get_dy_index_signature = Self::decode_index_signature(data.getDyIndexSignature);
+        pool.capability_version = data.capabilityVersion;
+
+        if pool.pool_type.is_stable() && pool.supports_offpeg_fee_multiplier {
+            pool.offpeg_fee_multiplier = data.offpegFeeMultiplier;
+        }
+
+        if pool.pool_type.is_crypto() {
+            pool.d = if data.d > U256::ZERO {
+                Some(data.d)
+            } else {
+                None
+            };
+            pool.gamma = if data.gamma > U256::ZERO {
+                Some(data.gamma)
+            } else {
+                None
+            };
+            pool.mid_fee = if data.midFee > U256::ZERO {
+                Some(data.midFee)
+            } else {
+                None
+            };
+            pool.out_fee = if data.outFee > U256::ZERO {
+                Some(data.outFee)
+            } else {
+                None
+            };
+            pool.fee_gamma = if data.feeGamma > U256::ZERO {
+                Some(data.feeGamma)
+            } else {
+                None
+            };
+
+            if !data.priceScale.is_empty() {
+                pool.price_scale = Some(data.priceScale.clone());
+            }
+        }
+
+        pool.update_spot_prices();
+    }
+
+    fn apply_stableswap_runtime_data(pool: &mut CurveNGPool, data: &StableSwapRuntimeData) {
+        if pool.pool_type != CurveNGPoolType::StableSwap {
+            return;
+        }
+
+        if !data.balances.is_empty() && data.balances.len() == pool.n_coins as usize {
+            pool.balances = data.balances.clone();
+        }
+
+        pool.amp = if data.amp > U256::ZERO {
+            Some(data.amp)
+        } else {
+            None
+        };
+        pool.fee = data.fee;
+        pool.admin_fee = data.adminFee;
+        pool.supports_stored_rates = data.supportsStoredRates;
+        pool.supports_offpeg_fee_multiplier = data.supportsOffpegFeeMultiplier;
+
+        if !data.rates.is_empty() && data.rates.len() == pool.n_coins as usize {
+            pool.rates = data.rates.clone();
+        }
+
+        if data.supportsOffpegFeeMultiplier {
+            pool.offpeg_fee_multiplier = data.offpegFeeMultiplier;
+        }
+
+        pool.update_spot_prices();
     }
 
     /// 创建新的 CurveNG Factory 实例
@@ -225,12 +359,7 @@ impl CurveNGFactory {
             .iter()
             .map(|amm| {
                 if let AMM::CurveNGPool(pool) = amm {
-                    let pool_type_u8: u8 = match pool.pool_type {
-                        CurveNGPoolType::StableSwap => 0,
-                        CurveNGPoolType::TwoCrypto => 1,
-                        CurveNGPoolType::TriCrypto => 2,
-                    };
-                    (pool.address, pool_type_u8)
+                    (pool.address, Self::pool_type_to_u8(pool.pool_type))
                 } else {
                     (Address::ZERO, 0) // Should not happen given logic, but needed for type safety
                 }
@@ -277,85 +406,7 @@ impl CurveNGFactory {
                                 let pool_addr = data.poolAddress;
 
                                 if let Some(AMM::CurveNGPool(pool)) = amms_map.get_mut(&pool_addr) {
-                                    // 更新池子数据
-                                    pool.n_coins = data.nCoins;
-                                    pool.coins = data.coins.clone();
-                                    pool.balances = data.balances.clone();
-                                    pool.decimals = data.decimals.clone();
-
-                                    // 设置 rates (从合约响应获取, 如果为空则默认 1e18)
-                                    pool.rates = if !data.rates.is_empty() {
-                                        data.rates.clone()
-                                    } else {
-                                        data.decimals
-                                            .iter()
-                                            .map(|d| {
-                                                let precision = U256::from(10).pow(
-                                                    U256::from(18).saturating_sub(U256::from(*d)),
-                                                );
-                                                U256::from(10).pow(U256::from(18)) * precision
-                                            })
-                                            .collect()
-                                    };
-
-                                    pool.amp = if data.amp > U256::ZERO {
-                                        Some(data.amp)
-                                    } else {
-                                        None
-                                    };
-                                    pool.fee = data.fee;
-                                    pool.admin_fee = data.adminFee;
-                                    pool.supports_stored_rates = data.supportsStoredRates;
-                                    pool.supports_offpeg_fee_multiplier =
-                                        data.supportsOffpegFeeMultiplier;
-                                    pool.coins_index_signature =
-                                        Self::decode_index_signature(data.coinsIndexSignature);
-                                    pool.balances_index_signature =
-                                        Self::decode_index_signature(data.balancesIndexSignature);
-                                    pool.get_dy_index_signature =
-                                        Self::decode_index_signature(data.getDyIndexSignature);
-                                    pool.capability_version = data.capabilityVersion;
-                                    if pool.pool_type.is_stable()
-                                        && pool.supports_offpeg_fee_multiplier
-                                    {
-                                        pool.offpeg_fee_multiplier = data.offpegFeeMultiplier;
-                                    }
-
-                                    // CryptoSwap 特定参数
-                                    if pool.pool_type.is_crypto() {
-                                        pool.d = if data.d > U256::ZERO {
-                                            Some(data.d)
-                                        } else {
-                                            None
-                                        };
-                                        pool.gamma = if data.gamma > U256::ZERO {
-                                            Some(data.gamma)
-                                        } else {
-                                            None
-                                        };
-                                        pool.mid_fee = if data.midFee > U256::ZERO {
-                                            Some(data.midFee)
-                                        } else {
-                                            None
-                                        };
-                                        pool.out_fee = if data.outFee > U256::ZERO {
-                                            Some(data.outFee)
-                                        } else {
-                                            None
-                                        };
-                                        pool.fee_gamma = if data.feeGamma > U256::ZERO {
-                                            Some(data.feeGamma)
-                                        } else {
-                                            None
-                                        };
-
-                                        if !data.priceScale.is_empty() {
-                                            pool.price_scale = Some(data.priceScale.clone());
-                                        }
-                                    }
-
-                                    // 批量初始化后更新价格缓存
-                                    pool.update_spot_prices();
+                                    Self::apply_pool_data(pool, &data);
                                 }
                             }
                         }
@@ -399,11 +450,7 @@ impl CurveNGFactory {
 
             for pool_addr in failed_pools {
                 if let Some(AMM::CurveNGPool(pool)) = amms_map.get_mut(&pool_addr) {
-                    let pool_type_u8: u8 = match pool.pool_type {
-                        CurveNGPoolType::StableSwap => 0,
-                        CurveNGPoolType::TwoCrypto => 1,
-                        CurveNGPoolType::TriCrypto => 2,
-                    };
+                    let pool_type_u8 = Self::pool_type_to_u8(pool.pool_type);
 
                     let single_input = vec![PoolInput {
                         pool: pool_addr,
@@ -421,72 +468,7 @@ impl CurveNGFactory {
                                 <Vec<PoolData> as SolValue>::abi_decode(&res)
                             {
                                 if let Some(data) = pool_data_list.first() {
-                                    pool.n_coins = data.nCoins;
-                                    pool.coins = data.coins.clone();
-                                    pool.balances = data.balances.clone();
-                                    pool.decimals = data.decimals.clone();
-                                    pool.rates = if !data.rates.is_empty() {
-                                        data.rates.clone()
-                                    } else {
-                                        vec![
-                                            U256::from(10).pow(U256::from(18));
-                                            data.nCoins as usize
-                                        ]
-                                    };
-                                    pool.amp = if data.amp > U256::ZERO {
-                                        Some(data.amp)
-                                    } else {
-                                        None
-                                    };
-                                    pool.fee = data.fee;
-                                    pool.admin_fee = data.adminFee;
-                                    pool.supports_stored_rates = data.supportsStoredRates;
-                                    pool.supports_offpeg_fee_multiplier =
-                                        data.supportsOffpegFeeMultiplier;
-                                    pool.coins_index_signature =
-                                        Self::decode_index_signature(data.coinsIndexSignature);
-                                    pool.balances_index_signature =
-                                        Self::decode_index_signature(data.balancesIndexSignature);
-                                    pool.get_dy_index_signature =
-                                        Self::decode_index_signature(data.getDyIndexSignature);
-                                    pool.capability_version = data.capabilityVersion;
-                                    if pool.pool_type.is_stable()
-                                        && pool.supports_offpeg_fee_multiplier
-                                    {
-                                        pool.offpeg_fee_multiplier = data.offpegFeeMultiplier;
-                                    }
-
-                                    if pool.pool_type.is_crypto() {
-                                        pool.d = if data.d > U256::ZERO {
-                                            Some(data.d)
-                                        } else {
-                                            None
-                                        };
-                                        pool.gamma = if data.gamma > U256::ZERO {
-                                            Some(data.gamma)
-                                        } else {
-                                            None
-                                        };
-                                        pool.mid_fee = if data.midFee > U256::ZERO {
-                                            Some(data.midFee)
-                                        } else {
-                                            None
-                                        };
-                                        pool.out_fee = if data.outFee > U256::ZERO {
-                                            Some(data.outFee)
-                                        } else {
-                                            None
-                                        };
-                                        pool.fee_gamma = if data.feeGamma > U256::ZERO {
-                                            Some(data.feeGamma)
-                                        } else {
-                                            None
-                                        };
-                                        if !data.priceScale.is_empty() {
-                                            pool.price_scale = Some(data.priceScale.clone());
-                                        }
-                                    }
-                                    pool.update_spot_prices();
+                                    Self::apply_pool_data(pool, data);
 
                                     tracing::info!(
                                         target: "curve_ng::init_batch",
@@ -648,6 +630,80 @@ impl CurveNGFactory {
         P: Provider<N> + Clone,
     {
         Self::init_batch(amms, block, provider).await
+    }
+
+    pub async fn refresh_runtime_data_batch<N, P>(
+        pools: &mut [CurveNGPool],
+        block: BlockId,
+        provider: P,
+    ) -> Result<(), AMMError>
+    where
+        N: Network,
+        P: Provider<N> + Clone,
+    {
+        if pools.is_empty() {
+            return Ok(());
+        }
+
+        let step = 10;
+        let index_by_address = pools
+            .iter()
+            .enumerate()
+            .map(|(idx, pool)| (pool.address, idx))
+            .collect::<HashMap<_, _>>();
+
+        let pool_chunks = pools
+            .iter()
+            .filter(|pool| pool.pool_type == CurveNGPoolType::StableSwap)
+            .map(|pool| pool.address)
+            .chunks(step)
+            .into_iter()
+            .map(|chunk| chunk.collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+
+        for chunk in pool_chunks {
+            let deployer = GetCurveNGStableSwapRuntimeDataBatchRequest::deploy_builder(
+                provider.clone(),
+                chunk.clone(),
+            );
+
+            match deployer.call_raw().block(block).await {
+                Ok(res) => {
+                    let pool_data_list =
+                        <Vec<StableSwapRuntimeData> as SolValue>::abi_decode(&res)?;
+                    for data in pool_data_list {
+                        if let Some(&idx) = index_by_address.get(&data.poolAddress) {
+                            Self::apply_stableswap_runtime_data(&mut pools[idx], &data);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "curve_ng::refresh_runtime_data_batch",
+                        pools = ?chunk,
+                        error = %e,
+                        "Batch runtime refresh failed, retrying pools individually"
+                    );
+
+                    for addr in chunk {
+                        let deployer = GetCurveNGStableSwapRuntimeDataBatchRequest::deploy_builder(
+                            provider.clone(),
+                            vec![addr],
+                        );
+                        let res = deployer.call_raw().block(block).await?;
+                        let pool_data_list =
+                            <Vec<StableSwapRuntimeData> as SolValue>::abi_decode(&res)?;
+                        if let Some(data) = pool_data_list.first() {
+                            if let Some(&idx) = index_by_address.get(&addr) {
+                                Self::apply_stableswap_runtime_data(&mut pools[idx], data);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 

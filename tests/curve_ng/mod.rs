@@ -10,4 +10,5 @@ mod quote_parity;
 mod recalculate_precision;
 mod support;
 mod sync_drift;
+mod xlayer_stableswap;
 mod yieldbasis_special_twocrypto;

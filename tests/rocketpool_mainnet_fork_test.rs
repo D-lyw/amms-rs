@@ -117,12 +117,12 @@ async fn test_rocketpool_mainnet_fork() -> Result<()> {
     assert_eq!(converter.token_1, NATIVE_ETH_PLACEHOLDER);
 
     let reth = IRocketTokenRETH::new(addresses::RETH, provider.clone());
-    let network =
-        IRocketNetworkBalances::new(addresses::ROCKET_NETWORK_BALANCES, provider.clone());
-    let deposit =
-        IRocketDepositPool::new(addresses::ROCKET_DEPOSIT_POOL, provider.clone());
-    let settings =
-        IRocketDAOProtocolSettingsDeposit::new(addresses::ROCKET_SETTINGS_DEPOSIT, provider.clone());
+    let network = IRocketNetworkBalances::new(addresses::ROCKET_NETWORK_BALANCES, provider.clone());
+    let deposit = IRocketDepositPool::new(addresses::ROCKET_DEPOSIT_POOL, provider.clone());
+    let settings = IRocketDAOProtocolSettingsDeposit::new(
+        addresses::ROCKET_SETTINGS_DEPOSIT,
+        provider.clone(),
+    );
 
     // ── Phase 2: Raw-field parity (best-effort, skip reverts) ────────────
 
@@ -151,10 +151,7 @@ async fn test_rocketpool_mainnet_fork() -> Result<()> {
 
     // excess_balance
     if let Some(onchain) = try_call!(deposit.getExcessBalance().block(block_id).call()) {
-        assert_eq!(
-            converter.excess_balance, onchain,
-            "excess_balance mismatch"
-        );
+        assert_eq!(converter.excess_balance, onchain, "excess_balance mismatch");
     }
 
     // maximum_deposit_amount
@@ -189,9 +186,8 @@ async fn test_rocketpool_mainnet_fork() -> Result<()> {
 
     // 3b. exchange_rate = total_collateral * WAD / reth_supply
     if !converter.reth_supply.is_zero() && !converter.total_collateral.is_zero() {
-        let expected_rate =
-            U256::from(1_000_000_000_000_000_000u128) * converter.total_collateral
-                / converter.reth_supply;
+        let expected_rate = U256::from(1_000_000_000_000_000_000u128) * converter.total_collateral
+            / converter.reth_supply;
         assert_eq!(
             converter.exchange_rate, expected_rate,
             "exchange_rate should equal collateral * WAD / supply"
@@ -234,9 +230,8 @@ async fn test_rocketpool_mainnet_fork() -> Result<()> {
 
     // 3f. has_sufficient_liquidity matches threshold
     let min_threshold = U256::from(100_000_000_000_000_000u128);
-    let expected_liquid =
-        converter.redeemable_eth >= min_threshold
-            || converter.maximum_deposit_amount >= min_threshold;
+    let expected_liquid = converter.redeemable_eth >= min_threshold
+        || converter.maximum_deposit_amount >= min_threshold;
     assert_eq!(
         converter.has_sufficient_liquidity(),
         expected_liquid,
@@ -274,8 +269,8 @@ async fn test_rocketpool_mainnet_fork() -> Result<()> {
 
         // Verify against own formula: amount_in * exchange_rate / WAD
         if !converter.exchange_rate.is_zero() {
-            let expected = amount_in * converter.exchange_rate
-                / U256::from(1_000_000_000_000_000_000u128);
+            let expected =
+                amount_in * converter.exchange_rate / U256::from(1_000_000_000_000_000_000u128);
             assert_eq!(
                 local_out, expected,
                 "reth_to_eth({amount_in}) deviates from exchange_rate formula"
@@ -426,10 +421,7 @@ async fn test_rocketpool_mainnet_fork() -> Result<()> {
             let out2 = clone
                 .simulate_swap_mut(clone.token_1, clone.token_0, amount)
                 .unwrap_or(U256::ZERO);
-            assert!(
-                !out2.is_zero(),
-                "swap_mut ETH→rETH returned zero"
-            );
+            assert!(!out2.is_zero(), "swap_mut ETH→rETH returned zero");
         }
     }
 

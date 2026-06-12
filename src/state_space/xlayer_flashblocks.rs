@@ -392,11 +392,21 @@ fn extract_logs_from_xlayer_flashblock(
 
     // 3. 获取 metadata（receipts 从这里提取）
     let Some(metadata) = fb.metadata.as_ref() else {
-        return (out, Some(block_number), decode_fail, decode_failed_addresses);
+        return (
+            out,
+            Some(block_number),
+            decode_fail,
+            decode_failed_addresses,
+        );
     };
 
     if metadata.receipts.is_empty() {
-        return (out, Some(block_number), decode_fail, decode_failed_addresses);
+        return (
+            out,
+            Some(block_number),
+            decode_fail,
+            decode_failed_addresses,
+        );
     }
 
     // 4. 获取 block_hash（用于构造 Log）
@@ -591,7 +601,12 @@ fn extract_logs_from_xlayer_flashblock(
         }
     }
 
-    (out, Some(block_number), decode_fail, decode_failed_addresses)
+    (
+        out,
+        Some(block_number),
+        decode_fail,
+        decode_failed_addresses,
+    )
 }
 
 // ─────────────────────────────────────────────
@@ -823,5 +838,4 @@ impl<N, P> StateSpaceManager<N, P> {
             }
         }
     }
-
 }
