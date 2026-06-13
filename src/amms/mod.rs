@@ -27,6 +27,7 @@ pub mod fluid_dex;
 pub mod pancake_infinity;
 pub mod pancake_v2;
 pub mod pancake_v3;
+pub mod pendle;
 pub mod rocketpool;
 pub mod sky;
 pub mod sushi_v2;

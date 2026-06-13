@@ -9,6 +9,7 @@ use crate::amms::ekubo::EkuboPool;
 use crate::amms::fluid_dex::FluidDexPool;
 use crate::amms::pancake_infinity::PancakeInfinityPool;
 use crate::amms::pancake_v2::PancakeV2Pool;
+use crate::amms::pendle::PendlePool;
 use crate::amms::pancake_v3::PancakeV3Pool;
 use crate::amms::rocketpool::RocketPoolConverter;
 use crate::amms::sky::SkyConverter;
@@ -313,4 +314,5 @@ amm!(
     AerodromeSlipstreamPool,
     RocketPoolConverter,
     SkyConverter,
+    PendlePool,
 );

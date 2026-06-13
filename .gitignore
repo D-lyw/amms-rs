@@ -1,7 +1,7 @@
 /target
 Cargo.lock
 
-# Foundry 
+# Foundry
 
 # Compiler files
 contracts/cache/
@@ -20,8 +20,9 @@ contracts/src/flattened/
 # Temp checkpoint
 *.temp-checkpoint.json
 
-# intellij 
+# intellij
 *.idea/
 
 .algebra-*
 .curve-*
+.pendle-*

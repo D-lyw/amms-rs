@@ -1,6 +1,6 @@
 use crate::amms::{
     aerodrome_slipstream::pool::AerodromeSlipstreamError, balancer_v3::BalancerV3Error,
-    pancake_infinity::PancakeInfinityError, rocketpool::RocketPoolError,
+    pancake_infinity::PancakeInfinityError, pendle::PendleError, rocketpool::RocketPoolError,
     uniswap_v4::UniswapV4Error,
 };
 
@@ -34,6 +34,8 @@ pub enum AMMError {
     ERC4626VaultError(#[from] ERC4626VaultError),
     #[error(transparent)]
     RocketPoolError(#[from] RocketPoolError),
+    #[error(transparent)]
+    PendleError(#[from] PendleError),
     #[error(transparent)]
     AerodromeSlipstreamError(#[from] AerodromeSlipstreamError),
     #[error(transparent)]

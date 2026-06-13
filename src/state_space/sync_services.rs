@@ -22,6 +22,7 @@ use crate::amms::curve_ng::{CurveNGFactory, ICurveNGStableSwap};
 use crate::amms::fluid_dex::{
     DexReservesResolver, FluidDexT1, FluidLiquidity, TokenLimitData, FLUID_DEX_RESOLVER,
 };
+use crate::amms::pendle::PendlePool;
 use crate::amms::rocketpool::RocketPoolConverter;
 use crate::amms::uniswap_v3::GetUniswapV3PoolStaticMetaBatchRequest;
 use crate::state_space::StateSpace;
@@ -1074,6 +1075,63 @@ pub async fn start_rocketpool_sync_task<N, P>(
             if let Some(existing_amm) = write_guard.get_mut_cow(&pool.address) {
                 if let AMM::RocketPoolConverter(existing_pool) = existing_amm {
                     *existing_pool = pool;
+                }
+            }
+        }
+    }
+}
+
+/// 定期刷新 PendlePool 的 sy_exchange_rate（底层计息资产收益率）。
+/// sy_exchange_rate 变化缓慢且无事件通知，需周期性拉取。推荐 5-15 分钟间隔。
+pub async fn start_pendle_sync_task<N, P>(
+    state: Arc<RwLock<StateSpace>>,
+    provider: P,
+    interval: Duration,
+) where
+    N: Network,
+    P: Provider<N> + Clone + 'static,
+{
+    let mut next_sleep = startup_delay_with_jitter(interval, "pendle");
+    loop {
+        sleep(next_sleep).await;
+        next_sleep = interval;
+
+        let mut target_pools: Vec<PendlePool> = {
+            let read_guard = state.read().await;
+            read_guard
+                .state
+                .values()
+                .filter_map(|amm| match amm.as_ref() {
+                    AMM::PendlePool(pool) => Some(pool.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        if target_pools.is_empty() {
+            continue;
+        }
+
+        info!(
+            "Updating {} Pendle pools (sy_exchange_rate)",
+            target_pools.len()
+        );
+
+        for pool in &mut target_pools {
+            if let Err(e) = pool.update::<N, P>(provider.clone()).await {
+                error!(
+                    address = ?pool.address,
+                    error = ?e,
+                    "Failed to update Pendle pool"
+                );
+            }
+        }
+
+        let mut write_guard = state.write().await;
+        for pool in target_pools {
+            if let Some(existing_amm) = write_guard.get_mut_cow(&pool.address) {
+                if let AMM::PendlePool(existing) = existing_amm {
+                    *existing = pool;
                 }
             }
         }

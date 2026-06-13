@@ -1,5 +1,8 @@
 [profile.default]
 optimizer = false
 evm_version = "cancun"
-remappings = ["forge-std=lib/forge-std/src/"]
+remappings = [
+    "forge-std=lib/forge-std/src/",
+    "pendle-core=../.pendle-core/contracts/core",
+]
 fs_permissions = [{ access = "read-write", path = "./" }]
