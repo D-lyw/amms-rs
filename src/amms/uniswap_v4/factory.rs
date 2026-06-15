@@ -86,9 +86,11 @@ impl UniswapV4Factory {
                         if pool.pool_key.hooks == Address::ZERO {
                             pools.push(AMM::UniswapV4Pool(pool));
                         } else {
-                            info!(
+                            warn!(
                                 target = "amms::uniswap_v4::discover",
-                                "Skipping pool with hooks: {:?}", pool.pool_key.hooks
+                                pool_id = ?pool.pool_id,
+                                hooks = ?pool.pool_key.hooks,
+                                "Skipping unsupported V4 pool with hooks"
                             );
                         }
                     }
@@ -275,7 +277,7 @@ impl UniswapV4Factory {
                 let lp_fee = alloy::primitives::aliases::U24::from_be_bytes(lp_fee_bytes);
 
                 if liquidity_data.is_zero() {
-                    info!(
+                    warn!(
                         target: "amms::uniswap_v4::sync_slot_0",
                         pool_id = ?pool.pool_id,
                         manager = ?manager_address,

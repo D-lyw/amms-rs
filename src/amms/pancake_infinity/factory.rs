@@ -73,6 +73,13 @@ impl PancakeInfinityFactory {
                     AMM::PancakeInfinityPool(pool) => {
                         if pool.pool_key.hooks == Address::ZERO {
                             pools.push(AMM::PancakeInfinityPool(pool));
+                        } else {
+                            tracing::warn!(
+                                target: "amms::pancake_infinity::discover",
+                                pool_id = ?pool.pool_id,
+                                hooks = ?pool.pool_key.hooks,
+                                "Skipping unsupported PancakeInfinity pool with hooks"
+                            );
                         }
                     }
                     amm => pools.push(amm),
@@ -244,7 +251,7 @@ impl PancakeInfinityFactory {
                 let lp_fee = alloy::primitives::aliases::U24::from_be_bytes(lp_fee_bytes);
 
                 if liquidity_data.is_zero() {
-                    tracing::info!(
+                    tracing::warn!(
                         target: "amms::pancake_infinity::sync_slot_0",
                         pool_id = ?pool.pool_id,
                         manager = ?manager_address,
@@ -649,7 +656,7 @@ impl PancakeInfinityFactory {
 
         if !structurally_invalid.is_empty() {
             for pool in &structurally_invalid {
-                tracing::info!(
+                tracing::warn!(
                     target: "amms::pancake_infinity::init_batch",
                     pool_id = ?pool.pool_id,
                     token_a = ?pool.token_a.address,

@@ -1227,7 +1227,7 @@ impl PancakeV3Factory {
         if !structurally_invalid.is_empty() {
             for pool in &structurally_invalid {
                 if let AMM::PancakeV3Pool(pv3_pool) = pool {
-                    info!(
+                    tracing::warn!(
                         target: "amms::pancake_v3::init_batch",
                         address = ?pv3_pool.address,
                         tick_spacing = ?pv3_pool.tick_spacing,

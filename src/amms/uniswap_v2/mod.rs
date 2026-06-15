@@ -787,7 +787,7 @@ impl UniswapV2Factory {
 
         if !invalid_amms.is_empty() {
             for (_, amm) in &invalid_amms {
-                info!(
+                tracing::warn!(
                     target: "amms::uniswap_v2::sync",
                     address = ?amm.address(),
                     tokens = ?amm.tokens(),
@@ -897,7 +897,7 @@ impl UniswapV2Factory {
 
         if !invalid_amms.is_empty() {
             for (_, amm) in &invalid_amms {
-                info!(
+                tracing::warn!(
                     target: "amms::uniswap_v2::init_batch",
                     address = ?amm.address(),
                     tokens = ?amm.tokens(),

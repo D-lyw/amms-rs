@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::{sleep, Duration};
-use tracing::{info, warn};
+use tracing::warn;
 
 pub(super) const DRIFT_HOT_POOL_INTERVAL: Duration = Duration::from_secs(30);
 pub(super) const DRIFT_COLD_POOL_INTERVAL: Duration = Duration::from_secs(300);
@@ -648,7 +648,7 @@ impl<N, P> StateSpaceManager<N, P> {
         for (address, task) in due_tasks {
             match Self::execute_pending_task(provider, state, address, &task, canonical).await {
                 Ok(PendingExecutionOutcome::Applied) => {
-                    info!(
+                    warn!(
                         ?address,
                         action = ?task.action,
                         reason = ?task.reason,
@@ -662,7 +662,7 @@ impl<N, P> StateSpaceManager<N, P> {
                         .complete_success(address, canonical);
                 }
                 Ok(PendingExecutionOutcome::SkippedStale) => {
-                    info!(
+                    warn!(
                         ?address,
                         action = ?task.action,
                         reason = ?task.reason,

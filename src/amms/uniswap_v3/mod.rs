@@ -1347,7 +1347,7 @@ impl UniswapV3Factory {
         if !structurally_invalid.is_empty() {
             for pool in &structurally_invalid {
                 if let AMM::UniswapV3Pool(uv3_pool) = pool {
-                    info!(
+                    tracing::warn!(
                         target: "amms::uniswap_v3::init_batch",
                         address = ?uv3_pool.address,
                         tick_spacing = ?uv3_pool.tick_spacing,
