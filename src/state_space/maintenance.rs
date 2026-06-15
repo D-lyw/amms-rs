@@ -1,14 +1,16 @@
 use super::{StateSpace, StateSpaceManager};
 use crate::amms::aerodrome_slipstream::pool::GetAerodromeSlipstreamProbeBatchRequest;
-use crate::amms::amm::{AutomatedMarketMaker, SyncAction, AMM};
+use crate::amms::amm::{AutomatedMarketMaker, SyncAction, Variant, AMM};
 use crate::amms::curve_ng::{CurveNGFactory, CurveNGPool};
 use crate::amms::error::AMMError;
 use crate::amms::pancake_v3::GetPancakeV3PoolSlot0BatchRequest;
+use crate::amms::uniswap_v2::GetV2LikeReservesProbeBatchRequest;
 use crate::amms::uniswap_v3::GetUniswapV3PoolSlot0BatchRequest;
+use crate::amms::uniswap_v4::GetV4LitePoolStateBatchRequest;
 use crate::state_space::error::StateSpaceError;
 use alloy::eips::BlockId;
 use alloy::network::Network;
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, B256, U256};
 use alloy::providers::Provider;
 use alloy::sol_types::SolValue;
 use std::cmp::Reverse;
@@ -45,8 +47,23 @@ struct CurveNGStableProbeSnapshot {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct V2LikeProbeSnapshot {
+    reserve_0: u128,
+    reserve_1: u128,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct V4LiteProbeSnapshot {
+    sqrt_price: U256,
+    tick: i32,
+    liquidity: u128,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DriftProbeKind {
+    V2Like,
     V3Like,
+    V4Like,
     Slipstream,
     CurveNGStable,
 }
@@ -54,9 +71,11 @@ enum DriftProbeKind {
 impl DriftProbeKind {
     fn next(self) -> Self {
         match self {
-            DriftProbeKind::V3Like => DriftProbeKind::Slipstream,
+            DriftProbeKind::V2Like => DriftProbeKind::V3Like,
+            DriftProbeKind::V3Like => DriftProbeKind::V4Like,
+            DriftProbeKind::V4Like => DriftProbeKind::Slipstream,
             DriftProbeKind::Slipstream => DriftProbeKind::CurveNGStable,
-            DriftProbeKind::CurveNGStable => DriftProbeKind::V3Like,
+            DriftProbeKind::CurveNGStable => DriftProbeKind::V2Like,
         }
     }
 }
@@ -781,6 +800,44 @@ impl<N, P> StateSpaceManager<N, P> {
         }
     }
 
+    fn local_v2_like_probe_snapshot(amm: &AMM) -> Option<V2LikeProbeSnapshot> {
+        match amm {
+            AMM::UniswapV2Pool(pool) => Some(V2LikeProbeSnapshot {
+                reserve_0: pool.reserve_0,
+                reserve_1: pool.reserve_1,
+            }),
+            AMM::SushiV2Pool(pool) => Some(V2LikeProbeSnapshot {
+                reserve_0: pool.reserve_0,
+                reserve_1: pool.reserve_1,
+            }),
+            AMM::PancakeV2Pool(pool) => Some(V2LikeProbeSnapshot {
+                reserve_0: pool.reserve_0,
+                reserve_1: pool.reserve_1,
+            }),
+            AMM::AerodromeV2Pool(pool) => Some(V2LikeProbeSnapshot {
+                reserve_0: pool.reserve_0,
+                reserve_1: pool.reserve_1,
+            }),
+            _ => None,
+        }
+    }
+
+    fn local_v4_lite_probe_snapshot(amm: &AMM) -> Option<V4LiteProbeSnapshot> {
+        match amm {
+            AMM::UniswapV4Pool(pool) => Some(V4LiteProbeSnapshot {
+                sqrt_price: pool.sqrt_price,
+                tick: pool.tick,
+                liquidity: pool.liquidity,
+            }),
+            AMM::PancakeInfinityPool(pool) => Some(V4LiteProbeSnapshot {
+                sqrt_price: pool.sqrt_price,
+                tick: pool.tick,
+                liquidity: pool.liquidity,
+            }),
+            _ => None,
+        }
+    }
+
     fn curve_ng_stable_probe_snapshot_from_pool(pool: &CurveNGPool) -> CurveNGStableProbeSnapshot {
         CurveNGStableProbeSnapshot {
             balances: pool.balances.clone(),
@@ -824,6 +881,63 @@ impl<N, P> StateSpaceManager<N, P> {
                 Self::curve_ng_stable_probe_snapshot_from_pool(pool),
             );
         }
+        Ok(snapshots)
+    }
+
+    async fn fetch_v2_like_probe_snapshots_batch(
+        provider: &P,
+        targets: &[(Address, Variant)],
+        block: u64,
+    ) -> Result<HashMap<Address, V2LikeProbeSnapshot>, AMMError>
+    where
+        P: Provider<N> + Clone,
+        N: Network,
+    {
+        let block = BlockId::from(block);
+        let addresses: Vec<Address> = targets
+            .iter()
+            .filter_map(|(address, variant)| match variant {
+                Variant::UniswapV2Pool
+                | Variant::SushiV2Pool
+                | Variant::PancakeV2Pool
+                | Variant::AerodromeV2Pool => Some(*address),
+                _ => None,
+            })
+            .collect();
+
+        if addresses.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let return_data =
+            GetV2LikeReservesProbeBatchRequest::deploy_builder(provider.clone(), addresses.clone())
+                .call_raw()
+                .block(block)
+                .await?;
+
+        let decoded = <Vec<(bool, u128, u128)> as SolValue>::abi_decode(&return_data)?;
+        if decoded.len() != addresses.len() {
+            warn!(
+                expected = addresses.len(),
+                decoded = decoded.len(),
+                "V2Like drift probe batch decode length mismatch"
+            );
+        }
+
+        let mut snapshots = HashMap::with_capacity(addresses.len());
+        for (address, (ok, reserve_0, reserve_1)) in addresses.into_iter().zip(decoded) {
+            if !ok {
+                continue;
+            }
+            snapshots.insert(
+                address,
+                V2LikeProbeSnapshot {
+                    reserve_0,
+                    reserve_1,
+                },
+            );
+        }
+
         Ok(snapshots)
     }
 
@@ -1099,6 +1213,66 @@ impl<N, P> StateSpaceManager<N, P> {
         Ok(snapshots)
     }
 
+    async fn fetch_v4_lite_probe_snapshots_batch(
+        provider: &P,
+        targets: &[(Address, Variant, Address, B256)],
+        block: u64,
+    ) -> Result<HashMap<Address, V4LiteProbeSnapshot>, AMMError>
+    where
+        P: Provider<N> + Clone,
+        N: Network,
+    {
+        let mut addresses = Vec::new();
+        let mut probes = Vec::new();
+        for (address, variant, manager_address, pool_id) in targets {
+            match variant {
+                Variant::UniswapV4Pool | Variant::PancakeInfinityPool => {
+                    addresses.push(*address);
+                    probes.push(GetV4LitePoolStateBatchRequest::PoolProbe {
+                        manager: *manager_address,
+                        poolId: *pool_id,
+                    });
+                }
+                _ => continue,
+            }
+        }
+
+        if probes.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let return_data = GetV4LitePoolStateBatchRequest::deploy_builder(provider.clone(), probes)
+            .call_raw()
+            .block(BlockId::from(block))
+            .await?;
+
+        let decoded = <Vec<(bool, i32, u128, U256)> as SolValue>::abi_decode(&return_data)?;
+        if decoded.len() != addresses.len() {
+            warn!(
+                expected = addresses.len(),
+                decoded = decoded.len(),
+                "V4Lite drift probe batch decode length mismatch"
+            );
+        }
+
+        let mut snapshots = HashMap::with_capacity(addresses.len());
+        for (address, (ok, tick, liquidity, sqrt_price)) in addresses.into_iter().zip(decoded) {
+            if !ok {
+                continue;
+            }
+            snapshots.insert(
+                address,
+                V4LiteProbeSnapshot {
+                    sqrt_price,
+                    tick,
+                    liquidity,
+                },
+            );
+        }
+
+        Ok(snapshots)
+    }
+
     pub(super) async fn run_silent_drift_probe_task(
         provider: P,
         state: Arc<RwLock<StateSpace>>,
@@ -1110,21 +1284,37 @@ impl<N, P> StateSpaceManager<N, P> {
         N: Network + 'static,
     {
         let mut last_probe_at: HashMap<Address, Instant> = HashMap::new();
+        let mut cached_v2_like_addresses: Vec<Address> = Vec::new();
         let mut cached_v3_addresses: Vec<Address> = Vec::new();
+        let mut cached_v4_like_addresses: Vec<Address> = Vec::new();
         let mut cached_slipstream_addresses: Vec<Address> = Vec::new();
         let mut cached_curve_ng_stable_addresses: Vec<Address> = Vec::new();
+        let mut v2_like_cursor: usize = 0;
         let mut v3_cursor: usize = 0;
+        let mut v4_like_cursor: usize = 0;
         let mut slipstream_cursor: usize = 0;
         let mut curve_ng_stable_cursor: usize = 0;
-        let mut active_kind = DriftProbeKind::V3Like;
+        let mut active_kind = DriftProbeKind::V2Like;
         let mut last_cache_refresh: Option<Instant> = None;
 
         enum DueProbe {
+            V2Like {
+                address: Address,
+                local: V2LikeProbeSnapshot,
+                variant: Variant,
+            },
             Cl {
                 address: Address,
                 local: ClProbeSnapshot,
                 is_pancake: bool,
                 kind: DriftProbeKind,
+            },
+            V4Like {
+                address: Address,
+                local: V4LiteProbeSnapshot,
+                variant: Variant,
+                manager_address: Address,
+                pool_id: B256,
             },
             CurveNGStable {
                 pool: CurveNGPool,
@@ -1145,18 +1335,29 @@ impl<N, P> StateSpaceManager<N, P> {
                 .map(|t| now.saturating_duration_since(t) >= DRIFT_CANDIDATE_CACHE_TTL)
                 .unwrap_or(true);
             if cache_stale
-                || (cached_v3_addresses.is_empty()
+                || (cached_v2_like_addresses.is_empty()
+                    && cached_v3_addresses.is_empty()
+                    && cached_v4_like_addresses.is_empty()
                     && cached_slipstream_addresses.is_empty()
                     && cached_curve_ng_stable_addresses.is_empty())
             {
                 let guard = state.read().await;
+                cached_v2_like_addresses.clear();
                 cached_v3_addresses.clear();
+                cached_v4_like_addresses.clear();
                 cached_slipstream_addresses.clear();
                 cached_curve_ng_stable_addresses.clear();
                 for (addr, amm) in &guard.state {
                     match amm.as_ref() {
+                        AMM::UniswapV2Pool(_)
+                        | AMM::SushiV2Pool(_)
+                        | AMM::PancakeV2Pool(_)
+                        | AMM::AerodromeV2Pool(_) => cached_v2_like_addresses.push(*addr),
                         AMM::UniswapV3Pool(_) | AMM::PancakeV3Pool(_) => {
                             cached_v3_addresses.push(*addr)
+                        }
+                        AMM::UniswapV4Pool(_) | AMM::PancakeInfinityPool(_) => {
+                            cached_v4_like_addresses.push(*addr)
                         }
                         AMM::AerodromeSlipstreamPool(_) => cached_slipstream_addresses.push(*addr),
                         AMM::CurveNGPool(pool)
@@ -1167,11 +1368,19 @@ impl<N, P> StateSpaceManager<N, P> {
                         _ => {}
                     }
                 }
+                cached_v2_like_addresses.sort_unstable();
                 cached_v3_addresses.sort_unstable();
+                cached_v4_like_addresses.sort_unstable();
                 cached_slipstream_addresses.sort_unstable();
                 cached_curve_ng_stable_addresses.sort_unstable();
+                if v2_like_cursor >= cached_v2_like_addresses.len() {
+                    v2_like_cursor = 0;
+                }
                 if v3_cursor >= cached_v3_addresses.len() {
                     v3_cursor = 0;
+                }
+                if v4_like_cursor >= cached_v4_like_addresses.len() {
+                    v4_like_cursor = 0;
                 }
                 if slipstream_cursor >= cached_slipstream_addresses.len() {
                     slipstream_cursor = 0;
@@ -1184,15 +1393,19 @@ impl<N, P> StateSpaceManager<N, P> {
 
             let mut selected_kind = active_kind;
             let mut selected_addresses = match selected_kind {
+                DriftProbeKind::V2Like => &cached_v2_like_addresses,
                 DriftProbeKind::V3Like => &cached_v3_addresses,
+                DriftProbeKind::V4Like => &cached_v4_like_addresses,
                 DriftProbeKind::Slipstream => &cached_slipstream_addresses,
                 DriftProbeKind::CurveNGStable => &cached_curve_ng_stable_addresses,
             };
             let mut attempts = 0;
-            while selected_addresses.is_empty() && attempts < 3 {
+            while selected_addresses.is_empty() && attempts < 5 {
                 selected_kind = selected_kind.next();
                 selected_addresses = match selected_kind {
+                    DriftProbeKind::V2Like => &cached_v2_like_addresses,
                     DriftProbeKind::V3Like => &cached_v3_addresses,
+                    DriftProbeKind::V4Like => &cached_v4_like_addresses,
                     DriftProbeKind::Slipstream => &cached_slipstream_addresses,
                     DriftProbeKind::CurveNGStable => &cached_curve_ng_stable_addresses,
                 };
@@ -1204,7 +1417,9 @@ impl<N, P> StateSpaceManager<N, P> {
             active_kind = selected_kind.next();
 
             let cursor = match selected_kind {
+                DriftProbeKind::V2Like => &mut v2_like_cursor,
                 DriftProbeKind::V3Like => &mut v3_cursor,
+                DriftProbeKind::V4Like => &mut v4_like_cursor,
                 DriftProbeKind::Slipstream => &mut slipstream_cursor,
                 DriftProbeKind::CurveNGStable => &mut curve_ng_stable_cursor,
             };
@@ -1225,7 +1440,12 @@ impl<N, P> StateSpaceManager<N, P> {
                 };
                 let amm_ref = amm.as_ref();
                 let kind = match amm_ref {
+                    AMM::UniswapV2Pool(_)
+                    | AMM::SushiV2Pool(_)
+                    | AMM::PancakeV2Pool(_)
+                    | AMM::AerodromeV2Pool(_) => DriftProbeKind::V2Like,
                     AMM::UniswapV3Pool(_) | AMM::PancakeV3Pool(_) => DriftProbeKind::V3Like,
+                    AMM::UniswapV4Pool(_) | AMM::PancakeInfinityPool(_) => DriftProbeKind::V4Like,
                     AMM::AerodromeSlipstreamPool(_) => DriftProbeKind::Slipstream,
                     AMM::CurveNGPool(pool) if pool.pool_type.is_stable() && pool.n_coins > 0 => {
                         DriftProbeKind::CurveNGStable
@@ -1236,6 +1456,16 @@ impl<N, P> StateSpaceManager<N, P> {
                     continue;
                 }
                 let local = match selected_kind {
+                    DriftProbeKind::V2Like => {
+                        let Some(snapshot) = Self::local_v2_like_probe_snapshot(amm_ref) else {
+                            continue;
+                        };
+                        DueProbe::V2Like {
+                            address,
+                            local: snapshot,
+                            variant: amm_ref.variant(),
+                        }
+                    }
                     DriftProbeKind::CurveNGStable => {
                         let Some(snapshot) = Self::local_curve_ng_stable_probe_snapshot(amm_ref)
                         else {
@@ -1259,6 +1489,29 @@ impl<N, P> StateSpaceManager<N, P> {
                             local: snapshot,
                             is_pancake,
                             kind: selected_kind,
+                        }
+                    }
+                    DriftProbeKind::V4Like => {
+                        let Some(snapshot) = Self::local_v4_lite_probe_snapshot(amm_ref) else {
+                            continue;
+                        };
+                        let (variant, manager_address, pool_id) = match amm_ref {
+                            AMM::UniswapV4Pool(pool) => {
+                                (Variant::UniswapV4Pool, pool.manager_address, pool.pool_id)
+                            }
+                            AMM::PancakeInfinityPool(pool) => (
+                                Variant::PancakeInfinityPool,
+                                pool.manager_address,
+                                pool.pool_id,
+                            ),
+                            _ => continue,
+                        };
+                        DueProbe::V4Like {
+                            address,
+                            local: snapshot,
+                            variant,
+                            manager_address,
+                            pool_id,
                         }
                     }
                 };
@@ -1298,22 +1551,71 @@ impl<N, P> StateSpaceManager<N, P> {
                 continue;
             }
 
+            let mut v2_due = Vec::new();
             let mut cl_due = Vec::new();
+            let mut v4_due = Vec::new();
             let mut curve_due = Vec::new();
             for item in due {
                 match item {
+                    DueProbe::V2Like {
+                        address,
+                        local,
+                        variant,
+                    } => v2_due.push((address, local, variant)),
                     DueProbe::Cl {
                         address,
                         local,
                         is_pancake,
                         kind,
                     } => cl_due.push((address, local, is_pancake, kind)),
+                    DueProbe::V4Like {
+                        address,
+                        local,
+                        variant,
+                        manager_address,
+                        pool_id,
+                    } => v4_due.push((address, local, variant, manager_address, pool_id)),
                     DueProbe::CurveNGStable { pool, local } => curve_due.push((pool, local)),
                 }
             }
 
             let mut enqueue_resync = Vec::new();
             let mut enqueue_async = Vec::new();
+
+            if !v2_due.is_empty() {
+                let v2_targets: Vec<(Address, Variant)> = v2_due
+                    .iter()
+                    .map(|(address, _, variant)| (*address, *variant))
+                    .collect();
+                match Self::fetch_v2_like_probe_snapshots_batch(&provider, &v2_targets, canonical)
+                    .await
+                {
+                    Ok(remote_by_address) => {
+                        for (address, local, _) in v2_due {
+                            let Some(remote) = remote_by_address.get(&address) else {
+                                continue;
+                            };
+                            if local != *remote {
+                                warn!(
+                                    ?address,
+                                    local_reserve_0 = local.reserve_0,
+                                    local_reserve_1 = local.reserve_1,
+                                    remote_reserve_0 = remote.reserve_0,
+                                    remote_reserve_1 = remote.reserve_1,
+                                    "drift_probe: V2Like reserve drift detected; enqueueing resync"
+                                );
+                                enqueue_resync.push(address);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            count = v2_targets.len(),
+                            "drift_probe: V2Like batch failed: {}", e
+                        );
+                    }
+                }
+            }
 
             if !cl_due.is_empty() {
                 let mut remote_by_address: HashMap<Address, ClProbeSnapshot> = HashMap::new();
@@ -1345,7 +1647,7 @@ impl<N, P> StateSpaceManager<N, P> {
                                 count = v3_due.len(),
                                 failed_count = failed_addresses.len(),
                                 failed_sample = ?sample,
-                                "V3 drift probe batch failed: {}",
+                                "drift_probe: V3 batch failed: {}",
                                 e
                             );
                         }
@@ -1374,7 +1676,7 @@ impl<N, P> StateSpaceManager<N, P> {
                         Err(e) => {
                             warn!(
                                 count = pancake_due.len(),
-                                "Pancake V3 drift probe batch failed: {}", e
+                                "drift_probe: PancakeV3 batch failed: {}", e
                             );
                         }
                     }
@@ -1415,7 +1717,7 @@ impl<N, P> StateSpaceManager<N, P> {
                                 count = slipstream_due.len(),
                                 failed_count = failed_addresses.len(),
                                 failed_sample = ?sample,
-                                "Slipstream drift probe batch failed: {}",
+                                "drift_probe: Slipstream batch failed: {}",
                                 e
                             );
                         }
@@ -1448,7 +1750,56 @@ impl<N, P> StateSpaceManager<N, P> {
                         continue;
                     }
 
+                    warn!(
+                        ?address,
+                        local_sqrt_price = ?local.sqrt_price,
+                        remote_sqrt_price = ?remote.sqrt_price,
+                        local_tick = local.tick,
+                        remote_tick = remote.tick,
+                        local_liquidity = local.liquidity,
+                        remote_liquidity = remote.liquidity,
+                        "drift_probe: CL state drift detected; enqueueing resync"
+                    );
                     enqueue_resync.push(address);
+                }
+            }
+
+            if !v4_due.is_empty() {
+                let v4_targets: Vec<(Address, Variant, Address, B256)> = v4_due
+                    .iter()
+                    .map(|(address, _, variant, manager_address, pool_id)| {
+                        (*address, *variant, *manager_address, *pool_id)
+                    })
+                    .collect();
+                match Self::fetch_v4_lite_probe_snapshots_batch(&provider, &v4_targets, canonical)
+                    .await
+                {
+                    Ok(remote_by_address) => {
+                        for (address, local, _, _, _) in v4_due {
+                            let Some(remote) = remote_by_address.get(&address) else {
+                                continue;
+                            };
+                            if local != *remote {
+                                warn!(
+                                    ?address,
+                                    local_sqrt_price = ?local.sqrt_price,
+                                    remote_sqrt_price = ?remote.sqrt_price,
+                                    local_tick = local.tick,
+                                    remote_tick = remote.tick,
+                                    local_liquidity = local.liquidity,
+                                    remote_liquidity = remote.liquidity,
+                                    "drift_probe: V4Lite state drift detected; enqueueing resync"
+                                );
+                                enqueue_resync.push(address);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            count = v4_targets.len(),
+                            "drift_probe: V4Lite batch failed: {}", e
+                        );
+                    }
                 }
             }
 
@@ -1479,7 +1830,7 @@ impl<N, P> StateSpaceManager<N, P> {
                     Err(e) => {
                         warn!(
                             count = remote_pools.len(),
-                            "CurveNG stable drift probe batch failed: {}", e
+                            "drift_probe: CurveNG stable batch failed: {}", e
                         );
                     }
                 }

@@ -44,7 +44,9 @@ pub mod factory;
 pub mod math;
 pub mod types;
 
-pub use factory::{CurveNGFactory, GetCurveNGStableSwapRuntimeDataBatchRequest, StableSwapRuntimeData};
+pub use factory::{
+    CurveNGFactory, GetCurveNGStableSwapRuntimeDataBatchRequest, StableSwapRuntimeData,
+};
 pub use types::{CurveIndexSignature, CurveNGPool, CurveNGPoolType, CurveNGTwoCryptoVariant};
 
 // Curve NG 池合约 ABI (简化版)

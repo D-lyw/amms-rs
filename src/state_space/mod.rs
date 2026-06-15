@@ -1848,9 +1848,8 @@ impl StateSpace {
                         error!(target: "state_space::sync", ?address, ?log_block_number, "Failed to sync AMM with log: {}", e);
                         if let Some(tx_hash) = log.transaction_hash {
                             error!(target: "state_space::sync", ?target_address, ?tx_hash, "Marking AMM for resync after sync error");
-                        } else {
-                            needs_resync.insert(target_address);
                         }
+                        needs_resync.insert(target_address);
                     }
                 }
             }

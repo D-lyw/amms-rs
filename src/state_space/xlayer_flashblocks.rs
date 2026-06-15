@@ -97,7 +97,7 @@ struct XlayerFlashblockMessage<'a> {
     #[serde(default)]
     diff: Option<XlayerFlashblockDiff<'a>>,
     #[serde(default)]
-    metadata: Option<XlayerFlashblockMetadata<'a>>,
+    metadata: Option<XlayerFlashblockMetadata>,
 }
 
 /// index=0 时携带的区块头信息
@@ -120,31 +120,55 @@ struct XlayerFlashblockDiff<'a> {
 
 /// 每个 slice 中的 metadata
 #[derive(Debug, Deserialize)]
-struct XlayerFlashblockMetadata<'a> {
+struct XlayerFlashblockMetadata {
     #[serde(default)]
     block_number: Option<u64>,
-    #[serde(default, borrow)]
-    receipts: HashMap<Cow<'a, str>, XlayerFlashblockReceipt<'a>>,
+    /// 使用 serde_json::Map 保留 receipts 的 JSON 插入顺序，
+    /// 后续再按 cumulativeGasUsed 二次排序确保确定性。
+    #[serde(default)]
+    receipts: serde_json::Map<String, serde_json::Value>,
 }
 
-/// 交易收据（Xlayer 版本：无 transactionIndex，用 cumulativeGasUsed 推导顺序）
-#[derive(Debug, Deserialize)]
-struct XlayerFlashblockReceipt<'a> {
-    #[serde(default, borrow)]
-    logs: Vec<XlayerFlashblockLog<'a>>,
-    #[serde(default, rename = "cumulativeGasUsed", borrow)]
-    _cumulative_gas_used: Option<Cow<'a, str>>,
+/// 从 serde_json::Value 中提取 cumulativeGasUsed（排序用）
+fn parse_cumulative_gas(v: &serde_json::Value) -> Option<u64> {
+    let s = v.get("cumulativeGasUsed")?.as_str()?;
+    Some(u64::from_str_radix(s.trim_start_matches("0x"), 16).ok()?)
 }
 
-/// 单条日志（与 Base 格式兼容）
-#[derive(Debug, Deserialize)]
-struct XlayerFlashblockLog<'a> {
-    #[serde(borrow)]
-    address: Cow<'a, str>,
-    #[serde(default, borrow)]
-    topics: Vec<Cow<'a, str>>,
-    #[serde(default, borrow)]
-    data: Cow<'a, str>,
+/// 从 serde_json::Value 中提取日志列表
+fn parse_logs_from_value(v: &serde_json::Value) -> Vec<XlayerFlashblockLog> {
+    let Some(logs_array) = v.get("logs").and_then(|l| l.as_array()) else {
+        return vec![];
+    };
+    logs_array
+        .iter()
+        .filter_map(|lv| {
+            let address = lv.get("address")?.as_str()?.to_string();
+            let topics = lv
+                .get("topics")
+                .and_then(|t| t.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|t| t.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let data = lv.get("data")?.as_str()?.to_string();
+            Some(XlayerFlashblockLog {
+                address,
+                topics,
+                data,
+            })
+        })
+        .collect()
+}
+
+/// 单条日志（Xlayer flashblocks 用 owned String）
+#[derive(Debug)]
+struct XlayerFlashblockLog {
+    address: String,
+    topics: Vec<String>,
+    data: String,
 }
 
 // ─────────────────────────────────────────────
@@ -438,11 +462,21 @@ fn extract_logs_from_xlayer_flashblock(
     //  ═══════════════════════════════════════════════════════════════════
     let tx_base = tx_tracker.base(&fb.payload_id);
 
-    let mut tx_position = 0u64;
-    for (_tx_hash, receipt) in metadata.receipts.iter() {
-        let transaction_index = tx_base + tx_position;
+    // 按 cumulativeGasUsed 排序 receipts，替代不安全的 HashMap 迭代顺序
+    let mut sorted_receipts: Vec<(&String, &serde_json::Value)> =
+        metadata.receipts.iter().collect();
+    sorted_receipts.sort_by(|(_, a), (_, b)| {
+        parse_cumulative_gas(a)
+            .unwrap_or(0)
+            .cmp(&parse_cumulative_gas(b).unwrap_or(0))
+    });
 
-        for (log_idx, raw_log) in receipt.logs.iter().enumerate() {
+    let mut tx_position = 0u64;
+    for (_tx_hash, receipt_value) in sorted_receipts {
+        let transaction_index = tx_base + tx_position;
+        let receipt_logs = parse_logs_from_value(receipt_value);
+
+        for (log_idx, raw_log) in receipt_logs.iter().enumerate() {
             // 5a. dedup 检查
             if !dedup_cache.insert(&fb.payload_id, _tx_hash, log_idx as u64) {
                 continue;

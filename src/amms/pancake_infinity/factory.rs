@@ -86,11 +86,18 @@ impl PancakeInfinityFactory {
         pools: &mut [PancakeInfinityPool],
         block_number: BlockId,
         provider: P,
-    ) -> Result<(), AMMError>
+    ) -> Result<HashSet<B256>, AMMError>
     where
         N: Network,
         P: Provider<N> + Clone,
     {
+        #[derive(Clone, Copy)]
+        enum SlotRequestKind {
+            Slot0,
+            Liquidity,
+        }
+
+        let mut failed_pool_ids = HashSet::new();
         let mut pools_by_manager: HashMap<Address, Vec<&mut PancakeInfinityPool>> = HashMap::new();
         for pool in pools.iter_mut() {
             pools_by_manager
@@ -98,39 +105,132 @@ impl PancakeInfinityFactory {
                 .or_default()
                 .push(pool);
         }
-        for (manager_address, manager_pools) in pools_by_manager {
+        for (manager_address, mut manager_pools) in pools_by_manager {
             let ipool_manager = ICLPoolManagerInstance::new(manager_address, provider.clone());
-            let slots: Vec<B256> = manager_pools
-                .iter()
-                .flat_map(|pool| {
-                    vec![
-                        B256::from(get_pool_state_slot(pool.pool_id)),
-                        B256::from(get_liquidity_slot(pool.pool_id)),
-                    ]
-                })
-                .collect();
-            let chunks: Vec<_> = slots.chunks(200).collect();
-            let mut futures = Vec::new();
-            for chunk in chunks {
-                let chunk_vec = chunk.to_vec();
-                let ipool_manager = ipool_manager.clone();
-                futures.push(async move {
-                    ipool_manager
-                        .extsload_2(chunk_vec)
-                        .block(block_number)
-                        .call()
-                        .await
-                });
+            let mut slots = Vec::with_capacity(manager_pools.len() * 2);
+            let mut slot_requests = Vec::with_capacity(manager_pools.len() * 2);
+            for (pool_idx, pool) in manager_pools.iter().enumerate() {
+                slots.push(B256::from(get_pool_state_slot(pool.pool_id)));
+                slot_requests.push((pool_idx, pool.pool_id, SlotRequestKind::Slot0));
+                slots.push(B256::from(get_liquidity_slot(pool.pool_id)));
+                slot_requests.push((pool_idx, pool.pool_id, SlotRequestKind::Liquidity));
             }
-            let results = futures::future::try_join_all(futures).await?;
-            let mut flat_results = results.into_iter().flatten();
-            for pool in manager_pools {
-                let slot0_data = flat_results
-                    .next()
-                    .ok_or(AMMError::SyncError(Address::ZERO))?;
-                let liquidity_data = flat_results
-                    .next()
-                    .ok_or(AMMError::SyncError(Address::ZERO))?;
+
+            let chunks: Vec<_> = slots.chunks(200).collect();
+            let mut slot0_by_pool = HashMap::new();
+            let mut liquidity_by_pool = HashMap::new();
+            let mut chunk_cursor = 0usize;
+
+            for batch in chunks.chunks(10) {
+                let mut futures = Vec::new();
+                let mut batch_ranges = Vec::with_capacity(batch.len());
+                for chunk in batch {
+                    let start = chunk_cursor;
+                    let end = start + chunk.len();
+                    batch_ranges.push((start, end));
+                    chunk_cursor = end;
+
+                    let chunk_vec = chunk.to_vec();
+                    let ipool_manager = ipool_manager.clone();
+                    futures.push(async move {
+                        ipool_manager
+                            .extsload_2(chunk_vec)
+                            .block(block_number)
+                            .call()
+                            .await
+                    });
+                }
+
+                let batch_results = futures::future::join_all(futures).await;
+                for ((start, end), result) in
+                    batch_ranges.into_iter().zip(batch_results.into_iter())
+                {
+                    match result {
+                        Ok(chunk_results) => {
+                            if chunk_results.len() != end - start {
+                                tracing::warn!(
+                                    target: "amms::pancake_infinity::sync_slot_0",
+                                    manager = ?manager_address,
+                                    expected = end - start,
+                                    actual = chunk_results.len(),
+                                    "extsload_2 returned mismatched slot count; failing affected pools"
+                                );
+                                for (_, pool_id, _) in &slot_requests[start..end] {
+                                    failed_pool_ids.insert(*pool_id);
+                                }
+                                continue;
+                            }
+
+                            for ((pool_idx, pool_id, kind), data) in slot_requests[start..end]
+                                .iter()
+                                .copied()
+                                .zip(chunk_results.into_iter())
+                            {
+                                if failed_pool_ids.contains(&pool_id) {
+                                    continue;
+                                }
+                                match kind {
+                                    SlotRequestKind::Slot0 => {
+                                        slot0_by_pool.insert(pool_idx, data);
+                                    }
+                                    SlotRequestKind::Liquidity => {
+                                        liquidity_by_pool.insert(pool_idx, data);
+                                    }
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                target: "amms::pancake_infinity::sync_slot_0",
+                                manager = ?manager_address,
+                                error = ?err,
+                                "extsload_2 batch failed; failing affected pools"
+                            );
+                            for (_, pool_id, _) in &slot_requests[start..end] {
+                                failed_pool_ids.insert(*pool_id);
+                            }
+                        }
+                    }
+                }
+            }
+
+            for (pool_idx, pool) in manager_pools.iter_mut().enumerate() {
+                if failed_pool_ids.contains(&pool.pool_id) {
+                    continue;
+                }
+
+                let Some(slot0_data) = slot0_by_pool.get(&pool_idx).copied() else {
+                    tracing::warn!(
+                        target: "amms::pancake_infinity::sync_slot_0",
+                        pool_id = ?pool.pool_id,
+                        manager = ?manager_address,
+                        "Missing slot0 data for pool; failing refresh"
+                    );
+                    failed_pool_ids.insert(pool.pool_id);
+                    continue;
+                };
+                let Some(liquidity_data) = liquidity_by_pool.get(&pool_idx).copied() else {
+                    tracing::warn!(
+                        target: "amms::pancake_infinity::sync_slot_0",
+                        pool_id = ?pool.pool_id,
+                        manager = ?manager_address,
+                        "Missing liquidity data for pool; failing refresh"
+                    );
+                    failed_pool_ids.insert(pool.pool_id);
+                    continue;
+                };
+
+                if slot0_data.is_zero() {
+                    tracing::warn!(
+                        target: "amms::pancake_infinity::sync_slot_0",
+                        pool_id = ?pool.pool_id,
+                        manager = ?manager_address,
+                        "Pool has zero slot0 data; failing refresh"
+                    );
+                    failed_pool_ids.insert(pool.pool_id);
+                    continue;
+                }
+
                 let sqrt_price_x96 = U160::from_be_slice(&slot0_data[12..32]);
                 let tick_bytes =
                     unsafe { (slot0_data.as_ptr().add(9) as *const [u8; 3]).read_unaligned() };
@@ -142,6 +242,16 @@ impl PancakeInfinityFactory {
                 let lp_fee_bytes =
                     unsafe { (slot0_data.as_ptr().add(3) as *const [u8; 3]).read_unaligned() };
                 let lp_fee = alloy::primitives::aliases::U24::from_be_bytes(lp_fee_bytes);
+
+                if liquidity_data.is_zero() {
+                    tracing::info!(
+                        target: "amms::pancake_infinity::sync_slot_0",
+                        pool_id = ?pool.pool_id,
+                        manager = ?manager_address,
+                        "Pool active liquidity is zero at current tick; keeping pool tracked"
+                    );
+                }
+
                 let liquidity = u128::from_be_bytes(liquidity_data[16..32].try_into().unwrap());
                 pool.sqrt_price = U256::from(sqrt_price_x96);
                 pool.tick = tick.as_i32();
@@ -150,7 +260,7 @@ impl PancakeInfinityFactory {
                 pool.liquidity = liquidity;
             }
         }
-        Ok(())
+        Ok(failed_pool_ids)
     }
 
     pub async fn sync_token_decimals<N, P>(
@@ -183,11 +293,12 @@ impl PancakeInfinityFactory {
         pools: &mut [PancakeInfinityPool],
         block_id: BlockId,
         provider: P,
-    ) -> Result<(), AMMError>
+    ) -> Result<HashSet<B256>, AMMError>
     where
         N: Network,
         P: Provider<N> + Clone,
     {
+        let mut failed_pool_ids = HashSet::new();
         let pool_ticks = pools
             .into_par_iter()
             .filter_map(|pool| {
@@ -218,7 +329,7 @@ impl PancakeInfinityFactory {
             })
             .collect::<HashMap<_, _>>();
         if pool_ticks.is_empty() {
-            return Ok(());
+            return Ok(failed_pool_ids);
         }
         let mut pools_by_manager: HashMap<Address, Vec<&mut PancakeInfinityPool>> = HashMap::new();
         for pool in pools.iter_mut() {
@@ -237,52 +348,102 @@ impl PancakeInfinityFactory {
                     for &tick in ticks {
                         let slot = B256::from(get_tick_info_slot(pool.pool_id, tick));
                         all_slots.push(slot);
-                        pool_slot_indices.push((pool_idx, tick, all_slots.len() - 1));
+                        pool_slot_indices.push((pool_idx, pool.pool_id, tick));
                     }
                 }
             }
             let chunks: Vec<_> = all_slots.chunks(100).collect();
-            let mut futures = Vec::new();
             let ipool_manager = ICLPoolManagerInstance::new(manager_address, provider.clone());
-            for chunk in chunks {
-                let chunk_vec = chunk.to_vec();
-                let ipool_manager = ipool_manager.clone();
-                futures.push(async move {
-                    ipool_manager
-                        .extsload_2(chunk_vec)
-                        .block(block_id)
-                        .call()
-                        .await
-                });
-            }
-            let results = futures::future::try_join_all(futures).await?;
-            let flat_results: Vec<B256> = results.into_iter().flatten().collect();
-            for (pool_idx, tick, slot_idx) in pool_slot_indices {
-                let word = flat_results[slot_idx];
-                let (liquidity_gross, liquidity_net) =
-                    decode_liquidity_gross_and_net(B256::from(word));
-                manager_pools[pool_idx].ticks.insert(
-                    tick,
-                    crate::amms::uniswap_v3::Info {
-                        liquidity_gross,
-                        liquidity_net,
-                        initialized: true,
-                    },
-                );
+            let mut chunk_cursor = 0usize;
+
+            for batch in chunks.chunks(10) {
+                let mut futures = Vec::new();
+                let mut batch_ranges = Vec::with_capacity(batch.len());
+                for chunk in batch {
+                    let start = chunk_cursor;
+                    let end = start + chunk.len();
+                    batch_ranges.push((start, end));
+                    chunk_cursor = end;
+
+                    let chunk_vec = chunk.to_vec();
+                    let ipool_manager = ipool_manager.clone();
+                    futures.push(async move {
+                        ipool_manager
+                            .extsload_2(chunk_vec)
+                            .block(block_id)
+                            .call()
+                            .await
+                    });
+                }
+
+                let batch_results = futures::future::join_all(futures).await;
+                for ((start, end), result) in
+                    batch_ranges.into_iter().zip(batch_results.into_iter())
+                {
+                    match result {
+                        Ok(chunk_results) => {
+                            if chunk_results.len() != end - start {
+                                tracing::warn!(
+                                    target: "amms::pancake_infinity::sync_tick_data",
+                                    manager = ?manager_address,
+                                    expected = end - start,
+                                    actual = chunk_results.len(),
+                                    "extsload_2 returned mismatched tick count; failing affected pools"
+                                );
+                                for (_, pool_id, _) in &pool_slot_indices[start..end] {
+                                    failed_pool_ids.insert(*pool_id);
+                                }
+                                continue;
+                            }
+
+                            for ((pool_idx, pool_id, tick), word) in pool_slot_indices[start..end]
+                                .iter()
+                                .copied()
+                                .zip(chunk_results.into_iter())
+                            {
+                                if failed_pool_ids.contains(&pool_id) {
+                                    continue;
+                                }
+                                let (liquidity_gross, liquidity_net) =
+                                    decode_liquidity_gross_and_net(B256::from(word));
+                                manager_pools[pool_idx].ticks.insert(
+                                    tick,
+                                    crate::amms::uniswap_v3::Info {
+                                        liquidity_gross,
+                                        liquidity_net,
+                                        initialized: true,
+                                    },
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                target: "amms::pancake_infinity::sync_tick_data",
+                                manager = ?manager_address,
+                                error = ?err,
+                                "extsload_2 batch failed; failing affected pools"
+                            );
+                            for (_, pool_id, _) in &pool_slot_indices[start..end] {
+                                failed_pool_ids.insert(*pool_id);
+                            }
+                        }
+                    }
+                }
             }
         }
-        Ok(())
+        Ok(failed_pool_ids)
     }
 
     pub async fn sync_tick_bitmap<N, P>(
         pools: &mut [PancakeInfinityPool],
         block_id: BlockId,
         provider: P,
-    ) -> Result<(), AMMError>
+    ) -> Result<HashSet<B256>, AMMError>
     where
         N: Network,
         P: Provider<N> + Clone,
     {
+        let mut failed_pool_ids = HashSet::new();
         let mut pools_by_manager: HashMap<Address, Vec<&mut PancakeInfinityPool>> = HashMap::new();
         for pool in pools.iter_mut() {
             pools_by_manager
@@ -300,35 +461,83 @@ impl PancakeInfinityFactory {
                     let slot = get_tick_bitmap_slot(pool.pool_id, word as i16);
                     if slot != U256::ZERO {
                         all_slots.push(B256::from(slot));
-                        pool_slot_indices.push((pool_idx, word, all_slots.len() - 1));
+                        pool_slot_indices.push((pool_idx, pool.pool_id, word as i16));
                     }
                 }
             }
             let chunks: Vec<_> = all_slots.chunks(500).collect();
-            let mut futures = Vec::new();
             let ipool_manager = ICLPoolManagerInstance::new(manager_address, provider.clone());
-            for chunk in chunks {
-                let chunk_vec = chunk.to_vec();
-                let ipool_manager = ipool_manager.clone();
-                futures.push(async move {
-                    let words = ipool_manager
-                        .extsload_2(chunk_vec)
-                        .block(block_id)
-                        .call()
-                        .await?;
-                    Ok::<Vec<B256>, AMMError>(words)
-                });
-            }
-            let results = futures::future::try_join_all(futures).await?;
-            let flat_results: Vec<B256> = results.into_iter().flatten().collect();
-            for (pool_idx, word, slot_idx) in pool_slot_indices {
-                let bitmap = U256::from_be_bytes(flat_results[slot_idx].0);
-                manager_pools[pool_idx]
-                    .tick_bitmap
-                    .insert(word as i16, bitmap);
+            let mut chunk_cursor = 0usize;
+
+            for batch in chunks.chunks(10) {
+                let mut futures = Vec::new();
+                let mut batch_ranges = Vec::with_capacity(batch.len());
+                for chunk in batch {
+                    let start = chunk_cursor;
+                    let end = start + chunk.len();
+                    batch_ranges.push((start, end));
+                    chunk_cursor = end;
+
+                    let chunk_vec = chunk.to_vec();
+                    let ipool_manager = ipool_manager.clone();
+                    futures.push(async move {
+                        ipool_manager
+                            .extsload_2(chunk_vec)
+                            .block(block_id)
+                            .call()
+                            .await
+                    });
+                }
+
+                let batch_results = futures::future::join_all(futures).await;
+                for ((start, end), result) in
+                    batch_ranges.into_iter().zip(batch_results.into_iter())
+                {
+                    match result {
+                        Ok(chunk_results) => {
+                            if chunk_results.len() != end - start {
+                                tracing::warn!(
+                                    target: "amms::pancake_infinity::sync_tick_bitmap",
+                                    manager = ?manager_address,
+                                    expected = end - start,
+                                    actual = chunk_results.len(),
+                                    "extsload_2 returned mismatched bitmap count; failing affected pools"
+                                );
+                                for (_, pool_id, _) in &pool_slot_indices[start..end] {
+                                    failed_pool_ids.insert(*pool_id);
+                                }
+                                continue;
+                            }
+
+                            for ((pool_idx, pool_id, word), bitmap_word) in pool_slot_indices
+                                [start..end]
+                                .iter()
+                                .copied()
+                                .zip(chunk_results.into_iter())
+                            {
+                                if failed_pool_ids.contains(&pool_id) {
+                                    continue;
+                                }
+                                let bitmap = U256::from_be_bytes(bitmap_word.0);
+                                manager_pools[pool_idx].tick_bitmap.insert(word, bitmap);
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                target: "amms::pancake_infinity::sync_tick_bitmap",
+                                manager = ?manager_address,
+                                error = ?err,
+                                "extsload_2 batch failed; failing affected pools"
+                            );
+                            for (_, pool_id, _) in &pool_slot_indices[start..end] {
+                                failed_pool_ids.insert(*pool_id);
+                            }
+                        }
+                    }
+                }
             }
         }
-        Ok(())
+        Ok(failed_pool_ids)
     }
 
     pub async fn sync_all_pools<N, P>(
@@ -350,7 +559,11 @@ impl PancakeInfinityFactory {
                 }
             })
             .collect();
-        Self::sync_slot_0(&mut pools, block_number, provider.clone()).await?;
+        let mut failed_pool_ids =
+            Self::sync_slot_0(&mut pools, block_number, provider.clone()).await?;
+        if !failed_pool_ids.is_empty() {
+            pools.retain(|pool| !failed_pool_ids.contains(&pool.pool_id));
+        }
 
         // Clear previous tick data to prevent stale data buildup
         for pool in pools.iter_mut() {
@@ -358,9 +571,19 @@ impl PancakeInfinityFactory {
             pool.ticks.clear();
         }
 
-        Self::sync_tick_bitmap(&mut pools, block_number, provider.clone()).await?;
-        Self::sync_tick_data(&mut pools, block_number, provider.clone()).await?;
+        failed_pool_ids
+            .extend(Self::sync_tick_bitmap(&mut pools, block_number, provider.clone()).await?);
+        if !failed_pool_ids.is_empty() {
+            pools.retain(|pool| !failed_pool_ids.contains(&pool.pool_id));
+        }
 
+        failed_pool_ids
+            .extend(Self::sync_tick_data(&mut pools, block_number, provider.clone()).await?);
+        if !failed_pool_ids.is_empty() {
+            pools.retain(|pool| !failed_pool_ids.contains(&pool.pool_id));
+        }
+
+        let mut price_failed_pool_ids = HashSet::new();
         for pool in pools.iter_mut() {
             match pool.calculate_price(pool.token_a.address, pool.token_b.address) {
                 Ok(price) => {
@@ -372,10 +595,16 @@ impl PancakeInfinityFactory {
                         target: "amms::pancake_infinity::sync",
                         pool_id = ?pool.pool_id,
                         error = ?e,
-                        "Failed to refresh PancakeInfinity spot prices; keeping previous values"
+                        "Failed to refresh PancakeInfinity spot prices; failing pool refresh"
                     );
+                    price_failed_pool_ids.insert(pool.pool_id);
                 }
             }
+        }
+
+        failed_pool_ids.extend(price_failed_pool_ids);
+        if !failed_pool_ids.is_empty() {
+            pools.retain(|pool| !failed_pool_ids.contains(&pool.pool_id));
         }
 
         Ok(pools.into_iter().map(AMM::PancakeInfinityPool).collect())
@@ -403,7 +632,11 @@ impl PancakeInfinityFactory {
             })
             .collect();
 
-        Self::sync_slot_0(&mut pools, block_number, provider.clone()).await?;
+        let mut failed_pool_ids =
+            Self::sync_slot_0(&mut pools, block_number, provider.clone()).await?;
+        if !failed_pool_ids.is_empty() {
+            pools.retain(|pool| !failed_pool_ids.contains(&pool.pool_id));
+        }
         Self::sync_token_decimals(&mut pools, provider.clone()).await?;
 
         let (structurally_valid, structurally_invalid): (Vec<_>, Vec<_>) =
@@ -436,8 +669,17 @@ impl PancakeInfinityFactory {
             pool.ticks.clear();
         }
 
-        Self::sync_tick_bitmap(&mut pools, block_number, provider.clone()).await?;
-        Self::sync_tick_data(&mut pools, block_number, provider.clone()).await?;
+        failed_pool_ids
+            .extend(Self::sync_tick_bitmap(&mut pools, block_number, provider.clone()).await?);
+        if !failed_pool_ids.is_empty() {
+            pools.retain(|pool| !failed_pool_ids.contains(&pool.pool_id));
+        }
+
+        failed_pool_ids
+            .extend(Self::sync_tick_data(&mut pools, block_number, provider.clone()).await?);
+        if !failed_pool_ids.is_empty() {
+            pools.retain(|pool| !failed_pool_ids.contains(&pool.pool_id));
+        }
 
         let (liquid_pools, dust_pools): (Vec<_>, Vec<_>) = pools
             .into_par_iter()

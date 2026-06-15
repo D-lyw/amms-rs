@@ -67,6 +67,13 @@ sol!(
     "src/amms/abi/GetUniswapV2PoolDataBatchRequest.json"
 );
 
+sol!(
+    #[allow(missing_docs)]
+    #[sol(rpc)]
+    GetV2LikeReservesProbeBatchRequest,
+    "src/amms/abi/GetV2LikeReservesProbeBatchRequest.json"
+);
+
 #[derive(Error, Debug)]
 pub enum UniswapV2Error {
     #[error("Division by zero")]

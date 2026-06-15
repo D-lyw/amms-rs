@@ -149,9 +149,7 @@ impl Variant {
             Variant::SkyConverter => {
                 SkyConverter::init_batch::<N, _>(amms, to_block, provider).await
             }
-            Variant::PendlePool => {
-                PendlePool::init_batch::<N, _>(amms, to_block, provider).await
-            }
+            Variant::PendlePool => PendlePool::init_batch::<N, _>(amms, to_block, provider).await,
         }
     }
 
@@ -229,9 +227,7 @@ impl Variant {
             Variant::SkyConverter => {
                 SkyConverter::init_batch::<N, _>(amms, to_block, provider).await
             }
-            Variant::PendlePool => {
-                PendlePool::init_batch::<N, _>(amms, to_block, provider).await
-            }
+            Variant::PendlePool => PendlePool::init_batch::<N, _>(amms, to_block, provider).await,
         }
     }
 }

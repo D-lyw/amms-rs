@@ -109,11 +109,18 @@ impl UniswapV4Factory {
         pools: &mut [UniswapV4Pool],
         block_number: BlockId,
         provider: P,
-    ) -> Result<(), AMMError>
+    ) -> Result<HashSet<B256>, AMMError>
     where
         N: Network,
         P: Provider<N> + Clone,
     {
+        #[derive(Clone, Copy)]
+        enum SlotRequestKind {
+            Slot0,
+            Liquidity,
+        }
+
+        let mut failed_pool_ids = HashSet::new();
         let mut pools_by_manager: HashMap<Address, Vec<&mut UniswapV4Pool>> = HashMap::new();
         for pool in pools.iter_mut() {
             pools_by_manager
@@ -122,25 +129,32 @@ impl UniswapV4Factory {
                 .push(pool);
         }
 
-        for (manager_address, manager_pools) in pools_by_manager {
+        for (manager_address, mut manager_pools) in pools_by_manager {
             let ipool_manager = IPoolManagerInstance::new(manager_address, provider.clone());
 
-            let slots: Vec<B256> = manager_pools
-                .iter()
-                .flat_map(|pool| {
-                    vec![
-                        B256::from(get_pool_state_slot(pool.pool_id)),
-                        B256::from(get_liquidity_slot(pool.pool_id)),
-                    ]
-                })
-                .collect();
+            let mut slots = Vec::with_capacity(manager_pools.len() * 2);
+            let mut slot_requests = Vec::with_capacity(manager_pools.len() * 2);
+            for (pool_idx, pool) in manager_pools.iter().enumerate() {
+                slots.push(B256::from(get_pool_state_slot(pool.pool_id)));
+                slot_requests.push((pool_idx, pool.pool_id, SlotRequestKind::Slot0));
+                slots.push(B256::from(get_liquidity_slot(pool.pool_id)));
+                slot_requests.push((pool_idx, pool.pool_id, SlotRequestKind::Liquidity));
+            }
 
             let chunks: Vec<_> = slots.chunks(100).collect();
-            let mut all_results = Vec::new();
+            let mut slot0_by_pool = HashMap::new();
+            let mut liquidity_by_pool = HashMap::new();
+            let mut chunk_cursor = 0usize;
 
             for batch in chunks.chunks(Self::MAX_CONCURRENT_RPC_REQUESTS) {
                 let mut futures = Vec::new();
+                let mut batch_ranges = Vec::with_capacity(batch.len());
                 for chunk in batch {
+                    let start = chunk_cursor;
+                    let end = start + chunk.len();
+                    batch_ranges.push((start, end));
+                    chunk_cursor = end;
+
                     let chunk_vec = chunk.to_vec();
                     let ipool_manager = ipool_manager.clone();
                     futures.push(async move {
@@ -152,44 +166,87 @@ impl UniswapV4Factory {
                     });
                 }
 
-                let batch_results: Vec<_> = futures::future::join_all(futures)
-                    .await
-                    .into_iter()
-                    .filter_map(|r| r.ok())
-                    .collect();
-                all_results.extend(batch_results);
+                let batch_results = futures::future::join_all(futures).await;
+                for ((start, end), result) in
+                    batch_ranges.into_iter().zip(batch_results.into_iter())
+                {
+                    match result {
+                        Ok(chunk_results) => {
+                            if chunk_results.len() != end - start {
+                                warn!(
+                                    target: "amms::uniswap_v4::sync_slot_0",
+                                    manager = ?manager_address,
+                                    expected = end - start,
+                                    actual = chunk_results.len(),
+                                    "extsload_2 returned mismatched slot count; failing affected pools"
+                                );
+                                for (_, pool_id, _) in &slot_requests[start..end] {
+                                    failed_pool_ids.insert(*pool_id);
+                                }
+                                continue;
+                            }
+
+                            for ((pool_idx, pool_id, kind), data) in slot_requests[start..end]
+                                .iter()
+                                .copied()
+                                .zip(chunk_results.into_iter())
+                            {
+                                if failed_pool_ids.contains(&pool_id) {
+                                    continue;
+                                }
+                                match kind {
+                                    SlotRequestKind::Slot0 => {
+                                        slot0_by_pool.insert(pool_idx, data);
+                                    }
+                                    SlotRequestKind::Liquidity => {
+                                        liquidity_by_pool.insert(pool_idx, data);
+                                    }
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            warn!(
+                                target: "amms::uniswap_v4::sync_slot_0",
+                                manager = ?manager_address,
+                                error = ?err,
+                                "extsload_2 batch failed; failing affected pools"
+                            );
+                            for (_, pool_id, _) in &slot_requests[start..end] {
+                                failed_pool_ids.insert(*pool_id);
+                            }
+                        }
+                    }
+                }
 
                 if Self::BATCH_DELAY_MS > 0 {
                     sleep(Duration::from_millis(Self::BATCH_DELAY_MS)).await;
                 }
             }
 
-            let mut flat_results = all_results.into_iter().flatten();
+            for (pool_idx, pool) in manager_pools.iter_mut().enumerate() {
+                if failed_pool_ids.contains(&pool.pool_id) {
+                    continue;
+                }
 
-            for pool in manager_pools {
-                let slot0_data = match flat_results.next() {
-                    Some(data) => data,
-                    None => {
-                        warn!(
-                            target: "amms::uniswap_v4::sync_slot_0",
-                            pool_id = ?pool.pool_id,
-                            manager = ?manager_address,
-                            "Missing slot0 data for pool"
-                        );
-                        continue;
-                    }
+                let Some(slot0_data) = slot0_by_pool.get(&pool_idx).copied() else {
+                    warn!(
+                        target: "amms::uniswap_v4::sync_slot_0",
+                        pool_id = ?pool.pool_id,
+                        manager = ?manager_address,
+                        "Missing slot0 data for pool; failing refresh"
+                    );
+                    failed_pool_ids.insert(pool.pool_id);
+                    continue;
                 };
-                let liquidity_data = match flat_results.next() {
-                    Some(data) => data,
-                    None => {
-                        warn!(
-                            target: "amms::uniswap_v4::sync_slot_0",
-                            pool_id = ?pool.pool_id,
-                            manager = ?manager_address,
-                            "Missing liquidity data for pool"
-                        );
-                        continue;
-                    }
+                let Some(liquidity_data) = liquidity_by_pool.get(&pool_idx).copied() else {
+                    warn!(
+                        target: "amms::uniswap_v4::sync_slot_0",
+                        pool_id = ?pool.pool_id,
+                        manager = ?manager_address,
+                        "Missing liquidity data for pool; failing refresh"
+                    );
+                    failed_pool_ids.insert(pool.pool_id);
+                    continue;
                 };
 
                 if slot0_data.is_zero() {
@@ -197,8 +254,9 @@ impl UniswapV4Factory {
                         target: "amms::uniswap_v4::sync_slot_0",
                         pool_id = ?pool.pool_id,
                         manager = ?manager_address,
-                        "Pool has zero slot0 data"
+                        "Pool has zero slot0 data; failing refresh"
                     );
+                    failed_pool_ids.insert(pool.pool_id);
                     continue;
                 }
 
@@ -235,7 +293,7 @@ impl UniswapV4Factory {
             }
         }
 
-        Ok(())
+        Ok(failed_pool_ids)
     }
 
     pub async fn sync_token_decimals<N, P>(
@@ -271,11 +329,12 @@ impl UniswapV4Factory {
         pools: &mut [UniswapV4Pool],
         block_id: BlockId,
         provider: P,
-    ) -> Result<(), AMMError>
+    ) -> Result<HashSet<B256>, AMMError>
     where
         N: Network,
         P: Provider<N> + Clone,
     {
+        let mut failed_pool_ids = HashSet::new();
         let pool_ticks = pools
             .into_par_iter()
             .filter_map(|pool| {
@@ -309,7 +368,7 @@ impl UniswapV4Factory {
             .collect::<HashMap<_, _>>();
 
         if pool_ticks.is_empty() {
-            return Ok(());
+            return Ok(failed_pool_ids);
         }
 
         let mut pools_by_manager: HashMap<Address, Vec<&mut UniswapV4Pool>> = HashMap::new();
@@ -331,18 +390,24 @@ impl UniswapV4Factory {
                     for &tick in ticks {
                         let slot = B256::from(get_tick_info_slot(pool.pool_id, tick));
                         all_slots.push(slot);
-                        pool_slot_indices.push((pool_idx, tick, all_slots.len() - 1));
+                        pool_slot_indices.push((pool_idx, pool.pool_id, tick));
                     }
                 }
             }
 
             let chunks: Vec<_> = all_slots.chunks(50).collect();
             let ipool_manager = IPoolManagerInstance::new(manager_address, provider.clone());
-            let mut all_results = Vec::new();
+            let mut chunk_cursor = 0usize;
 
             for batch in chunks.chunks(Self::MAX_CONCURRENT_RPC_REQUESTS) {
                 let mut futures = Vec::new();
+                let mut batch_ranges = Vec::with_capacity(batch.len());
                 for chunk in batch {
+                    let start = chunk_cursor;
+                    let end = start + chunk.len();
+                    batch_ranges.push((start, end));
+                    chunk_cursor = end;
+
                     let chunk_vec = chunk.to_vec();
                     let ipool_manager = ipool_manager.clone();
                     futures.push(async move {
@@ -354,50 +419,80 @@ impl UniswapV4Factory {
                     });
                 }
 
-                let batch_results: Vec<_> = futures::future::join_all(futures)
-                    .await
-                    .into_iter()
-                    .filter_map(|r| r.ok())
-                    .collect();
-                all_results.extend(batch_results);
+                let batch_results = futures::future::join_all(futures).await;
+                for ((start, end), result) in
+                    batch_ranges.into_iter().zip(batch_results.into_iter())
+                {
+                    match result {
+                        Ok(chunk_results) => {
+                            if chunk_results.len() != end - start {
+                                warn!(
+                                    target: "amms::uniswap_v4::sync_tick_data",
+                                    manager = ?manager_address,
+                                    expected = end - start,
+                                    actual = chunk_results.len(),
+                                    "extsload_2 returned mismatched tick count; failing affected pools"
+                                );
+                                for (_, pool_id, _) in &pool_slot_indices[start..end] {
+                                    failed_pool_ids.insert(*pool_id);
+                                }
+                                continue;
+                            }
+
+                            for ((pool_idx, pool_id, tick), word) in pool_slot_indices[start..end]
+                                .iter()
+                                .copied()
+                                .zip(chunk_results.into_iter())
+                            {
+                                if failed_pool_ids.contains(&pool_id) {
+                                    continue;
+                                }
+                                let (liquidity_gross, liquidity_net) =
+                                    decode_liquidity_gross_and_net(B256::from(word));
+
+                                manager_pools[pool_idx].ticks.insert(
+                                    tick,
+                                    Info {
+                                        liquidity_gross,
+                                        liquidity_net,
+                                        initialized: true,
+                                    },
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            warn!(
+                                target: "amms::uniswap_v4::sync_tick_data",
+                                manager = ?manager_address,
+                                error = ?err,
+                                "extsload_2 batch failed; failing affected pools"
+                            );
+                            for (_, pool_id, _) in &pool_slot_indices[start..end] {
+                                failed_pool_ids.insert(*pool_id);
+                            }
+                        }
+                    }
+                }
 
                 if Self::BATCH_DELAY_MS > 0 {
                     sleep(Duration::from_millis(Self::BATCH_DELAY_MS)).await;
                 }
             }
-
-            let flat_results: Vec<B256> = all_results.into_iter().flatten().collect();
-
-            for (pool_idx, tick, slot_idx) in pool_slot_indices {
-                if slot_idx < flat_results.len() {
-                    let word = flat_results[slot_idx];
-                    let (liquidity_gross, liquidity_net) =
-                        decode_liquidity_gross_and_net(B256::from(word));
-
-                    manager_pools[pool_idx].ticks.insert(
-                        tick,
-                        Info {
-                            liquidity_gross,
-                            liquidity_net,
-                            initialized: true,
-                        },
-                    );
-                }
-            }
         }
 
-        Ok(())
+        Ok(failed_pool_ids)
     }
 
     pub async fn sync_tick_bitmap<N, P>(
         pools: &mut [UniswapV4Pool],
         block_id: BlockId,
         provider: P,
-    ) -> Result<(), AMMError>
+    ) -> Result<HashSet<B256>, AMMError>
     where
         N: Network,
         P: Provider<N> + Clone,
     {
+        let mut failed_pool_ids = HashSet::new();
         let mut pools_by_manager: HashMap<Address, Vec<&mut UniswapV4Pool>> = HashMap::new();
         for pool in pools.iter_mut() {
             pools_by_manager
@@ -418,18 +513,24 @@ impl UniswapV4Factory {
                     let slot = get_tick_bitmap_slot(pool.pool_id, word as i16);
                     if slot != U256::ZERO {
                         all_slots.push(B256::from(slot));
-                        pool_slot_indices.push((pool_idx, word, all_slots.len() - 1));
+                        pool_slot_indices.push((pool_idx, pool.pool_id, word as i16));
                     }
                 }
             }
 
             let chunks: Vec<_> = all_slots.chunks(200).collect();
             let ipool_manager = IPoolManagerInstance::new(manager_address, provider.clone());
-            let mut all_results = Vec::new();
+            let mut chunk_cursor = 0usize;
 
             for batch in chunks.chunks(Self::MAX_CONCURRENT_RPC_REQUESTS) {
                 let mut futures = Vec::new();
+                let mut batch_ranges = Vec::with_capacity(batch.len());
                 for chunk in batch {
+                    let start = chunk_cursor;
+                    let end = start + chunk.len();
+                    batch_ranges.push((start, end));
+                    chunk_cursor = end;
+
                     let chunk_vec = chunk.to_vec();
                     let ipool_manager = ipool_manager.clone();
                     futures.push(async move {
@@ -441,31 +542,61 @@ impl UniswapV4Factory {
                     });
                 }
 
-                let batch_results: Vec<_> = futures::future::join_all(futures)
-                    .await
-                    .into_iter()
-                    .filter_map(|r| r.ok())
-                    .collect();
-                all_results.extend(batch_results);
+                let batch_results = futures::future::join_all(futures).await;
+                for ((start, end), result) in
+                    batch_ranges.into_iter().zip(batch_results.into_iter())
+                {
+                    match result {
+                        Ok(chunk_results) => {
+                            if chunk_results.len() != end - start {
+                                warn!(
+                                    target: "amms::uniswap_v4::sync_tick_bitmap",
+                                    manager = ?manager_address,
+                                    expected = end - start,
+                                    actual = chunk_results.len(),
+                                    "extsload_2 returned mismatched bitmap count; failing affected pools"
+                                );
+                                for (_, pool_id, _) in &pool_slot_indices[start..end] {
+                                    failed_pool_ids.insert(*pool_id);
+                                }
+                                continue;
+                            }
+
+                            for ((pool_idx, pool_id, word), bitmap_word) in pool_slot_indices
+                                [start..end]
+                                .iter()
+                                .copied()
+                                .zip(chunk_results.into_iter())
+                            {
+                                if failed_pool_ids.contains(&pool_id) {
+                                    continue;
+                                }
+
+                                let bitmap = U256::from_be_bytes(bitmap_word.0);
+                                manager_pools[pool_idx].tick_bitmap.insert(word, bitmap);
+                            }
+                        }
+                        Err(err) => {
+                            warn!(
+                                target: "amms::uniswap_v4::sync_tick_bitmap",
+                                manager = ?manager_address,
+                                error = ?err,
+                                "extsload_2 batch failed; failing affected pools"
+                            );
+                            for (_, pool_id, _) in &pool_slot_indices[start..end] {
+                                failed_pool_ids.insert(*pool_id);
+                            }
+                        }
+                    }
+                }
 
                 if Self::BATCH_DELAY_MS > 0 {
                     sleep(Duration::from_millis(Self::BATCH_DELAY_MS)).await;
                 }
             }
-
-            let flat_results: Vec<B256> = all_results.into_iter().flatten().collect();
-
-            for (pool_idx, word, slot_idx) in pool_slot_indices {
-                if slot_idx < flat_results.len() {
-                    let bitmap = U256::from_be_bytes(flat_results[slot_idx].0);
-                    manager_pools[pool_idx]
-                        .tick_bitmap
-                        .insert(word as i16, bitmap);
-                }
-            }
         }
 
-        Ok(())
+        Ok(failed_pool_ids)
     }
 
     pub async fn init_batch<N, P>(
@@ -489,7 +620,11 @@ impl UniswapV4Factory {
             })
             .collect();
 
-        Self::sync_slot_0(&mut pools, block_number, provider.clone()).await?;
+        let mut failed_pool_ids =
+            Self::sync_slot_0(&mut pools, block_number, provider.clone()).await?;
+        if !failed_pool_ids.is_empty() {
+            pools.retain(|pool| !failed_pool_ids.contains(&pool.pool_id));
+        }
         Self::sync_token_decimals(&mut pools, provider.clone()).await?;
 
         let (structurally_valid, structurally_invalid): (Vec<_>, Vec<_>) =
@@ -511,8 +646,17 @@ impl UniswapV4Factory {
         }
         let mut pools = structurally_valid;
 
-        Self::sync_tick_bitmap(&mut pools, block_number, provider.clone()).await?;
-        Self::sync_tick_data(&mut pools, block_number, provider.clone()).await?;
+        failed_pool_ids
+            .extend(Self::sync_tick_bitmap(&mut pools, block_number, provider.clone()).await?);
+        if !failed_pool_ids.is_empty() {
+            pools.retain(|pool| !failed_pool_ids.contains(&pool.pool_id));
+        }
+
+        failed_pool_ids
+            .extend(Self::sync_tick_data(&mut pools, block_number, provider.clone()).await?);
+        if !failed_pool_ids.is_empty() {
+            pools.retain(|pool| !failed_pool_ids.contains(&pool.pool_id));
+        }
 
         let (liquid_pools, dust_pools): (Vec<_>, Vec<_>) = pools
             .into_par_iter()
@@ -570,7 +714,11 @@ impl UniswapV4Factory {
             })
             .collect();
 
-        Self::sync_slot_0(&mut pools, block_number, provider.clone()).await?;
+        let mut failed_pool_ids =
+            Self::sync_slot_0(&mut pools, block_number, provider.clone()).await?;
+        if !failed_pool_ids.is_empty() {
+            pools.retain(|pool| !failed_pool_ids.contains(&pool.pool_id));
+        }
 
         // Clear previous tick data to prevent stale data buildup
         for pool in pools.iter_mut() {
@@ -578,32 +726,56 @@ impl UniswapV4Factory {
             pool.ticks.clear();
         }
 
-        Self::sync_tick_bitmap(&mut pools, block_number, provider.clone()).await?;
-        Self::sync_tick_data(&mut pools, block_number, provider.clone()).await?;
+        failed_pool_ids
+            .extend(Self::sync_tick_bitmap(&mut pools, block_number, provider.clone()).await?);
+        if !failed_pool_ids.is_empty() {
+            pools.retain(|pool| !failed_pool_ids.contains(&pool.pool_id));
+        }
 
+        failed_pool_ids
+            .extend(Self::sync_tick_data(&mut pools, block_number, provider.clone()).await?);
+        if !failed_pool_ids.is_empty() {
+            pools.retain(|pool| !failed_pool_ids.contains(&pool.pool_id));
+        }
+
+        let mut price_failed_pool_ids = HashSet::new();
         for pool in pools.iter_mut() {
-            match pool.calculate_price(pool.token_a.address, pool.token_b.address) {
-                Ok(p) => pool.token_a_price = p,
-                Err(e) => {
-                    warn!(
-                        target: "amms::uniswap_v4::sync",
-                        pool_id = ?pool.pool_id,
-                        error = ?e,
-                        "Failed to refresh token_a_price; keeping previous value"
-                    );
-                }
-            }
-            match pool.calculate_price(pool.token_b.address, pool.token_a.address) {
-                Ok(p) => pool.token_b_price = p,
-                Err(e) => {
-                    warn!(
-                        target: "amms::uniswap_v4::sync",
-                        pool_id = ?pool.pool_id,
-                        error = ?e,
-                        "Failed to refresh token_b_price; keeping previous value"
-                    );
-                }
-            }
+            let token_a_price =
+                match pool.calculate_price(pool.token_a.address, pool.token_b.address) {
+                    Ok(price) => price,
+                    Err(err) => {
+                        warn!(
+                            target: "amms::uniswap_v4::sync",
+                            pool_id = ?pool.pool_id,
+                            error = ?err,
+                            "Failed to refresh token_a_price; failing pool refresh"
+                        );
+                        price_failed_pool_ids.insert(pool.pool_id);
+                        continue;
+                    }
+                };
+            let token_b_price =
+                match pool.calculate_price(pool.token_b.address, pool.token_a.address) {
+                    Ok(price) => price,
+                    Err(err) => {
+                        warn!(
+                            target: "amms::uniswap_v4::sync",
+                            pool_id = ?pool.pool_id,
+                            error = ?err,
+                            "Failed to refresh token_b_price; failing pool refresh"
+                        );
+                        price_failed_pool_ids.insert(pool.pool_id);
+                        continue;
+                    }
+                };
+
+            pool.token_a_price = token_a_price;
+            pool.token_b_price = token_b_price;
+        }
+
+        failed_pool_ids.extend(price_failed_pool_ids);
+        if !failed_pool_ids.is_empty() {
+            pools.retain(|pool| !failed_pool_ids.contains(&pool.pool_id));
         }
 
         Ok(pools.into_iter().map(AMM::UniswapV4Pool).collect())

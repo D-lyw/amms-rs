@@ -103,15 +103,12 @@ async fn fetch_snapshot<P: Provider + Clone>(
     block: u64,
 ) -> Result<StableSnapshot> {
     let block_id = BlockId::from(block);
-    let deployer = GetCurveNGStableSwapRuntimeDataBatchRequest::deploy_builder(
-        provider.clone(),
-        vec![pool],
-    );
+    let deployer =
+        GetCurveNGStableSwapRuntimeDataBatchRequest::deploy_builder(provider.clone(), vec![pool]);
     let res = deployer.call_raw().block(block_id).await?;
-    let mut pool_data_list =
-        <Vec<StableSwapRuntimeData> as SolValue>::abi_decode(&res)?
-            .into_iter()
-            .filter(|d: &StableSwapRuntimeData| d.balances.len() == n_coins);
+    let mut pool_data_list = <Vec<StableSwapRuntimeData> as SolValue>::abi_decode(&res)?
+        .into_iter()
+        .filter(|d: &StableSwapRuntimeData| d.balances.len() == n_coins);
 
     let data = pool_data_list
         .next()
@@ -462,30 +459,34 @@ async fn process_block_logs<P: Provider + Clone + 'static>(
         assert_balance_alignment(block, pool, &chain_at_block, U256::ZERO)?;
         assert_eq!(
             pool.fee, chain_at_block.fee,
-            "block {} fee mismatch after refresh", block
+            "block {} fee mismatch after refresh",
+            block
         );
         assert_eq!(
             pool.admin_fee, chain_at_block.admin_fee,
-            "block {} admin_fee mismatch after refresh", block
+            "block {} admin_fee mismatch after refresh",
+            block
         );
         assert_eq!(
             pool.offpeg_fee_multiplier, chain_at_block.offpeg_fee_multiplier,
-            "block {} offpeg mismatch after refresh", block
+            "block {} offpeg mismatch after refresh",
+            block
         );
         assert_eq!(
             pool.rates, chain_at_block.rates,
-            "block {} rates mismatch after refresh", block
+            "block {} rates mismatch after refresh",
+            block
         );
         assert_eq!(
             pool.amp.unwrap_or_default(),
             chain_at_block.amp,
-            "block {} amp mismatch after refresh", block
+            "block {} amp mismatch after refresh",
+            block
         );
 
         println!(
             "[XLayer CurveNG Stable] block={} async update verified ({} calls)",
-            block,
-            *update_calls
+            block, *update_calls
         );
     } else {
         // SyncAction::None — verify local state has not silently drifted.

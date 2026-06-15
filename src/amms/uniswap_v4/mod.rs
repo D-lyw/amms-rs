@@ -143,6 +143,12 @@ sol! {
     }
 }
 
+sol! {
+    #[sol(rpc)]
+    GetV4LitePoolStateBatchRequest,
+    "src/amms/abi/GetV4LitePoolStateBatchRequest.json",
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UniswapV4Pool {
     pub pool_key: IPoolManager::PoolKey,

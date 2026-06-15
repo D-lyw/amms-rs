@@ -19,10 +19,7 @@ use alloy::{
     rpc::types::{Filter, Log},
     sol,
 };
-use amms::amms::{
-    amm::AutomatedMarketMaker,
-    pendle::PendlePool,
-};
+use amms::amms::{amm::AutomatedMarketMaker, pendle::PendlePool};
 use eyre::Result;
 use std::{
     process::{Child, Command, Stdio},
@@ -32,8 +29,14 @@ use tokio::time::{sleep, Duration};
 
 /// 测试用例：多个 Pendle Market（与 fork_test 一致）
 const CASES: &[(Address, &str)] = &[
-    (address!("0271A803f0d3Dec9cCd105A4A4d41e6Ee1458765"), "srUSDe"),
-    (address!("9c560ebaf78e596cbcc27411d633a74d628dd7dc"), "sUSDS"),
+    (
+        address!("0271A803f0d3Dec9cCd105A4A4d41e6Ee1458765"),
+        "srUSDe",
+    ),
+    (
+        address!("9c560ebaf78e596cbcc27411d633a74d628dd7dc"),
+        "sUSDS",
+    ),
     (address!("f80b67a32df07960c731794769309e3d30e9717f"), "USDG"),
 ];
 
@@ -53,7 +56,9 @@ sol! {
 }
 
 fn swap_sig() -> B256 {
-    B256::from(keccak256(b"Swap(address,address,int256,int256,uint256,uint256)"))
+    B256::from(keccak256(
+        b"Swap(address,address,int256,int256,uint256,uint256)",
+    ))
 }
 fn mint_sig() -> B256 {
     B256::from(keccak256(b"Mint(address,uint256,uint256,uint256)"))
@@ -70,34 +75,46 @@ fn start_anvil(rpc_url: &str, fork_block: u64) -> Child {
         .args(["--fork-url", rpc_url])
         .args(["--fork-block-number", &fork_block.to_string()])
         .args(["--port", "8549", "--silent"])
-        .stdout(Stdio::null()).stderr(Stdio::null())
-        .spawn().expect("anvil 未安装; 请运行: foundryup && anvil --version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("anvil 未安装; 请运行: foundryup && anvil --version")
 }
 
 async fn wait_anvil() {
     let p = ProviderBuilder::new().connect_http("http://localhost:8549".parse().unwrap());
     let t = Instant::now();
     loop {
-        if p.get_block_number().await.is_ok() { return; }
+        if p.get_block_number().await.is_ok() {
+            return;
+        }
         assert!(t.elapsed() < Duration::from_secs(30), "anvil 启动超时");
         sleep(Duration::from_millis(300)).await;
     }
 }
 
 /// 分块拉取事件，避免 RPC block range limit
-async fn fetch_events(provider: &impl Provider, market: Address, from: u64, to: u64) -> Result<Vec<Log>> {
+async fn fetch_events(
+    provider: &impl Provider,
+    market: Address,
+    from: u64,
+    to: u64,
+) -> Result<Vec<Log>> {
     let sigs = vec![swap_sig(), mint_sig(), burn_sig(), rate_sig()];
     let mut all = Vec::new();
     let mut cur = from;
     while cur <= to {
         let end = (cur + EVENT_CHUNK - 1).min(to);
-        match provider.get_logs(
-            &Filter::new()
-                .address(market)
-                .event_signature(sigs.clone())
-                .from_block(cur)
-                .to_block(end)
-        ).await {
+        match provider
+            .get_logs(
+                &Filter::new()
+                    .address(market)
+                    .event_signature(sigs.clone())
+                    .from_block(cur)
+                    .to_block(end),
+            )
+            .await
+        {
             Ok(logs) => all.extend(logs),
             Err(e) => println!("⚠️ get_logs [{},{}]: {:?}", cur, end, e),
         }
@@ -105,22 +122,22 @@ async fn fetch_events(provider: &impl Provider, market: Address, from: u64, to: 
         sleep(Duration::from_millis(100)).await;
     }
     // 按 (block, tx_idx, log_idx) 排序
-    all.sort_by(|a, b| {
-        match a.block_number.cmp(&b.block_number) {
-            std::cmp::Ordering::Equal => {
-                match a.transaction_index.cmp(&b.transaction_index) {
-                    std::cmp::Ordering::Equal => a.log_index.cmp(&b.log_index),
-                    other => other,
-                }
-            }
+    all.sort_by(|a, b| match a.block_number.cmp(&b.block_number) {
+        std::cmp::Ordering::Equal => match a.transaction_index.cmp(&b.transaction_index) {
+            std::cmp::Ordering::Equal => a.log_index.cmp(&b.log_index),
             other => other,
-        }
+        },
+        other => other,
     });
     Ok(all)
 }
 
 /// 从链上 _storage() 读取状态
-async fn onchain_state(provider: &impl Provider, market: Address, block: BlockId) -> Result<(U256, U256, U256)> {
+async fn onchain_state(
+    provider: &impl Provider,
+    market: Address,
+    block: BlockId,
+) -> Result<(U256, U256, U256)> {
     let c = IPMarketStorage::new(market, provider);
     let s = c._storage().block(block).call().await?;
     Ok((
@@ -142,7 +159,8 @@ async fn run_drift_test(
 
     // ── 1. Init + 零漂移断言 ──
     let mut pool = match PendlePool::new(market)
-        .init(BlockId::from(start_block), provider).await
+        .init(BlockId::from(start_block), provider)
+        .await
     {
         Ok(p) => p,
         Err(e) => {
@@ -152,10 +170,15 @@ async fn run_drift_test(
     };
     pool.set_last_synced_block(start_block);
 
-    let (oc_pt, oc_sy, oc_rate) = onchain_state(provider, market, BlockId::from(start_block)).await?;
+    let (oc_pt, oc_sy, oc_rate) =
+        onchain_state(provider, market, BlockId::from(start_block)).await?;
     assert_eq!(pool.total_pt, oc_pt, "[{}] init totalPt 漂移", label);
     assert_eq!(pool.total_sy, oc_sy, "[{}] init totalSy 漂移", label);
-    assert_eq!(pool.last_ln_implied_rate, oc_rate, "[{}] init impliedRate 漂移", label);
+    assert_eq!(
+        pool.last_ln_implied_rate, oc_rate,
+        "[{}] init impliedRate 漂移",
+        label
+    );
 
     // 如果在 start_block 时已到期，说明整个范围内都无交易事件
     if pool.expiry <= start_block {
@@ -167,7 +190,12 @@ async fn run_drift_test(
 
     // ── 2. 拉取事件 ──
     let events = fetch_events(provider, market, start_block + 1, end_block).await?;
-    println!("事件数: {} (block {} ~ {})", events.len(), start_block + 1, end_block);
+    println!(
+        "事件数: {} (block {} ~ {})",
+        events.len(),
+        start_block + 1,
+        end_block
+    );
     if events.is_empty() {
         println!("⚠️ 无事件, 跳过");
         return Ok(());
@@ -184,17 +212,22 @@ async fn run_drift_test(
         let block_num = log.block_number.unwrap_or(0);
 
         // sync 事件
-        pool.sync(log).map_err(|e| {
-            println!("⚠️ [{}] sync error block {}: {:?}", label, block_num, e);
-        }).ok();
+        pool.sync(log)
+            .map_err(|e| {
+                println!("⚠️ [{}] sync error block {}: {:?}", label, block_num, e);
+            })
+            .ok();
         processed += 1;
 
         // 判断是否是 block 内最后一个事件
-        let is_last_in_block = events.get(idx + 1)
+        let is_last_in_block = events
+            .get(idx + 1)
             .map(|next| next.block_number.unwrap_or(0) > block_num)
             .unwrap_or(true);
 
-        if !is_last_in_block { continue; }
+        if !is_last_in_block {
+            continue;
+        }
 
         // 到达 block 边界
 
@@ -202,19 +235,39 @@ async fn run_drift_test(
         if block_num >= last_check_block.saturating_add(CHECK_INTERVAL) {
             match onchain_state(provider, market, BlockId::from(block_num)).await {
                 Ok((cpt, csy, crate_r)) => {
-                    let dp = if pool.total_pt > cpt { pool.total_pt - cpt } else { cpt - pool.total_pt };
-                    let ds = if pool.total_sy > csy { pool.total_sy - csy } else { csy - pool.total_sy };
-                    let dr = if pool.last_ln_implied_rate > crate_r { pool.last_ln_implied_rate - crate_r } else { crate_r - pool.last_ln_implied_rate };
+                    let dp = if pool.total_pt > cpt {
+                        pool.total_pt - cpt
+                    } else {
+                        cpt - pool.total_pt
+                    };
+                    let ds = if pool.total_sy > csy {
+                        pool.total_sy - csy
+                    } else {
+                        csy - pool.total_sy
+                    };
+                    let dr = if pool.last_ln_implied_rate > crate_r {
+                        pool.last_ln_implied_rate - crate_r
+                    } else {
+                        crate_r - pool.last_ln_implied_rate
+                    };
 
-                    if dp > max_drift_pt { max_drift_pt = dp; }
-                    if ds > max_drift_sy { max_drift_sy = ds; }
-                    if dr > max_drift_rate { max_drift_rate = dr; }
+                    if dp > max_drift_pt {
+                        max_drift_pt = dp;
+                    }
+                    if ds > max_drift_sy {
+                        max_drift_sy = ds;
+                    }
+                    if dr > max_drift_rate {
+                        max_drift_rate = dr;
+                    }
 
                     if dp.is_zero() && ds.is_zero() && dr.is_zero() {
                         println!("  block {:>8}: ✅ 零漂移 (events={})", block_num, processed);
                     } else {
-                        println!("  block {:>8}: ⚠️ Δpt={} Δsy={} Δrate={} (events={})",
-                            block_num, dp, ds, dr, processed);
+                        println!(
+                            "  block {:>8}: ⚠️ Δpt={} Δsy={} Δrate={} (events={})",
+                            block_num, dp, ds, dr, processed
+                        );
                     }
                 }
                 Err(e) => println!("⚠️ checkpoint block {}: {:?}", block_num, e),
@@ -224,19 +277,43 @@ async fn run_drift_test(
     }
 
     // 最终校验
-    let final_block = events.last().and_then(|l| l.block_number).unwrap_or(end_block);
+    let final_block = events
+        .last()
+        .and_then(|l| l.block_number)
+        .unwrap_or(end_block);
     match onchain_state(provider, market, BlockId::from(final_block)).await {
         Ok((cpt, csy, crate_r)) => {
-            let dp = if pool.total_pt > cpt { pool.total_pt - cpt } else { cpt - pool.total_pt };
-            let ds = if pool.total_sy > csy { pool.total_sy - csy } else { csy - pool.total_sy };
-            let dr = if pool.last_ln_implied_rate > crate_r { pool.last_ln_implied_rate - crate_r } else { crate_r - pool.last_ln_implied_rate };
-            if dp > max_drift_pt { max_drift_pt = dp; }
-            if ds > max_drift_sy { max_drift_sy = ds; }
-            if dr > max_drift_rate { max_drift_rate = dr; }
+            let dp = if pool.total_pt > cpt {
+                pool.total_pt - cpt
+            } else {
+                cpt - pool.total_pt
+            };
+            let ds = if pool.total_sy > csy {
+                pool.total_sy - csy
+            } else {
+                csy - pool.total_sy
+            };
+            let dr = if pool.last_ln_implied_rate > crate_r {
+                pool.last_ln_implied_rate - crate_r
+            } else {
+                crate_r - pool.last_ln_implied_rate
+            };
+            if dp > max_drift_pt {
+                max_drift_pt = dp;
+            }
+            if ds > max_drift_sy {
+                max_drift_sy = ds;
+            }
+            if dr > max_drift_rate {
+                max_drift_rate = dr;
+            }
             if dp.is_zero() && ds.is_zero() && dr.is_zero() {
                 println!("  block {:>8} (final):  ✅ 零漂移", final_block);
             } else {
-                println!("  block {:>8} (final):  ⚠️ Δpt={} Δsy={} Δrate={}", final_block, dp, ds, dr);
+                println!(
+                    "  block {:>8} (final):  ⚠️ Δpt={} Δsy={} Δrate={}",
+                    final_block, dp, ds, dr
+                );
             }
         }
         Err(e) => println!("⚠️ 最终校验失败: {:?}", e),
@@ -248,9 +325,24 @@ async fn run_drift_test(
     println!("最大 totalSy 漂移: {}", max_drift_sy);
     println!("最大 impliedRate 漂移: {}", max_drift_rate);
 
-    assert!(max_drift_pt < U256::from(100), "[{}] totalPt 漂移过大: {}", label, max_drift_pt);
-    assert!(max_drift_sy < U256::from(100), "[{}] totalSy 漂移过大: {}", label, max_drift_sy);
-    assert!(max_drift_rate < U256::from(100), "[{}] impliedRate 漂移过大: {}", label, max_drift_rate);
+    assert!(
+        max_drift_pt < U256::from(100),
+        "[{}] totalPt 漂移过大: {}",
+        label,
+        max_drift_pt
+    );
+    assert!(
+        max_drift_sy < U256::from(100),
+        "[{}] totalSy 漂移过大: {}",
+        label,
+        max_drift_sy
+    );
+    assert!(
+        max_drift_rate < U256::from(100),
+        "[{}] impliedRate 漂移过大: {}",
+        label,
+        max_drift_rate
+    );
     println!("✅ [{}] 漂移测试通过", label);
     Ok(())
 }
@@ -267,9 +359,14 @@ async fn test_sync_drift_matrix() -> Result<()> {
     let fork_block = current.saturating_sub(1000);
     let event_end_block = current.saturating_sub(1000);
     let event_start_block = current.saturating_sub(50000);
-    println!("current={} fork={} event_range={}~{} ({} blocks)",
-        current, fork_block, event_start_block, event_end_block,
-        event_end_block.saturating_sub(event_start_block));
+    println!(
+        "current={} fork={} event_range={}~{} ({} blocks)",
+        current,
+        fork_block,
+        event_start_block,
+        event_end_block,
+        event_end_block.saturating_sub(event_start_block)
+    );
 
     // ── 启动 anvil fork ──
     let mut anvil = start_anvil(&rpc, fork_block);
@@ -278,7 +375,14 @@ async fn test_sync_drift_matrix() -> Result<()> {
     let provider = ProviderBuilder::new().connect_http("http://localhost:8549".parse().unwrap());
 
     for (market, label) in CASES {
-        let _ = run_drift_test(&provider, *market, label, event_start_block, event_end_block).await;
+        let _ = run_drift_test(
+            &provider,
+            *market,
+            label,
+            event_start_block,
+            event_end_block,
+        )
+        .await;
     }
 
     let _ = anvil.kill();

@@ -15,43 +15,76 @@ const PERCENTAGE_DECIMALS: i128 = 100;
 const MAX_MARKET_PROPORTION: i128 = 960_000_000_000_000_000; // 0.96 * 1e18
 
 // ── 包装运算 ────────────────────────────────────────────────────────────
-fn wmul(a: I256, b: I256) -> I256 { I256::wrapping_mul(a, b) }
-fn wdiv(a: I256, b: I256) -> I256 { I256::wrapping_div(a, b) }
-fn wadd(a: I256, b: I256) -> I256 { I256::wrapping_add(a, b) }
-fn wsub(a: I256, b: I256) -> I256 { I256::wrapping_sub(a, b) }
-fn neg(a: I256) -> I256 { wsub(I256::ZERO, a) }
+fn wmul(a: I256, b: I256) -> I256 {
+    I256::wrapping_mul(a, b)
+}
+fn wdiv(a: I256, b: I256) -> I256 {
+    I256::wrapping_div(a, b)
+}
+fn wadd(a: I256, b: I256) -> I256 {
+    I256::wrapping_add(a, b)
+}
+fn wsub(a: I256, b: I256) -> I256 {
+    I256::wrapping_sub(a, b)
+}
+fn neg(a: I256) -> I256 {
+    wsub(I256::ZERO, a)
+}
 
-fn i128_to_i256(v: i128) -> I256 { I256::from_raw(U256::from(v as u128)) }
-fn u64_to_i256(v: u64) -> I256 { i128_to_i256(v as i128) }
+fn i128_to_i256(v: i128) -> I256 {
+    I256::from_raw(U256::from(v as u128))
+}
+fn u64_to_i256(v: u64) -> I256 {
+    i128_to_i256(v as i128)
+}
 
 /// mulDown: a * b / ONE_18
-fn mul_down(a: I256, b: I256) -> I256 { wdiv(wmul(a, b), IONE) }
+fn mul_down(a: I256, b: I256) -> I256 {
+    wdiv(wmul(a, b), IONE)
+}
 
 /// divDown: a * ONE_18 / b
-fn div_down(a: I256, b: I256) -> I256 { wdiv(wmul(a, IONE), b) }
+fn div_down(a: I256, b: I256) -> I256 {
+    wdiv(wmul(a, IONE), b)
+}
 
 /// rawDivUp: (a + b - 1) / b
-fn raw_div_up(a: I256, b: I256) -> I256 { wdiv(wadd(wadd(a, b), neg(i128_to_i256(1))), b) }
+fn raw_div_up(a: I256, b: I256) -> I256 {
+    wdiv(wadd(wadd(a, b), neg(i128_to_i256(1))), b)
+}
 
 /// I256 → U256（已知非负）
 fn to_u256(v: I256) -> U256 {
-    if v < I256::ZERO { U256::ZERO } else { v.into_raw() }
+    if v < I256::ZERO {
+        U256::ZERO
+    } else {
+        v.into_raw()
+    }
 }
 
 /// U256 → I256
-fn to_i256(v: U256) -> I256 { I256::from_raw(v) }
+fn to_i256(v: U256) -> I256 {
+    I256::from_raw(v)
+}
 
 // ═════════════════════════════════════════════════════════════════════════
 //   SY ↔ Underlying 转换 (纯 U256)
 // ═════════════════════════════════════════════════════════════════════════
 pub fn sy_to_asset(sy_amount: U256, exchange_rate: U256) -> U256 {
-    if sy_amount.is_zero() || exchange_rate.is_zero() { return U256::ZERO; }
+    if sy_amount.is_zero() || exchange_rate.is_zero() {
+        return U256::ZERO;
+    }
     sy_amount.checked_mul(exchange_rate).unwrap_or(U256::MAX) / U256::from(ONE_18 as u128)
 }
 
 pub fn asset_to_sy(asset_amount: U256, exchange_rate: U256) -> U256 {
-    if asset_amount.is_zero() || exchange_rate.is_zero() { return U256::ZERO; }
-    asset_amount.checked_mul(U256::from(ONE_18 as u128)).unwrap_or(U256::MAX) / exchange_rate
+    if asset_amount.is_zero() || exchange_rate.is_zero() {
+        return U256::ZERO;
+    }
+    asset_amount
+        .checked_mul(U256::from(ONE_18 as u128))
+        .unwrap_or(U256::MAX)
+        / exchange_rate
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -83,8 +116,11 @@ pub fn get_exchange_rate_from_implied_rate(ln_implied_rate: U256, time_to_expiry
 //   _getRateAnchor
 // ═════════════════════════════════════════════════════════════════════════
 fn get_rate_anchor(
-    total_pt: U256, last_ln_implied_rate: U256, total_asset: U256,
-    rate_scalar: I256, time_to_expiry: u64,
+    total_pt: U256,
+    last_ln_implied_rate: U256,
+    total_asset: U256,
+    rate_scalar: I256,
+    time_to_expiry: u64,
 ) -> I256 {
     // newRate = exp(lastLnImpliedRate * timeToExpiry / IMPLIED_RATE_TIME)
     let new_rate = get_exchange_rate_from_implied_rate(last_ln_implied_rate, time_to_expiry);
@@ -122,8 +158,11 @@ fn get_rate_anchor(
 //   _getExchangeRate (边际汇率)
 // ═════════════════════════════════════════════════════════════════════════
 fn get_exchange_rate(
-    total_pt: U256, total_asset: U256, rate_scalar: I256,
-    rate_anchor: I256, net_pt_to_account: I256,
+    total_pt: U256,
+    total_asset: U256,
+    rate_scalar: I256,
+    rate_anchor: I256,
+    net_pt_to_account: I256,
 ) -> I256 {
     let tp = to_i256(total_pt);
     let ta = to_i256(total_asset);
@@ -167,10 +206,16 @@ fn get_exchange_rate(
 // ═════════════════════════════════════════════════════════════════════════
 #[allow(clippy::too_many_arguments)]
 pub fn calc_trade(
-    total_pt: U256, total_sy: U256, scalar_root: U256,
-    last_ln_implied_rate: U256, ln_fee_rate_root: U256,
-    reserve_fee_percent: u8, sy_exchange_rate: U256,
-    expiry: u64, block_time: u64, net_pt_to_account: I256,
+    total_pt: U256,
+    total_sy: U256,
+    scalar_root: U256,
+    last_ln_implied_rate: U256,
+    ln_fee_rate_root: U256,
+    reserve_fee_percent: u8,
+    sy_exchange_rate: U256,
+    expiry: u64,
+    block_time: u64,
+    net_pt_to_account: I256,
 ) -> Result<(I256, U256, U256), AMMError> {
     if net_pt_to_account == I256::ZERO {
         return Ok((I256::ZERO, U256::ZERO, U256::ZERO));
@@ -198,12 +243,20 @@ pub fn calc_trade(
 
     // 3. rateAnchor
     let rate_anchor = get_rate_anchor(
-        total_pt, last_ln_implied_rate, total_asset, rate_scalar, time_to_expiry,
+        total_pt,
+        last_ln_implied_rate,
+        total_asset,
+        rate_scalar,
+        time_to_expiry,
     );
 
     // 4. exchangeRate (pre-fee)
     let exchange_rate = get_exchange_rate(
-        total_pt, total_asset, rate_scalar, rate_anchor, net_pt_to_account,
+        total_pt,
+        total_asset,
+        rate_scalar,
+        rate_anchor,
+        net_pt_to_account,
     );
 
     // 5. preFeeAssetToAccount = -(netPtToAccount / exchangeRate)
@@ -269,17 +322,32 @@ pub fn calc_trade(
 // ═════════════════════════════════════════════════════════════════════════
 #[allow(clippy::too_many_arguments)]
 pub fn calc_swap_exact_pt_for_sy(
-    total_pt: U256, total_sy: U256, scalar_root: U256,
-    last_ln_implied_rate: U256, ln_fee_rate_root: U256,
-    reserve_fee_percent: u8, sy_exchange_rate: U256,
-    expiry: u64, block_time: u64, exact_pt_in: U256,
+    total_pt: U256,
+    total_sy: U256,
+    scalar_root: U256,
+    last_ln_implied_rate: U256,
+    ln_fee_rate_root: U256,
+    reserve_fee_percent: u8,
+    sy_exchange_rate: U256,
+    expiry: u64,
+    block_time: u64,
+    exact_pt_in: U256,
 ) -> Result<(U256, U256), AMMError> {
-    if exact_pt_in.is_zero() { return Ok((U256::ZERO, U256::ZERO)); }
+    if exact_pt_in.is_zero() {
+        return Ok((U256::ZERO, U256::ZERO));
+    }
     let net_pt = neg(to_i256(exact_pt_in));
     let (net_sy, fee, _reserve) = calc_trade(
-        total_pt, total_sy, scalar_root, last_ln_implied_rate,
-        ln_fee_rate_root, reserve_fee_percent, sy_exchange_rate,
-        expiry, block_time, net_pt,
+        total_pt,
+        total_sy,
+        scalar_root,
+        last_ln_implied_rate,
+        ln_fee_rate_root,
+        reserve_fee_percent,
+        sy_exchange_rate,
+        expiry,
+        block_time,
+        net_pt,
     )?;
     Ok((to_u256(net_sy), fee))
 }
@@ -289,20 +357,39 @@ pub fn calc_swap_exact_pt_for_sy(
 // ═════════════════════════════════════════════════════════════════════════
 #[allow(clippy::too_many_arguments)]
 pub fn calc_swap_sy_for_exact_pt(
-    total_pt: U256, total_sy: U256, scalar_root: U256,
-    last_ln_implied_rate: U256, ln_fee_rate_root: U256,
-    reserve_fee_percent: u8, sy_exchange_rate: U256,
-    expiry: u64, block_time: u64, exact_pt_out: U256,
+    total_pt: U256,
+    total_sy: U256,
+    scalar_root: U256,
+    last_ln_implied_rate: U256,
+    ln_fee_rate_root: U256,
+    reserve_fee_percent: u8,
+    sy_exchange_rate: U256,
+    expiry: u64,
+    block_time: u64,
+    exact_pt_out: U256,
 ) -> Result<(U256, U256), AMMError> {
-    if exact_pt_out.is_zero() { return Ok((U256::ZERO, U256::ZERO)); }
+    if exact_pt_out.is_zero() {
+        return Ok((U256::ZERO, U256::ZERO));
+    }
     let net_pt = to_i256(exact_pt_out);
     let (net_sy, fee, _reserve) = calc_trade(
-        total_pt, total_sy, scalar_root, last_ln_implied_rate,
-        ln_fee_rate_root, reserve_fee_percent, sy_exchange_rate,
-        expiry, block_time, net_pt,
+        total_pt,
+        total_sy,
+        scalar_root,
+        last_ln_implied_rate,
+        ln_fee_rate_root,
+        reserve_fee_percent,
+        sy_exchange_rate,
+        expiry,
+        block_time,
+        net_pt,
     )?;
     // net_sy < 0 → 用户支付 SY
-    let sy_in = if net_sy < I256::ZERO { to_u256(neg(net_sy)) } else { U256::ZERO };
+    let sy_in = if net_sy < I256::ZERO {
+        to_u256(neg(net_sy))
+    } else {
+        U256::ZERO
+    };
     Ok((sy_in, fee))
 }
 
@@ -311,12 +398,20 @@ pub fn calc_swap_sy_for_exact_pt(
 // ═════════════════════════════════════════════════════════════════════════
 #[allow(clippy::too_many_arguments)]
 pub fn calc_swap_exact_sy_for_pt(
-    total_pt: U256, total_sy: U256, scalar_root: U256,
-    last_ln_implied_rate: U256, ln_fee_rate_root: U256,
-    reserve_fee_percent: u8, sy_exchange_rate: U256,
-    expiry: u64, block_time: u64, exact_sy_in: U256,
+    total_pt: U256,
+    total_sy: U256,
+    scalar_root: U256,
+    last_ln_implied_rate: U256,
+    ln_fee_rate_root: U256,
+    reserve_fee_percent: u8,
+    sy_exchange_rate: U256,
+    expiry: u64,
+    block_time: u64,
+    exact_sy_in: U256,
 ) -> Result<U256, AMMError> {
-    if exact_sy_in.is_zero() { return Ok(U256::ZERO); }
+    if exact_sy_in.is_zero() {
+        return Ok(U256::ZERO);
+    }
 
     let mut lo = U256::ZERO;
     let mut hi = total_pt;
@@ -324,12 +419,22 @@ pub fn calc_swap_exact_sy_for_pt(
     while hi - lo > U256::from(1) {
         let mid = (lo + hi) / U256::from(2);
         let (sy_needed, _) = calc_swap_sy_for_exact_pt(
-            total_pt, total_sy, scalar_root, last_ln_implied_rate,
-            ln_fee_rate_root, reserve_fee_percent, sy_exchange_rate,
-            expiry, block_time, mid,
+            total_pt,
+            total_sy,
+            scalar_root,
+            last_ln_implied_rate,
+            ln_fee_rate_root,
+            reserve_fee_percent,
+            sy_exchange_rate,
+            expiry,
+            block_time,
+            mid,
         )?;
-        if sy_needed <= exact_sy_in { lo = mid; }
-        else { hi = mid; }
+        if sy_needed <= exact_sy_in {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
     }
     Ok(lo)
 }
@@ -339,24 +444,35 @@ pub fn calc_swap_exact_sy_for_pt(
 // ═════════════════════════════════════════════════════════════════════════
 #[allow(clippy::too_many_arguments)]
 pub fn calc_new_ln_implied_rate(
-    total_pt: U256, total_sy: U256, scalar_root: U256,
-    sy_exchange_rate: U256, last_ln_implied_rate: U256,
-    expiry: u64, block_time: u64,
+    total_pt: U256,
+    total_sy: U256,
+    scalar_root: U256,
+    sy_exchange_rate: U256,
+    last_ln_implied_rate: U256,
+    expiry: u64,
+    block_time: u64,
 ) -> Result<U256, AMMError> {
-    if expiry <= block_time { return Ok(U256::ZERO); }
+    if expiry <= block_time {
+        return Ok(U256::ZERO);
+    }
     let time_to_expiry = expiry - block_time;
 
     let rate_scalar = get_rate_scalar(scalar_root, time_to_expiry);
     let total_asset = sy_to_asset(total_sy, sy_exchange_rate);
     let rate_anchor = get_rate_anchor(
-        total_pt, last_ln_implied_rate, total_asset, rate_scalar, time_to_expiry,
+        total_pt,
+        last_ln_implied_rate,
+        total_asset,
+        rate_scalar,
+        time_to_expiry,
     );
-    let exchange_rate = get_exchange_rate(
-        total_pt, total_asset, rate_scalar, rate_anchor, I256::ZERO,
-    );
+    let exchange_rate =
+        get_exchange_rate(total_pt, total_asset, rate_scalar, rate_anchor, I256::ZERO);
 
     // ln(exchangeRate) * IMPLIED_RATE_TIME / timeToExpiry
-    if exchange_rate <= I256::ZERO { return Err(AMMError::DivisionByZero); }
+    if exchange_rate <= I256::ZERO {
+        return Err(AMMError::DivisionByZero);
+    }
     let ln_rate = log_exp::ln(exchange_rate);
     let result = wdiv(
         wmul(ln_rate, u64_to_i256(IMPLIED_RATE_TIME)),
@@ -372,7 +488,9 @@ pub fn calc_new_ln_implied_rate(
 mod tests {
     use super::*;
 
-    fn e18(v: u128) -> U256 { U256::from(v) * U256::from(ONE_18 as u128) }
+    fn e18(v: u128) -> U256 {
+        U256::from(v) * U256::from(ONE_18 as u128)
+    }
 
     #[test]
     fn test_sy_to_asset_roundtrip() {
@@ -386,9 +504,18 @@ mod tests {
 
     #[test]
     fn test_calc_trade_zero() {
-        let r = calc_trade(e18(1000), e18(1000), e18(100),
-            U256::from(5e16 as u128), U256::from(1e16 as u128), 10, U256::from(ONE_18 as u128),
-            2000000, 1000000, I256::ZERO);
+        let r = calc_trade(
+            e18(1000),
+            e18(1000),
+            e18(100),
+            U256::from(5e16 as u128),
+            U256::from(1e16 as u128),
+            10,
+            U256::from(ONE_18 as u128),
+            2000000,
+            1000000,
+            I256::ZERO,
+        );
         assert!(r.is_ok());
         let (s, f, v) = r.unwrap();
         assert_eq!(s, I256::ZERO);
@@ -404,9 +531,20 @@ mod tests {
         let er = get_exchange_rate_from_implied_rate(rate, time);
         // ln(er) * IMPLIED_RATE_TIME / time ≈ rate
         let ln_er = log_exp::ln(er);
-        let back = wdiv(wmul(ln_er, u64_to_i256(IMPLIED_RATE_TIME)), u64_to_i256(time));
-        let diff = if back > to_i256(rate) { back - to_i256(rate) } else { to_i256(rate) - back };
+        let back = wdiv(
+            wmul(ln_er, u64_to_i256(IMPLIED_RATE_TIME)),
+            u64_to_i256(time),
+        );
+        let diff = if back > to_i256(rate) {
+            back - to_i256(rate)
+        } else {
+            to_i256(rate) - back
+        };
         // fork 测试为主要验证手段，单元测试放宽
-        assert!(diff < i128_to_i256(ONE_18 as i128), "exp/ln 不匹配: {}", diff);
+        assert!(
+            diff < i128_to_i256(ONE_18 as i128),
+            "exp/ln 不匹配: {}",
+            diff
+        );
     }
 }

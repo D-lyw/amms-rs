@@ -91,7 +91,9 @@ fn wsub(a: I256, b: I256) -> I256 {
     I256::wrapping_sub(a, b)
 }
 
-fn neg(x: I256) -> I256 { wsub(I256::ZERO, x) }
+fn neg(x: I256) -> I256 {
+    wsub(I256::ZERO, x)
+}
 
 // ═════════════════════════════════════════════════════════════════════════
 //   exp(x) — e^x, 18 位定点数
@@ -103,10 +105,7 @@ pub fn exp(x: I256) -> I256 {
 
     // e^(-x) = 1 / e^x
     if x < I256::ZERO {
-        return wdiv(
-            wmul(i(ONE_18 as u128), i(ONE_18 as u128)),
-            exp(neg(x)),
-        );
+        return wdiv(wmul(i(ONE_18 as u128), i(ONE_18 as u128)), exp(neg(x)));
     }
 
     // 分解 x = sum(x_n), 其中 x_n = 2^(7-n), e^x_n = a_n
@@ -419,7 +418,14 @@ mod tests {
     #[test]
     fn test_ln_exp_roundtrip() {
         // ln(exp(x)) == x
-        let vals = [-10i128.pow(17), -ONE_18 / 10, 0, ONE_18 / 10, ONE_18 / 2, ONE_18];
+        let vals = [
+            -10i128.pow(17),
+            -ONE_18 / 10,
+            0,
+            ONE_18 / 10,
+            ONE_18 / 2,
+            ONE_18,
+        ];
         for &v in &vals {
             let x = e18(v);
             let e = exp(x);
@@ -435,14 +441,22 @@ mod tests {
         let exp_005 = exp(e18(5 * 10i128.pow(16))); // 0.05e18
         let exp_raw = exp_005.into_raw();
         let expected = U256::from(1_051_271_096_376_024_526u128);
-        let diff = if exp_raw > expected { exp_raw - expected } else { expected - exp_raw };
+        let diff = if exp_raw > expected {
+            exp_raw - expected
+        } else {
+            expected - exp_raw
+        };
         assert!(diff < U256::from(1000), "exp(0.05)偏差: {}", diff);
 
         // ln(1.05) ≈ 0.048790164169432
         let ln_105 = ln(i(1_050_000_000_000_000_000));
         let ln_raw = ln_105.into_raw();
         let expected_ln = U256::from(48_790_164_169_432_000u128);
-        let diff_ln = if ln_raw > expected_ln { ln_raw - expected_ln } else { expected_ln - ln_raw };
+        let diff_ln = if ln_raw > expected_ln {
+            ln_raw - expected_ln
+        } else {
+            expected_ln - ln_raw
+        };
         assert!(diff_ln < U256::from(1000), "ln(1.05)偏差: {}", diff_ln);
     }
 }

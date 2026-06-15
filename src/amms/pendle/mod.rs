@@ -3,8 +3,8 @@
 //! Exposes the [PT, Underlying] token pair while internally handling
 //! the SY (StandardizedYield) intermediate layer.
 
-mod math;
 mod log_exp;
+mod math;
 
 use math::*;
 
@@ -12,6 +12,7 @@ use crate::amms::{
     amm::{AutomatedMarketMaker, SyncAction},
     error::AMMError,
 };
+use alloy::primitives::{address, I256};
 use alloy::{
     eips::BlockId,
     network::Network,
@@ -21,7 +22,6 @@ use alloy::{
     sol,
     sol_types::{SolEvent, SolValue},
 };
-use alloy::primitives::{address, I256};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::info;
@@ -230,15 +230,25 @@ impl PendlePool {
             return Ok(amms);
         }
 
-        let deployer = GetPendlePoolDataBatchRequest::deploy_builder(
-            provider.clone(),
-            market_addresses,
-        );
+        let deployer =
+            GetPendlePoolDataBatchRequest::deploy_builder(provider.clone(), market_addresses);
         let res = deployer.call_raw().block(block_number).await?;
 
         let batch_data = <Vec<(
-            I256, I256, I256, U256, U256, U256, U256,
-            Address, Address, U256, Address, u16, u16, U256,
+            I256,
+            I256,
+            I256,
+            U256,
+            U256,
+            U256,
+            U256,
+            Address,
+            Address,
+            U256,
+            Address,
+            u16,
+            u16,
+            U256,
         )> as SolValue>::abi_decode(&res)?;
 
         let mut result = amms;
@@ -330,9 +340,7 @@ impl AutomatedMarketMaker for PendlePool {
                     self.total_pt = self.total_pt.saturating_sub(ev.netPtOut.into_raw());
                 } else {
                     // PT flows to market → market gains PT
-                    self.total_pt = self
-                        .total_pt
-                        .saturating_add((-ev.netPtOut).into_raw());
+                    self.total_pt = self.total_pt.saturating_add((-ev.netPtOut).into_raw());
                 }
 
                 // totalSy change = -(netSyOut + netSyToReserve)
@@ -342,9 +350,7 @@ impl AutomatedMarketMaker for PendlePool {
                     self.total_sy = self.total_sy.saturating_sub(sy_total.into_raw());
                 } else {
                     // SY flows to market
-                    self.total_sy = self
-                        .total_sy
-                        .saturating_add((-sy_total).into_raw());
+                    self.total_sy = self.total_sy.saturating_add((-sy_total).into_raw());
                 }
 
                 info!(
@@ -582,10 +588,10 @@ impl AutomatedMarketMaker for PendlePool {
         } else {
             let time_to_expiry = self.expiry - block_time;
             // PT marginal price = e^(lastLnImpliedRate * timeToExpiry / IMPLIED_RATE_TIME)
-            let rate = get_exchange_rate_from_implied_rate(self.last_ln_implied_rate, time_to_expiry);
+            let rate =
+                get_exchange_rate_from_implied_rate(self.last_ln_implied_rate, time_to_expiry);
             i256_to_f64(rate)
         };
-
 
         if base_token == self.pt_token {
             Ok(pt_price)
@@ -645,20 +651,20 @@ impl AutomatedMarketMaker for PendlePool {
         // Tuple matches PendlePoolData struct order
         // NOTE: uint8 uses u16 for SolValue trait compatibility
         let data_vec = <Vec<(
-            I256,     // totalPt
-            I256,     // totalSy
-            I256,     // scalarRoot
-            U256,     // expiry
-            U256,     // lnFeeRateRoot
-            U256,     // reserveFeePercent
-            U256,     // lastLnImpliedRate
-            Address,  // pt
-            Address,  // sy
-            U256,     // syExchangeRate
-            Address,  // underlying
-            u16,      // underlyingDecimals (uint8 → u16 for SolValue)
-            u16,      // ptDecimals
-            U256,     // blockTimestamp
+            I256,    // totalPt
+            I256,    // totalSy
+            I256,    // scalarRoot
+            U256,    // expiry
+            U256,    // lnFeeRateRoot
+            U256,    // reserveFeePercent
+            U256,    // lastLnImpliedRate
+            Address, // pt
+            Address, // sy
+            U256,    // syExchangeRate
+            Address, // underlying
+            u16,     // underlyingDecimals (uint8 → u16 for SolValue)
+            u16,     // ptDecimals
+            U256,    // blockTimestamp
         )> as SolValue>::abi_decode(&res)?;
 
         let d = data_vec
