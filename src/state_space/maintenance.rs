@@ -648,14 +648,27 @@ impl<N, P> StateSpaceManager<N, P> {
         for (address, task) in due_tasks {
             match Self::execute_pending_task(provider, state, address, &task, canonical).await {
                 Ok(PendingExecutionOutcome::Applied) => {
-                    warn!(
-                        ?address,
-                        action = ?task.action,
-                        reason = ?task.reason,
-                        first_seen_ms = task.first_seen_at.elapsed().as_millis(),
-                        target_block = canonical,
-                        "Pending sync task applied"
-                    );
+                    if matches!(task.action, PendingSyncAction::AsyncUpdate)
+                        && matches!(task.reason, PendingSyncReason::AsyncUpdate)
+                    {
+                        info!(
+                            ?address,
+                            action = ?task.action,
+                            reason = ?task.reason,
+                            first_seen_ms = task.first_seen_at.elapsed().as_millis(),
+                            target_block = canonical,
+                            "Pending sync task applied"
+                        );
+                    } else {
+                        warn!(
+                            ?address,
+                            action = ?task.action,
+                            reason = ?task.reason,
+                            first_seen_ms = task.first_seen_at.elapsed().as_millis(),
+                            target_block = canonical,
+                            "Pending sync task applied"
+                        );
+                    }
                     pending_sync_queue
                         .lock()
                         .await
