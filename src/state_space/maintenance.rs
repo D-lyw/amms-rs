@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::{sleep, Duration};
-use tracing::warn;
+use tracing::{info, warn};
 
 pub(super) const DRIFT_HOT_POOL_INTERVAL: Duration = Duration::from_secs(30);
 pub(super) const DRIFT_COLD_POOL_INTERVAL: Duration = Duration::from_secs(300);
