@@ -69,6 +69,9 @@ pub struct CurveNGPool {
     pub decimals: Vec<u8>,
     /// 费率/汇率 (用于 rate provider, 如 wstETH)
     pub rates: Vec<U256>,
+    /// 各代币资产类型 (0=Standard, 1=Oracle, 2=Rebasing, 3=ERC4626, Stableswap-ng only)
+    #[serde(default)]
+    pub asset_types: Vec<u8>,
 
     // === StableSwap 参数 ===
     /// 放大系数 A (StableSwap)
@@ -168,6 +171,7 @@ impl CurveNGPool {
             balances: Vec::new(),
             decimals: Vec::new(),
             rates: Vec::new(),
+            asset_types: Vec::new(),
             amp: None,
             fee: U256::ZERO,
             admin_fee: U256::ZERO,

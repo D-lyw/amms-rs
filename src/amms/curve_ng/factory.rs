@@ -45,6 +45,7 @@ sol!(
         uint256 feeGamma;
         uint256[] priceScale;
         uint256[] rates;
+        uint8[] assetTypes;
         bool supportsStoredRates;
         bool supportsOffpegFeeMultiplier;
         uint8 coinsIndexSignature;
@@ -168,6 +169,11 @@ impl CurveNGFactory {
             data.rates.clone()
         } else {
             Self::default_rates_from_decimals(&data.decimals)
+        };
+        pool.asset_types = if !data.assetTypes.is_empty() {
+            data.assetTypes.clone()
+        } else {
+            Vec::new()
         };
 
         pool.amp = if data.amp > U256::ZERO {

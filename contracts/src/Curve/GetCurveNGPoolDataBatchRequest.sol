@@ -72,6 +72,8 @@ contract GetCurveNGPoolDataBatchRequest {
         uint256[] priceScale;
         // StableSwap-NG: stored_rates for rebasing tokens
         uint256[] rates;
+        // Per-coin asset type (0=Standard, 1=Oracle, 2=Rebasing, 3=ERC4626)
+        uint8[] assetTypes;
         // Capability profile
         bool supportsStoredRates;
         bool supportsOffpegFeeMultiplier;
@@ -239,6 +241,19 @@ contract GetCurveNGPoolDataBatchRequest {
                     data.supportsOffpegFeeMultiplier = false;
                 }
 
+                // Fetch per-coin asset type (Stableswap-ng only). Default to 0 (Standard) on failure.
+                data.assetTypes = new uint8[](nCoins);
+                for (uint256 k = 0; k < nCoins; k++) {
+                    (bool atSuccess, bytes memory atRet) = input.pool.staticcall(
+                        abi.encodeWithSignature("asset_types(uint256)", k)
+                    );
+                    if (atSuccess && atRet.length >= 32) {
+                        data.assetTypes[k] = abi.decode(atRet, (uint8));
+                    } else {
+                        data.assetTypes[k] = 0;
+                    }
+                }
+
                 if (nCoins > 1) {
                     try ICurveNGStableSwap(input.pool).get_dy(0, 1, 1) returns (uint256) {
                         data.getDyIndexSignature = 2; // Int128
@@ -256,6 +271,7 @@ contract GetCurveNGPoolDataBatchRequest {
                 for (uint256 k = 0; k < nCoins; k++) {
                     data.rates[k] = 1e18;
                 }
+                data.assetTypes = new uint8[](nCoins);
                 data.supportsStoredRates = false;
                 data.supportsOffpegFeeMultiplier = false;
                 data.getDyIndexSignature = 1; // uint256

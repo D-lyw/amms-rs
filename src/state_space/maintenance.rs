@@ -47,6 +47,9 @@ struct ClProbeSnapshot {
 struct CurveNGStableProbeSnapshot {
     balances: Vec<U256>,
     rates: Option<Vec<U256>>,
+    /// Per-rate asset type (0=Standard, 1=Oracle, 2=Rebasing, 3=ERC4626).
+    /// Only populated when rates is Some. None means asset type unknown → compare all rates.
+    rates_asset_types: Option<Vec<u8>>,
     amp: Option<U256>,
 }
 
@@ -105,8 +108,20 @@ fn classify_curve_ng_stable_drift(
     }
     // Non-event-driven fields: silent drift is normal, lightweight refresh is sufficient.
     // rates: accrues via interest (rebasing tokens like stETH/weETH)
+    // Skip rates comparison for ERC4626 tokens (type 3) — their rates change every block
+    // via convertToAssets() as yield accrues, making comparison always produce false positives.
     if let (Some(local_rates), Some(remote_rates)) = (&local.rates, &remote.rates) {
-        if local_rates != remote_rates {
+        let asset_types = local.rates_asset_types.as_deref();
+        let all_match = local_rates.iter().zip(remote_rates.iter()).enumerate().all(
+            |(i, (l, r))| {
+                // Skip comparison for ERC4626 tokens (type 3)
+                if asset_types.map(|at| at.get(i) == Some(&3)).unwrap_or(false) {
+                    return true;
+                }
+                l == r
+            },
+        );
+        if !all_match {
             return Some(PendingSyncAction::AsyncUpdate);
         }
     }
@@ -893,6 +908,11 @@ impl<N, P> StateSpaceManager<N, P> {
             balances: pool.balances.clone(),
             rates: if pool.supports_stored_rates {
                 Some(pool.rates.clone())
+            } else {
+                None
+            },
+            rates_asset_types: if pool.supports_stored_rates && !pool.asset_types.is_empty() {
+                Some(pool.asset_types.clone())
             } else {
                 None
             },
@@ -2192,22 +2212,28 @@ mod tests {
 
     #[test]
     fn test_curve_ng_stable_drift_classification() {
-        let base = CurveNGStableProbeSnapshot {
-            balances: vec![U256::from(100u64), U256::from(200u64)],
-            rates: Some(vec![
+        let make = |balances, rates, amp| CurveNGStableProbeSnapshot {
+            balances,
+            rates,
+            rates_asset_types: None,
+            amp,
+        };
+
+        let base = make(
+            vec![U256::from(100u64), U256::from(200u64)],
+            Some(vec![
                 U256::from(1_000_000_000_000_000_000u128),
                 U256::from(2_000_000_000_000_000_000u128),
             ]),
-            amp: Some(U256::from(100u64)),
-        };
+            Some(U256::from(100u64)),
+        );
 
         let no_diff = base.clone();
         assert_eq!(classify_curve_ng_stable_drift(&base, &no_diff), None);
 
         let remote_without_rates = CurveNGStableProbeSnapshot {
-            balances: base.balances.clone(),
             rates: None,
-            amp: base.amp,
+            ..base.clone()
         };
         // If one side does not expose rates, we intentionally skip rate drift classification.
         assert_eq!(
@@ -2216,12 +2242,11 @@ mod tests {
         );
 
         let rate_diff = CurveNGStableProbeSnapshot {
-            balances: base.balances.clone(),
             rates: Some(vec![
                 U256::from(1_000_000_000_000_000_001u128),
                 U256::from(2_000_000_000_000_000_000u128),
             ]),
-            amp: base.amp,
+            ..base.clone()
         };
         assert_eq!(
             classify_curve_ng_stable_drift(&base, &rate_diff),
@@ -2229,9 +2254,8 @@ mod tests {
         );
 
         let both_without_rates = CurveNGStableProbeSnapshot {
-            balances: base.balances.clone(),
             rates: None,
-            amp: base.amp,
+            ..base.clone()
         };
         assert_eq!(
             classify_curve_ng_stable_drift(&both_without_rates, &remote_without_rates),
@@ -2240,8 +2264,7 @@ mod tests {
 
         let balance_diff = CurveNGStableProbeSnapshot {
             balances: vec![U256::from(101u64), U256::from(200u64)],
-            rates: base.rates.clone(),
-            amp: base.amp,
+            ..base.clone()
         };
         assert_eq!(
             classify_curve_ng_stable_drift(&base, &balance_diff),
@@ -2250,12 +2273,65 @@ mod tests {
 
         // amp drift → AsyncUpdate
         let amp_diff = CurveNGStableProbeSnapshot {
-            balances: base.balances.clone(),
-            rates: base.rates.clone(),
             amp: Some(U256::from(200u64)),
+            ..base.clone()
         };
         assert_eq!(
             classify_curve_ng_stable_drift(&base, &amp_diff),
+            Some(PendingSyncAction::AsyncUpdate)
+        );
+
+        // ERC4626 token (type 3): rates drift should be SKIPPED (no false positive)
+        let pool_with_4626 = CurveNGStableProbeSnapshot {
+            balances: vec![U256::from(100u64), U256::from(200u64)],
+            rates: Some(vec![
+                U256::from(1_000_000_000_000_000_000u128),
+                U256::from(2_000_000_000_000_000_000u128),
+            ]),
+            rates_asset_types: Some(vec![0, 3]), // coin 1 is ERC4626
+            amp: Some(U256::from(100u64)),
+        };
+        let remote_4626_drift = CurveNGStableProbeSnapshot {
+            rates: Some(vec![
+                U256::from(1_000_000_000_000_000_000u128), // Standard coin 0: same
+                U256::from(2_000_000_000_000_000_001u128), // ERC4626 coin 1: drifted (should be skipped)
+            ]),
+            ..pool_with_4626.clone()
+        };
+        // Both rates differ at coin 0? No — coin 0 is standard and matches.
+        // Only coin 1 (ERC4626) differs, which should be skipped → no drift detected.
+        assert_eq!(
+            classify_curve_ng_stable_drift(&pool_with_4626, &remote_4626_drift),
+            None
+        );
+
+        // ERC4626 coin 0 also drifts → should still skip ERC4626 but detect standard drift
+        let remote_standard_drift = CurveNGStableProbeSnapshot {
+            rates: Some(vec![
+                U256::from(1_000_000_000_000_000_001u128), // Standard coin 0: drifted
+                U256::from(2_000_000_000_000_000_001u128), // ERC4626 coin 1: drifted (skipped)
+            ]),
+            ..pool_with_4626.clone()
+        };
+        assert_eq!(
+            classify_curve_ng_stable_drift(&pool_with_4626, &remote_standard_drift),
+            Some(PendingSyncAction::AsyncUpdate)
+        );
+
+        // asset_types unknown (None) → compare all rates normally (legacy behavior)
+        let unknown_at = CurveNGStableProbeSnapshot {
+            rates_asset_types: None,
+            ..pool_with_4626.clone()
+        };
+        let remote_all_drift = CurveNGStableProbeSnapshot {
+            rates: Some(vec![
+                U256::from(1_000_000_000_000_000_001u128),
+                U256::from(2_000_000_000_000_000_001u128),
+            ]),
+            ..unknown_at.clone()
+        };
+        assert_eq!(
+            classify_curve_ng_stable_drift(&unknown_at, &remote_all_drift),
             Some(PendingSyncAction::AsyncUpdate)
         );
     }
