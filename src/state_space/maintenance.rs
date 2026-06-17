@@ -43,6 +43,7 @@ struct ClProbeSnapshot {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CurveNGStableProbeSnapshot {
     balances: Vec<U256>,
+    rates: Option<Vec<U256>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,8 +84,17 @@ fn classify_curve_ng_stable_drift(
     local: &CurveNGStableProbeSnapshot,
     remote: &CurveNGStableProbeSnapshot,
 ) -> Option<PendingSyncAction> {
+    if local == remote {
+        return None;
+    }
     if local.balances != remote.balances {
         return Some(PendingSyncAction::Resync);
+    }
+    // Capability-driven rule: only compare rates when both sides explicitly expose rates.
+    if let (Some(local_rates), Some(remote_rates)) = (&local.rates, &remote.rates) {
+        if local_rates != remote_rates {
+            return Some(PendingSyncAction::AsyncUpdate);
+        }
     }
     None
 }
@@ -844,6 +854,11 @@ impl<N, P> StateSpaceManager<N, P> {
     fn curve_ng_stable_probe_snapshot_from_pool(pool: &CurveNGPool) -> CurveNGStableProbeSnapshot {
         CurveNGStableProbeSnapshot {
             balances: pool.balances.clone(),
+            rates: if pool.supports_stored_rates {
+                Some(pool.rates.clone())
+            } else {
+                None
+            },
         }
     }
 
