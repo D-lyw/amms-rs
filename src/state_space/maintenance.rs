@@ -44,6 +44,7 @@ struct ClProbeSnapshot {
 struct CurveNGStableProbeSnapshot {
     balances: Vec<U256>,
     rates: Option<Vec<U256>>,
+    amp: Option<U256>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,9 +91,16 @@ fn classify_curve_ng_stable_drift(
     if local.balances != remote.balances {
         return Some(PendingSyncAction::Resync);
     }
-    // Capability-driven rule: only compare rates when both sides explicitly expose rates.
+    // Non-event-driven fields: silent drift is normal, lightweight refresh is sufficient.
+    // rates: accrues via interest (rebasing tokens like stETH/weETH)
     if let (Some(local_rates), Some(remote_rates)) = (&local.rates, &remote.rates) {
         if local_rates != remote_rates {
+            return Some(PendingSyncAction::AsyncUpdate);
+        }
+    }
+    // amp: changes every block during a RampA period without per-block events
+    if let (Some(local_amp), Some(remote_amp)) = (local.amp, remote.amp) {
+        if local_amp != remote_amp {
             return Some(PendingSyncAction::AsyncUpdate);
         }
     }
@@ -859,6 +867,7 @@ impl<N, P> StateSpaceManager<N, P> {
             } else {
                 None
             },
+            amp: pool.amp,
         }
     }
 
