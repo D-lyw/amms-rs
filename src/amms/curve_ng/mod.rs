@@ -45,7 +45,9 @@ pub mod math;
 pub mod types;
 
 pub use factory::{
-    CurveNGFactory, GetCurveNGStableSwapRuntimeDataBatchRequest, StableSwapRuntimeData,
+    CurveNGFactory, GetCurveNGStableSwapRuntimeDataBatchRequest,
+    GetCurveNGTwoCryptoRuntimeDataBatchRequest, GetCurveNGTriCryptoRuntimeDataBatchRequest,
+    StableSwapRuntimeData, TwoCryptoRuntimeData, TriCryptoRuntimeData,
 };
 pub use types::{CurveIndexSignature, CurveNGPool, CurveNGPoolType, CurveNGTwoCryptoVariant};
 

@@ -1,7 +1,10 @@
 use super::{StateSpace, StateSpaceManager};
 use crate::amms::aerodrome_slipstream::pool::GetAerodromeSlipstreamProbeBatchRequest;
 use crate::amms::amm::{AutomatedMarketMaker, SyncAction, Variant, AMM};
-use crate::amms::curve_ng::{CurveNGFactory, CurveNGPool};
+use crate::amms::curve_ng::{
+    CurveNGFactory, CurveNGPool, GetCurveNGTwoCryptoRuntimeDataBatchRequest,
+    GetCurveNGTriCryptoRuntimeDataBatchRequest, TwoCryptoRuntimeData, TriCryptoRuntimeData,
+};
 use crate::amms::error::AMMError;
 use crate::amms::pancake_v3::GetPancakeV3PoolSlot0BatchRequest;
 use crate::amms::uniswap_v2::GetV2LikeReservesProbeBatchRequest;
@@ -47,6 +50,13 @@ struct CurveNGStableProbeSnapshot {
     amp: Option<U256>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CurveNGCryptoProbeSnapshot {
+    balances: Vec<U256>,
+    price_scale: Vec<U256>,
+    d: Option<U256>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct V2LikeProbeSnapshot {
     reserve_0: u128,
@@ -67,6 +77,7 @@ enum DriftProbeKind {
     V4Like,
     Slipstream,
     CurveNGStable,
+    CurveNGCrypto,
 }
 
 impl DriftProbeKind {
@@ -76,7 +87,8 @@ impl DriftProbeKind {
             DriftProbeKind::V3Like => DriftProbeKind::V4Like,
             DriftProbeKind::V4Like => DriftProbeKind::Slipstream,
             DriftProbeKind::Slipstream => DriftProbeKind::CurveNGStable,
-            DriftProbeKind::CurveNGStable => DriftProbeKind::V2Like,
+            DriftProbeKind::CurveNGStable => DriftProbeKind::CurveNGCrypto,
+            DriftProbeKind::CurveNGCrypto => DriftProbeKind::V2Like,
         }
     }
 }
@@ -103,6 +115,23 @@ fn classify_curve_ng_stable_drift(
         if local_amp != remote_amp {
             return Some(PendingSyncAction::AsyncUpdate);
         }
+    }
+    None
+}
+
+fn classify_curve_ng_crypto_drift(
+    local: &CurveNGCryptoProbeSnapshot,
+    remote: &CurveNGCryptoProbeSnapshot,
+) -> Option<PendingSyncAction> {
+    if local == remote {
+        return None;
+    }
+    if local.balances != remote.balances {
+        return Some(PendingSyncAction::Resync);
+    }
+    // price_scale or D changes are non-event-driven (per-swap updates), lightweight refresh.
+    if local.price_scale != remote.price_scale || local.d != remote.d {
+        return Some(PendingSyncAction::AsyncUpdate);
     }
     None
 }
@@ -880,6 +909,23 @@ impl<N, P> StateSpaceManager<N, P> {
         }
     }
 
+    fn curve_ng_crypto_probe_snapshot_from_pool(pool: &CurveNGPool) -> CurveNGCryptoProbeSnapshot {
+        CurveNGCryptoProbeSnapshot {
+            balances: pool.balances.clone(),
+            price_scale: pool.price_scale.clone().unwrap_or_default(),
+            d: pool.d,
+        }
+    }
+
+    fn local_curve_ng_crypto_probe_snapshot(amm: &AMM) -> Option<CurveNGCryptoProbeSnapshot> {
+        match amm {
+            AMM::CurveNGPool(pool) if pool.pool_type.is_crypto() && pool.n_coins > 0 => {
+                Some(Self::curve_ng_crypto_probe_snapshot_from_pool(pool))
+            }
+            _ => None,
+        }
+    }
+
     async fn fetch_curve_ng_stable_probe_snapshots(
         provider: &P,
         targets: &mut [CurveNGPool],
@@ -904,6 +950,191 @@ impl<N, P> StateSpaceManager<N, P> {
             );
         }
         Ok(snapshots)
+    }
+
+    async fn fetch_curve_ng_crypto_probe_snapshots(
+        provider: &P,
+        targets: &[CurveNGPool],
+        block: u64,
+    ) -> Result<HashMap<Address, CurveNGCryptoProbeSnapshot>, AMMError>
+    where
+        P: Provider<N> + Clone,
+        N: Network,
+    {
+        let block = BlockId::from(block);
+        let mut snapshots = HashMap::with_capacity(targets.len());
+
+        let mut twocrypto_addrs: Vec<Address> = Vec::new();
+        let mut tricrypto_addrs: Vec<Address> = Vec::new();
+        for pool in targets.iter() {
+            match pool.pool_type {
+                crate::amms::curve_ng::CurveNGPoolType::TwoCrypto => {
+                    twocrypto_addrs.push(pool.address);
+                }
+                crate::amms::curve_ng::CurveNGPoolType::TriCrypto => {
+                    tricrypto_addrs.push(pool.address);
+                }
+                _ => {}
+            }
+        }
+
+        // Fetch TwoCrypto pools
+        if !twocrypto_addrs.is_empty() {
+            Self::fetch_twocrypto_probe_snapshots(
+                provider, block, &twocrypto_addrs, &mut snapshots,
+            )
+            .await;
+        }
+
+        // Fetch TriCrypto pools
+        if !tricrypto_addrs.is_empty() {
+            Self::fetch_tricrypto_probe_snapshots(
+                provider, block, &tricrypto_addrs, &mut snapshots,
+            )
+            .await;
+        }
+
+        Ok(snapshots)
+    }
+
+    async fn fetch_twocrypto_probe_snapshots(
+        provider: &P,
+        block: BlockId,
+        addresses: &[Address],
+        snapshots: &mut HashMap<Address, CurveNGCryptoProbeSnapshot>,
+    ) where
+        P: Provider<N> + Clone,
+        N: Network,
+    {
+        let return_data = match GetCurveNGTwoCryptoRuntimeDataBatchRequest::deploy_builder(
+            provider.clone(),
+            addresses.to_vec(),
+        )
+        .call_raw()
+        .block(block)
+        .await
+        {
+            Ok(data) => data,
+            Err(e) => {
+                warn!(
+                    count = addresses.len(),
+                    "drift_probe: TwoCrypto batch failed, retrying individually: {}", e
+                );
+                for &addr in addresses {
+                    let Ok(single) = GetCurveNGTwoCryptoRuntimeDataBatchRequest::deploy_builder(
+                        provider.clone(),
+                        vec![addr],
+                    )
+                    .call_raw()
+                    .block(block)
+                    .await
+                    else {
+                        warn!(address = ?addr, "drift_probe: TwoCrypto individual fetch failed");
+                        continue;
+                    };
+                    let Ok(decoded) = <Vec<TwoCryptoRuntimeData> as SolValue>::abi_decode(&single)
+                    else {
+                        continue;
+                    };
+                    if let Some(data) = decoded.into_iter().next() {
+                        snapshots.insert(
+                            data.poolAddress,
+                            CurveNGCryptoProbeSnapshot {
+                                balances: data.balances,
+                                price_scale: vec![data.priceScale],
+                                d: Some(data.d),
+                            },
+                        );
+                    }
+                }
+                return;
+            }
+        };
+
+        let Ok(decoded) = <Vec<TwoCryptoRuntimeData> as SolValue>::abi_decode(&return_data) else {
+            warn!("drift_probe: TwoCrypto batch decode failed");
+            return;
+        };
+        for data in decoded {
+            snapshots.insert(
+                data.poolAddress,
+                CurveNGCryptoProbeSnapshot {
+                    balances: data.balances,
+                    price_scale: vec![data.priceScale],
+                    d: Some(data.d),
+                },
+            );
+        }
+    }
+
+    async fn fetch_tricrypto_probe_snapshots(
+        provider: &P,
+        block: BlockId,
+        addresses: &[Address],
+        snapshots: &mut HashMap<Address, CurveNGCryptoProbeSnapshot>,
+    ) where
+        P: Provider<N> + Clone,
+        N: Network,
+    {
+        let return_data = match GetCurveNGTriCryptoRuntimeDataBatchRequest::deploy_builder(
+            provider.clone(),
+            addresses.to_vec(),
+        )
+        .call_raw()
+        .block(block)
+        .await
+        {
+            Ok(data) => data,
+            Err(e) => {
+                warn!(
+                    count = addresses.len(),
+                    "drift_probe: TriCrypto batch failed, retrying individually: {}", e
+                );
+                for &addr in addresses {
+                    let Ok(single) = GetCurveNGTriCryptoRuntimeDataBatchRequest::deploy_builder(
+                        provider.clone(),
+                        vec![addr],
+                    )
+                    .call_raw()
+                    .block(block)
+                    .await
+                    else {
+                        warn!(address = ?addr, "drift_probe: TriCrypto individual fetch failed");
+                        continue;
+                    };
+                    let Ok(decoded) = <Vec<TriCryptoRuntimeData> as SolValue>::abi_decode(&single)
+                    else {
+                        continue;
+                    };
+                    if let Some(data) = decoded.into_iter().next() {
+                        snapshots.insert(
+                            data.poolAddress,
+                            CurveNGCryptoProbeSnapshot {
+                                balances: data.balances,
+                                price_scale: data.priceScale,
+                                d: Some(data.d),
+                            },
+                        );
+                    }
+                }
+                return;
+            }
+        };
+
+        let Ok(decoded) = <Vec<TriCryptoRuntimeData> as SolValue>::abi_decode(&return_data) else {
+            warn!("drift_probe: TriCrypto batch decode failed");
+            return;
+        };
+        for data in decoded {
+            snapshots.insert(
+                data.poolAddress,
+                CurveNGCryptoProbeSnapshot {
+                    balances: data.balances,
+                    price_scale: data.priceScale,
+                    d: Some(data.d),
+                },
+            );
+        }
     }
 
     async fn fetch_v2_like_probe_snapshots_batch(
@@ -1311,11 +1542,13 @@ impl<N, P> StateSpaceManager<N, P> {
         let mut cached_v4_like_addresses: Vec<Address> = Vec::new();
         let mut cached_slipstream_addresses: Vec<Address> = Vec::new();
         let mut cached_curve_ng_stable_addresses: Vec<Address> = Vec::new();
+        let mut cached_curve_ng_crypto_addresses: Vec<Address> = Vec::new();
         let mut v2_like_cursor: usize = 0;
         let mut v3_cursor: usize = 0;
         let mut v4_like_cursor: usize = 0;
         let mut slipstream_cursor: usize = 0;
         let mut curve_ng_stable_cursor: usize = 0;
+        let mut curve_ng_crypto_cursor: usize = 0;
         let mut active_kind = DriftProbeKind::V2Like;
         let mut last_cache_refresh: Option<Instant> = None;
 
@@ -1342,6 +1575,10 @@ impl<N, P> StateSpaceManager<N, P> {
                 pool: CurveNGPool,
                 local: CurveNGStableProbeSnapshot,
             },
+            CurveNGCrypto {
+                pool: CurveNGPool,
+                local: CurveNGCryptoProbeSnapshot,
+            },
         }
 
         loop {
@@ -1361,7 +1598,8 @@ impl<N, P> StateSpaceManager<N, P> {
                     && cached_v3_addresses.is_empty()
                     && cached_v4_like_addresses.is_empty()
                     && cached_slipstream_addresses.is_empty()
-                    && cached_curve_ng_stable_addresses.is_empty())
+                    && cached_curve_ng_stable_addresses.is_empty()
+                    && cached_curve_ng_crypto_addresses.is_empty())
             {
                 let guard = state.read().await;
                 cached_v2_like_addresses.clear();
@@ -1369,6 +1607,7 @@ impl<N, P> StateSpaceManager<N, P> {
                 cached_v4_like_addresses.clear();
                 cached_slipstream_addresses.clear();
                 cached_curve_ng_stable_addresses.clear();
+                cached_curve_ng_crypto_addresses.clear();
                 for (addr, amm) in &guard.state {
                     match amm.as_ref() {
                         AMM::UniswapV2Pool(_)
@@ -1387,6 +1626,11 @@ impl<N, P> StateSpaceManager<N, P> {
                         {
                             cached_curve_ng_stable_addresses.push(*addr)
                         }
+                        AMM::CurveNGPool(pool)
+                            if pool.pool_type.is_crypto() && pool.n_coins > 0 =>
+                        {
+                            cached_curve_ng_crypto_addresses.push(*addr)
+                        }
                         _ => {}
                     }
                 }
@@ -1395,6 +1639,7 @@ impl<N, P> StateSpaceManager<N, P> {
                 cached_v4_like_addresses.sort_unstable();
                 cached_slipstream_addresses.sort_unstable();
                 cached_curve_ng_stable_addresses.sort_unstable();
+                cached_curve_ng_crypto_addresses.sort_unstable();
                 if v2_like_cursor >= cached_v2_like_addresses.len() {
                     v2_like_cursor = 0;
                 }
@@ -1410,6 +1655,9 @@ impl<N, P> StateSpaceManager<N, P> {
                 if curve_ng_stable_cursor >= cached_curve_ng_stable_addresses.len() {
                     curve_ng_stable_cursor = 0;
                 }
+                if curve_ng_crypto_cursor >= cached_curve_ng_crypto_addresses.len() {
+                    curve_ng_crypto_cursor = 0;
+                }
                 last_cache_refresh = Some(now);
             }
 
@@ -1420,6 +1668,7 @@ impl<N, P> StateSpaceManager<N, P> {
                 DriftProbeKind::V4Like => &cached_v4_like_addresses,
                 DriftProbeKind::Slipstream => &cached_slipstream_addresses,
                 DriftProbeKind::CurveNGStable => &cached_curve_ng_stable_addresses,
+                DriftProbeKind::CurveNGCrypto => &cached_curve_ng_crypto_addresses,
             };
             let mut attempts = 0;
             while selected_addresses.is_empty() && attempts < 5 {
@@ -1430,6 +1679,7 @@ impl<N, P> StateSpaceManager<N, P> {
                     DriftProbeKind::V4Like => &cached_v4_like_addresses,
                     DriftProbeKind::Slipstream => &cached_slipstream_addresses,
                     DriftProbeKind::CurveNGStable => &cached_curve_ng_stable_addresses,
+                    DriftProbeKind::CurveNGCrypto => &cached_curve_ng_crypto_addresses,
                 };
                 attempts += 1;
             }
@@ -1444,6 +1694,7 @@ impl<N, P> StateSpaceManager<N, P> {
                 DriftProbeKind::V4Like => &mut v4_like_cursor,
                 DriftProbeKind::Slipstream => &mut slipstream_cursor,
                 DriftProbeKind::CurveNGStable => &mut curve_ng_stable_cursor,
+                DriftProbeKind::CurveNGCrypto => &mut curve_ng_crypto_cursor,
             };
             if *cursor >= selected_addresses.len() {
                 *cursor = 0;
@@ -1472,6 +1723,9 @@ impl<N, P> StateSpaceManager<N, P> {
                     AMM::CurveNGPool(pool) if pool.pool_type.is_stable() && pool.n_coins > 0 => {
                         DriftProbeKind::CurveNGStable
                     }
+                    AMM::CurveNGPool(pool) if pool.pool_type.is_crypto() && pool.n_coins > 0 => {
+                        DriftProbeKind::CurveNGCrypto
+                    }
                     _ => continue,
                 };
                 if kind != selected_kind {
@@ -1486,6 +1740,19 @@ impl<N, P> StateSpaceManager<N, P> {
                             address,
                             local: snapshot,
                             variant: amm_ref.variant(),
+                        }
+                    }
+                    DriftProbeKind::CurveNGCrypto => {
+                        let Some(snapshot) = Self::local_curve_ng_crypto_probe_snapshot(amm_ref)
+                        else {
+                            continue;
+                        };
+                        let AMM::CurveNGPool(pool) = amm_ref else {
+                            continue;
+                        };
+                        DueProbe::CurveNGCrypto {
+                            pool: pool.clone(),
+                            local: snapshot,
                         }
                     }
                     DriftProbeKind::CurveNGStable => {
@@ -1577,6 +1844,7 @@ impl<N, P> StateSpaceManager<N, P> {
             let mut cl_due = Vec::new();
             let mut v4_due = Vec::new();
             let mut curve_due = Vec::new();
+            let mut curve_crypto_due = Vec::new();
             for item in due {
                 match item {
                     DueProbe::V2Like {
@@ -1598,6 +1866,9 @@ impl<N, P> StateSpaceManager<N, P> {
                         pool_id,
                     } => v4_due.push((address, local, variant, manager_address, pool_id)),
                     DueProbe::CurveNGStable { pool, local } => curve_due.push((pool, local)),
+                    DueProbe::CurveNGCrypto { pool, local } => {
+                        curve_crypto_due.push((pool, local))
+                    }
                 }
             }
 
@@ -1858,6 +2129,39 @@ impl<N, P> StateSpaceManager<N, P> {
                 }
             }
 
+            if !curve_crypto_due.is_empty() {
+                let crypto_pools: Vec<CurveNGPool> =
+                    curve_crypto_due.iter().map(|(pool, _)| pool.clone()).collect();
+
+                match Self::fetch_curve_ng_crypto_probe_snapshots(
+                    &provider,
+                    &crypto_pools,
+                    canonical,
+                )
+                .await
+                {
+                    Ok(remote_by_address) => {
+                        for (pool, local) in curve_crypto_due {
+                            let address = pool.address;
+                            let Some(remote) = remote_by_address.get(&address) else {
+                                continue;
+                            };
+                            match classify_curve_ng_crypto_drift(&local, remote) {
+                                Some(PendingSyncAction::Resync) => enqueue_resync.push(address),
+                                Some(PendingSyncAction::AsyncUpdate) => enqueue_async.push(address),
+                                None => {}
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            count = crypto_pools.len(),
+                            "drift_probe: CurveNG crypto batch failed: {}", e
+                        );
+                    }
+                }
+            }
+
             if !enqueue_resync.is_empty() || !enqueue_async.is_empty() {
                 let mut queue = pending_sync_queue.lock().await;
                 for address in enqueue_resync {
@@ -1894,6 +2198,7 @@ mod tests {
                 U256::from(1_000_000_000_000_000_000u128),
                 U256::from(2_000_000_000_000_000_000u128),
             ]),
+            amp: Some(U256::from(100u64)),
         };
 
         let no_diff = base.clone();
@@ -1902,6 +2207,7 @@ mod tests {
         let remote_without_rates = CurveNGStableProbeSnapshot {
             balances: base.balances.clone(),
             rates: None,
+            amp: base.amp,
         };
         // If one side does not expose rates, we intentionally skip rate drift classification.
         assert_eq!(
@@ -1915,6 +2221,7 @@ mod tests {
                 U256::from(1_000_000_000_000_000_001u128),
                 U256::from(2_000_000_000_000_000_000u128),
             ]),
+            amp: base.amp,
         };
         assert_eq!(
             classify_curve_ng_stable_drift(&base, &rate_diff),
@@ -1924,6 +2231,7 @@ mod tests {
         let both_without_rates = CurveNGStableProbeSnapshot {
             balances: base.balances.clone(),
             rates: None,
+            amp: base.amp,
         };
         assert_eq!(
             classify_curve_ng_stable_drift(&both_without_rates, &remote_without_rates),
@@ -1933,10 +2241,78 @@ mod tests {
         let balance_diff = CurveNGStableProbeSnapshot {
             balances: vec![U256::from(101u64), U256::from(200u64)],
             rates: base.rates.clone(),
+            amp: base.amp,
         };
         assert_eq!(
             classify_curve_ng_stable_drift(&base, &balance_diff),
             Some(PendingSyncAction::Resync)
+        );
+
+        // amp drift → AsyncUpdate
+        let amp_diff = CurveNGStableProbeSnapshot {
+            balances: base.balances.clone(),
+            rates: base.rates.clone(),
+            amp: Some(U256::from(200u64)),
+        };
+        assert_eq!(
+            classify_curve_ng_stable_drift(&base, &amp_diff),
+            Some(PendingSyncAction::AsyncUpdate)
+        );
+    }
+
+    #[test]
+    fn test_curve_ng_crypto_drift_classification() {
+        let base = CurveNGCryptoProbeSnapshot {
+            balances: vec![U256::from(100u64), U256::from(200u64)],
+            price_scale: vec![U256::from(1_000_000u64)],
+            d: Some(U256::from(300u64)),
+        };
+
+        let no_diff = base.clone();
+        assert_eq!(classify_curve_ng_crypto_drift(&base, &no_diff), None);
+
+        // Balance drift → Resync
+        let balance_diff = CurveNGCryptoProbeSnapshot {
+            balances: vec![U256::from(101u64), U256::from(200u64)],
+            price_scale: base.price_scale.clone(),
+            d: base.d,
+        };
+        assert_eq!(
+            classify_curve_ng_crypto_drift(&base, &balance_diff),
+            Some(PendingSyncAction::Resync)
+        );
+
+        // price_scale drift → AsyncUpdate
+        let ps_diff = CurveNGCryptoProbeSnapshot {
+            balances: base.balances.clone(),
+            price_scale: vec![U256::from(1_000_001u64)],
+            d: base.d,
+        };
+        assert_eq!(
+            classify_curve_ng_crypto_drift(&base, &ps_diff),
+            Some(PendingSyncAction::AsyncUpdate)
+        );
+
+        // D drift → AsyncUpdate
+        let d_diff = CurveNGCryptoProbeSnapshot {
+            balances: base.balances.clone(),
+            price_scale: base.price_scale.clone(),
+            d: Some(U256::from(301u64)),
+        };
+        assert_eq!(
+            classify_curve_ng_crypto_drift(&base, &d_diff),
+            Some(PendingSyncAction::AsyncUpdate)
+        );
+
+        // D None vs Some → differs → AsyncUpdate
+        let d_none = CurveNGCryptoProbeSnapshot {
+            balances: base.balances.clone(),
+            price_scale: base.price_scale.clone(),
+            d: None,
+        };
+        assert_eq!(
+            classify_curve_ng_crypto_drift(&base, &d_none),
+            Some(PendingSyncAction::AsyncUpdate)
         );
     }
 

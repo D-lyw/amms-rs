@@ -69,6 +69,20 @@ sol!(
     "src/amms/abi/GetCurveNGStableSwapRuntimeDataBatchRequest.json"
 );
 
+sol!(
+    #[allow(missing_docs)]
+    #[sol(rpc)]
+    GetCurveNGTwoCryptoRuntimeDataBatchRequest,
+    "src/amms/abi/GetCurveNGTwoCryptoRuntimeDataBatchRequest.json"
+);
+
+sol!(
+    #[allow(missing_docs)]
+    #[sol(rpc)]
+    GetCurveNGTriCryptoRuntimeDataBatchRequest,
+    "src/amms/abi/GetCurveNGTriCryptoRuntimeDataBatchRequest.json"
+);
+
 sol! {
     #[derive(Debug)]
     struct StableSwapRuntimeData {
@@ -81,6 +95,26 @@ sol! {
         bool supportsStoredRates;
         bool supportsOffpegFeeMultiplier;
         uint256 offpegFeeMultiplier;
+    }
+}
+
+sol! {
+    #[derive(Debug)]
+    struct TwoCryptoRuntimeData {
+        address poolAddress;
+        uint256[] balances;
+        uint256 priceScale;
+        uint256 d;
+    }
+}
+
+sol! {
+    #[derive(Debug)]
+    struct TriCryptoRuntimeData {
+        address poolAddress;
+        uint256[] balances;
+        uint256[] priceScale;
+        uint256 d;
     }
 }
 
