@@ -242,15 +242,15 @@ contract GetCurveNGPoolDataBatchRequest {
                 }
 
                 // Fetch per-coin asset type (Stableswap-ng only). Default to 0 (Standard) on failure.
+                // Vyper's public DynArray getter returns the whole array, not indexed.
                 data.assetTypes = new uint8[](nCoins);
-                for (uint256 k = 0; k < nCoins; k++) {
-                    (bool atSuccess, bytes memory atRet) = input.pool.staticcall(
-                        abi.encodeWithSignature("asset_types(uint256)", k)
-                    );
-                    if (atSuccess && atRet.length >= 32) {
-                        data.assetTypes[k] = abi.decode(atRet, (uint8));
-                    } else {
-                        data.assetTypes[k] = 0;
+                (bool atSuccess, bytes memory atRet) = input.pool.staticcall(
+                    abi.encodeWithSignature("asset_types()")
+                );
+                if (atSuccess && atRet.length >= 32) {
+                    uint8[] memory types = abi.decode(atRet, (uint8[]));
+                    for (uint256 k = 0; k < types.length && k < nCoins; k++) {
+                        data.assetTypes[k] = types[k];
                     }
                 }
 
