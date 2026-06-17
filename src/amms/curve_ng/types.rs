@@ -69,7 +69,9 @@ pub struct CurveNGPool {
     pub decimals: Vec<u8>,
     /// 费率/汇率 (用于 rate provider, 如 wstETH)
     pub rates: Vec<U256>,
-    /// 各代币资产类型 (0=Standard, 1=Oracle, 2=Rebasing, 3=ERC4626, Stableswap-ng only)
+    /// 各代币资产类型 (0=Standard, 3=ERC4626, Stableswap-ng only)
+    /// 通过检测各代币合约的 convertToAssets() 确定。池合约的 immutable
+    /// asset_types 无 public getter，无法直接读取。
     #[serde(default)]
     pub asset_types: Vec<u8>,
 

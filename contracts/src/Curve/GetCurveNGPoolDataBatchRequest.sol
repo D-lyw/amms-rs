@@ -241,16 +241,21 @@ contract GetCurveNGPoolDataBatchRequest {
                     data.supportsOffpegFeeMultiplier = false;
                 }
 
-                // Fetch per-coin asset type (Stableswap-ng only). Default to 0 (Standard) on failure.
-                // Vyper's public DynArray getter returns the whole array, not indexed.
+                // Per-coin asset type detection. The pool contract does NOT expose
+                // asset_types publicly (immutable without public getter).
+                // Instead, probe each coin for ERC4626 by checking convertToAssets().
+                // This is the core ERC4626 function — wstETH does not have it.
+                // 0=Standard, 3=ERC4626. Only ERC4626 is relevant for probe filtering.
                 data.assetTypes = new uint8[](nCoins);
-                (bool atSuccess, bytes memory atRet) = input.pool.staticcall(
-                    abi.encodeWithSignature("asset_types()")
-                );
-                if (atSuccess && atRet.length >= 32) {
-                    uint8[] memory types = abi.decode(atRet, (uint8[]));
-                    for (uint256 k = 0; k < types.length && k < nCoins; k++) {
-                        data.assetTypes[k] = types[k];
+                for (uint256 k = 0; k < nCoins; k++) {
+                    (bool success, bytes memory ret) = data.coins[k].staticcall(
+                        abi.encodeWithSignature("convertToAssets(uint256)", 1e18)
+                    );
+                    if (success && ret.length == 32) {
+                        uint256 rate = abi.decode(ret, (uint256));
+                        if (rate > 0) {
+                            data.assetTypes[k] = 3; // ERC4626
+                        }
                     }
                 }
 
