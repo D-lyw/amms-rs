@@ -96,6 +96,11 @@ impl DriftProbeKind {
     }
 }
 
+// Drift classification for CurveNG StableSwap pools.
+// Balances drift → Resync (event-driven, mismatch indicates real state error).
+// Rates/amp drift → AsyncUpdate (non-event-driven slow variables, lightweight refresh).
+// ERC4626 rates (type 3) are skipped — yield accrues every block via convertToAssets(),
+// comparison always produces false positives. Handled by rate sync task instead.
 fn classify_curve_ng_stable_drift(
     local: &CurveNGStableProbeSnapshot,
     remote: &CurveNGStableProbeSnapshot,
@@ -134,6 +139,10 @@ fn classify_curve_ng_stable_drift(
     None
 }
 
+// Drift classification for CurveNG CryptoSwap pools (TwoCrypto/TriCrypto).
+// No ERC4626/Oracle complexity — CryptoSwap uses price_scale (embedded in events)
+// instead of rates. Balances, price_scale and D all drift per-swap without events,
+// so any field mismatch triggers AsyncUpdate (cheap multicall refresh).
 fn classify_curve_ng_crypto_drift(
     local: &CurveNGCryptoProbeSnapshot,
     remote: &CurveNGCryptoProbeSnapshot,
@@ -972,6 +981,8 @@ impl<N, P> StateSpaceManager<N, P> {
         Ok(snapshots)
     }
 
+    // Fetch remote snapshots for CryptoSwap pools by splitting into TwoCrypto/TriCrypto
+    // and calling their respective batch contracts. Each has individual fallback on failure.
     async fn fetch_curve_ng_crypto_probe_snapshots(
         provider: &P,
         targets: &[CurveNGPool],

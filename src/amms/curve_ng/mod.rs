@@ -28,6 +28,31 @@
 //!     ├── stableswap.rs  # StableSwap 不变量计算
 //!     └── cryptoswap.rs  # CryptoSwap 不变量计算
 //! ```
+//!
+//! ## 事件处理架构差异
+//!
+//! 三种池子的事件同步策略不同，源于它们的事件结构差异：
+//!
+//! - **CryptoSwap (TwoCrypto / TriCrypto)**: TokenExchange 事件包含
+//!   `packed_price_scale`，携带完整的后交易价格信息。因此 sync 可以直接
+//!   用事件数据更新 balances + price_scale + D，无需模拟验证，事件即权威。
+//!
+//! - **StableSwap**: TokenExchange 事件**不**包含实时 rates 或 price_scale。
+//!   必须用本地缓存的 rates 模拟 swap 来验证。当 rates 因 ERC4626 yield
+//!   累积而漂移时，模拟结果与事件值有微小偏差。此时用事件数据更新 balances
+//!   （事件值精确），但触发 Resync 修正 rates。
+//!
+//! ## ERC4626 代币的特殊处理
+//!
+//! ERC4626 vault 代币（sDAI, sUSDe 等）的 `convertToAssets()` 每块递增，
+//! 导致本地 rates 持续缓慢漂移。三个层面的适配：
+//!
+//! 1. **Sync 路径**: TokenExchange 偏差阈值从 1 wei 提升至 1000 wei（仅涉
+//!    ERC4626 的 swap），避免连续误报 Resync。偏差 ≤ 1000 时走 AsyncUpdate，
+//!    rates 在事件处理后立即被刷新。
+//! 2. **Drift Probe**: 跳过 ERC4626 代币的 rates 比较，不产生误报 AsyncUpdate。
+//! 3. **初始化**: 通过 `convertToAssets(1e18)` 探测每个代币是否为 ERC4626
+//!    （池合约的 immutable asset_types 无 public getter，无法直接读取）。
 
 use crate::amms::{amm::AutomatedMarketMaker, amm::SyncAction, error::AMMError};
 use alloy::{
@@ -477,31 +502,51 @@ impl AutomatedMarketMaker for CurveNGPool {
                     let (sim_dy, admin_fee_out) =
                         self.stableswap_exchange_amounts(i, j, event.tokens_sold)?;
                     if Self::abs_diff(sim_dy, event.tokens_bought) > U256::from(1u8) {
-                        tracing::warn!(
+                        // For swaps involving ERC4626 tokens, rates drift every block via
+                        // convertToAssets(). Use a relaxed tolerance (1000 wei) to absorb
+                        // this normal drift while still catching genuine mismatches.
+                        let erc4626_involved = !self.asset_types.is_empty()
+                            && (self.asset_types.get(i).copied().unwrap_or(0) == 3
+                                || self.asset_types.get(j).copied().unwrap_or(0) == 3);
+
+                        let threshold = if erc4626_involved {
+                            U256::from(1000u64)
+                        } else {
+                            U256::from(1u8)
+                        };
+
+                        if Self::abs_diff(sim_dy, event.tokens_bought) > threshold {
+                            tracing::warn!(
+                                target = "amms::curve_ng::sync",
+                                pool = ?self.address,
+                                sold_id = i,
+                                bought_id = j,
+                                tokens_sold = ?event.tokens_sold,
+                                event_tokens_bought = ?event.tokens_bought,
+                                simulated_tokens_bought = ?sim_dy,
+                                "TokenExchange (StableSwap) mismatch - triggering Resync"
+                            );
+                            if i < self.balances.len() {
+                                self.balances[i] += event.tokens_sold;
+                            }
+                            if j < self.balances.len() {
+                                let amount_out = event.tokens_bought + admin_fee_out;
+                                self.balances[j] = self.balances[j]
+                                    .checked_sub(amount_out)
+                                    .ok_or(AMMError::Msg("Balance underflow".into()))?;
+                            }
+                            return Ok(SyncAction::Resync);
+                        }
+
+                        // ERC4626 rate drift within relaxed threshold — use event data directly.
+                        tracing::debug!(
                             target = "amms::curve_ng::sync",
                             pool = ?self.address,
                             sold_id = i,
                             bought_id = j,
-                            tokens_sold = ?event.tokens_sold,
-                            event_tokens_bought = ?event.tokens_bought,
-                            simulated_tokens_bought = ?sim_dy,
-                            "TokenExchange (StableSwap) mismatch - triggering Resync"
+                            drift_wei = ?Self::abs_diff(sim_dy, event.tokens_bought),
+                            "TokenExchange (StableSwap) ERC4626 drift within tolerance"
                         );
-                        // Event data (tokens_sold/tokens_bought) is authoritative.
-                        // Update balances for interim accuracy until Resync takes effect.
-                        // admin_fee_out uses local rates which may be slightly stale for
-                        // ERC4626 tokens, but the deviation (~10^9 wei) is negligible
-                        // compared to balance magnitudes (~10^22).
-                        if i < self.balances.len() {
-                            self.balances[i] += event.tokens_sold;
-                        }
-                        if j < self.balances.len() {
-                            let amount_out = event.tokens_bought + admin_fee_out;
-                            self.balances[j] = self.balances[j]
-                                .checked_sub(amount_out)
-                                .ok_or(AMMError::Msg("Balance underflow".into()))?;
-                        }
-                        return Ok(SyncAction::Resync);
                     }
 
                     if i < self.balances.len() {
