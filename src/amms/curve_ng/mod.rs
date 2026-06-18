@@ -487,6 +487,20 @@ impl AutomatedMarketMaker for CurveNGPool {
                             simulated_tokens_bought = ?sim_dy,
                             "TokenExchange (StableSwap) mismatch - triggering Resync"
                         );
+                        // Event data (tokens_sold/tokens_bought) is authoritative.
+                        // Update balances for interim accuracy until Resync takes effect.
+                        // admin_fee_out uses local rates which may be slightly stale for
+                        // ERC4626 tokens, but the deviation (~10^9 wei) is negligible
+                        // compared to balance magnitudes (~10^22).
+                        if i < self.balances.len() {
+                            self.balances[i] += event.tokens_sold;
+                        }
+                        if j < self.balances.len() {
+                            let amount_out = event.tokens_bought + admin_fee_out;
+                            self.balances[j] = self.balances[j]
+                                .checked_sub(amount_out)
+                                .ok_or(AMMError::Msg("Balance underflow".into()))?;
+                        }
                         return Ok(SyncAction::Resync);
                     }
 
