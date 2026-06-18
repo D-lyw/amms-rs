@@ -525,7 +525,8 @@ impl AutomatedMarketMaker for CurveNGPool {
                                 tokens_sold = ?event.tokens_sold,
                                 event_tokens_bought = ?event.tokens_bought,
                                 simulated_tokens_bought = ?sim_dy,
-                                "TokenExchange (StableSwap) mismatch - triggering Resync"
+                                drift_wei = ?Self::abs_diff(sim_dy, event.tokens_bought),
+                                "TokenExchange (StableSwap) mismatch - AsyncUpdate refreshes rates"
                             );
                             if i < self.balances.len() {
                                 self.balances[i] += event.tokens_sold;
@@ -536,7 +537,8 @@ impl AutomatedMarketMaker for CurveNGPool {
                                     .checked_sub(amount_out)
                                     .ok_or(AMMError::Msg("Balance underflow".into()))?;
                             }
-                            return Ok(SyncAction::Resync);
+                            self.update_spot_prices();
+                            return Ok(SyncAction::AsyncUpdate);
                         }
 
                         // ERC4626 rate drift within relaxed threshold — use event data directly.
