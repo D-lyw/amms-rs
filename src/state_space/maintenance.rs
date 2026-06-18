@@ -2,8 +2,8 @@ use super::{StateSpace, StateSpaceManager};
 use crate::amms::aerodrome_slipstream::pool::GetAerodromeSlipstreamProbeBatchRequest;
 use crate::amms::amm::{AutomatedMarketMaker, SyncAction, Variant, AMM};
 use crate::amms::curve_ng::{
-    CurveNGFactory, CurveNGPool, GetCurveNGTwoCryptoRuntimeDataBatchRequest,
-    GetCurveNGTriCryptoRuntimeDataBatchRequest, TwoCryptoRuntimeData, TriCryptoRuntimeData,
+    CurveNGFactory, CurveNGPool, GetCurveNGTriCryptoRuntimeDataBatchRequest,
+    GetCurveNGTwoCryptoRuntimeDataBatchRequest, TriCryptoRuntimeData, TwoCryptoRuntimeData,
 };
 use crate::amms::error::AMMError;
 use crate::amms::pancake_v3::GetPancakeV3PoolSlot0BatchRequest;
@@ -17,11 +17,11 @@ use alloy::primitives::{Address, B256, U256};
 use alloy::providers::Provider;
 use alloy::sol_types::SolValue;
 use std::cmp::Reverse;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
 use tokio::time::{sleep, Duration};
 use tracing::{info, warn};
 
@@ -117,15 +117,18 @@ fn classify_curve_ng_stable_drift(
     // via convertToAssets() as yield accrues, making comparison always produce false positives.
     if let (Some(local_rates), Some(remote_rates)) = (&local.rates, &remote.rates) {
         let asset_types = local.rates_asset_types.as_deref();
-        let all_match = local_rates.iter().zip(remote_rates.iter()).enumerate().all(
-            |(i, (l, r))| {
-                // Skip comparison for ERC4626 tokens (type 3)
-                if asset_types.map(|at| at.get(i) == Some(&3)).unwrap_or(false) {
-                    return true;
-                }
-                l == r
-            },
-        );
+        let all_match =
+            local_rates
+                .iter()
+                .zip(remote_rates.iter())
+                .enumerate()
+                .all(|(i, (l, r))| {
+                    // Skip comparison for ERC4626 tokens (type 3)
+                    if asset_types.map(|at| at.get(i) == Some(&3)).unwrap_or(false) {
+                        return true;
+                    }
+                    l == r
+                });
         if !all_match {
             return Some(PendingSyncAction::AsyncUpdate);
         }
@@ -222,8 +225,13 @@ pub(super) struct PendingSyncTask {
 }
 
 #[derive(Default)]
+struct PendingSyncAddressQueue {
+    tasks: VecDeque<PendingSyncTask>,
+}
+
+#[derive(Default)]
 pub(super) struct PendingSyncQueue {
-    tasks: HashMap<Address, PendingSyncTask>,
+    tasks: HashMap<Address, PendingSyncAddressQueue>,
     in_flight: HashSet<Address>,
 }
 
@@ -234,6 +242,35 @@ enum PendingExecutionOutcome {
 }
 
 impl PendingSyncQueue {
+    fn merge_task(
+        existing: &mut PendingSyncTask,
+        action: PendingSyncAction,
+        reason: PendingSyncReason,
+    ) {
+        if action.priority() > existing.action.priority() {
+            existing.action = action;
+        }
+        if reason.priority() >= existing.reason.priority() {
+            existing.reason = reason;
+        }
+    }
+
+    fn new_task(
+        action: PendingSyncAction,
+        required_block: u64,
+        reason: PendingSyncReason,
+        now: Instant,
+    ) -> PendingSyncTask {
+        PendingSyncTask {
+            action,
+            required_block,
+            reason,
+            retry_count: 0,
+            next_retry_at: now,
+            first_seen_at: now,
+        }
+    }
+
     pub(super) fn enqueue(
         &mut self,
         address: Address,
@@ -242,28 +279,39 @@ impl PendingSyncQueue {
         reason: PendingSyncReason,
     ) {
         let now = Instant::now();
+        let in_flight = self.in_flight.contains(&address);
         match self.tasks.get_mut(&address) {
-            Some(existing) => {
-                existing.required_block = existing.required_block.max(required_block);
-                if action.priority() > existing.action.priority() {
-                    existing.action = action;
+            Some(queue) => {
+                let start_idx = usize::from(in_flight);
+                if let Some(existing) = queue
+                    .tasks
+                    .iter_mut()
+                    .skip(start_idx)
+                    .find(|task| task.required_block == required_block)
+                {
+                    Self::merge_task(existing, action, reason);
+                    return;
                 }
-                if reason.priority() >= existing.reason.priority() {
-                    existing.reason = reason;
-                }
+
+                let insert_at = queue
+                    .tasks
+                    .iter()
+                    .enumerate()
+                    .skip(start_idx)
+                    .find_map(|(idx, task)| (required_block < task.required_block).then_some(idx))
+                    .unwrap_or(queue.tasks.len());
+
+                queue.tasks.insert(
+                    insert_at,
+                    Self::new_task(action, required_block, reason, now),
+                );
             }
             None => {
-                self.tasks.insert(
-                    address,
-                    PendingSyncTask {
-                        action,
-                        required_block,
-                        reason,
-                        retry_count: 0,
-                        next_retry_at: now,
-                        first_seen_at: now,
-                    },
-                );
+                let mut queue = PendingSyncAddressQueue::default();
+                queue
+                    .tasks
+                    .push_back(Self::new_task(action, required_block, reason, now));
+                self.tasks.insert(address, queue);
             }
         }
     }
@@ -281,13 +329,14 @@ impl PendingSyncQueue {
         let mut due: Vec<(Address, PendingSyncTask)> = self
             .tasks
             .iter()
-            .filter(|(addr, task)| {
-                !self.in_flight.iter().any(|in_flight| in_flight == *addr)
+            .filter_map(|(addr, queue)| {
+                let task = queue.tasks.front()?;
+                (!self.in_flight.iter().any(|in_flight| *in_flight == *addr)
                     && task.required_block <= canonical_head
                     && task.next_retry_at <= now
-                    && filter(task)
+                    && filter(task))
+                .then_some((*addr, task.clone()))
             })
-            .map(|(addr, task)| (*addr, task.clone()))
             .collect();
 
         due.sort_by_key(|(_, task)| {
@@ -325,14 +374,15 @@ impl PendingSyncQueue {
         let mut due: Vec<(Address, PendingSyncTask)> = self
             .tasks
             .iter()
-            .filter(|(addr, task)| {
-                addresses.contains(*addr)
-                    && !self.in_flight.iter().any(|in_flight| in_flight == *addr)
+            .filter_map(|(addr, queue)| {
+                let task = queue.tasks.front()?;
+                (addresses.contains(addr)
+                    && !self.in_flight.iter().any(|in_flight| *in_flight == *addr)
                     && task.required_block <= canonical_head
                     && task.next_retry_at <= now
-                    && task.reason != PendingSyncReason::MaintenanceCoverage
+                    && task.reason != PendingSyncReason::MaintenanceCoverage)
+                    .then_some((*addr, task.clone()))
             })
-            .map(|(addr, task)| (*addr, task.clone()))
             .collect();
 
         due.sort_by_key(|(_, task)| {
@@ -362,14 +412,23 @@ impl PendingSyncQueue {
 
     pub(super) fn complete_success(&mut self, address: Address, executed_block: u64) {
         self.in_flight.remove(&address);
-        if let Some(task) = self.tasks.get_mut(&address) {
-            if task.required_block > executed_block {
-                task.retry_count = 0;
-                task.next_retry_at = Instant::now();
-                return;
+        let mut should_remove = false;
+        if let Some(queue) = self.tasks.get_mut(&address) {
+            if let Some(front) = queue.tasks.front() {
+                if front.required_block > executed_block {
+                    if let Some(front_mut) = queue.tasks.front_mut() {
+                        front_mut.retry_count = 0;
+                        front_mut.next_retry_at = Instant::now();
+                    }
+                    return;
+                }
             }
+            queue.tasks.pop_front();
+            should_remove = queue.tasks.is_empty();
         }
-        self.tasks.remove(&address);
+        if should_remove {
+            self.tasks.remove(&address);
+        }
     }
 
     pub(super) fn drop_task(&mut self, address: Address) {
@@ -379,22 +438,37 @@ impl PendingSyncQueue {
 
     pub(super) fn on_failure(&mut self, address: Address, maybe_next_required_block: Option<u64>) {
         self.in_flight.remove(&address);
-        if let Some(task) = self.tasks.get_mut(&address) {
+        if let Some(task) = self
+            .tasks
+            .get_mut(&address)
+            .and_then(|queue| queue.tasks.front_mut())
+        {
             task.retry_count = task.retry_count.saturating_add(1);
             let exp = task.retry_count.min(5);
             let delay_ms = (200u64).saturating_mul(2u64.saturating_pow(exp));
             task.next_retry_at = Instant::now() + Duration::from_millis(delay_ms.min(10_000));
             if let Some(required) = maybe_next_required_block {
-                task.required_block = task.required_block.max(required);
+                if required == task.required_block {
+                    task.next_retry_at = Instant::now();
+                }
             }
         }
     }
 
     pub(super) fn defer_task(&mut self, address: Address, required_block: u64) {
         self.in_flight.remove(&address);
-        if let Some(task) = self.tasks.get_mut(&address) {
-            task.required_block = task.required_block.max(required_block);
-            task.next_retry_at = Instant::now();
+        let mut enqueue_follow_up = None;
+        if let Some(queue) = self.tasks.get_mut(&address) {
+            if let Some(task) = queue.tasks.front_mut() {
+                if task.required_block == required_block {
+                    task.next_retry_at = Instant::now();
+                    return;
+                }
+                enqueue_follow_up = Some((task.action, task.reason));
+            }
+        }
+        if let Some((action, reason)) = enqueue_follow_up {
+            self.enqueue(address, action, required_block, reason);
         }
     }
 }
@@ -773,6 +847,7 @@ impl<N, P> StateSpaceManager<N, P> {
         provider: P,
         state: Arc<RwLock<StateSpace>>,
         pending_sync_queue: Arc<Mutex<PendingSyncQueue>>,
+        pending_sync_notify: Arc<Notify>,
         canonical_head: Arc<AtomicU64>,
         interval: Duration,
     ) where
@@ -789,7 +864,10 @@ impl<N, P> StateSpaceManager<N, P> {
                 usize::MAX,
             )
             .await;
-            sleep(interval).await;
+            tokio::select! {
+                _ = pending_sync_notify.notified() => {},
+                _ = sleep(interval) => {},
+            }
         }
     }
 
@@ -1012,7 +1090,10 @@ impl<N, P> StateSpaceManager<N, P> {
         // Fetch TwoCrypto pools
         if !twocrypto_addrs.is_empty() {
             Self::fetch_twocrypto_probe_snapshots(
-                provider, block, &twocrypto_addrs, &mut snapshots,
+                provider,
+                block,
+                &twocrypto_addrs,
+                &mut snapshots,
             )
             .await;
         }
@@ -1020,7 +1101,10 @@ impl<N, P> StateSpaceManager<N, P> {
         // Fetch TriCrypto pools
         if !tricrypto_addrs.is_empty() {
             Self::fetch_tricrypto_probe_snapshots(
-                provider, block, &tricrypto_addrs, &mut snapshots,
+                provider,
+                block,
+                &tricrypto_addrs,
+                &mut snapshots,
             )
             .await;
         }
@@ -1897,9 +1981,7 @@ impl<N, P> StateSpaceManager<N, P> {
                         pool_id,
                     } => v4_due.push((address, local, variant, manager_address, pool_id)),
                     DueProbe::CurveNGStable { pool, local } => curve_due.push((pool, local)),
-                    DueProbe::CurveNGCrypto { pool, local } => {
-                        curve_crypto_due.push((pool, local))
-                    }
+                    DueProbe::CurveNGCrypto { pool, local } => curve_crypto_due.push((pool, local)),
                 }
             }
 
@@ -2161,8 +2243,10 @@ impl<N, P> StateSpaceManager<N, P> {
             }
 
             if !curve_crypto_due.is_empty() {
-                let crypto_pools: Vec<CurveNGPool> =
-                    curve_crypto_due.iter().map(|(pool, _)| pool.clone()).collect();
+                let crypto_pools: Vec<CurveNGPool> = curve_crypto_due
+                    .iter()
+                    .map(|(pool, _)| pool.clone())
+                    .collect();
 
                 match Self::fetch_curve_ng_crypto_probe_snapshots(
                     &provider,
@@ -2433,5 +2517,79 @@ mod tests {
             1,
             "task should be claimable at canonical boundary"
         );
+    }
+
+    #[test]
+    fn test_pending_queue_merges_same_block_but_preserves_later_blocks() {
+        let mut queue = PendingSyncQueue::default();
+        let addr = address!("00000000000000000000000000000000000000ab");
+
+        queue.enqueue(
+            addr,
+            PendingSyncAction::AsyncUpdate,
+            120,
+            PendingSyncReason::AsyncUpdate,
+        );
+        queue.enqueue(
+            addr,
+            PendingSyncAction::Resync,
+            120,
+            PendingSyncReason::Resync,
+        );
+        queue.enqueue(
+            addr,
+            PendingSyncAction::AsyncUpdate,
+            121,
+            PendingSyncReason::AsyncUpdate,
+        );
+
+        let due_120 = queue.claim_due_non_coverage(120, usize::MAX);
+        assert_eq!(due_120.len(), 1, "same-block requests should coalesce");
+        assert_eq!(due_120[0].1.required_block, 120);
+        assert_eq!(
+            due_120[0].1.action,
+            PendingSyncAction::Resync,
+            "same-block merge should preserve the stronger action"
+        );
+
+        queue.complete_success(addr, 120);
+
+        let due_121 = queue.claim_due_non_coverage(121, usize::MAX);
+        assert_eq!(
+            due_121.len(),
+            1,
+            "later block should remain queued separately"
+        );
+        assert_eq!(due_121[0].1.required_block, 121);
+    }
+
+    #[test]
+    fn test_inflight_task_does_not_absorb_later_block() {
+        let mut queue = PendingSyncQueue::default();
+        let addr = address!("00000000000000000000000000000000000000ac");
+
+        queue.enqueue(
+            addr,
+            PendingSyncAction::AsyncUpdate,
+            200,
+            PendingSyncReason::AsyncUpdate,
+        );
+
+        let due = queue.claim_due_non_coverage(200, usize::MAX);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].1.required_block, 200);
+
+        queue.enqueue(
+            addr,
+            PendingSyncAction::AsyncUpdate,
+            201,
+            PendingSyncReason::AsyncUpdate,
+        );
+
+        queue.complete_success(addr, 200);
+
+        let due_next = queue.claim_due_non_coverage(201, usize::MAX);
+        assert_eq!(due_next.len(), 1);
+        assert_eq!(due_next[0].1.required_block, 201);
     }
 }

@@ -46,7 +46,7 @@ use std::pin::Pin;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::{future::Future, marker::PhantomData, sync::Arc};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
 
 use tokio::time::{sleep, Duration};
 use tracing::{error, info, warn};
@@ -84,6 +84,7 @@ pub struct StateSpaceManager<N, P> {
     pub canonical_head: Arc<AtomicU64>,
     pub reconcile_cursor: Arc<AtomicU64>,
     pending_sync_queue: Arc<Mutex<PendingSyncQueue>>,
+    pending_sync_notify: Arc<Notify>,
     applied_log_dedup: Arc<Mutex<AppliedLogDedupCache>>,
     background_started: Arc<std::sync::atomic::AtomicBool>,
     pending_sync_worker_interval: Duration,
@@ -289,6 +290,7 @@ impl<N, P> StateSpaceManager<N, P> {
                 queue.enqueue(*address, pending_action, required_block, reason);
             }
         }
+        self.pending_sync_notify.notify_one();
 
         if matches!(action, PoolRefreshAction::AsyncUpdate) {
             let targets: Vec<Address> = unique.iter().copied().collect();
@@ -336,20 +338,29 @@ impl<N, P> StateSpaceManager<N, P> {
         {
             let provider = self.provider.clone();
             let state = self.state.clone();
+            let notify = self.pending_sync_notify.clone();
             let canonical_head = self.canonical_head.clone();
             tokio::spawn(async move {
-                Self::run_canonical_head_tracker(provider, state, canonical_head).await;
+                Self::run_canonical_head_tracker(provider, state, notify, canonical_head).await;
             });
         }
 
         let provider = self.provider.clone();
         let state = self.state.clone();
         let queue = self.pending_sync_queue.clone();
+        let notify = self.pending_sync_notify.clone();
         let canonical_head = self.canonical_head.clone();
         let pending_interval = self.pending_sync_worker_interval;
         tokio::spawn(async move {
-            Self::run_pending_sync_worker(provider, state, queue, canonical_head, pending_interval)
-                .await;
+            Self::run_pending_sync_worker(
+                provider,
+                state,
+                queue,
+                notify,
+                canonical_head,
+                pending_interval,
+            )
+            .await;
         });
 
         if matches!(
@@ -1117,6 +1128,7 @@ impl<N, P> StateSpaceManager<N, P> {
     async fn run_canonical_head_tracker(
         provider: P,
         state: Arc<RwLock<StateSpace>>,
+        pending_sync_notify: Arc<Notify>,
         canonical_head: Arc<AtomicU64>,
     ) where
         P: Provider<N> + Clone + 'static,
@@ -1138,6 +1150,7 @@ impl<N, P> StateSpaceManager<N, P> {
                                     let guard = state.read().await;
                                     Self::store_monotonic_head(&guard.canonical_head, block);
                                 }
+                                pending_sync_notify.notify_one();
                             }
                             Ok(None) => {
                                 warn!("canonical newHeads stream ended, reconnecting");
@@ -1613,6 +1626,7 @@ where
             provider: self.provider,
             realtime_source: self.realtime_source,
             pending_sync_queue: Arc::new(Mutex::new(PendingSyncQueue::default())),
+            pending_sync_notify: Arc::new(Notify::new()),
             applied_log_dedup: Arc::new(Mutex::new(AppliedLogDedupCache::default())),
             background_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pending_sync_worker_interval: self.pending_sync_worker_interval,
