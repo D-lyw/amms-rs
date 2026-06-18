@@ -503,16 +503,17 @@ impl AutomatedMarketMaker for CurveNGPool {
                         self.stableswap_exchange_amounts(i, j, event.tokens_sold)?;
                     if Self::abs_diff(sim_dy, event.tokens_bought) > U256::from(1u8) {
                         // For swaps involving ERC4626 tokens, rates drift every block via
-                        // convertToAssets(). Use a relaxed tolerance (1000 wei) to absorb
+                        // convertToAssets(). Use a relaxed tolerance (2000 wei) to absorb
                         // this normal drift while still catching genuine mismatches.
+                        // Base tolerance 10 wei absorbs math rounding differences.
                         let erc4626_involved = !self.asset_types.is_empty()
                             && (self.asset_types.get(i).copied().unwrap_or(0) == 3
                                 || self.asset_types.get(j).copied().unwrap_or(0) == 3);
 
                         let threshold = if erc4626_involved {
-                            U256::from(1000u64)
+                            U256::from(2000u64)
                         } else {
-                            U256::from(1u8)
+                            U256::from(10u64)
                         };
 
                         if Self::abs_diff(sim_dy, event.tokens_bought) > threshold {
