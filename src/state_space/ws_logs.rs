@@ -11,7 +11,8 @@ use async_stream::stream;
 use futures::{Stream, StreamExt};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use std::time::Instant;
+use tokio::sync::{Mutex, Notify, RwLock};
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
@@ -20,13 +21,20 @@ impl<N, P> StateSpaceManager<N, P> {
         provider: P,
         state: Arc<RwLock<StateSpace>>,
         hooks: HookRegistry<Vec<alloy::primitives::Address>>,
+        update_seq: Arc<AtomicU64>,
         realtime_head: Arc<AtomicU64>,
         canonical_head: Arc<AtomicU64>,
         pending_sync_queue: Arc<Mutex<PendingSyncQueue>>,
+        pending_sync_notify: Arc<Notify>,
         applied_log_dedup: Arc<Mutex<AppliedLogDedupCache>>,
         query_chunks: Vec<LogQueryChunk>,
         chain_id: u64,
-    ) -> impl Stream<Item = Result<Vec<alloy::primitives::Address>, StateSpaceError>> + Send
+    ) -> impl Stream<
+        Item = Result<
+            (super::RealtimeUpdateMeta, Vec<alloy::primitives::Address>),
+            StateSpaceError,
+        >,
+    > + Send
     where
         P: Provider<N> + Clone + 'static,
         N: Network + 'static,
@@ -50,6 +58,7 @@ impl<N, P> StateSpaceManager<N, P> {
                     &realtime_head,
                     &canonical_head,
                     &pending_sync_queue,
+                    &pending_sync_notify,
                     &applied_log_dedup,
                     LogSource::NewHeadsPull,
                     chain_id,
@@ -60,7 +69,7 @@ impl<N, P> StateSpaceManager<N, P> {
                         // Catch-up stage: apply state updates only; do not emit tradable updates downstream.
                         let mut non_empty_batches = 0usize;
                         let mut affected_pools = 0usize;
-                        for affected in results {
+                        for (_, affected) in results {
                             if !affected.is_empty() {
                                 non_empty_batches += 1;
                                 affected_pools += affected.len();
@@ -102,6 +111,7 @@ impl<N, P> StateSpaceManager<N, P> {
                                 }
                             } else {
                                 if block_num > last_processed + 1 {
+                                    let backfill_received_at = Instant::now();
                                     match Self::backfill_range(
                                         &provider,
                                         &state,
@@ -112,6 +122,7 @@ impl<N, P> StateSpaceManager<N, P> {
                                         &realtime_head,
                                         &canonical_head,
                                         &pending_sync_queue,
+                                        &pending_sync_notify,
                                         &applied_log_dedup,
                                         LogSource::NewHeadsPull,
                                         chain_id,
@@ -119,9 +130,20 @@ impl<N, P> StateSpaceManager<N, P> {
                                     .await
                                     {
                                         Ok(results) => {
-                                            for affected in results {
+                                            for (backfill_block_num, affected) in results {
                                                 if !affected.is_empty() {
-                                                    yield Ok(affected);
+                                                    let meta = super::build_realtime_update_meta(
+                                                        &update_seq,
+                                                        backfill_block_num,
+                                                        LogSource::NewHeadsPull,
+                                                        backfill_received_at,
+                                                    );
+                                                    super::log_realtime_update_applied(
+                                                        meta,
+                                                        affected.len(),
+                                                        0,
+                                                    );
+                                                    yield Ok((meta, affected));
                                                 }
                                             }
                                         }
@@ -147,6 +169,7 @@ impl<N, P> StateSpaceManager<N, P> {
                                 }
                             }
 
+                            let received_at = Instant::now();
                             let logs = match Self::collect_logs_for_chunks(
                                 &provider,
                                 &query_chunks,
@@ -162,6 +185,7 @@ impl<N, P> StateSpaceManager<N, P> {
                                     continue;
                                 }
                             };
+                            let log_count = logs.len();
 
                             match Self::apply_logs_for_block(
                                 &provider,
@@ -172,6 +196,7 @@ impl<N, P> StateSpaceManager<N, P> {
                                 &realtime_head,
                                 &canonical_head,
                                 &pending_sync_queue,
+                                &pending_sync_notify,
                                 &applied_log_dedup,
                                 LogSource::NewHeadsPull,
                             )
@@ -180,7 +205,18 @@ impl<N, P> StateSpaceManager<N, P> {
                                 Ok(affected) => {
                                     last_hash = Some(block_hash);
                                     if !affected.is_empty() {
-                                        yield Ok(affected);
+                                        let meta = super::build_realtime_update_meta(
+                                            &update_seq,
+                                            block_num,
+                                            LogSource::NewHeadsPull,
+                                            received_at,
+                                        );
+                                        super::log_realtime_update_applied(
+                                            meta,
+                                            affected.len(),
+                                            log_count,
+                                        );
+                                        yield Ok((meta, affected));
                                     }
                                 }
                                 Err(e) => {

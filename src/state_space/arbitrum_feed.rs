@@ -11,7 +11,8 @@ use futures::{SinkExt, Stream, StreamExt};
 use serde_json::Value;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use std::time::Instant as StdInstant;
+use tokio::sync::{Mutex, Notify, RwLock};
 use tokio::time::{sleep, Duration, Instant};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tracing::{error, info, warn};
@@ -124,13 +125,15 @@ impl<N, P> StateSpaceManager<N, P> {
         state: &Arc<RwLock<StateSpace>>,
         hooks: &HookRegistry<Vec<Address>>,
         _query_chunks: &[LogQueryChunk],
+        update_seq: &Arc<AtomicU64>,
         realtime_head: &Arc<AtomicU64>,
         canonical_head: &Arc<AtomicU64>,
         pending_sync_queue: &Arc<Mutex<PendingSyncQueue>>,
+        pending_sync_notify: &Arc<Notify>,
         applied_log_dedup: &Arc<Mutex<AppliedLogDedupCache>>,
         max_seq: u64,
         unreadable_block: &mut Option<UnreadableBlockRetryState>,
-    ) -> Result<Vec<Vec<Address>>, StateSpaceError>
+    ) -> Result<Vec<(super::RealtimeUpdateMeta, Vec<Address>)>, StateSpaceError>
     where
         P: Provider<N> + Clone,
         N: Network,
@@ -158,6 +161,7 @@ impl<N, P> StateSpaceManager<N, P> {
             let filter = Filter::new()
                 .from_block(next_block_to_sync)
                 .to_block(next_block_to_sync);
+            let received_at = StdInstant::now();
             let logs = match provider.get_logs(&filter).await {
                 Ok(logs) => logs,
                 Err(e) => {
@@ -200,6 +204,7 @@ impl<N, P> StateSpaceManager<N, P> {
                     return Err(state_err);
                 }
             };
+            let log_count = logs.len();
 
             *unreadable_block = None;
 
@@ -212,13 +217,21 @@ impl<N, P> StateSpaceManager<N, P> {
                 realtime_head,
                 canonical_head,
                 pending_sync_queue,
+                pending_sync_notify,
                 applied_log_dedup,
                 LogSource::ArbitrumFeedPull,
             )
             .await?;
 
             if !affected.is_empty() {
-                updates.push(affected);
+                let meta = super::build_realtime_update_meta(
+                    update_seq,
+                    next_block_to_sync,
+                    LogSource::ArbitrumFeedPull,
+                    received_at,
+                );
+                super::log_realtime_update_applied(meta, affected.len(), log_count);
+                updates.push((meta, affected));
             }
         }
 
@@ -229,13 +242,15 @@ impl<N, P> StateSpaceManager<N, P> {
         provider: P,
         state: Arc<RwLock<StateSpace>>,
         hooks: HookRegistry<Vec<Address>>,
+        update_seq: Arc<AtomicU64>,
         realtime_head: Arc<AtomicU64>,
         canonical_head: Arc<AtomicU64>,
         pending_sync_queue: Arc<Mutex<PendingSyncQueue>>,
+        pending_sync_notify: Arc<Notify>,
         applied_log_dedup: Arc<Mutex<AppliedLogDedupCache>>,
         query_chunks: Vec<LogQueryChunk>,
         chain_id: u64,
-    ) -> impl Stream<Item = Result<Vec<Address>, StateSpaceError>> + Send
+    ) -> impl Stream<Item = Result<(super::RealtimeUpdateMeta, Vec<Address>), StateSpaceError>> + Send
     where
         P: Provider<N> + Clone + 'static,
         N: Network + 'static,
@@ -261,6 +276,7 @@ impl<N, P> StateSpaceManager<N, P> {
                     &realtime_head,
                     &canonical_head,
                     &pending_sync_queue,
+                    &pending_sync_notify,
                     &applied_log_dedup,
                     LogSource::ArbitrumFeedPull,
                     chain_id,
@@ -271,7 +287,7 @@ impl<N, P> StateSpaceManager<N, P> {
                         // Catch-up stage: apply state updates only; do not emit tradable updates downstream.
                         let mut non_empty_batches = 0usize;
                         let mut affected_pools = 0usize;
-                        for affected in results {
+                        for (_, affected) in results {
                             if !affected.is_empty() {
                                 non_empty_batches += 1;
                                 affected_pools += affected.len();
@@ -312,9 +328,11 @@ impl<N, P> StateSpaceManager<N, P> {
                         &state,
                         &hooks,
                         &query_chunks,
+                        &update_seq,
                         &realtime_head,
                         &canonical_head,
                         &pending_sync_queue,
+                        &pending_sync_notify,
                         &applied_log_dedup,
                         max_seq,
                         &mut unreadable_block,
@@ -322,9 +340,9 @@ impl<N, P> StateSpaceManager<N, P> {
                     .await
                     {
                         Ok(results) => {
-                            for affected in results {
+                            for (meta, affected) in results {
                                 if !affected.is_empty() {
-                                    yield Ok(affected);
+                                    yield Ok((meta, affected));
                                 }
                             }
                         }

@@ -364,42 +364,6 @@ impl PendingSyncQueue {
         })
     }
 
-    pub(super) fn claim_due_non_coverage_for_addresses(
-        &mut self,
-        canonical_head: u64,
-        max_items: usize,
-        addresses: &HashSet<Address>,
-    ) -> Vec<(Address, PendingSyncTask)> {
-        let now = Instant::now();
-        let mut due: Vec<(Address, PendingSyncTask)> = self
-            .tasks
-            .iter()
-            .filter_map(|(addr, queue)| {
-                let task = queue.tasks.front()?;
-                (addresses.contains(addr)
-                    && !self.in_flight.iter().any(|in_flight| *in_flight == *addr)
-                    && task.required_block <= canonical_head
-                    && task.next_retry_at <= now
-                    && task.reason != PendingSyncReason::MaintenanceCoverage)
-                    .then_some((*addr, task.clone()))
-            })
-            .collect();
-
-        due.sort_by_key(|(_, task)| {
-            (
-                Reverse(task.action.priority()),
-                task.first_seen_at,
-                Reverse(task.required_block),
-            )
-        });
-        due.truncate(max_items);
-        for (addr, _) in &due {
-            self.in_flight.insert(*addr);
-        }
-
-        due
-    }
-
     pub(super) fn claim_due_coverage(
         &mut self,
         canonical_head: u64,
@@ -649,12 +613,11 @@ impl<N, P> StateSpaceManager<N, P> {
         P: Provider<N> + Clone,
         N: Network,
     {
-        let Some(mut local_amm) = ({ state.read().await.get(&address).cloned() }) else {
-            return Ok(PendingExecutionOutcome::MissingPool);
-        };
-
         match task.action {
             PendingSyncAction::AsyncUpdate => {
+                let Some(mut local_amm) = ({ state.read().await.get(&address).cloned() }) else {
+                    return Ok(PendingExecutionOutcome::MissingPool);
+                };
                 let snapshot_last_synced_block = local_amm.last_synced_block();
                 // AsyncUpdate: no last_synced_block guard.
                 // RPC availability is already guaranteed by claim_due_filtered's
@@ -675,6 +638,9 @@ impl<N, P> StateSpaceManager<N, P> {
                 Ok(PendingExecutionOutcome::Applied)
             }
             PendingSyncAction::Resync => {
+                let Some(local_amm) = ({ state.read().await.get(&address).cloned() }) else {
+                    return Ok(PendingExecutionOutcome::MissingPool);
+                };
                 let variant = local_amm.variant();
                 let mut refreshed = variant
                     .sync_all_pools::<N, _>(
@@ -733,38 +699,6 @@ impl<N, P> StateSpaceManager<N, P> {
                 queue.claim_due_non_coverage(canonical, max_items)
             }
         };
-        Self::execute_due_tasks(provider, state, pending_sync_queue, canonical, due_tasks).await;
-
-        Ok(())
-    }
-
-    pub(super) async fn drain_pending_sync_queue_for_addresses(
-        provider: &P,
-        state: &Arc<RwLock<StateSpace>>,
-        pending_sync_queue: &Arc<Mutex<PendingSyncQueue>>,
-        canonical_head: &Arc<AtomicU64>,
-        addresses: &[Address],
-        max_items: usize,
-    ) -> Result<(), StateSpaceError>
-    where
-        P: Provider<N> + Clone,
-        N: Network,
-    {
-        if addresses.is_empty() || max_items == 0 {
-            return Ok(());
-        }
-
-        let canonical = canonical_head.load(Ordering::Relaxed);
-        if canonical == 0 {
-            return Ok(());
-        }
-
-        let addresses: HashSet<Address> = addresses.iter().copied().collect();
-        let due_tasks = {
-            let mut queue = pending_sync_queue.lock().await;
-            queue.claim_due_non_coverage_for_addresses(canonical, max_items, &addresses)
-        };
-
         Self::execute_due_tasks(provider, state, pending_sync_queue, canonical, due_tasks).await;
 
         Ok(())

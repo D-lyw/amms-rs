@@ -45,6 +45,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 use std::{future::Future, marker::PhantomData, sync::Arc};
 use tokio::sync::{Mutex, Notify, RwLock};
 
@@ -75,6 +76,24 @@ pub enum PoolRefreshAction {
     Resync,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RealtimeUpdateSource {
+    BaseFlashblock,
+    XlayerFlashblock,
+    ArbitrumFeed,
+    NewHeads,
+    CanonicalReconcile,
+    Maintenance,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct RealtimeUpdateMeta {
+    pub seq: u64,
+    pub block_number: u64,
+    pub source: RealtimeUpdateSource,
+    pub received_at: Instant,
+}
+
 #[derive(Clone)]
 pub struct StateSpaceManager<N, P> {
     pub state: Arc<RwLock<StateSpace>>,
@@ -83,6 +102,7 @@ pub struct StateSpaceManager<N, P> {
     pub realtime_head: Arc<AtomicU64>,
     pub canonical_head: Arc<AtomicU64>,
     pub reconcile_cursor: Arc<AtomicU64>,
+    update_seq: Arc<AtomicU64>,
     pending_sync_queue: Arc<Mutex<PendingSyncQueue>>,
     pending_sync_notify: Arc<Notify>,
     applied_log_dedup: Arc<Mutex<AppliedLogDedupCache>>,
@@ -129,6 +149,49 @@ enum LogSource {
     CanonicalReconcile,
     NewHeadsPull,
     Maintenance,
+}
+
+impl RealtimeUpdateSource {
+    fn from_log_source(source: LogSource) -> Self {
+        match source {
+            LogSource::RealtimeFlashblock => Self::BaseFlashblock,
+            LogSource::XlayerFlashblock => Self::XlayerFlashblock,
+            LogSource::ArbitrumFeedPull => Self::ArbitrumFeed,
+            LogSource::CanonicalReconcile => Self::CanonicalReconcile,
+            LogSource::NewHeadsPull => Self::NewHeads,
+            LogSource::Maintenance => Self::Maintenance,
+        }
+    }
+}
+
+fn next_realtime_update_seq(update_seq: &Arc<AtomicU64>) -> u64 {
+    update_seq.fetch_add(1, Ordering::Relaxed).saturating_add(1)
+}
+
+fn build_realtime_update_meta(
+    update_seq: &Arc<AtomicU64>,
+    block_number: u64,
+    source: LogSource,
+    received_at: Instant,
+) -> RealtimeUpdateMeta {
+    RealtimeUpdateMeta {
+        seq: next_realtime_update_seq(update_seq),
+        block_number,
+        source: RealtimeUpdateSource::from_log_source(source),
+        received_at,
+    }
+}
+
+fn log_realtime_update_applied(meta: RealtimeUpdateMeta, affected_pools: usize, log_count: usize) {
+    info!(
+        seq = meta.seq,
+        block = meta.block_number,
+        source = ?meta.source,
+        affected_pools,
+        log_count,
+        ms_recv_to_apply = meta.received_at.elapsed().as_millis(),
+        "realtime_update_applied"
+    );
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -292,19 +355,6 @@ impl<N, P> StateSpaceManager<N, P> {
         }
         self.pending_sync_notify.notify_one();
 
-        if matches!(action, PoolRefreshAction::AsyncUpdate) {
-            let targets: Vec<Address> = unique.iter().copied().collect();
-            let _ = Self::drain_pending_sync_queue_for_addresses(
-                &self.provider,
-                &self.state,
-                &self.pending_sync_queue,
-                &self.canonical_head,
-                &targets,
-                targets.len(),
-            )
-            .await;
-        }
-
         unique.len()
     }
 
@@ -376,6 +426,7 @@ impl<N, P> StateSpaceManager<N, P> {
             let canonical_head = self.canonical_head.clone();
             let reconcile_cursor = self.reconcile_cursor.clone();
             let queue = self.pending_sync_queue.clone();
+            let notify = self.pending_sync_notify.clone();
             let dedup = self.applied_log_dedup.clone();
             tokio::spawn(async move {
                 Self::run_reconcile_worker(
@@ -387,6 +438,7 @@ impl<N, P> StateSpaceManager<N, P> {
                     canonical_head,
                     reconcile_cursor,
                     queue,
+                    notify,
                     dedup,
                     chain_id,
                 )
@@ -443,12 +495,37 @@ impl<N, P> StateSpaceManager<N, P> {
         P: Provider<N> + Clone + 'static,
         N: Network,
     {
+        let stream = self.subscribe_with_meta().await?;
+        Ok(Box::pin(
+            stream.map(|item| item.map(|(_, addresses)| addresses)),
+        ))
+    }
+
+    /// Subscribes to AMM state changes and includes lightweight realtime metadata
+    /// for latency attribution in downstream consumers.
+    pub async fn subscribe_with_meta(
+        &self,
+    ) -> Result<
+        Pin<
+            Box<
+                dyn Stream<Item = Result<(RealtimeUpdateMeta, Vec<Address>), StateSpaceError>>
+                    + Send,
+            >,
+        >,
+        StateSpaceError,
+    >
+    where
+        P: Provider<N> + Clone + 'static,
+        N: Network,
+    {
         let provider = self.provider.clone();
         let realtime_head = self.realtime_head.clone();
         let canonical_head = self.canonical_head.clone();
         let state = self.state.clone();
         let hooks = self.hooks.clone();
+        let update_seq = self.update_seq.clone();
         let pending_sync_queue = self.pending_sync_queue.clone();
+        let pending_sync_notify = self.pending_sync_notify.clone();
         let applied_log_dedup = self.applied_log_dedup.clone();
         let realtime_source = self.realtime_source.clone();
 
@@ -469,9 +546,11 @@ impl<N, P> StateSpaceManager<N, P> {
                     provider,
                     state,
                     hooks,
+                    update_seq,
                     realtime_head,
                     canonical_head,
                     pending_sync_queue,
+                    pending_sync_notify,
                     applied_log_dedup,
                     query_chunks,
                     chain_id,
@@ -488,9 +567,11 @@ impl<N, P> StateSpaceManager<N, P> {
                     provider,
                     state,
                     hooks,
+                    update_seq,
                     realtime_head,
                     canonical_head,
                     pending_sync_queue,
+                    pending_sync_notify,
                     applied_log_dedup,
                     query_chunks,
                     chain_id,
@@ -508,9 +589,11 @@ impl<N, P> StateSpaceManager<N, P> {
                     provider,
                     state,
                     hooks,
+                    update_seq,
                     realtime_head,
                     canonical_head,
                     pending_sync_queue,
+                    pending_sync_notify,
                     applied_log_dedup,
                     query_chunks,
                     chain_id,
@@ -527,9 +610,11 @@ impl<N, P> StateSpaceManager<N, P> {
                     provider,
                     state,
                     hooks,
+                    update_seq,
                     realtime_head,
                     canonical_head,
                     pending_sync_queue,
+                    pending_sync_notify,
                     applied_log_dedup,
                     query_chunks,
                     chain_id,
@@ -571,10 +656,11 @@ impl<N, P> StateSpaceManager<N, P> {
         realtime_head: &Arc<AtomicU64>,
         canonical_head: &Arc<AtomicU64>,
         pending_sync_queue: &Arc<Mutex<PendingSyncQueue>>,
+        pending_sync_notify: &Arc<Notify>,
         applied_log_dedup: &Arc<Mutex<AppliedLogDedupCache>>,
         source: LogSource,
         chain_id: u64,
-    ) -> Result<Vec<Vec<Address>>, StateSpaceError>
+    ) -> Result<Vec<(u64, Vec<Address>)>, StateSpaceError>
     where
         P: Provider<N> + Clone,
         N: Network,
@@ -599,6 +685,7 @@ impl<N, P> StateSpaceManager<N, P> {
             realtime_head,
             canonical_head,
             pending_sync_queue,
+            pending_sync_notify,
             applied_log_dedup,
             source,
             chain_id,
@@ -656,6 +743,7 @@ impl<N, P> StateSpaceManager<N, P> {
         realtime_head: &Arc<AtomicU64>,
         canonical_head: &Arc<AtomicU64>,
         pending_sync_queue: &Arc<Mutex<PendingSyncQueue>>,
+        pending_sync_notify: &Arc<Notify>,
         applied_log_dedup: &Arc<Mutex<AppliedLogDedupCache>>,
         source: LogSource,
     ) -> Result<Vec<Address>, StateSpaceError>
@@ -751,22 +839,7 @@ impl<N, P> StateSpaceManager<N, P> {
                 );
             }
             drop(queue);
-
-            // Immediately drain AsyncUpdate tasks, which are lightweight RPC
-            // refreshes. On Ethereum this runs after each complete block sync;
-            // on Base it runs per flashblock slice, naturally gated by
-            // required_block ≤ canonical_head.
-            if !needs_async_update.is_empty() {
-                let _ = Self::drain_pending_sync_queue_for_addresses(
-                    _provider,
-                    state,
-                    pending_sync_queue,
-                    canonical_head,
-                    &needs_async_update,
-                    needs_async_update.len(),
-                )
-                .await;
-            }
+            pending_sync_notify.notify_one();
         }
 
         if !affected.is_empty() {
@@ -817,10 +890,11 @@ impl<N, P> StateSpaceManager<N, P> {
         realtime_head: &Arc<AtomicU64>,
         canonical_head: &Arc<AtomicU64>,
         pending_sync_queue: &Arc<Mutex<PendingSyncQueue>>,
+        pending_sync_notify: &Arc<Notify>,
         applied_log_dedup: &Arc<Mutex<AppliedLogDedupCache>>,
         source: LogSource,
         chain_id: u64,
-    ) -> Result<Vec<Vec<Address>>, StateSpaceError>
+    ) -> Result<Vec<(u64, Vec<Address>)>, StateSpaceError>
     where
         P: Provider<N> + Clone,
         N: Network,
@@ -868,13 +942,14 @@ impl<N, P> StateSpaceManager<N, P> {
                                 realtime_head,
                                 canonical_head,
                                 pending_sync_queue,
+                                pending_sync_notify,
                                 applied_log_dedup,
                                 source,
                             )
                             .await?;
 
                             if !affected.is_empty() {
-                                results.push(affected);
+                                results.push((block_num, affected));
                             }
                         }
 
@@ -1621,6 +1696,7 @@ where
             realtime_head,
             canonical_head,
             reconcile_cursor,
+            update_seq: Arc::new(AtomicU64::new(0)),
             state: state_space,
             block_filter,
             provider: self.provider,
@@ -1714,20 +1790,11 @@ impl StateSpace {
         logs: &[Log],
     ) -> Result<(Vec<Address>, Vec<Address>, Vec<Address>), StateSpaceError> {
         // 处理流程：
-        // 1) 先按 (block_number, transaction_index, log_index) 排序，避免 WS/回补乱序破坏应用顺序
+        // 1) 调用方保证 logs 已按 (block_number, transaction_index, log_index) 有序
         // 2) 逐条应用 log 到对应池子的本地状态
         if logs.is_empty() {
             return Ok((vec![], vec![], vec![]));
         }
-
-        let mut logs_sorted = logs.to_vec();
-        logs_sorted.sort_by_key(|log| {
-            (
-                log.block_number.unwrap_or_default(),
-                log.transaction_index.unwrap_or_default(),
-                log.log_index.unwrap_or_default(),
-            )
-        });
 
         let latest = self.realtime_head.load(Ordering::Relaxed);
 
@@ -1744,7 +1811,7 @@ impl StateSpace {
         let mut needs_async_update = HashSet::new();
         let mut max_processed_block = latest;
 
-        for log in &logs_sorted {
+        for log in logs {
             let log_block_number = log
                 .block_number
                 .ok_or(StateSpaceError::MissingBlockNumber)?;

@@ -16,7 +16,8 @@ use std::io::Read;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use std::time::Instant;
+use tokio::sync::{Mutex, Notify, RwLock};
 use tokio::time::{sleep, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tracing::{error, info, warn};
@@ -446,14 +447,16 @@ impl<N, P> StateSpaceManager<N, P> {
         provider: P,
         state: Arc<RwLock<StateSpace>>,
         hooks: HookRegistry<Vec<Address>>,
+        update_seq: Arc<AtomicU64>,
         realtime_head: Arc<AtomicU64>,
         canonical_head: Arc<AtomicU64>,
         pending_sync_queue: Arc<Mutex<PendingSyncQueue>>,
+        pending_sync_notify: Arc<Notify>,
         applied_log_dedup: Arc<Mutex<AppliedLogDedupCache>>,
         query_chunks: Vec<LogQueryChunk>,
         chain_id: u64,
         ws_url: &'static str,
-    ) -> impl Stream<Item = Result<Vec<Address>, StateSpaceError>> + Send
+    ) -> impl Stream<Item = Result<(super::RealtimeUpdateMeta, Vec<Address>), StateSpaceError>> + Send
     where
         P: Provider<N> + Clone + 'static,
         N: Network + 'static,
@@ -475,6 +478,7 @@ impl<N, P> StateSpaceManager<N, P> {
                     &realtime_head,
                     &canonical_head,
                     &pending_sync_queue,
+                    &pending_sync_notify,
                     &applied_log_dedup,
                     LogSource::RealtimeFlashblock,
                     chain_id,
@@ -485,7 +489,7 @@ impl<N, P> StateSpaceManager<N, P> {
                         // Catch-up stage: apply state updates only; do not emit tradable updates downstream.
                         let mut non_empty_batches = 0usize;
                         let mut affected_pools = 0usize;
-                        for affected in results {
+                        for (_, affected) in results {
                             if !affected.is_empty() {
                                 non_empty_batches += 1;
                                 affected_pools += affected.len();
@@ -536,6 +540,8 @@ impl<N, P> StateSpaceManager<N, P> {
                             break;
                         }
                     };
+
+                    let received_at = Instant::now();
 
                     let fb = match message {
                         Message::Text(text) => {
@@ -602,6 +608,7 @@ impl<N, P> StateSpaceManager<N, P> {
                     if logs.is_empty() {
                         continue;
                     }
+                    let log_count = logs.len();
 
                     match Self::apply_logs_for_block(
                         &provider,
@@ -612,6 +619,7 @@ impl<N, P> StateSpaceManager<N, P> {
                         &realtime_head,
                         &canonical_head,
                         &pending_sync_queue,
+                        &pending_sync_notify,
                         &applied_log_dedup,
                         LogSource::RealtimeFlashblock,
                     )
@@ -619,7 +627,14 @@ impl<N, P> StateSpaceManager<N, P> {
                     {
                         Ok(affected) => {
                             if !affected.is_empty() {
-                                yield Ok(affected);
+                                let meta = super::build_realtime_update_meta(
+                                    &update_seq,
+                                    block_num,
+                                    LogSource::RealtimeFlashblock,
+                                    received_at,
+                                );
+                                super::log_realtime_update_applied(meta, affected.len(), log_count);
+                                yield Ok((meta, affected));
                             }
                         }
                         Err(e) => {
@@ -642,6 +657,7 @@ impl<N, P> StateSpaceManager<N, P> {
         canonical_head: Arc<AtomicU64>,
         reconcile_cursor: Arc<AtomicU64>,
         pending_sync_queue: Arc<Mutex<PendingSyncQueue>>,
+        pending_sync_notify: Arc<Notify>,
         applied_log_dedup: Arc<Mutex<AppliedLogDedupCache>>,
         chain_id: u64,
     ) where
@@ -670,6 +686,7 @@ impl<N, P> StateSpaceManager<N, P> {
                 &realtime_head,
                 &canonical_head,
                 &pending_sync_queue,
+                &pending_sync_notify,
                 &applied_log_dedup,
                 LogSource::CanonicalReconcile,
                 chain_id,

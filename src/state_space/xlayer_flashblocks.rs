@@ -40,7 +40,8 @@ use std::io::Read;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use std::time::Instant;
+use tokio::sync::{Mutex, Notify, RwLock};
 use tokio::time::sleep;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tracing::{error, info, warn};
@@ -656,13 +657,15 @@ impl<N, P> StateSpaceManager<N, P> {
         provider: P,
         state: Arc<RwLock<StateSpace>>,
         hooks: HookRegistry<Vec<Address>>,
+        update_seq: Arc<AtomicU64>,
         realtime_head: Arc<AtomicU64>,
         canonical_head: Arc<AtomicU64>,
         pending_sync_queue: Arc<Mutex<PendingSyncQueue>>,
+        pending_sync_notify: Arc<Notify>,
         applied_log_dedup: Arc<Mutex<AppliedLogDedupCache>>,
         query_chunks: Vec<LogQueryChunk>,
         chain_id: u64,
-    ) -> impl Stream<Item = Result<Vec<Address>, StateSpaceError>> + Send
+    ) -> impl Stream<Item = Result<(super::RealtimeUpdateMeta, Vec<Address>), StateSpaceError>> + Send
     where
         P: Provider<N> + Clone + 'static,
         N: Network + 'static,
@@ -687,6 +690,7 @@ impl<N, P> StateSpaceManager<N, P> {
                     &realtime_head,
                     &canonical_head,
                     &pending_sync_queue,
+                    &pending_sync_notify,
                     &applied_log_dedup,
                     LogSource::XlayerFlashblock,
                     chain_id,
@@ -696,7 +700,7 @@ impl<N, P> StateSpaceManager<N, P> {
                     Ok(results) => {
                         let mut non_empty_batches = 0usize;
                         let mut affected_pools = 0usize;
-                        for affected in results {
+                        for (_, affected) in results {
                             if !affected.is_empty() {
                                 non_empty_batches += 1;
                                 affected_pools += affected.len();
@@ -751,6 +755,8 @@ impl<N, P> StateSpaceManager<N, P> {
                             break;
                         }
                     };
+
+                    let received_at = Instant::now();
 
                     // 4. 解析消息（decode_buf 在 stream 作用域内，保证生命周期覆盖返回值的借用）
                     decode_buf.clear();
@@ -841,6 +847,7 @@ impl<N, P> StateSpaceManager<N, P> {
                     if logs.is_empty() {
                         continue;
                     }
+                    let log_count = logs.len();
 
                     // 9. 应用日志到池子状态
                     match Self::apply_logs_for_block(
@@ -852,6 +859,7 @@ impl<N, P> StateSpaceManager<N, P> {
                         &realtime_head,
                         &canonical_head,
                         &pending_sync_queue,
+                        &pending_sync_notify,
                         &applied_log_dedup,
                         LogSource::XlayerFlashblock,
                     )
@@ -859,7 +867,14 @@ impl<N, P> StateSpaceManager<N, P> {
                     {
                         Ok(affected) => {
                             if !affected.is_empty() {
-                                yield Ok(affected);
+                                let meta = super::build_realtime_update_meta(
+                                    &update_seq,
+                                    block_num,
+                                    LogSource::XlayerFlashblock,
+                                    received_at,
+                                );
+                                super::log_realtime_update_applied(meta, affected.len(), log_count);
+                                yield Ok((meta, affected));
                             }
                         }
                         Err(e) => {
