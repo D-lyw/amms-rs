@@ -35,9 +35,9 @@ const ALGEBRA_TICK_TREE_ROOT_BITS: u8 = 32;
 const ALGEBRA_PLUGIN_BEFORE_SWAP_FLAG: u8 = 1 << 0;
 const ALGEBRA_PLUGIN_DYNAMIC_FEE_FLAG: u8 = 1 << 7;
 const ALGEBRA_BATCH_MAX_IN_FLIGHT: usize = 3;
-const ALGEBRA_BATCH_META_STEP: usize = 120;
-const ALGEBRA_BATCH_STATE_STEP: usize = 120;
-const ALGEBRA_BATCH_TICK_TABLE_STEP: usize = 24;
+const ALGEBRA_BATCH_META_STEP: usize = 8;
+const ALGEBRA_BATCH_STATE_STEP: usize = 8;
+const ALGEBRA_BATCH_TICK_TABLE_STEP: usize = 8;
 const ALGEBRA_BATCH_MAX_TICKS: usize = 48;
 const ALGEBRA_INTER_BATCH_SLEEP_MS: u64 = 500;
 
@@ -500,22 +500,20 @@ impl AlgebraIntegralFactory {
         while let Some((start, addresses)) = iter.next() {
             let provider = provider.clone();
             futures.push(Box::pin(async move {
-                Ok::<(usize, Bytes), AMMError>((
+                Ok::<(usize, Vec<(bool, Address, Address, i32, u16)>), AMMError>((
                     start,
-                    GetAlgebraPoolStaticMetaBatchRequest::deploy_builder(provider, addresses)
-                        .call_raw()
-                        .block(block_number)
-                        .await?,
+                    Self::fetch_static_meta_batch_with_fallback::<N, _>(
+                        provider,
+                        block_number,
+                        addresses,
+                    )
+                    .await?,
                 ))
             }));
 
             if futures.len() >= ALGEBRA_BATCH_MAX_IN_FLIGHT {
                 if let Some(res) = futures.next().await {
-                    let (start, return_data) = res?;
-                    let decoded =
-                        <Vec<(bool, Address, Address, i32, u16)> as SolValue>::abi_decode(
-                            &return_data,
-                        )?;
+                    let (start, decoded) = res?;
                     let end = (start + decoded.len()).min(pools.len());
                     for (meta, pool) in decoded.into_iter().zip(pools[start..end].iter_mut()) {
                         let AMM::AlgebraIntegralPool(pool) = pool else {
@@ -540,9 +538,7 @@ impl AlgebraIntegralFactory {
         }
 
         while let Some(res) = futures.next().await {
-            let (start, return_data) = res?;
-            let decoded =
-                <Vec<(bool, Address, Address, i32, u16)> as SolValue>::abi_decode(&return_data)?;
+            let (start, decoded) = res?;
             let end = (start + decoded.len()).min(pools.len());
             for (meta, pool) in decoded.into_iter().zip(pools[start..end].iter_mut()) {
                 let AMM::AlgebraIntegralPool(pool) = pool else {
@@ -594,31 +590,38 @@ impl AlgebraIntegralFactory {
         while let Some((start, addresses)) = iter.next() {
             let provider = provider.clone();
             futures.push(Box::pin(async move {
-                Ok::<(usize, Bytes), AMMError>((
+                Ok::<
+                    (
+                        usize,
+                        Vec<(
+                            bool,
+                            U256,
+                            i32,
+                            u128,
+                            u16,
+                            u32,
+                            i32,
+                            i32,
+                            u16,
+                            bool,
+                            Address,
+                        )>,
+                    ),
+                    AMMError,
+                >((
                     start,
-                    GetAlgebraPoolStateBatchRequest::deploy_builder(provider, addresses)
-                        .call_raw()
-                        .block(block_number)
-                        .await?,
+                    Self::fetch_state_batch_with_fallback::<N, _>(
+                        provider,
+                        block_number,
+                        addresses,
+                    )
+                    .await?,
                 ))
             }));
 
             if futures.len() >= ALGEBRA_BATCH_MAX_IN_FLIGHT {
                 if let Some(res) = futures.next().await {
-                    let (start, return_data) = res?;
-                    let decoded = <Vec<(
-                        bool,
-                        U256,
-                        i32,
-                        u128,
-                        u16,
-                        u32,
-                        i32,
-                        i32,
-                        u16,
-                        bool,
-                        Address,
-                    )> as SolValue>::abi_decode(&return_data)?;
+                    let (start, decoded) = res?;
                     let end = (start + decoded.len()).min(pools.len());
                     for (state, pool) in decoded.into_iter().zip(pools[start..end].iter_mut()) {
                         let AMM::AlgebraIntegralPool(pool) = pool else {
@@ -652,20 +655,7 @@ impl AlgebraIntegralFactory {
         }
 
         while let Some(res) = futures.next().await {
-            let (start, return_data) = res?;
-            let decoded = <Vec<(
-                bool,
-                U256,
-                i32,
-                u128,
-                u16,
-                u32,
-                i32,
-                i32,
-                u16,
-                bool,
-                Address,
-            )> as SolValue>::abi_decode(&return_data)?;
+            let (start, decoded) = res?;
             let end = (start + decoded.len()).min(pools.len());
             for (state, pool) in decoded.into_iter().zip(pools[start..end].iter_mut()) {
                 let AMM::AlgebraIntegralPool(pool) = pool else {
@@ -726,19 +716,20 @@ impl AlgebraIntegralFactory {
         while let Some((start, addresses)) = iter.next() {
             let provider = provider.clone();
             futures.push(Box::pin(async move {
-                Ok::<(usize, Bytes), AMMError>((
+                Ok::<(usize, Vec<Vec<U256>>), AMMError>((
                     start,
-                    GetAlgebraPoolTickTableBatchRequest::deploy_builder(provider, addresses)
-                        .call_raw()
-                        .block(block_number)
-                        .await?,
+                    Self::fetch_tick_table_batch_with_fallback::<N, _>(
+                        provider,
+                        block_number,
+                        addresses,
+                    )
+                    .await?,
                 ))
             }));
 
             if futures.len() >= ALGEBRA_BATCH_MAX_IN_FLIGHT {
                 if let Some(res) = futures.next().await {
-                    let (start, return_data) = res?;
-                    let decoded = <Vec<Vec<U256>> as SolValue>::abi_decode(&return_data)?;
+                    let (start, decoded) = res?;
                     let end = (start + decoded.len()).min(pools.len());
                     for (tables, pool) in decoded.into_iter().zip(pools[start..end].iter_mut()) {
                         let AMM::AlgebraIntegralPool(pool) = pool else {
@@ -759,8 +750,7 @@ impl AlgebraIntegralFactory {
         }
 
         while let Some(res) = futures.next().await {
-            let (start, return_data) = res?;
-            let decoded = <Vec<Vec<U256>> as SolValue>::abi_decode(&return_data)?;
+            let (start, decoded) = res?;
             let end = (start + decoded.len()).min(pools.len());
             for (tables, pool) in decoded.into_iter().zip(pools[start..end].iter_mut()) {
                 let AMM::AlgebraIntegralPool(pool) = pool else {
@@ -850,20 +840,20 @@ impl AlgebraIntegralFactory {
         while let Some(calldata) = iter.next() {
             let provider = provider.clone();
             futures.push(Box::pin(async move {
-                Ok::<(Vec<TickDataInfo>, Bytes), AMMError>((
+                Ok::<(Vec<TickDataInfo>, Vec<Vec<(bool, u128, i128)>>), AMMError>((
                     calldata.clone(),
-                    GetAlgebraPoolTickDataBatchRequest::deploy_builder(provider, calldata)
-                        .call_raw()
-                        .block(block_number)
-                        .await?,
+                    Self::fetch_tick_data_batch_with_fallback::<N, _>(
+                        provider,
+                        block_number,
+                        calldata,
+                    )
+                    .await?,
                 ))
             }));
 
             if futures.len() >= ALGEBRA_BATCH_MAX_IN_FLIGHT {
                 if let Some(res) = futures.next().await {
-                    let (tick_info, return_data) = res?;
-                    let decoded =
-                        <Vec<Vec<(bool, u128, i128)>> as SolValue>::abi_decode(&return_data)?;
+                    let (tick_info, decoded) = res?;
 
                     for (tick_results, tick_info_item) in decoded.iter().zip(tick_info.iter()) {
                         let Some(pool) = pool_set.get_mut(&tick_info_item.pool) else {
@@ -890,8 +880,7 @@ impl AlgebraIntegralFactory {
         }
 
         while let Some(res) = futures.next().await {
-            let (tick_info, return_data) = res?;
-            let decoded = <Vec<Vec<(bool, u128, i128)>> as SolValue>::abi_decode(&return_data)?;
+            let (tick_info, decoded) = res?;
 
             for (tick_results, tick_info_item) in decoded.iter().zip(tick_info.iter()) {
                 let Some(pool) = pool_set.get_mut(&tick_info_item.pool) else {
@@ -914,6 +903,259 @@ impl AlgebraIntegralFactory {
         }
 
         Ok(())
+    }
+
+    async fn fetch_static_meta_batch_with_fallback<N, P>(
+        provider: P,
+        block_number: BlockId,
+        addresses: Vec<Address>,
+    ) -> Result<Vec<(bool, Address, Address, i32, u16)>, AMMError>
+    where
+        N: Network,
+        P: Provider<N> + Clone,
+    {
+        let mut pending = vec![(0usize, addresses)];
+        let mut segments = Vec::new();
+
+        while let Some((offset, batch)) = pending.pop() {
+            let batch_len = batch.len();
+            let result: Result<Vec<(bool, Address, Address, i32, u16)>, AMMError> = async {
+                let return_data = GetAlgebraPoolStaticMetaBatchRequest::deploy_builder(
+                    provider.clone(),
+                    batch.clone(),
+                )
+                .call_raw()
+                .block(block_number)
+                .await
+                .map_err(AMMError::from)?;
+                <Vec<(bool, Address, Address, i32, u16)> as SolValue>::abi_decode(&return_data)
+                    .map_err(AMMError::from)
+            }
+            .await;
+
+            match result {
+                Ok(decoded) => segments.push((offset, decoded)),
+                Err(err) if batch_len > 1 => {
+                    let mid = batch_len / 2;
+                    warn!(
+                        batch_size = batch_len,
+                        split_left = mid,
+                        split_right = batch_len - mid,
+                        error = ?err,
+                        "Algebra static meta batch failed, splitting"
+                    );
+                    pending.push((offset + mid, batch[mid..].to_vec()));
+                    pending.push((offset, batch[..mid].to_vec()));
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        segments.sort_by_key(|(offset, _)| *offset);
+        Ok(segments
+            .into_iter()
+            .flat_map(|(_, decoded)| decoded)
+            .collect())
+    }
+
+    async fn fetch_state_batch_with_fallback<N, P>(
+        provider: P,
+        block_number: BlockId,
+        addresses: Vec<Address>,
+    ) -> Result<
+        Vec<(
+            bool,
+            U256,
+            i32,
+            u128,
+            u16,
+            u32,
+            i32,
+            i32,
+            u16,
+            bool,
+            Address,
+        )>,
+        AMMError,
+    >
+    where
+        N: Network,
+        P: Provider<N> + Clone,
+    {
+        let mut pending = vec![(0usize, addresses)];
+        let mut segments = Vec::new();
+
+        while let Some((offset, batch)) = pending.pop() {
+            let batch_len = batch.len();
+            let result: Result<
+                Vec<(
+                    bool,
+                    U256,
+                    i32,
+                    u128,
+                    u16,
+                    u32,
+                    i32,
+                    i32,
+                    u16,
+                    bool,
+                    Address,
+                )>,
+                AMMError,
+            > = async {
+                let return_data = GetAlgebraPoolStateBatchRequest::deploy_builder(
+                    provider.clone(),
+                    batch.clone(),
+                )
+                .call_raw()
+                .block(block_number)
+                .await
+                .map_err(AMMError::from)?;
+                <Vec<(
+                    bool,
+                    U256,
+                    i32,
+                    u128,
+                    u16,
+                    u32,
+                    i32,
+                    i32,
+                    u16,
+                    bool,
+                    Address,
+                )> as SolValue>::abi_decode(&return_data)
+                .map_err(AMMError::from)
+            }
+            .await;
+
+            match result {
+                Ok(decoded) => segments.push((offset, decoded)),
+                Err(err) if batch_len > 1 => {
+                    let mid = batch_len / 2;
+                    warn!(
+                        batch_size = batch_len,
+                        split_left = mid,
+                        split_right = batch_len - mid,
+                        error = ?err,
+                        "Algebra state batch failed, splitting"
+                    );
+                    pending.push((offset + mid, batch[mid..].to_vec()));
+                    pending.push((offset, batch[..mid].to_vec()));
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        segments.sort_by_key(|(offset, _)| *offset);
+        Ok(segments
+            .into_iter()
+            .flat_map(|(_, decoded)| decoded)
+            .collect())
+    }
+
+    async fn fetch_tick_table_batch_with_fallback<N, P>(
+        provider: P,
+        block_number: BlockId,
+        addresses: Vec<Address>,
+    ) -> Result<Vec<Vec<U256>>, AMMError>
+    where
+        N: Network,
+        P: Provider<N> + Clone,
+    {
+        let mut pending = vec![(0usize, addresses)];
+        let mut segments = Vec::new();
+
+        while let Some((offset, batch)) = pending.pop() {
+            let batch_len = batch.len();
+            let result: Result<Vec<Vec<U256>>, AMMError> = async {
+                let return_data = GetAlgebraPoolTickTableBatchRequest::deploy_builder(
+                    provider.clone(),
+                    batch.clone(),
+                )
+                .call_raw()
+                .block(block_number)
+                .await
+                .map_err(AMMError::from)?;
+                <Vec<Vec<U256>> as SolValue>::abi_decode(&return_data).map_err(AMMError::from)
+            }
+            .await;
+
+            match result {
+                Ok(decoded) => segments.push((offset, decoded)),
+                Err(err) if batch_len > 1 => {
+                    let mid = batch_len / 2;
+                    warn!(
+                        batch_size = batch_len,
+                        split_left = mid,
+                        split_right = batch_len - mid,
+                        error = ?err,
+                        "Algebra tick table batch failed, splitting"
+                    );
+                    pending.push((offset + mid, batch[mid..].to_vec()));
+                    pending.push((offset, batch[..mid].to_vec()));
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        segments.sort_by_key(|(offset, _)| *offset);
+        Ok(segments
+            .into_iter()
+            .flat_map(|(_, decoded)| decoded)
+            .collect())
+    }
+
+    async fn fetch_tick_data_batch_with_fallback<N, P>(
+        provider: P,
+        block_number: BlockId,
+        calldata: Vec<GetAlgebraPoolTickDataBatchRequest::TickDataInfo>,
+    ) -> Result<Vec<Vec<(bool, u128, i128)>>, AMMError>
+    where
+        N: Network,
+        P: Provider<N> + Clone,
+    {
+        let mut pending = vec![(0usize, calldata)];
+        let mut segments = Vec::new();
+
+        while let Some((offset, batch)) = pending.pop() {
+            let batch_len = batch.len();
+            let result: Result<Vec<Vec<(bool, u128, i128)>>, AMMError> = async {
+                let return_data = GetAlgebraPoolTickDataBatchRequest::deploy_builder(
+                    provider.clone(),
+                    batch.clone(),
+                )
+                .call_raw()
+                .block(block_number)
+                .await
+                .map_err(AMMError::from)?;
+                <Vec<Vec<(bool, u128, i128)>> as SolValue>::abi_decode(&return_data)
+                    .map_err(AMMError::from)
+            }
+            .await;
+
+            match result {
+                Ok(decoded) => segments.push((offset, decoded)),
+                Err(err) if batch_len > 1 => {
+                    let mid = batch_len / 2;
+                    warn!(
+                        batch_size = batch_len,
+                        split_left = mid,
+                        split_right = batch_len - mid,
+                        error = ?err,
+                        "Algebra tick data batch failed, splitting"
+                    );
+                    pending.push((offset + mid, batch[mid..].to_vec()));
+                    pending.push((offset, batch[..mid].to_vec()));
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        segments.sort_by_key(|(offset, _)| *offset);
+        Ok(segments
+            .into_iter()
+            .flat_map(|(_, decoded)| decoded)
+            .collect())
     }
 
     pub async fn init_batch<N, P>(
