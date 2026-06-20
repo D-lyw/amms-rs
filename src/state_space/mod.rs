@@ -1,7 +1,14 @@
 mod arbitrum_feed;
+mod base_pending_logs;
 pub mod discovery;
 pub mod error;
 pub mod filters;
+// Retained intentionally for historical reference and probe/debug reuse.
+// Base mainnet no longer uses this raw flashblocks parser in the default
+// realtime path because the official upstream payload shape changed.
+// Current Base realtime syncing is implemented via `pendingLogs`; see
+// `base_pending_logs.rs` and `RealtimeSyncSource::BaseFlashblocksRaw` below.
+#[allow(dead_code)]
 mod flashblocks;
 pub mod hooks;
 mod maintenance;
@@ -59,6 +66,15 @@ pub enum RealtimeSyncSource {
     // Legacy compatibility knob: non-Base realtime path now follows
     // newHeads + per-block get_logs pull mode.
     WsLogs,
+    /// Legacy config name kept for backward compatibility.
+    ///
+    /// Historically this selected the old Base raw flashblocks parser.
+    /// After the upstream Base Flashblocks raw payload format changed,
+    /// Base realtime syncing was migrated to `pendingLogs` subscriptions.
+    ///
+    /// The enum variant name is preserved so downstream users do not need
+    /// to immediately change configuration, but it now resolves to the
+    /// Base `pendingLogs` implementation internally.
     BaseFlashblocksRaw,
     /// Xlayer flashblocks 流式同步（OP Stack 乐观架构）。
     ///
@@ -99,6 +115,7 @@ pub struct StateSpaceManager<N, P> {
     pub state: Arc<RwLock<StateSpace>>,
     pub block_filter: Filter,
     pub provider: P,
+    realtime_ws_endpoints: Option<Vec<String>>,
     pub realtime_head: Arc<AtomicU64>,
     pub canonical_head: Arc<AtomicU64>,
     pub reconcile_cursor: Arc<AtomicU64>,
@@ -120,7 +137,6 @@ const BASE_CHAIN_ID: u64 = 8453;
 const ARBITRUM_CHAIN_ID: u64 = 42161;
 const ETHEREUM_MAINNET_CHAIN_ID: u64 = 1;
 const XLAYER_CHAIN_ID: u64 = 196;
-const BASE_FLASHBLOCKS_RAW_WS_URL: &str = "wss://mainnet.flashblocks.base.org/ws";
 /// Xlayer Flashblocks WebSocket 端点。
 ///
 /// 端点说明（由用户调研确认）:
@@ -317,7 +333,7 @@ impl LogQueryChunk {
 #[derive(Clone, Copy, Debug)]
 enum SelectedRealtimeSource {
     NewHeadsPull,
-    BaseFlashblocksRaw,
+    BasePendingLogs,
     XlayerFlashblocksPull,
     ArbitrumFeedPull,
 }
@@ -382,7 +398,7 @@ impl<N, P> StateSpaceManager<N, P> {
         }
 
         if (chain_id == BASE_CHAIN_ID
-            && matches!(selected, SelectedRealtimeSource::BaseFlashblocksRaw))
+            && matches!(selected, SelectedRealtimeSource::BasePendingLogs))
             || (chain_id == XLAYER_CHAIN_ID
                 && matches!(selected, SelectedRealtimeSource::XlayerFlashblocksPull))
         {
@@ -415,7 +431,7 @@ impl<N, P> StateSpaceManager<N, P> {
 
         if matches!(
             selected,
-            SelectedRealtimeSource::BaseFlashblocksRaw
+            SelectedRealtimeSource::BasePendingLogs
                 | SelectedRealtimeSource::XlayerFlashblocksPull
                 | SelectedRealtimeSource::ArbitrumFeedPull
         ) {
@@ -483,8 +499,15 @@ impl<N, P> StateSpaceManager<N, P> {
     }
 
     /// Subscribes to AMM state changes through a configurable realtime source:
-    /// - Base: Flashblocks infrastructure stream by default.
+    /// - Base: `pendingLogs` on a Flashblocks-aware WebSocket endpoint by default.
     /// - Other chains: newHeads + logsBloom prefilter + per-block get_logs.
+    ///
+    /// For Base, the `pendingLogs` path deliberately reuses `build_query_chunks()`,
+    /// so all special AMM address/event coverage stays aligned with the canonical
+    /// log-pull path instead of introducing a second subscription rule set.
+    ///
+    /// Note: Base `pendingLogs` also requires explicit realtime WebSocket
+    /// endpoints via `StateSpaceBuilder::with_realtime_ws_endpoints(...)`.
     pub async fn subscribe(
         &self,
     ) -> Result<
@@ -532,6 +555,15 @@ impl<N, P> StateSpaceManager<N, P> {
         let chain_id = { state.read().await.chain_id };
         let query_chunks = Self::build_query_chunks(&provider, &state, chain_id).await?;
         let selected = Self::resolve_realtime_source(chain_id, &realtime_source);
+        let base_ws_candidates = if matches!(selected, SelectedRealtimeSource::BasePendingLogs) {
+            Some(self.realtime_ws_endpoints.clone().ok_or_else(|| {
+                StateSpaceError::from(AMMError::Msg(
+                    "Base pendingLogs realtime source requires explicit websocket endpoints. Use StateSpaceBuilder::with_realtime_ws_endpoints(vec![\"wss://...\".into(), ...]).".to_string(),
+                ))
+            })?)
+        } else {
+            None
+        };
         self.ensure_background_tasks(query_chunks.clone(), chain_id, selected)
             .await?;
 
@@ -556,14 +588,15 @@ impl<N, P> StateSpaceManager<N, P> {
                     chain_id,
                 )))
             }
-            SelectedRealtimeSource::BaseFlashblocksRaw => {
+            SelectedRealtimeSource::BasePendingLogs => {
+                let ws_candidates = base_ws_candidates
+                    .expect("BasePendingLogs selected must prevalidate ws endpoints");
                 info!(
-                    "Starting Flashblocks raw sync (chain_id={}, ws_url={}, {} query chunks)",
+                    "Starting Base pendingLogs sync (chain_id={}, {} query chunks)",
                     chain_id,
-                    BASE_FLASHBLOCKS_RAW_WS_URL,
                     query_chunks.len()
                 );
-                Ok(Box::pin(Self::subscribe_flashblocks_raw_stream(
+                Ok(Box::pin(Self::subscribe_base_pending_logs_stream(
                     provider,
                     state,
                     hooks,
@@ -574,8 +607,8 @@ impl<N, P> StateSpaceManager<N, P> {
                     pending_sync_notify,
                     applied_log_dedup,
                     query_chunks,
+                    ws_candidates,
                     chain_id,
-                    BASE_FLASHBLOCKS_RAW_WS_URL,
                 )))
             }
             SelectedRealtimeSource::XlayerFlashblocksPull => {
@@ -630,7 +663,7 @@ impl<N, P> StateSpaceManager<N, P> {
         match source {
             RealtimeSyncSource::Auto => {
                 if chain_id == BASE_CHAIN_ID {
-                    SelectedRealtimeSource::BaseFlashblocksRaw
+                    SelectedRealtimeSource::BasePendingLogs
                 } else if chain_id == XLAYER_CHAIN_ID {
                     SelectedRealtimeSource::XlayerFlashblocksPull
                 } else if chain_id == ARBITRUM_CHAIN_ID {
@@ -640,7 +673,9 @@ impl<N, P> StateSpaceManager<N, P> {
                 }
             }
             RealtimeSyncSource::WsLogs => SelectedRealtimeSource::NewHeadsPull,
-            RealtimeSyncSource::BaseFlashblocksRaw => SelectedRealtimeSource::BaseFlashblocksRaw,
+            // Backward-compatible mapping: keep the old public config knob, but
+            // route it to the new Base `pendingLogs` implementation.
+            RealtimeSyncSource::BaseFlashblocksRaw => SelectedRealtimeSource::BasePendingLogs,
             RealtimeSyncSource::XlayerFlashblocksRaw => {
                 SelectedRealtimeSource::XlayerFlashblocksPull
             }
@@ -985,6 +1020,9 @@ impl<N, P> StateSpaceManager<N, P> {
     {
         let guard = state.read().await;
 
+        // This function is the canonical place where realtime log coverage is built.
+        // Base `pendingLogs`, generic get_logs backfill/pull, and other log-driven
+        // flows all reuse these chunks so we do not drift across protocols.
         let mut topic_addresses = HashSet::new();
         let mut address_only_addresses = HashSet::new();
         let mut topic_signatures: HashSet<FixedBytes<32>> = HashSet::new();
@@ -1099,6 +1137,10 @@ impl<N, P> StateSpaceManager<N, P> {
             let mut topic_signatures: Vec<FixedBytes<32>> = topic_signatures.into_iter().collect();
             topic_signatures.sort();
 
+            // Note: topic signatures are unioned across all pools/protocols.
+            // This may subscribe somewhat wider than strictly necessary, but it
+            // avoids false negatives when different AMM types route through
+            // shared manager/vault/plugin contracts.
             for addresses in topic_addresses.chunks(LOG_ADDRESS_CHUNK_SIZE) {
                 chunks.push(LogQueryChunk {
                     addresses: addresses.to_vec(),
@@ -1269,6 +1311,7 @@ pub struct StateSpaceBuilder<N, P> {
     pub drift_probe_interval: Duration,
     pub maintenance_interval: Option<Duration>,
     pub realtime_source: RealtimeSyncSource,
+    pub realtime_ws_endpoints: Option<Vec<String>>,
     phantom: PhantomData<N>,
 }
 
@@ -1295,6 +1338,7 @@ where
             drift_probe_interval: DEFAULT_DRIFT_PROBE_INTERVAL,
             maintenance_interval: None,
             realtime_source: RealtimeSyncSource::Auto,
+            realtime_ws_endpoints: None,
             hooks: vec![],
         }
     }
@@ -1394,6 +1438,34 @@ where
     pub fn with_realtime_source(self, source: RealtimeSyncSource) -> StateSpaceBuilder<N, P> {
         StateSpaceBuilder {
             realtime_source: source,
+            ..self
+        }
+    }
+
+    /// Provide explicit WebSocket endpoints for realtime sources that require
+    /// their own direct subscription connection.
+    ///
+    /// This is currently required for Base `pendingLogs`, because that
+    /// subscription does not reuse the passed `Provider` transport session.
+    /// Empty / blank entries are ignored.
+    pub fn with_realtime_ws_endpoints(
+        self,
+        endpoints: Vec<String>,
+    ) -> StateSpaceBuilder<N, P> {
+        let mut normalized = Vec::new();
+        for endpoint in endpoints {
+            let trimmed = endpoint.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let candidate = trimmed.to_string();
+            if !normalized.contains(&candidate) {
+                normalized.push(candidate);
+            }
+        }
+
+        StateSpaceBuilder {
+            realtime_ws_endpoints: (!normalized.is_empty()).then_some(normalized),
             ..self
         }
     }
@@ -1693,6 +1765,7 @@ where
         }
 
         Ok(StateSpaceManager {
+            realtime_ws_endpoints: self.realtime_ws_endpoints,
             realtime_head,
             canonical_head,
             reconcile_cursor,

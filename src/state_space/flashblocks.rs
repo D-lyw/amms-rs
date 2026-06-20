@@ -22,6 +22,14 @@ use tokio::time::{sleep, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tracing::{error, info, warn};
 
+// Historical Base raw Flashblocks parser.
+//
+// We retain this implementation for reference, debugging, replay/probe tools,
+// and possible future upstream compatibility work. It is no longer the default
+// Base realtime path because the official upstream raw payload structure
+// changed. Base mainnet now uses `pendingLogs` subscriptions instead; see
+// `base_pending_logs.rs` and the compatibility mapping in `state_space/mod.rs`.
+
 const FLASHBLOCKS_DEDUP_PAYLOAD_WINDOW: usize = 4;
 const FLASHBLOCKS_HEX_CACHE_MAX: usize = 8192;
 const FLASHBLOCKS_BROTLI_READER_BUF_SIZE: usize = 64 * 1024;
