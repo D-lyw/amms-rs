@@ -762,10 +762,11 @@ impl AutomatedMarketMaker for AerodromeSlipstreamPool {
             ICLPoolEvents::Mint::SIGNATURE_HASH => {
                 let mint_event = ICLPoolEvents::Mint::decode_log(log.as_ref())?;
                 if mint_event.amount != 0 {
+                    let tl: i32 = mint_event.tickLower.unchecked_into();
                     let tu: i32 = mint_event.tickUpper.unchecked_into();
                     let nb =
                         log.block_number.unwrap_or(0) > self.observations_cache.last_write_block;
-                    if self.tick < tu && nb {
+                    if self.tick >= tl && self.tick < tu && nb {
                         if let Some(bt) = log.block_timestamp {
                             self.observations_cache.write(
                                 bt as u32,
@@ -798,10 +799,11 @@ impl AutomatedMarketMaker for AerodromeSlipstreamPool {
             ICLPoolEvents::Burn::SIGNATURE_HASH => {
                 let burn_event = ICLPoolEvents::Burn::decode_log(log.as_ref())?;
                 if burn_event.amount != 0 {
+                    let tl: i32 = burn_event.tickLower.unchecked_into();
                     let tu: i32 = burn_event.tickUpper.unchecked_into();
                     let nb =
                         log.block_number.unwrap_or(0) > self.observations_cache.last_write_block;
-                    if self.tick < tu && nb {
+                    if self.tick >= tl && self.tick < tu && nb {
                         if let Some(bt) = log.block_timestamp {
                             self.observations_cache.write(
                                 bt as u32,
@@ -2972,6 +2974,152 @@ impl AerodromeSlipstreamFactory {
         }
 
         Ok(amms)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::primitives::{address, aliases::I24};
+
+    fn seeded_pool(current_tick: i32) -> AerodromeSlipstreamPool {
+        AerodromeSlipstreamPool {
+            address: address!("b2cc224c1c9fee385f8ad6a55b4d94e92359dc59"),
+            tick: current_tick,
+            tick_spacing: 1,
+            fee: 100,
+            dynamic_fee_config: DynamicFeeConfig {
+                base_fee: 100,
+                ..Default::default()
+            },
+            observations_cache: ObservationsCache {
+                observations: vec![Observation {
+                    block_timestamp: 10,
+                    tick_cumulative: 0,
+                    initialized: true,
+                }],
+                index: 0,
+                cardinality: 1,
+                cardinality_next: 1,
+                last_write_block: 0,
+                seeded: true,
+                tc_ago: 0,
+            },
+            ..Default::default()
+        }
+    }
+
+    fn mint_log(tick_lower: i32, tick_upper: i32) -> Log {
+        let event = ICLPoolEvents::Mint {
+            sender: address!("1111111111111111111111111111111111111111"),
+            owner: address!("2222222222222222222222222222222222222222"),
+            tickLower: I24::try_from(tick_lower).expect("tick_lower in int24 range"),
+            tickUpper: I24::try_from(tick_upper).expect("tick_upper in int24 range"),
+            amount: 1,
+            amount0: U256::ZERO,
+            amount1: U256::ZERO,
+        };
+
+        Log {
+            inner: alloy::primitives::Log {
+                address: address!("b2cc224c1c9fee385f8ad6a55b4d94e92359dc59"),
+                data: event.encode_log_data(),
+            },
+            block_hash: None,
+            block_number: Some(1),
+            block_timestamp: Some(20),
+            transaction_hash: None,
+            transaction_index: Some(0),
+            log_index: Some(0),
+            removed: false,
+        }
+    }
+
+    fn burn_log(tick_lower: i32, tick_upper: i32) -> Log {
+        let event = ICLPoolEvents::Burn {
+            owner: address!("2222222222222222222222222222222222222222"),
+            tickLower: I24::try_from(tick_lower).expect("tick_lower in int24 range"),
+            tickUpper: I24::try_from(tick_upper).expect("tick_upper in int24 range"),
+            amount: 1,
+            amount0: U256::ZERO,
+            amount1: U256::ZERO,
+        };
+
+        Log {
+            inner: alloy::primitives::Log {
+                address: address!("b2cc224c1c9fee385f8ad6a55b4d94e92359dc59"),
+                data: event.encode_log_data(),
+            },
+            block_hash: None,
+            block_number: Some(1),
+            block_timestamp: Some(20),
+            transaction_hash: None,
+            transaction_index: Some(0),
+            log_index: Some(0),
+            removed: false,
+        }
+    }
+
+    #[test]
+    fn mint_observation_write_requires_current_tick_inside_range() {
+        let mut outside_pool = seeded_pool(50);
+        outside_pool
+            .sync(&mint_log(100, 200))
+            .expect("mint sync should succeed");
+        assert_eq!(outside_pool.observations_cache.last_write_block, 0);
+        assert_eq!(
+            outside_pool
+                .observations_cache
+                .last()
+                .expect("seeded observation exists")
+                .block_timestamp,
+            10
+        );
+
+        let mut inside_pool = seeded_pool(150);
+        inside_pool
+            .sync(&mint_log(100, 200))
+            .expect("mint sync should succeed");
+        assert_eq!(inside_pool.observations_cache.last_write_block, 1);
+        assert_eq!(
+            inside_pool
+                .observations_cache
+                .last()
+                .expect("written observation exists")
+                .block_timestamp,
+            20
+        );
+    }
+
+    #[test]
+    fn burn_observation_write_requires_current_tick_inside_range() {
+        let mut outside_pool = seeded_pool(50);
+        outside_pool
+            .sync(&burn_log(100, 200))
+            .expect("burn sync should succeed");
+        assert_eq!(outside_pool.observations_cache.last_write_block, 0);
+        assert_eq!(
+            outside_pool
+                .observations_cache
+                .last()
+                .expect("seeded observation exists")
+                .block_timestamp,
+            10
+        );
+
+        let mut inside_pool = seeded_pool(150);
+        inside_pool
+            .sync(&burn_log(100, 200))
+            .expect("burn sync should succeed");
+        assert_eq!(inside_pool.observations_cache.last_write_block, 1);
+        assert_eq!(
+            inside_pool
+                .observations_cache
+                .last()
+                .expect("written observation exists")
+                .block_timestamp,
+            20
+        );
     }
 }
 
