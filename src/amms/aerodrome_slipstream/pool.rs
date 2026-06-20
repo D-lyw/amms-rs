@@ -1894,6 +1894,267 @@ impl AerodromeSlipstreamFactory {
         Ok(())
     }
 
+    async fn sync_fee_context_batch_strict<N, P>(
+        pools: &mut [AMM],
+        block_number: BlockId,
+        provider: P,
+    ) -> Result<(), AMMError>
+    where
+        N: Network,
+        P: Provider<N> + Clone,
+    {
+        use alloy::sol_types::SolType;
+
+        type FeeConfigDataArray = sol!((address, address, bool, bool, bool, bool, bool, int24, uint24, uint24, uint24, uint64, bool, uint24)[]);
+
+        let max_in_flight = 3;
+        let pool_index: HashMap<Address, usize> = pools
+            .iter()
+            .enumerate()
+            .map(|(idx, amm)| (amm.address(), idx))
+            .collect();
+
+        let pool_addrs: Vec<Address> = pools.iter().map(|a| a.address()).collect();
+        let mut futures: FuturesUnordered<BoxFuture<'_, _>> = FuturesUnordered::new();
+
+        for chunk in pool_addrs.chunks(SLIPSTREAM_FEE_CONFIG_BATCH_STEP) {
+            let provider = provider.clone();
+            let addresses = chunk.to_vec();
+            let addresses_clone = addresses.clone();
+            futures.push(Box::pin(async move {
+                let mut attempt = 1u8;
+                loop {
+                    match GetAerodromeSlipstreamFeeConfigBatchRequest::deploy_builder(
+                        provider.clone(),
+                        addresses_clone.clone(),
+                    )
+                    .call_raw()
+                    .block(block_number)
+                    .await
+                    {
+                        Ok(return_data) => {
+                            break Ok::<(Vec<Address>, Bytes), AMMError>((addresses, return_data));
+                        }
+                        Err(e) if attempt < SLIPSTREAM_BATCH_RETRY_ATTEMPTS => {
+                            let delay = slipstream_retry_delay(attempt);
+                            tracing::warn!(
+                                target = "amms::aerodrome_slipstream::init_batch",
+                                attempt,
+                                max_attempts = SLIPSTREAM_BATCH_RETRY_ATTEMPTS,
+                                error = ?e,
+                                "Strict fee-context batch call failed, retrying"
+                            );
+                            sleep(delay).await;
+                            attempt = attempt.saturating_add(1);
+                        }
+                        Err(e) => break Err(e.into()),
+                    }
+                }
+            }));
+
+            // Preserve chunk-level throttling to avoid exceeding upstream RPC RPS limits.
+            sleep(Duration::from_millis(SLIPSTREAM_INTER_BATCH_SLEEP_MS)).await;
+
+            if futures.len() >= max_in_flight {
+                if let Some(res) = futures.next().await {
+                    let (addresses, return_data) = res.map_err(|e| {
+                        AMMError::Msg(format!(
+                            "strict fee-context batch failed after retries: {}",
+                            e
+                        ))
+                    })?;
+                    let decoded = FeeConfigDataArray::abi_decode(&return_data).map_err(|e| {
+                        AMMError::Msg(format!(
+                            "strict fee-context decode failed: {}, return_data_len={}",
+                            e,
+                            return_data.len()
+                        ))
+                    })?;
+                    if decoded.len() != addresses.len() {
+                        return Err(AMMError::Msg(format!(
+                            "strict fee-context decode length mismatch: expected {}, got {}",
+                            addresses.len(),
+                            decoded.len()
+                        )));
+                    }
+
+                    for (pool_addr, fcd) in addresses.into_iter().zip(decoded.into_iter()) {
+                        let Some(pool_idx) = pool_index.get(&pool_addr).copied() else {
+                            return Err(AMMError::Msg(format!(
+                                "pool index missing during fee-context init: {}",
+                                pool_addr
+                            )));
+                        };
+                        let AMM::AerodromeSlipstreamPool(ref mut p) = pools[pool_idx] else {
+                            continue;
+                        };
+
+                        if !fcd.2 {
+                            return Err(AMMError::Msg(format!(
+                                "strict fee-context fetch failed: factory call failed for pool {}",
+                                p.address
+                            )));
+                        }
+                        if fcd.0 == Address::ZERO {
+                            return Err(AMMError::Msg(format!(
+                                "strict fee-context fetch failed: factory is zero for pool {}",
+                                p.address
+                            )));
+                        }
+                        if !fcd.3 || fcd.7.as_i32() == 0 {
+                            return Err(AMMError::Msg(format!(
+                                "strict fee-context fetch failed: invalid tick_spacing {} for pool {}",
+                                fcd.7.as_i32(),
+                                p.address
+                            )));
+                        }
+                        if !fcd.4 || fcd.8.to::<u32>() == 0 {
+                            return Err(AMMError::Msg(format!(
+                                "strict fee-context fetch failed: tickSpacingToFee returned 0 for pool {}",
+                                p.address
+                            )));
+                        }
+                        if !fcd.5 {
+                            return Err(AMMError::Msg(format!(
+                                "strict fee-context fetch failed: swapFeeModule call failed for pool {}",
+                                p.address
+                            )));
+                        }
+
+                        p.tick_spacing = fcd.7.as_i32();
+                        p.factory_tick_spacing_fee = fcd.8.to::<u32>();
+                        p.dynamic_fee_config = DynamicFeeConfig::default();
+
+                        let fee_module = fcd.1;
+                        if fee_module != Address::ZERO {
+                            if !fcd.6 {
+                                return Err(AMMError::Msg(format!(
+                                    "strict fee-context fetch failed: dynamicFeeConfig call failed for pool {}",
+                                    p.address
+                                )));
+                            }
+                            p.dynamic_fee_config = DynamicFeeConfig {
+                                base_fee: fcd.9.to::<u32>(),
+                                fee_cap: fcd.10.to::<u32>(),
+                                scaling_factor: fcd.11,
+                                initial_fee_enabled: fcd.12,
+                                initial_fee: fcd.13.to::<u32>(),
+                            };
+                        }
+
+                        if p.dynamic_fee_config.base_fee == 0 && p.factory_tick_spacing_fee == 0 {
+                            return Err(AMMError::Msg(format!(
+                                "strict fee-context fetch failed: base_fee=0 and tickSpacingToFee=0 for pool {}",
+                                p.address
+                            )));
+                        }
+                    }
+
+                    sleep(Duration::from_millis(2)).await;
+                }
+            }
+        }
+
+        while let Some(res) = futures.next().await {
+            let (addresses, return_data) = res.map_err(|e| {
+                AMMError::Msg(format!(
+                    "strict fee-context batch failed after retries: {}",
+                    e
+                ))
+            })?;
+            let decoded = FeeConfigDataArray::abi_decode(&return_data).map_err(|e| {
+                AMMError::Msg(format!(
+                    "strict fee-context decode failed: {}, return_data_len={}",
+                    e,
+                    return_data.len()
+                ))
+            })?;
+            if decoded.len() != addresses.len() {
+                return Err(AMMError::Msg(format!(
+                    "strict fee-context decode length mismatch: expected {}, got {}",
+                    addresses.len(),
+                    decoded.len()
+                )));
+            }
+
+            for (pool_addr, fcd) in addresses.into_iter().zip(decoded.into_iter()) {
+                let Some(pool_idx) = pool_index.get(&pool_addr).copied() else {
+                    return Err(AMMError::Msg(format!(
+                        "pool index missing during fee-context init: {}",
+                        pool_addr
+                    )));
+                };
+                let AMM::AerodromeSlipstreamPool(ref mut p) = pools[pool_idx] else {
+                    continue;
+                };
+
+                if !fcd.2 {
+                    return Err(AMMError::Msg(format!(
+                        "strict fee-context fetch failed: factory call failed for pool {}",
+                        p.address
+                    )));
+                }
+                if fcd.0 == Address::ZERO {
+                    return Err(AMMError::Msg(format!(
+                        "strict fee-context fetch failed: factory is zero for pool {}",
+                        p.address
+                    )));
+                }
+                if !fcd.3 || fcd.7.as_i32() == 0 {
+                    return Err(AMMError::Msg(format!(
+                        "strict fee-context fetch failed: invalid tick_spacing {} for pool {}",
+                        fcd.7.as_i32(),
+                        p.address
+                    )));
+                }
+                if !fcd.4 || fcd.8.to::<u32>() == 0 {
+                    return Err(AMMError::Msg(format!(
+                        "strict fee-context fetch failed: tickSpacingToFee returned 0 for pool {}",
+                        p.address
+                    )));
+                }
+                if !fcd.5 {
+                    return Err(AMMError::Msg(format!(
+                        "strict fee-context fetch failed: swapFeeModule call failed for pool {}",
+                        p.address
+                    )));
+                }
+
+                p.tick_spacing = fcd.7.as_i32();
+                p.factory_tick_spacing_fee = fcd.8.to::<u32>();
+                p.dynamic_fee_config = DynamicFeeConfig::default();
+
+                let fee_module = fcd.1;
+                if fee_module != Address::ZERO {
+                    if !fcd.6 {
+                        return Err(AMMError::Msg(format!(
+                            "strict fee-context fetch failed: dynamicFeeConfig call failed for pool {}",
+                            p.address
+                        )));
+                    }
+                    p.dynamic_fee_config = DynamicFeeConfig {
+                        base_fee: fcd.9.to::<u32>(),
+                        fee_cap: fcd.10.to::<u32>(),
+                        scaling_factor: fcd.11,
+                        initial_fee_enabled: fcd.12,
+                        initial_fee: fcd.13.to::<u32>(),
+                    };
+                }
+
+                if p.dynamic_fee_config.base_fee == 0 && p.factory_tick_spacing_fee == 0 {
+                    return Err(AMMError::Msg(format!(
+                        "strict fee-context fetch failed: base_fee=0 and tickSpacingToFee=0 for pool {}",
+                        p.address
+                    )));
+                }
+            }
+
+            sleep(Duration::from_millis(2)).await;
+        }
+
+        Ok(())
+    }
+
     /// Batch sync tick bitmaps using the same batch contract as UniswapV3.
     /// Aerodrome Slipstream tickBitmap interface is ABI-compatible with UniswapV3.
     pub async fn sync_tick_bitmaps<N, P>(
@@ -2394,112 +2655,7 @@ impl AerodromeSlipstreamFactory {
 
         // Strict fee-context fetch for every pool.
         // Requirement: init/batch_init must fail immediately on partial retrieval failures.
-        {
-            let addr_to_idx: HashMap<Address, usize> = amms
-                .iter()
-                .enumerate()
-                .map(|(idx, amm)| (amm.address(), idx))
-                .collect();
-
-            for chunk in pool_addrs.chunks(SLIPSTREAM_FEE_CONFIG_BATCH_STEP) {
-                for &pool_addr in chunk {
-                    let Some(&amm_idx) = addr_to_idx.get(&pool_addr) else {
-                        return Err(AMMError::Msg(format!(
-                            "pool index missing during fee-context init: {}",
-                            pool_addr
-                        )));
-                    };
-                    let AMM::AerodromeSlipstreamPool(ref mut p) = amms[amm_idx] else {
-                        continue;
-                    };
-
-                    let fact = ICLPool::new(p.address, provider.clone())
-                        .factory()
-                        .block(block_number)
-                        .call()
-                        .await
-                        .map_err(|e| {
-                            AMMError::Msg(format!(
-                                "strict fee-context fetch failed: factory call failed for pool {}: {:?}",
-                                p.address, e
-                            ))
-                        })?;
-                    if fact == Address::ZERO {
-                        return Err(AMMError::Msg(format!(
-                            "strict fee-context fetch failed: factory is zero for pool {}",
-                            p.address
-                        )));
-                    }
-
-                    let ts_i24 = Signed::<24, 1>::try_from(p.tick_spacing).map_err(|_| {
-                        AMMError::Msg(format!(
-                            "strict fee-context fetch failed: invalid tick_spacing {} for pool {}",
-                            p.tick_spacing, p.address
-                        ))
-                    })?;
-                    let ts_fee = ICLPoolFactory::new(fact, provider.clone())
-                        .tickSpacingToFee(ts_i24)
-                        .block(block_number)
-                        .call()
-                        .await
-                        .map_err(|e| {
-                            AMMError::Msg(format!(
-                                "strict fee-context fetch failed: tickSpacingToFee call failed for pool {}: {:?}",
-                                p.address, e
-                            ))
-                        })?
-                        .to::<u32>();
-                    if ts_fee == 0 {
-                        return Err(AMMError::Msg(format!(
-                            "strict fee-context fetch failed: tickSpacingToFee returned 0 for pool {}",
-                            p.address
-                        )));
-                    }
-                    p.factory_tick_spacing_fee = ts_fee;
-
-                    let fm = ICLPoolFactory::new(fact, provider.clone())
-                        .swapFeeModule()
-                        .block(block_number)
-                        .call()
-                        .await
-                        .map_err(|e| {
-                            AMMError::Msg(format!(
-                                "strict fee-context fetch failed: swapFeeModule call failed for pool {}: {:?}",
-                                p.address, e
-                            ))
-                        })?;
-                    if fm != Address::ZERO {
-                        let dfc = IDynamicFeeModuleReader::new(fm, provider.clone())
-                            .dynamicFeeConfig(p.address)
-                            .block(block_number)
-                            .call()
-                            .await
-                            .map_err(|e| {
-                                AMMError::Msg(format!(
-                                    "strict fee-context fetch failed: dynamicFeeConfig call failed for pool {}: {:?}",
-                                    p.address, e
-                                ))
-                            })?;
-                        p.dynamic_fee_config = DynamicFeeConfig {
-                            base_fee: dfc.baseFee.to::<u32>(),
-                            fee_cap: dfc.feeCap.to::<u32>(),
-                            scaling_factor: dfc.scalingFactor,
-                            initial_fee_enabled: dfc.initialFeeEnabled,
-                            initial_fee: dfc.initialFee.to::<u32>(),
-                        };
-                    }
-
-                    if p.dynamic_fee_config.base_fee == 0 && p.factory_tick_spacing_fee == 0 {
-                        return Err(AMMError::Msg(format!(
-                            "strict fee-context fetch failed: base_fee=0 and tickSpacingToFee=0 for pool {}",
-                            p.address
-                        )));
-                    }
-                }
-
-                sleep(Duration::from_millis(SLIPSTREAM_INTER_BATCH_SLEEP_MS)).await;
-            }
-        }
+        Self::sync_fee_context_batch_strict(&mut amms, block_number, provider.clone()).await?;
         // Multicall3: batch observations(i) for all pools.
         // Split by total observation calls, not pool count, because high-cardinality pools can
         // exceed Base RPC gas limits even in very small pool groups.
