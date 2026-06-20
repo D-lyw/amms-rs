@@ -211,11 +211,20 @@ fn log_realtime_update_applied(meta: RealtimeUpdateMeta, affected_pools: usize, 
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum AppliedLogPosition {
+    // Prefer the log's own stable position when present:
+    // - canonical get_logs: block-global log_index
+    // - Base pendingLogs: provider-supplied log_index
+    // - flashblocks extractors: synthesized per-tx receipt log index
+    LogIndex(u64),
+    // Fallback only for sources that truly do not expose log_index.
+    TxOrdinal(u32),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct AppliedLogKey {
     tx_hash: Option<alloy::primitives::B256>,
-    // Canonical get_logs uses block-global log_index, while Flashblocks carries
-    // receipt-local log order. We normalize to tx-local ordinal in apply path.
-    tx_log_ordinal: u32,
+    position: AppliedLogPosition,
     address: Address,
     topic0: Option<FixedBytes<32>>,
 }
@@ -826,19 +835,20 @@ impl<N, P> StateSpaceManager<N, P> {
             let mut kept = Vec::with_capacity(logs.len());
 
             for log in logs {
-                let tx_log_ordinal = match log.transaction_hash {
-                    Some(tx_hash) => {
-                        let entry = per_tx_ordinal.entry(tx_hash).or_insert(0);
-                        let ordinal = *entry;
-                        *entry = entry.saturating_add(1);
-                        ordinal
-                    }
-                    None => log.log_index.unwrap_or_default().min(u32::MAX as u64) as u32,
+                let position = if let Some(log_index) = log.log_index {
+                    AppliedLogPosition::LogIndex(log_index)
+                } else if let Some(tx_hash) = log.transaction_hash {
+                    let entry = per_tx_ordinal.entry(tx_hash).or_insert(0);
+                    let ordinal = *entry;
+                    *entry = entry.saturating_add(1);
+                    AppliedLogPosition::TxOrdinal(ordinal)
+                } else {
+                    AppliedLogPosition::TxOrdinal(0)
                 };
 
                 let key = AppliedLogKey {
                     tx_hash: log.transaction_hash,
-                    tx_log_ordinal,
+                    position,
                     address: log.address(),
                     topic0: log.topics().first().copied(),
                 };
@@ -2199,6 +2209,28 @@ mod tests {
         assert!(state
             .resolve_algebra_plugin_event_pools(plugin, &topics)
             .is_empty());
+    }
+
+    #[test]
+    fn applied_log_dedup_keeps_same_tx_same_topic_when_log_index_differs() {
+        let tx_hash = alloy::primitives::B256::from([0x11u8; 32]);
+        let address = address!("3333333333333333333333333333333333333333");
+        let topic0 = FixedBytes::<32>::from([0x22u8; 32]);
+        let mut dedup = AppliedLogDedupCache::default();
+
+        assert!(dedup.insert_if_new(AppliedLogKey {
+            tx_hash: Some(tx_hash),
+            position: AppliedLogPosition::LogIndex(7),
+            address,
+            topic0: Some(topic0),
+        }));
+
+        assert!(dedup.insert_if_new(AppliedLogKey {
+            tx_hash: Some(tx_hash),
+            position: AppliedLogPosition::LogIndex(8),
+            address,
+            topic0: Some(topic0),
+        }));
     }
 
     #[test]
