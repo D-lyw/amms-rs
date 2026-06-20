@@ -508,6 +508,8 @@ impl<N, P> StateSpaceManager<N, P> {
     ///
     /// Note: Base `pendingLogs` also requires explicit realtime WebSocket
     /// endpoints via `StateSpaceBuilder::with_realtime_ws_endpoints(...)`.
+    /// These endpoints must support Base flashblock-related subscription
+    /// methods, specifically `eth_subscribe` with `pendingLogs`.
     pub async fn subscribe(
         &self,
     ) -> Result<
@@ -558,7 +560,7 @@ impl<N, P> StateSpaceManager<N, P> {
         let base_ws_candidates = if matches!(selected, SelectedRealtimeSource::BasePendingLogs) {
             Some(self.realtime_ws_endpoints.clone().ok_or_else(|| {
                 StateSpaceError::from(AMMError::Msg(
-                    "Base pendingLogs realtime source requires explicit websocket endpoints. Use StateSpaceBuilder::with_realtime_ws_endpoints(vec![\"wss://...\".into(), ...]).".to_string(),
+                    "Base pendingLogs realtime source requires explicit websocket endpoints that support Base flashblock-related subscription methods (specifically `eth_subscribe` with `pendingLogs`). Use StateSpaceBuilder::with_realtime_ws_endpoints(vec![\"wss://...\".into(), ...]).".to_string(),
                 ))
             })?)
         } else {
@@ -1447,6 +1449,11 @@ where
     ///
     /// This is currently required for Base `pendingLogs`, because that
     /// subscription does not reuse the passed `Provider` transport session.
+    /// The provided endpoints must support Base flashblock-related
+    /// subscription methods, specifically `eth_subscribe` with `pendingLogs`.
+    ///
+    /// It is safe for downstream applications to always call this builder
+    /// method; non-Base realtime paths currently ignore these endpoints.
     /// Empty / blank entries are ignored.
     pub fn with_realtime_ws_endpoints(
         self,

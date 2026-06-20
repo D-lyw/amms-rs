@@ -30,6 +30,10 @@ use tracing::{error, info, warn};
 // `StateSpaceBuilder::with_realtime_ws_endpoints(...)`, while the passed
 // `Provider` continues to serve regular RPC duties such as initial sync,
 // backfill, head tracking, and async/resync refreshes.
+//
+// Important: these endpoints are not just arbitrary chain RPC WebSockets.
+// They must support the Base flashblock-related subscription capability used
+// here: `eth_subscribe` with `pendingLogs`.
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct PendingLogDedupKey {
