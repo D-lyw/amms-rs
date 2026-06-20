@@ -34,7 +34,7 @@ use alloy::consensus::BlockHeader;
 use alloy::eips::BlockId;
 use alloy::network::Network;
 
-use alloy::primitives::{Address, Bloom, BloomInput, FixedBytes};
+use alloy::primitives::{keccak256, Address, Bloom, BloomInput, FixedBytes, B256};
 use alloy::providers::Provider;
 use alloy::rpc::types::{eth::Log, Filter, FilterSet};
 use alloy::sol;
@@ -211,22 +211,64 @@ fn log_realtime_update_applied(meta: RealtimeUpdateMeta, affected_pools: usize, 
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum AppliedLogPosition {
+pub(super) enum AppliedLogPosition {
     // Prefer the log's own stable position when present:
     // - canonical get_logs: block-global log_index
     // - Base pendingLogs: provider-supplied log_index
     // - flashblocks extractors: synthesized per-tx receipt log index
     LogIndex(u64),
-    // Fallback only for sources that truly do not expose log_index.
-    TxOrdinal(u32),
+    // Fallback for sources that do not expose log_index.
+    // We fingerprint the full event payload so singleton log delivery
+    // (like Base pendingLogs) does not collapse distinct logs that
+    // happen to share tx_hash/address/topic0.
+    ContentHash(B256),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct AppliedLogKey {
+pub(super) struct AppliedLogKey {
     tx_hash: Option<alloy::primitives::B256>,
+    block_number: Option<u64>,
     position: AppliedLogPosition,
     address: Address,
     topic0: Option<FixedBytes<32>>,
+}
+
+pub(super) fn build_log_content_hash(log: &Log) -> B256 {
+    let mut bytes = Vec::with_capacity(32 * (log.topics().len() + 2) + log.data().data.len());
+    bytes.extend_from_slice(log.address().as_slice());
+
+    match log.transaction_hash {
+        Some(tx_hash) => {
+            bytes.push(1);
+            bytes.extend_from_slice(tx_hash.as_slice());
+        }
+        None => bytes.push(0),
+    }
+
+    bytes.extend_from_slice(&log.block_number.unwrap_or_default().to_be_bytes());
+    bytes.extend_from_slice(&log.transaction_index.unwrap_or_default().to_be_bytes());
+    bytes.extend_from_slice(&(log.topics().len() as u64).to_be_bytes());
+    for topic in log.topics() {
+        bytes.extend_from_slice(topic.as_slice());
+    }
+    bytes.extend_from_slice(log.data().data.as_ref());
+    keccak256(bytes)
+}
+
+pub(super) fn build_applied_log_key(log: &Log) -> AppliedLogKey {
+    let position = if let Some(log_index) = log.log_index {
+        AppliedLogPosition::LogIndex(log_index)
+    } else {
+        AppliedLogPosition::ContentHash(build_log_content_hash(log))
+    };
+
+    AppliedLogKey {
+        tx_hash: log.transaction_hash,
+        block_number: log.block_number,
+        position,
+        address: log.address(),
+        topic0: log.topics().first().copied(),
+    }
 }
 
 #[derive(Default)]
@@ -831,29 +873,10 @@ impl<N, P> StateSpaceManager<N, P> {
 
         logs = {
             let mut dedup = applied_log_dedup.lock().await;
-            let mut per_tx_ordinal: HashMap<alloy::primitives::B256, u32> = HashMap::new();
             let mut kept = Vec::with_capacity(logs.len());
 
             for log in logs {
-                let position = if let Some(log_index) = log.log_index {
-                    AppliedLogPosition::LogIndex(log_index)
-                } else if let Some(tx_hash) = log.transaction_hash {
-                    let entry = per_tx_ordinal.entry(tx_hash).or_insert(0);
-                    let ordinal = *entry;
-                    *entry = entry.saturating_add(1);
-                    AppliedLogPosition::TxOrdinal(ordinal)
-                } else {
-                    AppliedLogPosition::TxOrdinal(0)
-                };
-
-                let key = AppliedLogKey {
-                    tx_hash: log.transaction_hash,
-                    position,
-                    address: log.address(),
-                    topic0: log.topics().first().copied(),
-                };
-
-                if dedup.insert_if_new(key) {
+                if dedup.insert_if_new(build_applied_log_key(&log)) {
                     kept.push(log);
                 }
             }
@@ -1465,10 +1488,7 @@ where
     /// It is safe for downstream applications to always call this builder
     /// method; non-Base realtime paths currently ignore these endpoints.
     /// Empty / blank entries are ignored.
-    pub fn with_realtime_ws_endpoints(
-        self,
-        endpoints: Vec<String>,
-    ) -> StateSpaceBuilder<N, P> {
+    pub fn with_realtime_ws_endpoints(self, endpoints: Vec<String>) -> StateSpaceBuilder<N, P> {
         let mut normalized = Vec::new();
         for endpoint in endpoints {
             let trimmed = endpoint.trim();
@@ -2070,7 +2090,7 @@ impl From<StateSpace> for SerializableStateSpace {
 mod tests {
     use super::*;
     use crate::amms::{algebra_integral::AlgebraIntegralPool, uniswap_v2::UniswapV2Pool};
-    use alloy::primitives::{address, FixedBytes};
+    use alloy::primitives::{address, Bytes, FixedBytes, LogData};
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
 
@@ -2078,6 +2098,31 @@ mod tests {
         let mut amm = AMM::UniswapV2Pool(UniswapV2Pool::new(pool_address));
         amm.set_last_synced_block(last_synced_block);
         amm
+    }
+
+    fn make_test_log(
+        tx_hash: Option<B256>,
+        log_index: Option<u64>,
+        topics: Vec<FixedBytes<32>>,
+        data: Vec<u8>,
+    ) -> Log {
+        let Some(log_data) = LogData::new(topics, Bytes::from(data)) else {
+            panic!("failed to build test log data");
+        };
+
+        Log {
+            inner: alloy::primitives::Log {
+                address: address!("3333333333333333333333333333333333333333"),
+                data: log_data,
+            },
+            block_hash: None,
+            block_number: Some(123),
+            block_timestamp: Some(1),
+            transaction_hash: tx_hash,
+            transaction_index: Some(0),
+            log_index,
+            removed: false,
+        }
     }
 
     #[test]
@@ -2220,6 +2265,7 @@ mod tests {
 
         assert!(dedup.insert_if_new(AppliedLogKey {
             tx_hash: Some(tx_hash),
+            block_number: Some(123),
             position: AppliedLogPosition::LogIndex(7),
             address,
             topic0: Some(topic0),
@@ -2227,10 +2273,49 @@ mod tests {
 
         assert!(dedup.insert_if_new(AppliedLogKey {
             tx_hash: Some(tx_hash),
+            block_number: Some(123),
             position: AppliedLogPosition::LogIndex(8),
             address,
             topic0: Some(topic0),
         }));
+    }
+
+    #[test]
+    fn applied_log_dedup_keeps_distinct_missing_log_index_events_in_same_tx() {
+        let tx_hash = alloy::primitives::B256::from([0x44u8; 32]);
+        let topic0 = FixedBytes::<32>::from([0x55u8; 32]);
+        let log_a = make_test_log(
+            Some(tx_hash),
+            None,
+            vec![topic0, FixedBytes::<32>::from([0x01u8; 32])],
+            vec![0xaa],
+        );
+        let log_b = make_test_log(
+            Some(tx_hash),
+            None,
+            vec![topic0, FixedBytes::<32>::from([0x02u8; 32])],
+            vec![0xaa],
+        );
+        let mut dedup = AppliedLogDedupCache::default();
+
+        assert!(dedup.insert_if_new(build_applied_log_key(&log_a)));
+        assert!(dedup.insert_if_new(build_applied_log_key(&log_b)));
+    }
+
+    #[test]
+    fn applied_log_dedup_drops_identical_missing_log_index_duplicates() {
+        let tx_hash = alloy::primitives::B256::from([0x66u8; 32]);
+        let topic0 = FixedBytes::<32>::from([0x77u8; 32]);
+        let log = make_test_log(
+            Some(tx_hash),
+            None,
+            vec![topic0, FixedBytes::<32>::from([0x03u8; 32])],
+            vec![0xde, 0xad],
+        );
+        let mut dedup = AppliedLogDedupCache::default();
+
+        assert!(dedup.insert_if_new(build_applied_log_key(&log)));
+        assert!(!dedup.insert_if_new(build_applied_log_key(&log)));
     }
 
     #[test]

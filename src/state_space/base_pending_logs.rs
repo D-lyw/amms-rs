@@ -1,6 +1,6 @@
 use super::{
-    AppliedLogDedupCache, HookRegistry, LogQueryChunk, LogSource, PendingSyncQueue,
-    StateSpace, StateSpaceError, StateSpaceManager,
+    build_applied_log_key, AppliedLogDedupCache, AppliedLogKey, HookRegistry, LogQueryChunk,
+    LogSource, PendingSyncQueue, StateSpace, StateSpaceError, StateSpaceManager,
 };
 use crate::state_space::{BASE_CHAIN_ID, STREAM_IDLE_TIMEOUT, STREAM_RECONNECT_DELAY};
 use alloy::network::Network;
@@ -35,22 +35,14 @@ use tracing::{error, info, warn};
 // They must support the Base flashblock-related subscription capability used
 // here: `eth_subscribe` with `pendingLogs`.
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct PendingLogDedupKey {
-    tx_hash: Option<alloy::primitives::B256>,
-    log_index: u64,
-    address: Address,
-    topic0: Option<alloy::primitives::FixedBytes<32>>,
-}
-
 #[derive(Default)]
 struct PendingLogDedupCache {
-    seen: HashSet<PendingLogDedupKey>,
-    order: std::collections::VecDeque<PendingLogDedupKey>,
+    seen: HashSet<AppliedLogKey>,
+    order: std::collections::VecDeque<AppliedLogKey>,
 }
 
 impl PendingLogDedupCache {
-    fn insert_if_new(&mut self, key: PendingLogDedupKey) -> bool {
+    fn insert_if_new(&mut self, key: AppliedLogKey) -> bool {
         if self.seen.contains(&key) {
             return false;
         }
@@ -378,12 +370,7 @@ impl<N, P> StateSpaceManager<N, P> {
                     // especially when shared infra contracts are involved.
                     // Dedup here prevents duplicated downstream sync work
                     // before logs reach the global applied-log dedup layer.
-                    let prededup_key = PendingLogDedupKey {
-                        tx_hash: log.transaction_hash,
-                        log_index: log.log_index.unwrap_or_default(),
-                        address: log.address(),
-                        topic0: log.topics().first().copied(),
-                    };
+                    let prededup_key = build_applied_log_key(&log);
                     if !pending_log_dedup.insert_if_new(prededup_key) {
                         continue;
                     }
