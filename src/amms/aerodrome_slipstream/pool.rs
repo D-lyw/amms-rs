@@ -270,7 +270,7 @@ pub struct AerodromeSlipstreamPool {
 }
 
 /// Tick information for concentrated liquidity
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TickInfo {
     /// Total liquidity at this tick
     pub liquidity_gross: u128,
@@ -761,26 +761,31 @@ impl AutomatedMarketMaker for AerodromeSlipstreamPool {
             }
             ICLPoolEvents::Mint::SIGNATURE_HASH => {
                 let mint_event = ICLPoolEvents::Mint::decode_log(log.as_ref())?;
-                if mint_event.amount != 0 {
-                    let tl: i32 = mint_event.tickLower.unchecked_into();
-                    let tu: i32 = mint_event.tickUpper.unchecked_into();
-                    let nb =
-                        log.block_number.unwrap_or(0) > self.observations_cache.last_write_block;
-                    if self.tick >= tl && self.tick < tu && nb {
-                        if let Some(bt) = log.block_timestamp {
-                            self.observations_cache.write(
-                                bt as u32,
-                                self.tick,
-                                log.block_number.unwrap_or(0),
-                            );
-                        }
+                let tl: i32 = mint_event.tickLower.unchecked_into();
+                let tu: i32 = mint_event.tickUpper.unchecked_into();
+                let should_write_observation = mint_event.amount != 0
+                    && log.block_number.unwrap_or(0) > self.observations_cache.last_write_block
+                    && self.tick >= tl
+                    && self.tick < tu;
+                if let Err(e) = self.modify_position(tl, tu, mint_event.amount as i128) {
+                    tracing::warn!(
+                        target: "amms::aerodrome_slipstream::sync",
+                        address = ?self.address,
+                        block_number = ?log.block_number,
+                        error = %e,
+                        "Mint position update failed, scheduling resync"
+                    );
+                    return Ok(SyncAction::Resync);
+                }
+                if should_write_observation {
+                    if let Some(bt) = log.block_timestamp {
+                        self.observations_cache.write(
+                            bt as u32,
+                            self.tick,
+                            log.block_number.unwrap_or(0),
+                        );
                     }
                 }
-                self.modify_position(
-                    mint_event.tickLower.unchecked_into(),
-                    mint_event.tickUpper.unchecked_into(),
-                    mint_event.amount as i128,
-                )?;
                 if let Some(bt) = log.block_timestamp {
                     self.fee = self.compute_fee(bt as u32);
                 }
@@ -798,26 +803,31 @@ impl AutomatedMarketMaker for AerodromeSlipstreamPool {
             }
             ICLPoolEvents::Burn::SIGNATURE_HASH => {
                 let burn_event = ICLPoolEvents::Burn::decode_log(log.as_ref())?;
-                if burn_event.amount != 0 {
-                    let tl: i32 = burn_event.tickLower.unchecked_into();
-                    let tu: i32 = burn_event.tickUpper.unchecked_into();
-                    let nb =
-                        log.block_number.unwrap_or(0) > self.observations_cache.last_write_block;
-                    if self.tick >= tl && self.tick < tu && nb {
-                        if let Some(bt) = log.block_timestamp {
-                            self.observations_cache.write(
-                                bt as u32,
-                                self.tick,
-                                log.block_number.unwrap_or(0),
-                            );
-                        }
+                let tl: i32 = burn_event.tickLower.unchecked_into();
+                let tu: i32 = burn_event.tickUpper.unchecked_into();
+                let should_write_observation = burn_event.amount != 0
+                    && log.block_number.unwrap_or(0) > self.observations_cache.last_write_block
+                    && self.tick >= tl
+                    && self.tick < tu;
+                if let Err(e) = self.modify_position(tl, tu, -(burn_event.amount as i128)) {
+                    tracing::warn!(
+                        target: "amms::aerodrome_slipstream::sync",
+                        address = ?self.address,
+                        block_number = ?log.block_number,
+                        error = %e,
+                        "Burn position update failed, scheduling resync"
+                    );
+                    return Ok(SyncAction::Resync);
+                }
+                if should_write_observation {
+                    if let Some(bt) = log.block_timestamp {
+                        self.observations_cache.write(
+                            bt as u32,
+                            self.tick,
+                            log.block_number.unwrap_or(0),
+                        );
                     }
                 }
-                self.modify_position(
-                    burn_event.tickLower.unchecked_into(),
-                    burn_event.tickUpper.unchecked_into(),
-                    -(burn_event.amount as i128),
-                )?;
                 if let Some(bt) = log.block_timestamp {
                     self.fee = self.compute_fee(bt as u32);
                 }
@@ -1612,6 +1622,45 @@ impl AutomatedMarketMaker for AerodromeSlipstreamPool {
 // ============================================================================
 
 impl AerodromeSlipstreamPool {
+    fn preview_tick_update(
+        &self,
+        tick: i32,
+        liquidity_delta: i128,
+        upper: bool,
+    ) -> Result<(TickInfo, bool), AMMError> {
+        let mut info = self.ticks.get(&tick).cloned().unwrap_or_default();
+        let liquidity_gross_before = info.liquidity_gross;
+
+        let liquidity_gross_after = if liquidity_delta < 0 {
+            liquidity_gross_before
+                .checked_sub((-liquidity_delta) as u128)
+                .ok_or(AMMError::ArithmeticError)?
+        } else {
+            liquidity_gross_before
+                .checked_add(liquidity_delta as u128)
+                .ok_or(AMMError::ArithmeticError)?
+        };
+
+        let flipped = (liquidity_gross_after == 0) != (liquidity_gross_before == 0);
+
+        if liquidity_gross_before == 0 {
+            info.initialized = true;
+        }
+
+        info.liquidity_gross = liquidity_gross_after;
+        info.liquidity_net = if upper {
+            info.liquidity_net
+                .checked_sub(liquidity_delta)
+                .ok_or(AMMError::ArithmeticError)?
+        } else {
+            info.liquidity_net
+                .checked_add(liquidity_delta)
+                .ok_or(AMMError::ArithmeticError)?
+        };
+
+        Ok((info, flipped))
+    }
+
     /// Modifies a position's liquidity in the pool
     pub fn modify_position(
         &mut self,
@@ -1624,9 +1673,13 @@ impl AerodromeSlipstreamPool {
         if liquidity_delta != 0 {
             if self.tick >= tick_lower && self.tick < tick_upper {
                 self.liquidity = if liquidity_delta < 0 {
-                    self.liquidity.saturating_sub((-liquidity_delta) as u128)
+                    self.liquidity
+                        .checked_sub((-liquidity_delta) as u128)
+                        .ok_or(AMMError::ArithmeticError)?
                 } else {
-                    self.liquidity.saturating_add(liquidity_delta as u128)
+                    self.liquidity
+                        .checked_add(liquidity_delta as u128)
+                        .ok_or(AMMError::ArithmeticError)?
                 };
             }
         }
@@ -1640,63 +1693,41 @@ impl AerodromeSlipstreamPool {
         tick_upper: i32,
         liquidity_delta: i128,
     ) -> Result<(), AMMError> {
-        let mut flipped_lower = false;
-        let mut flipped_upper = false;
-
         if liquidity_delta != 0 {
-            flipped_lower = self.update_tick(tick_lower, liquidity_delta, false)?;
-            flipped_upper = self.update_tick(tick_upper, liquidity_delta, true)?;
-            if flipped_lower {
-                self.flip_tick(tick_lower, self.tick_spacing, liquidity_delta > 0);
-            }
-            if flipped_upper {
-                self.flip_tick(tick_upper, self.tick_spacing, liquidity_delta > 0);
-            }
-        }
+            let (lower_info, flipped_lower) =
+                self.preview_tick_update(tick_lower, liquidity_delta, false)?;
+            let (upper_info, flipped_upper) =
+                self.preview_tick_update(tick_upper, liquidity_delta, true)?;
 
-        if liquidity_delta < 0 {
-            if flipped_lower {
+            if lower_info.liquidity_gross == 0 {
                 self.ticks.remove(&tick_lower);
+            } else {
+                self.ticks.insert(tick_lower, lower_info);
+            }
+
+            if upper_info.liquidity_gross == 0 {
+                self.ticks.remove(&tick_upper);
+            } else {
+                self.ticks.insert(tick_upper, upper_info);
+            }
+
+            if flipped_lower {
+                self.flip_tick(
+                    tick_lower,
+                    self.tick_spacing,
+                    self.ticks.contains_key(&tick_lower),
+                );
             }
             if flipped_upper {
-                self.ticks.remove(&tick_upper);
+                self.flip_tick(
+                    tick_upper,
+                    self.tick_spacing,
+                    self.ticks.contains_key(&tick_upper),
+                );
             }
         }
 
         Ok(())
-    }
-
-    fn update_tick(
-        &mut self,
-        tick: i32,
-        liquidity_delta: i128,
-        upper: bool,
-    ) -> Result<bool, AMMError> {
-        let info = self.ticks.entry(tick).or_default();
-
-        let liquidity_gross_before = info.liquidity_gross;
-
-        let liquidity_gross_after = if liquidity_delta < 0 {
-            liquidity_gross_before.saturating_sub((-liquidity_delta) as u128)
-        } else {
-            liquidity_gross_before.saturating_add(liquidity_delta as u128)
-        };
-
-        let flipped = (liquidity_gross_after == 0) != (liquidity_gross_before == 0);
-
-        if liquidity_gross_before == 0 {
-            info.initialized = true;
-        }
-
-        info.liquidity_gross = liquidity_gross_after;
-
-        info.liquidity_net = if upper {
-            info.liquidity_net - liquidity_delta
-        } else {
-            info.liquidity_net + liquidity_delta
-        };
-
-        Ok(flipped)
     }
 
     /// Compress a tick by dividing by tick spacing
@@ -1792,46 +1823,58 @@ impl AerodromeSlipstreamFactory {
                 .collect::<Vec<_>>();
 
             futures.push(async move {
-                Ok::<(&mut [AMM], alloy::primitives::Bytes), AMMError>((
-                    group,
-                    GetAerodromeSlipstreamSlot0BatchRequest::deploy_builder(
-                        provider,
-                        pool_addresses,
+                let mut attempt = 1u8;
+                loop {
+                    match GetAerodromeSlipstreamSlot0BatchRequest::deploy_builder(
+                        provider.clone(),
+                        pool_addresses.clone(),
                     )
                     .call_raw()
                     .block(block_number)
-                    .await?,
-                ))
+                    .await
+                    {
+                        Ok(return_data) => {
+                            break Ok::<(&mut [AMM], alloy::primitives::Bytes), AMMError>((
+                                group,
+                                return_data,
+                            ));
+                        }
+                        Err(e) if attempt < SLIPSTREAM_BATCH_RETRY_ATTEMPTS => {
+                            let delay = slipstream_retry_delay(attempt);
+                            tracing::warn!(
+                                target = "amms::aerodrome_slipstream::sync_slot_0",
+                                attempt,
+                                max_attempts = SLIPSTREAM_BATCH_RETRY_ATTEMPTS,
+                                error = ?e,
+                                "Batch slot0 call failed, retrying"
+                            );
+                            sleep(delay).await;
+                            attempt = attempt.saturating_add(1);
+                        }
+                        Err(e) => break Err(e.into()),
+                    }
+                }
             });
             sleep(Duration::from_millis(SLIPSTREAM_INTER_BATCH_SLEEP_MS)).await;
         }
 
         while let Some(res) = futures.next().await {
-            let (group, return_data) = match res {
-                Ok(data) => data,
-                Err(e) => {
-                    tracing::warn!(
-                        target = "amms::aerodrome_slipstream::sync_slot_0",
-                        error = ?e,
-                        "Batch slot0 call failed, skipping batch"
-                    );
-                    continue;
-                }
-            };
+            let (group, return_data) = res.map_err(|e| {
+                AMMError::Msg(format!(
+                    "Slipstream slot0 batch failed after retries: {}",
+                    e
+                ))
+            })?;
             use alloy::sol_types::SolValue;
 
-            let return_data = match <Vec<(u32, u128, U256)> as SolValue>::abi_decode(&return_data) {
-                Ok(data) => data,
-                Err(e) => {
-                    tracing::warn!(
-                        target = "amms::aerodrome_slipstream::sync_slot_0",
-                        error = ?e,
-                        return_data_len = return_data.len(),
-                        "Failed to decode slot0 data, skipping batch"
-                    );
-                    continue;
-                }
-            };
+            let return_data = <Vec<(u32, u128, U256)> as SolValue>::abi_decode(&return_data)
+                .map_err(|e| {
+                    AMMError::Msg(format!(
+                        "Slipstream slot0 decode failed: {}, return_data_len={}",
+                        e,
+                        return_data.len()
+                    ))
+                })?;
 
             for (pool, (tick, liquidity, sqrt_price)) in
                 group.iter_mut().zip(return_data.into_iter())
@@ -2589,44 +2632,54 @@ impl AerodromeSlipstreamFactory {
             let addresses = chunk.to_vec();
             let addresses_clone = addresses.clone();
             futures.push(Box::pin(async move {
-                Ok::<(Vec<Address>, Bytes), AMMError>((
-                    addresses,
-                    GetUniswapV3PoolStaticMetaBatchRequest::deploy_builder(
-                        provider,
-                        addresses_clone,
+                let mut attempt = 1u8;
+                loop {
+                    match GetUniswapV3PoolStaticMetaBatchRequest::deploy_builder(
+                        provider.clone(),
+                        addresses_clone.clone(),
                     )
                     .call_raw()
-                    .await?,
-                ))
+                    .await
+                    {
+                        Ok(return_data) => {
+                            break Ok::<(Vec<Address>, Bytes), AMMError>((addresses, return_data));
+                        }
+                        Err(e) if attempt < SLIPSTREAM_BATCH_RETRY_ATTEMPTS => {
+                            let delay = slipstream_retry_delay(attempt);
+                            tracing::warn!(
+                                target = "amms::aerodrome_slipstream::init_batch",
+                                attempt,
+                                max_attempts = SLIPSTREAM_BATCH_RETRY_ATTEMPTS,
+                                error = ?e,
+                                "Batch static meta call failed, retrying"
+                            );
+                            sleep(delay).await;
+                            attempt = attempt.saturating_add(1);
+                        }
+                        Err(e) => break Err(e.into()),
+                    }
+                }
             }));
             sleep(Duration::from_millis(SLIPSTREAM_INTER_BATCH_SLEEP_MS)).await;
         }
 
         while let Some(res) = futures.next().await {
-            let (addresses, return_data) = match res {
-                Ok(data) => data,
-                Err(e) => {
-                    tracing::warn!(
-                        target = "amms::aerodrome_slipstream::init_batch",
-                        error = ?e,
-                        "Batch static meta call failed, skipping batch"
-                    );
-                    continue;
-                }
-            };
-            let static_data =
-                match <Vec<(Address, Address, i32, u32)> as SolValue>::abi_decode(&return_data) {
-                    Ok(data) => data,
-                    Err(e) => {
-                        tracing::warn!(
-                            target = "amms::aerodrome_slipstream::init_batch",
-                            error = ?e,
-                            return_data_len = return_data.len(),
-                            "Failed to decode static data, skipping batch"
-                        );
-                        continue;
-                    }
-                };
+            let (addresses, return_data) = res.map_err(|e| {
+                AMMError::Msg(format!(
+                    "Slipstream static meta batch failed after retries: {}",
+                    e
+                ))
+            })?;
+            let static_data = <Vec<(Address, Address, i32, u32)> as SolValue>::abi_decode(
+                &return_data,
+            )
+            .map_err(|e| {
+                AMMError::Msg(format!(
+                    "Slipstream static meta decode failed: {}, return_data_len={}",
+                    e,
+                    return_data.len()
+                ))
+            })?;
 
             let addr_to_data: HashMap<Address, (Address, Address, i32, u32)> =
                 addresses.into_iter().zip(static_data.into_iter()).collect();
@@ -3095,6 +3148,9 @@ mod tests {
     fn burn_observation_write_requires_current_tick_inside_range() {
         let mut outside_pool = seeded_pool(50);
         outside_pool
+            .modify_position(100, 200, 1)
+            .expect("seed burnable position");
+        outside_pool
             .sync(&burn_log(100, 200))
             .expect("burn sync should succeed");
         assert_eq!(outside_pool.observations_cache.last_write_block, 0);
@@ -3109,6 +3165,9 @@ mod tests {
 
         let mut inside_pool = seeded_pool(150);
         inside_pool
+            .modify_position(100, 200, 1)
+            .expect("seed burnable position");
+        inside_pool
             .sync(&burn_log(100, 200))
             .expect("burn sync should succeed");
         assert_eq!(inside_pool.observations_cache.last_write_block, 1);
@@ -3120,6 +3179,41 @@ mod tests {
                 .block_timestamp,
             20
         );
+    }
+
+    #[test]
+    fn modify_position_rejects_liquidity_underflow() {
+        let mut pool = seeded_pool(150);
+        let err = pool
+            .modify_position(100, 200, -1)
+            .expect_err("burn should underflow");
+        assert!(matches!(err, AMMError::ArithmeticError));
+        assert_eq!(pool.liquidity, 0);
+        assert!(pool.ticks.is_empty());
+    }
+
+    #[test]
+    fn modify_position_is_atomic_on_upper_tick_failure() {
+        let mut pool = seeded_pool(150);
+        pool.ticks.insert(
+            100,
+            TickInfo {
+                liquidity_gross: 1,
+                liquidity_net: 1,
+                initialized: true,
+            },
+        );
+        pool.tick_bitmap.insert(0, U256::from(1) << 100usize);
+        pool.liquidity = 1;
+
+        let before = pool.clone();
+        let err = pool
+            .modify_position(100, 200, -1)
+            .expect_err("upper tick should underflow");
+        assert!(matches!(err, AMMError::ArithmeticError));
+        assert_eq!(pool.liquidity, before.liquidity);
+        assert_eq!(pool.ticks, before.ticks);
+        assert_eq!(pool.tick_bitmap, before.tick_bitmap);
     }
 }
 
