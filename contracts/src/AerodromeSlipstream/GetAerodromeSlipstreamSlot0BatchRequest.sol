@@ -12,6 +12,9 @@ contract GetAerodromeSlipstreamSlot0BatchRequest {
         int24 tick;
         uint128 liquidity;
         uint256 sqrtPrice;
+        uint16 observationIndex;
+        uint16 observationCardinality;
+        uint16 observationCardinalityNext;
     }
 
     constructor(address[] memory pools) {
@@ -24,15 +27,18 @@ contract GetAerodromeSlipstreamSlot0BatchRequest {
                 try ICLPoolState(poolAddress).slot0() returns (
                     uint160 sqrtPriceX96,
                     int24 tick,
-                    uint16,
-                    uint16,
-                    uint16,
+                    uint16 observationIndex,
+                    uint16 observationCardinality,
+                    uint16 observationCardinalityNext,
                     bool
                 ) {
                     allSlot0Data[i] = Slot0Data({
                         tick: tick,
                         liquidity: liquidity,
-                        sqrtPrice: uint256(sqrtPriceX96)
+                        sqrtPrice: uint256(sqrtPriceX96),
+                        observationIndex: observationIndex,
+                        observationCardinality: observationCardinality,
+                        observationCardinalityNext: observationCardinalityNext
                     });
                 } catch {
                     continue;

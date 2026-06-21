@@ -267,6 +267,15 @@ pub struct AerodromeSlipstreamPool {
     /// Cached on-chain factory.tickSpacingToFee(tickSpacing) used when base_fee == 0
     #[serde(default)]
     pub factory_tick_spacing_fee: u32,
+    /// Cached slot0 observation index from the latest batch slot0 refresh.
+    #[serde(default)]
+    pub slot0_observation_index: u16,
+    /// Cached slot0 observation cardinality from the latest batch slot0 refresh.
+    #[serde(default)]
+    pub slot0_observation_cardinality: u16,
+    /// Cached slot0 observation cardinalityNext from the latest batch slot0 refresh.
+    #[serde(default)]
+    pub slot0_observation_cardinality_next: u16,
 }
 
 /// Tick information for concentrated liquidity
@@ -1867,17 +1876,27 @@ impl AerodromeSlipstreamFactory {
             })?;
             use alloy::sol_types::SolValue;
 
-            let return_data = <Vec<(u32, u128, U256)> as SolValue>::abi_decode(&return_data)
-                .map_err(|e| {
-                    AMMError::Msg(format!(
-                        "Slipstream slot0 decode failed: {}, return_data_len={}",
-                        e,
-                        return_data.len()
-                    ))
-                })?;
+            let return_data =
+                <Vec<(u32, u128, U256, u16, u16, u16)> as SolValue>::abi_decode(&return_data)
+                    .map_err(|e| {
+                        AMMError::Msg(format!(
+                            "Slipstream slot0 decode failed: {}, return_data_len={}",
+                            e,
+                            return_data.len()
+                        ))
+                    })?;
 
-            for (pool, (tick, liquidity, sqrt_price)) in
-                group.iter_mut().zip(return_data.into_iter())
+            for (
+                pool,
+                (
+                    tick,
+                    liquidity,
+                    sqrt_price,
+                    observation_index,
+                    observation_cardinality,
+                    observation_cardinality_next,
+                ),
+            ) in group.iter_mut().zip(return_data.into_iter())
             {
                 let AMM::AerodromeSlipstreamPool(pool) = pool else {
                     continue;
@@ -1886,6 +1905,9 @@ impl AerodromeSlipstreamFactory {
                 pool.tick = tick as i32;
                 pool.liquidity = liquidity;
                 pool.sqrt_price = sqrt_price;
+                pool.slot0_observation_index = observation_index;
+                pool.slot0_observation_cardinality = observation_cardinality;
+                pool.slot0_observation_cardinality_next = observation_cardinality_next;
 
                 if let Ok(price) = pool.calculate_price(pool.token_a.address, pool.token_b.address)
                 {
@@ -2706,43 +2728,46 @@ impl AerodromeSlipstreamFactory {
             .map_err(AMMError::from)?;
         sleep(Duration::from_millis(SLIPSTREAM_INTER_BATCH_SLEEP_MS)).await;
 
-        let pool_addrs: Vec<Address> = amms.iter().map(|a| a.address()).collect();
-
         // Strict fee-context fetch for every pool.
         // Requirement: init/batch_init must fail immediately on partial retrieval failures.
         Self::sync_fee_context_batch_strict(&mut amms, block_number, provider.clone()).await?;
         // Multicall3: batch observations(i) for all pools.
         // Split by total observation calls, not pool count, because high-cardinality pools can
         // exceed Base RPC gas limits even in very small pool groups.
-        let mc3 = IMulticall3::new(MULTICALL3_ADDRESS, provider.clone());
         let mut pool_obs: HashMap<Address, (u16, Vec<Observation>)> = HashMap::new();
         let mut mc_calls: Vec<IMulticall3::Call3> = Vec::new();
         let mut mc_meta: Vec<(Address, usize, u16)> = Vec::new(); // addr, sidx, card
+        let mut observation_futures: FuturesUnordered<BoxFuture<'_, _>> = FuturesUnordered::new();
+        let observation_max_in_flight = 3;
 
-        async fn flush_observation_batch<N, P>(
-            mc3: &IMulticall3::IMulticall3Instance<P, N>,
+        async fn dispatch_observation_batch<N, P>(
+            provider: P,
             block_number: BlockId,
-            mc_calls: &mut Vec<IMulticall3::Call3>,
-            mc_meta: &mut Vec<(Address, usize, u16)>,
-            pool_obs: &mut HashMap<Address, (u16, Vec<Observation>)>,
-        ) -> Result<(), AMMError>
+            calls: Vec<IMulticall3::Call3>,
+            meta: Vec<(Address, usize, u16)>,
+        ) -> Result<(Vec<(Address, usize, u16)>, Vec<IMulticall3::Result>), AMMError>
         where
             N: Network,
             P: Provider<N> + Clone,
         {
-            if mc_calls.is_empty() {
-                return Ok(());
+            if calls.is_empty() {
+                return Ok((Vec::new(), Vec::new()));
             }
 
-            let calls = std::mem::take(mc_calls);
-            let meta = std::mem::take(mc_meta);
-            let results = mc3
+            let results = IMulticall3::new(MULTICALL3_ADDRESS, provider)
                 .aggregate3(calls)
                 .block(block_number)
                 .call()
                 .await
                 .map_err(|e| AMMError::Msg(format!("Multicall3 aggregate3 failed: {:?}", e)))?;
+            Ok((meta, results))
+        }
 
+        fn merge_observation_batch(
+            pool_obs: &mut HashMap<Address, (u16, Vec<Observation>)>,
+            meta: Vec<(Address, usize, u16)>,
+            results: Vec<IMulticall3::Result>,
+        ) {
             for (i, res) in results.iter().enumerate() {
                 if i >= meta.len() {
                     break;
@@ -2772,33 +2797,39 @@ impl AerodromeSlipstreamFactory {
                     }
                 }
             }
-
-            sleep(Duration::from_millis(SLIPSTREAM_INTER_BATCH_SLEEP_MS)).await;
-            Ok(())
         }
 
-        for &addr in &pool_addrs {
-            let s0 = ICLPoolFull::new(addr, provider.clone())
-                .slot0()
-                .block(block_number)
-                .call()
-                .await
-                .map_err(|e| {
-                    AMMError::Msg(format!("slot0 fetch failed for pool {}: {:?}", addr, e))
-                })?;
-            let card = s0.observationCardinality;
-            let ridx = s0.observationIndex;
+        for amm in &amms {
+            let AMM::AerodromeSlipstreamPool(pool) = amm else {
+                continue;
+            };
+
+            let addr = pool.address;
+            let card = pool.slot0_observation_cardinality;
+            let ridx = pool.slot0_observation_index;
+            if card == 0 {
+                continue;
+            }
             let count = (card as u16).min(1500);
             for j in 0..count {
                 if mc_calls.len() >= SLIPSTREAM_OBSERVATIONS_MULTICALL_STEP {
-                    flush_observation_batch(
-                        &mc3,
+                    let provider = provider.clone();
+                    let calls = std::mem::take(&mut mc_calls);
+                    let meta = std::mem::take(&mut mc_meta);
+                    observation_futures.push(Box::pin(dispatch_observation_batch::<N, _>(
+                        provider,
                         block_number,
-                        &mut mc_calls,
-                        &mut mc_meta,
-                        &mut pool_obs,
-                    )
-                    .await?;
+                        calls,
+                        meta,
+                    )));
+                    sleep(Duration::from_millis(SLIPSTREAM_INTER_BATCH_SLEEP_MS)).await;
+
+                    if observation_futures.len() >= observation_max_in_flight {
+                        if let Some(res) = observation_futures.next().await {
+                            let (meta, results) = res?;
+                            merge_observation_batch(&mut pool_obs, meta, results);
+                        }
+                    }
                 }
 
                 let sidx = ((ridx as u64 + card as u64 - j as u64) % card as u64) as usize;
@@ -2814,14 +2845,24 @@ impl AerodromeSlipstreamFactory {
                 mc_meta.push((addr, sidx, card));
             }
         }
-        flush_observation_batch(
-            &mc3,
-            block_number,
-            &mut mc_calls,
-            &mut mc_meta,
-            &mut pool_obs,
-        )
-        .await?;
+
+        if !mc_calls.is_empty() {
+            let provider = provider.clone();
+            let calls = std::mem::take(&mut mc_calls);
+            let meta = std::mem::take(&mut mc_meta);
+            observation_futures.push(Box::pin(dispatch_observation_batch::<N, _>(
+                provider,
+                block_number,
+                calls,
+                meta,
+            )));
+            sleep(Duration::from_millis(SLIPSTREAM_INTER_BATCH_SLEEP_MS)).await;
+        }
+
+        while let Some(res) = observation_futures.next().await {
+            let (meta, results) = res?;
+            merge_observation_batch(&mut pool_obs, meta, results);
+        }
 
         for (addr, (card, obs)) in pool_obs {
             if let Some(amm) = amms.iter_mut().find(|a| a.address() == addr) {
