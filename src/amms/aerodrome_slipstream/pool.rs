@@ -58,6 +58,9 @@ use uniswap_v3_math::tick_math::{MAX_SQRT_RATIO, MAX_TICK, MIN_SQRT_RATIO, MIN_T
 const SLIPSTREAM_BATCH_RETRY_ATTEMPTS: u8 = 3;
 const SLIPSTREAM_BATCH_RETRY_BASE_DELAY_MS: u64 = 400;
 const SLIPSTREAM_INTER_BATCH_SLEEP_MS: u64 = 700;
+// slot0 batch now returns 6 fields per pool (including observation metadata).
+// Keep the batch comfortably below RPC CreateContractSizeLimit on Base.
+const SLIPSTREAM_SLOT0_BATCH_STEP: usize = 50;
 // Keep constructor-return payload under EVM code-size limit during deploy_builder().call_raw().
 const SLIPSTREAM_FEE_CONFIG_BATCH_STEP: usize = 40;
 // Keep Multicall3 aggregate3 observation batches comfortably below Base's RPC gas ceiling.
@@ -1821,10 +1824,9 @@ impl AerodromeSlipstreamFactory {
         N: Network,
         P: Provider<N> + Clone,
     {
-        let step = 150;
         let mut futures = futures::stream::FuturesUnordered::new();
 
-        for group in pools.chunks_mut(step) {
+        for group in pools.chunks_mut(SLIPSTREAM_SLOT0_BATCH_STEP) {
             let provider = provider.clone();
             let pool_addresses = group
                 .iter_mut()
