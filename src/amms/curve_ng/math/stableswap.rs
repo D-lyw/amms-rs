@@ -54,25 +54,28 @@ pub fn get_d(balances: &[U256], amp: U256) -> Result<U256, AMMError> {
     }
 
     let mut d = s;
-    let ann = amp * n_coins; // A * n^n
+    let ann = amp * n_coins;
+    let n_power = n_coins.pow(U256::from(n));
 
     // Newton 迭代
     for _ in 0..MAX_ITERATIONS {
-        // D_P = D^(n+1) / (n^n * prod(x_i))
+        // Mirrors Curve StableSwap NG exactly:
+        // for x in _xp: D_P = D_P * D / x
+        // then D_P /= N_COINS ** N_COINS.
+        //
+        // Dividing by (x * n) inside the loop is mathematically close, but not
+        // integer-floor equivalent and produces wei-level drift.
         let mut d_p = d;
         for balance in balances {
-            // d_p = d_p * d / (balance * n)
-            // 防止除零
             if balance.is_zero() {
                 return Err(AMMError::Msg("Zero balance".into()));
             }
-            let divisor = *balance * n_coins;
-            if divisor.is_zero() {
-                // This shouldn't happen if balance != 0 unless overflow wraps to 0
-                return Err(AMMError::Msg("Zero divisor in get_d (overflow?)".into()));
-            }
-            d_p = d_p * d / divisor;
+            d_p = d_p * d / *balance;
         }
+        if n_power.is_zero() {
+            return Err(AMMError::Msg("Zero n^n divisor in get_d".into()));
+        }
+        d_p /= n_power;
 
         let d_prev = d;
 
@@ -107,6 +110,22 @@ pub fn get_d(balances: &[U256], amp: U256) -> Result<U256, AMMError> {
 /// # Returns
 /// 输出代币新余额 y
 pub fn get_y(balances: &[U256], amp: U256, i: usize, j: usize, x: U256) -> Result<U256, AMMError> {
+    let d = get_d(balances, amp)?;
+    get_y_given_d(balances, amp, d, i, j, x)
+}
+
+/// 计算 y，使用外部传入的 D。
+///
+/// Curve StableSwap NG 的 `__exchange` 先基于原始 xp 计算 D，再将同一个
+/// D 传入 `get_y`。这个函数用于保持 Rust replay 和 Vyper 的整数路径同构。
+pub fn get_y_given_d(
+    balances: &[U256],
+    amp: U256,
+    d: U256,
+    i: usize,
+    j: usize,
+    x: U256,
+) -> Result<U256, AMMError> {
     let n = balances.len();
     if i >= n || j >= n || i == j {
         return Err(AMMError::Msg("Invalid token indices".into()));
@@ -116,7 +135,6 @@ pub fn get_y(balances: &[U256], amp: U256, i: usize, j: usize, x: U256) -> Resul
     }
 
     let n_coins = U256::from(n);
-    let d = get_d(balances, amp)?;
     let ann = amp * n_coins;
 
     // c = D^(n+1) / (n^n * prod(x_k for k != j))

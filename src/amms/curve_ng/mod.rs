@@ -507,31 +507,71 @@ impl AutomatedMarketMaker for CurveNGPool {
                     let event = ICurveNGPool::TokenExchange::decode_log(&log.inner)?;
                     let i = event.sold_id as usize;
                     let j = event.bought_id as usize;
-                    let (sim_dy, simulated_admin_fee_out) =
-                        self.stableswap_exchange_amounts(i, j, event.tokens_sold)?;
-                    let mut admin_fee_out = simulated_admin_fee_out;
-                    if Self::abs_diff(sim_dy, event.tokens_bought) > U256::from(1u8) {
-                        admin_fee_out = self.stableswap_admin_fee_from_event_output(
+                    let (sim_dy, simulated_admin_fee_out) = self
+                        .stableswap_exchange_amounts_at_timestamp(
                             i,
                             j,
                             event.tokens_sold,
-                            event.tokens_bought,
+                            log.block_timestamp,
                         )?;
+                    let mut admin_fee_out = simulated_admin_fee_out;
+                    let output_drift = Self::abs_diff(sim_dy, event.tokens_bought);
+                    let erc4626_involved = !self.asset_types.is_empty()
+                        && (self.asset_types.get(i).copied().unwrap_or(0) == 3
+                            || self.asset_types.get(j).copied().unwrap_or(0) == 3);
+                    let mut needs_async_update = false;
+
+                    if !output_drift.is_zero() && !erc4626_involved {
+                        tracing::warn!(
+                            target = "amms::curve_ng::sync",
+                            pool = ?self.address,
+                            sold_id = i,
+                            bought_id = j,
+                            tokens_sold = ?event.tokens_sold,
+                            event_tokens_bought = ?event.tokens_bought,
+                            simulated_tokens_bought = ?sim_dy,
+                            drift_wei = ?output_drift,
+                            "TokenExchange (StableSwap) exact mismatch - Triggering AsyncUpdate"
+                        );
+                        return Ok(SyncAction::AsyncUpdate);
+                    }
+
+                    if output_drift > U256::from(1u8) {
+                        admin_fee_out = match self
+                            .stableswap_admin_fee_from_event_output_at_timestamp(
+                                i,
+                                j,
+                                event.tokens_sold,
+                                event.tokens_bought,
+                                log.block_timestamp,
+                            ) {
+                            Ok(v) => v,
+                            Err(err) => {
+                                tracing::warn!(
+                                    target = "amms::curve_ng::sync",
+                                    pool = ?self.address,
+                                    sold_id = i,
+                                    bought_id = j,
+                                    tokens_sold = ?event.tokens_sold,
+                                    event_tokens_bought = ?event.tokens_bought,
+                                    simulated_tokens_bought = ?sim_dy,
+                                    error = ?err,
+                                    "TokenExchange (StableSwap) admin fee inference failed - Triggering AsyncUpdate"
+                                );
+                                return Ok(SyncAction::AsyncUpdate);
+                            }
+                        };
                         // For swaps involving ERC4626 tokens, rates drift every block via
                         // convertToAssets(). Use a relaxed tolerance (2000 wei) to absorb
                         // this normal drift while still catching genuine mismatches.
                         // Base tolerance 10 wei absorbs math rounding differences.
-                        let erc4626_involved = !self.asset_types.is_empty()
-                            && (self.asset_types.get(i).copied().unwrap_or(0) == 3
-                                || self.asset_types.get(j).copied().unwrap_or(0) == 3);
-
                         let threshold = if erc4626_involved {
                             U256::from(2000u64)
                         } else {
-                            U256::from(10u64)
+                            U256::ZERO
                         };
 
-                        if Self::abs_diff(sim_dy, event.tokens_bought) > threshold {
+                        if output_drift > threshold {
                             tracing::warn!(
                                 target = "amms::curve_ng::sync",
                                 pool = ?self.address,
@@ -540,7 +580,7 @@ impl AutomatedMarketMaker for CurveNGPool {
                                 tokens_sold = ?event.tokens_sold,
                                 event_tokens_bought = ?event.tokens_bought,
                                 simulated_tokens_bought = ?sim_dy,
-                                drift_wei = ?Self::abs_diff(sim_dy, event.tokens_bought),
+                                drift_wei = ?output_drift,
                                 "TokenExchange (StableSwap) mismatch - AsyncUpdate refreshes rates"
                             );
                             if i < self.balances.len() {
@@ -551,19 +591,20 @@ impl AutomatedMarketMaker for CurveNGPool {
                                 self.balances[j] = self.balances[j]
                                     .checked_sub(amount_out)
                                     .ok_or(AMMError::Msg("Balance underflow".into()))?;
-                                self.stableswap_add_admin_balance(j, admin_fee_out);
+                                self.stableswap_add_admin_balance(j, admin_fee_out)?;
                             }
                             self.update_spot_prices();
                             return Ok(SyncAction::AsyncUpdate);
                         }
 
                         // ERC4626 rate drift within relaxed threshold — use event data directly.
+                        needs_async_update = erc4626_involved;
                         tracing::debug!(
                             target = "amms::curve_ng::sync",
                             pool = ?self.address,
                             sold_id = i,
                             bought_id = j,
-                            drift_wei = ?Self::abs_diff(sim_dy, event.tokens_bought),
+                            drift_wei = ?output_drift,
                             "TokenExchange (StableSwap) ERC4626 drift within tolerance"
                         );
                     }
@@ -579,7 +620,7 @@ impl AutomatedMarketMaker for CurveNGPool {
                         self.balances[j] = self.balances[j]
                             .checked_sub(amount_out)
                             .ok_or(AMMError::Msg("Balance underflow".into()))?;
-                        self.stableswap_add_admin_balance(j, admin_fee_out);
+                        self.stableswap_add_admin_balance(j, admin_fee_out)?;
                     }
 
                     tracing::info!(
@@ -595,7 +636,11 @@ impl AutomatedMarketMaker for CurveNGPool {
                     );
 
                     self.update_spot_prices();
-                    return Ok(SyncAction::AsyncUpdate);
+                    return Ok(if needs_async_update {
+                        SyncAction::AsyncUpdate
+                    } else {
+                        SyncAction::None
+                    });
                 } else if topic0 == ICurveNGPool::AddLiquidity::SIGNATURE_HASH {
                     let event = ICurveNGPool::AddLiquidity::decode_log(&log.inner)?;
                     for (i, &amount) in event.token_amounts.iter().enumerate() {
@@ -603,9 +648,11 @@ impl AutomatedMarketMaker for CurveNGPool {
                             let fee = event.fees.get(i).copied().unwrap_or(U256::ZERO);
                             let admin_share = self.stableswap_admin_share(fee);
                             self.balances[i] = self.balances[i]
-                                .saturating_add(amount)
-                                .saturating_sub(admin_share);
-                            self.stableswap_add_admin_balance(i, admin_share);
+                                .checked_add(amount)
+                                .ok_or(AMMError::Msg("Balance overflow".into()))?
+                                .checked_sub(admin_share)
+                                .ok_or(AMMError::Msg("Balance underflow".into()))?;
+                            self.stableswap_add_admin_balance(i, admin_share)?;
                         }
                     }
                     tracing::info!(
@@ -620,7 +667,9 @@ impl AutomatedMarketMaker for CurveNGPool {
                     let event = ICurveNGPool::RemoveLiquidity::decode_log(&log.inner)?;
                     for (i, &amount) in event.token_amounts.iter().enumerate() {
                         if i < self.balances.len() {
-                            self.balances[i] = self.balances[i].saturating_sub(amount);
+                            self.balances[i] = self.balances[i]
+                                .checked_sub(amount)
+                                .ok_or(AMMError::Msg("Balance underflow".into()))?;
                         }
                     }
                     tracing::info!(
@@ -638,19 +687,22 @@ impl AutomatedMarketMaker for CurveNGPool {
                         pool = ?self.address,
                         token_id = event.token_id as usize,
                         coin_amount = ?event.coin_amount,
-                        "RemoveLiquidityOne (StableSwap) - Triggering Resync"
+                        "RemoveLiquidityOne (StableSwap) - Triggering AsyncUpdate"
                     );
-                    return Ok(SyncAction::Resync);
+                    return Ok(SyncAction::AsyncUpdate);
                 } else if topic0 == ICurveNGPool::RemoveLiquidityImbalance::SIGNATURE_HASH {
                     let event = ICurveNGPool::RemoveLiquidityImbalance::decode_log(&log.inner)?;
                     for (i, &amount) in event.token_amounts.iter().enumerate() {
                         if i < self.balances.len() {
                             let fee = event.fees.get(i).copied().unwrap_or(U256::ZERO);
                             let admin_share = self.stableswap_admin_share(fee);
+                            let amount_out = amount
+                                .checked_add(admin_share)
+                                .ok_or(AMMError::Msg("Balance overflow".into()))?;
                             self.balances[i] = self.balances[i]
-                                .checked_sub(amount.saturating_add(admin_share))
+                                .checked_sub(amount_out)
                                 .ok_or(AMMError::Msg("Balance underflow".into()))?;
-                            self.stableswap_add_admin_balance(i, admin_share);
+                            self.stableswap_add_admin_balance(i, admin_share)?;
                         }
                     }
                     tracing::info!(
@@ -664,17 +716,17 @@ impl AutomatedMarketMaker for CurveNGPool {
                     return Ok(SyncAction::AsyncUpdate);
                 } else if topic0 == ICurveNGPool::ClaimAdminFees::SIGNATURE_HASH {
                     // ClaimAdminFees 事件仅包含一个总数 amount，未指明是哪个代币
-                    // 但对于 StableSwap NG，通常是逐个代币触发，或者需要 Resync
+                    // 但对于 StableSwap NG，通常是逐个代币触发，或者需要刷新运行时数据。
                     // 鉴于我们无法知道具体扣了哪个代币多少，这里触发 Resync 或 AsyncUpdate 是最安全的
                     // 但如果我们知道它是针对某个币的（通过 logs 顺序或上下文），或许可以处理。
                     // 遗憾的是，ClaimAdminFees(admin, amount) 丢失了 coin index 信息。
-                    // 所以最好的做法是 Resync。
+                    // 所以最好的做法是 AsyncUpdate 刷新 admin_balances/balances。
                     tracing::warn!(
                         target = "amms::curve_ng::sync",
                         pool = ?self.address,
-                        "ClaimAdminFees (StableSwap) - Triggering Resync"
+                        "ClaimAdminFees (StableSwap) - Triggering AsyncUpdate"
                     );
-                    return Ok(SyncAction::Resync);
+                    return Ok(SyncAction::AsyncUpdate);
                 } else if topic0 == ICurveNGPool::ApplyNewFee::SIGNATURE_HASH {
                     let event = ICurveNGPool::ApplyNewFee::decode_log(&log.inner)?;
                     self.fee = event.fee;
@@ -1781,16 +1833,19 @@ impl CurveNGPool {
         fee_amount * self.admin_fee / fee_denominator
     }
 
-    fn stableswap_add_admin_balance(&mut self, index: usize, amount: U256) {
+    fn stableswap_add_admin_balance(&mut self, index: usize, amount: U256) -> Result<(), AMMError> {
         if amount.is_zero() {
-            return;
+            return Ok(());
         }
         if self.admin_balances.len() < self.balances.len() {
             self.admin_balances.resize(self.balances.len(), U256::ZERO);
         }
         if let Some(balance) = self.admin_balances.get_mut(index) {
-            *balance = balance.saturating_add(amount);
+            *balance = balance
+                .checked_add(amount)
+                .ok_or(AMMError::Msg("Admin balance overflow".into()))?;
         }
+        Ok(())
     }
 
     fn stableswap_exchange_amounts(
@@ -1799,11 +1854,22 @@ impl CurveNGPool {
         j: usize,
         dx: U256,
     ) -> Result<(U256, U256), AMMError> {
-        let components = self.stableswap_exchange_components(i, j, dx)?;
+        self.stableswap_exchange_amounts_at_timestamp(i, j, dx, None)
+    }
+
+    fn stableswap_exchange_amounts_at_timestamp(
+        &self,
+        i: usize,
+        j: usize,
+        dx: U256,
+        block_timestamp: Option<u64>,
+    ) -> Result<(U256, U256), AMMError> {
+        let components = self.stableswap_exchange_components(i, j, dx, block_timestamp)?;
 
         Ok((components.dy, components.admin_fee_out))
     }
 
+    #[cfg(test)]
     fn stableswap_admin_fee_from_event_output(
         &self,
         i: usize,
@@ -1811,7 +1877,18 @@ impl CurveNGPool {
         dx: U256,
         event_dy: U256,
     ) -> Result<U256, AMMError> {
-        let components = self.stableswap_exchange_components(i, j, dx)?;
+        self.stableswap_admin_fee_from_event_output_at_timestamp(i, j, dx, event_dy, None)
+    }
+
+    fn stableswap_admin_fee_from_event_output_at_timestamp(
+        &self,
+        i: usize,
+        j: usize,
+        dx: U256,
+        event_dy: U256,
+        block_timestamp: Option<u64>,
+    ) -> Result<U256, AMMError> {
+        let components = self.stableswap_exchange_components(i, j, dx, block_timestamp)?;
         if components.out_rate.is_zero() {
             return Err(AMMError::Msg("rates[j] is zero".into()));
         }
@@ -1823,11 +1900,51 @@ impl CurveNGPool {
             .checked_mul(components.out_rate)
             .ok_or_else(|| AMMError::Msg("event dy scaling overflow".into()))?
             / components.precision;
-        let fee_amount = components.dy_raw.saturating_sub(event_scaled_dy);
+        let fee_amount = components
+            .dy_raw
+            .checked_sub(event_scaled_dy)
+            .ok_or_else(|| AMMError::Msg("event output exceeds no-fee dy_raw".into()))?;
         let fee_denominator = U256::from(10).pow(U256::from(10));
         let admin_fee_scaled = fee_amount * self.admin_fee / fee_denominator;
 
         Ok(admin_fee_scaled * components.precision / components.out_rate)
+    }
+
+    fn stableswap_current_amp_precise_at_timestamp(
+        &self,
+        block_timestamp: Option<u64>,
+    ) -> Result<U256, AMMError> {
+        let amp = self
+            .amp
+            .ok_or(AMMError::Msg("A parameter not set".into()))?;
+        let fallback = amp * math::stableswap::A_PRECISION;
+
+        let Some(ts) = block_timestamp.map(U256::from) else {
+            return Ok(fallback);
+        };
+        let (Some(initial_a), Some(future_a), Some(initial_time), Some(future_time)) = (
+            self.initial_a_precise,
+            self.future_a_precise,
+            self.initial_a_time,
+            self.future_a_time,
+        ) else {
+            return Ok(fallback);
+        };
+
+        if future_time.is_zero() || ts >= future_time {
+            return Ok(future_a);
+        }
+        if future_time <= initial_time || ts <= initial_time {
+            return Ok(initial_a);
+        }
+
+        let elapsed = ts - initial_time;
+        let duration = future_time - initial_time;
+        if future_a > initial_a {
+            Ok(initial_a + (future_a - initial_a) * elapsed / duration)
+        } else {
+            Ok(initial_a - (initial_a - future_a) * elapsed / duration)
+        }
     }
 
     fn stableswap_exchange_components(
@@ -1835,11 +1952,8 @@ impl CurveNGPool {
         i: usize,
         j: usize,
         dx: U256,
+        block_timestamp: Option<u64>,
     ) -> Result<StableSwapExchangeComponents, AMMError> {
-        let amp = self
-            .amp
-            .ok_or(AMMError::Msg("A parameter not set".into()))?;
-
         // 验证 rates 数组是否正确初始化
         if self.rates.len() <= i || self.rates.len() <= j {
             return Err(AMMError::Msg(format!(
@@ -1856,39 +1970,33 @@ impl CurveNGPool {
             )));
         }
 
-        // 关于 CurveNG 精度不一致问题
-        // 官方设计：Curve StableSwap NG 的核心设计是内部统一使用 18 位精度 (10^18) 进行计算。
-        // 不一致来源：虽然数学目标一致，但在 stored_rates 的实现上存在两种并存的模式：
-        // 模式 A (Pre-scaled): stored_rates 包含了精度补齐因子。例如 USDC (6 decimals)，其 Rate 返回 10^30 (10^18 基础汇率 * 10^12 补齐)。这是大多数 "MetaPool" 或含有 Oracle 的池子的行为。
-        // 模式 B (Unscaled): stored_rates 仅由 Oracle 或基础汇率决定（即 10^18），合约在内部计算 xp 时会额外乘上精度因子 precision_mul。这在某些 "Plain" 池子或特定工厂部署中出现。
-
-        // Adaptive Rate Scaling
-        // Some Curve NG pools return scaled rates (e.g. 10^30 for 6 dec), others return unscaled (10^18).
-        // We detect this by checking if the rate is plausible when normalized.
         let precision = U256::from(10).pow(U256::from(18));
-        let effective_rates: Vec<U256> = self
-            .rates
-            .iter()
-            .enumerate()
-            .map(|(i, &r)| {
-                let d = self.decimals[i];
-                let p = U256::from(10).pow(U256::from(18).saturating_sub(U256::from(d)));
-
-                // Check soundness: 1 unit of token worth roughly 1 USD (10^18)
-                // If scaled: r / p should be ~10^18
-                // If unscaled: r should be ~10^18
-
-                let normalized_if_scaled = r / p;
-
-                if normalized_if_scaled > U256::from(10).pow(U256::from(14)) {
-                    // It's likely already scaled (matches ~10^18 magnitude when divided by p)
-                    r
-                } else {
-                    // It's likely unscaled (matches ~10^18 magnitude directly, or just too small if scaled)
-                    r * p
-                }
-            })
-            .collect();
+        let effective_rates: Vec<U256> = if self.supports_stored_rates {
+            // Official StableSwap NG path: stored_rates() already returns the
+            // exact rate_multipliers / oracle-adjusted rates used by _xp_mem().
+            // Do not apply heuristic decimals scaling here; changing this input
+            // breaks source-level parity.
+            self.rates.clone()
+        } else {
+            // Fallback for non-standard pools that do not expose stored_rates().
+            // This is intentionally explicit instead of heuristic: it mirrors
+            // the constructor rate_multipliers for standard ERC20 coins.
+            self.decimals
+                .iter()
+                .map(|d| {
+                    let scale = U256::from(10).pow(U256::from(18u8.saturating_sub(*d)));
+                    precision * scale
+                })
+                .collect()
+        };
+        if effective_rates.len() <= i || effective_rates.len() <= j {
+            return Err(AMMError::Msg(format!(
+                "Effective rates array too short: len={}, need i={}, j={}",
+                effective_rates.len(),
+                i,
+                j
+            )));
+        }
 
         // Standardize balances to 18 decimals using effective rates
         let scaled_balances: Vec<U256> = self
@@ -1901,17 +2009,19 @@ impl CurveNGPool {
         // Standardize input
         let scaled_dx = dx * effective_rates[i] / precision;
 
-        // 调用数学计算
-        // Curve NG A() 返回 Raw A，但数学公式需要 Stored A (Raw A * A_PRECISION)
-        let amp_scaled = amp * math::stableswap::A_PRECISION;
+        // Mirrors Vyper _A(): use timestamp interpolation during RampA when
+        // available, otherwise fall back to the cached A() value.
+        let amp_scaled = self.stableswap_current_amp_precise_at_timestamp(block_timestamp)?;
 
         // Dynamic Fee Logic (Curve StableSwap NG)
         // https://github.com/curvefi/stableswap-ng/blob/main/contracts/main/CurveStableSwapNG.vy#L368
 
         let x_new = scaled_balances[i] + scaled_dx;
 
-        // Calculate y (new balance of output token)
-        let y = math::stableswap::get_y(&scaled_balances, amp_scaled, i, j, x_new)?;
+        // Match Vyper __exchange(): compute D from the original xp, then pass
+        // that exact D into get_y.
+        let d = math::stableswap::get_d(&scaled_balances, amp_scaled)?;
+        let y = math::stableswap::get_y_given_d(&scaled_balances, amp_scaled, d, i, j, x_new)?;
 
         // dy = xp[j] - y - 1
         let dy_raw = scaled_balances[j]

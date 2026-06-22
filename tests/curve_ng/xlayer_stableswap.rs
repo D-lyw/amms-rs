@@ -6,14 +6,15 @@ use alloy::{
     sol_types::SolValue,
 };
 use amms::amms::{
-    amm::{AutomatedMarketMaker, SyncAction},
+    amm::{AutomatedMarketMaker, SyncAction, AMM},
     curve_ng::{
         CurveNGFactory, CurveNGPool, CurveNGPoolType, GetCurveNGStableSwapRuntimeDataBatchRequest,
         StableSwapRuntimeData,
     },
 };
+use amms::state_space::StateSpaceBuilder;
 use eyre::{eyre, Result};
-use std::{env, sync::Arc};
+use std::{collections::HashMap, env, sync::Arc};
 
 use crate::common::amounts::sample_amounts;
 
@@ -25,6 +26,7 @@ const POOL: Address = address!("7EC81Ef12057008c0BB6B540127f88f917b4fC6c");
 #[derive(Debug, Clone)]
 struct StableSnapshot {
     balances: Vec<U256>,
+    admin_balances: Vec<U256>,
     amp: U256,
     fee: U256,
     admin_fee: U256,
@@ -55,6 +57,41 @@ fn sort_logs(logs: &mut [Log]) {
             l.log_index.unwrap_or_default(),
         )
     });
+}
+
+async fn hydrate_block_timestamps<P: Provider + Clone>(
+    provider: &P,
+    logs: &mut [Log],
+) -> Result<()> {
+    let mut timestamps: HashMap<u64, u64> = HashMap::new();
+    for log in logs.iter() {
+        if log.block_timestamp.is_some() {
+            continue;
+        }
+        let block = log
+            .block_number
+            .ok_or_else(|| eyre!("log missing block_number"))?;
+        if let std::collections::hash_map::Entry::Vacant(entry) = timestamps.entry(block) {
+            let block_id = BlockId::from(block);
+            let ts = provider
+                .get_block(block_id)
+                .await?
+                .ok_or_else(|| eyre!("missing block header for {}", block))?
+                .header
+                .timestamp;
+            entry.insert(ts);
+        }
+    }
+
+    for log in logs.iter_mut() {
+        if log.block_timestamp.is_none() {
+            if let Some(block) = log.block_number {
+                log.block_timestamp = timestamps.get(&block).copied();
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn abs_diff(a: U256, b: U256) -> U256 {
@@ -116,6 +153,7 @@ async fn fetch_snapshot<P: Provider + Clone>(
 
     Ok(StableSnapshot {
         balances: data.balances,
+        admin_balances: data.adminBalances,
         amp: data.amp,
         fee: data.fee,
         admin_fee: data.adminFee,
@@ -159,10 +197,49 @@ fn assert_balance_alignment(
     Ok(())
 }
 
+fn assert_admin_balance_alignment(
+    block: u64,
+    local: &CurveNGPool,
+    chain: &StableSnapshot,
+) -> Result<()> {
+    if local.admin_balances.len() != chain.admin_balances.len() {
+        return Err(eyre!(
+            "block {} admin_balances len mismatch local={} chain={}",
+            block,
+            local.admin_balances.len(),
+            chain.admin_balances.len()
+        ));
+    }
+
+    for (idx, (local_balance, chain_balance)) in local
+        .admin_balances
+        .iter()
+        .zip(chain.admin_balances.iter())
+        .enumerate()
+    {
+        if local_balance != chain_balance {
+            return Err(eyre!(
+                "block {} admin_balance[{}] mismatch: local={} chain={}",
+                block,
+                idx,
+                local_balance,
+                chain_balance
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 fn assert_full_alignment(block: u64, local: &CurveNGPool, chain: &StableSnapshot) -> Result<()> {
     assert_eq!(
         local.balances, chain.balances,
         "block {} balances mismatch after reinit",
+        block
+    );
+    assert_eq!(
+        local.admin_balances, chain.admin_balances,
+        "block {} admin_balances mismatch after reinit",
         block
     );
     assert_eq!(
@@ -253,6 +330,186 @@ async fn test_xlayer_curve_ng_stableswap_swap_parity() -> Result<()> {
             }
         }
     }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_xlayer_curve_ng_stableswap_state_space_replay_window() -> Result<()> {
+    const INIT_BLOCK: u64 = 63_348_392;
+    let replay_blocks = env_u64("CURVE_NG_XLAYER_STATE_SPACE_REPLAY_BLOCKS", 100).max(1);
+
+    let rpc_url = match xlayer_provider_url() {
+        Some(url) => url,
+        None => {
+            println!("Skipping test: XLAYER_PROVIDER / XLAYER_RPC_URL not set");
+            return Ok(());
+        }
+    };
+
+    let provider = Arc::new(ProviderBuilder::new().connect_http(rpc_url.parse()?));
+    let chain_id = provider.get_chain_id().await?;
+    if chain_id != XLAYER_CHAIN_ID {
+        println!(
+            "Skipping test: expected XLayer chain_id {}, got {}",
+            XLAYER_CHAIN_ID, chain_id
+        );
+        return Ok(());
+    }
+
+    let end_block = INIT_BLOCK + replay_blocks;
+    let head = provider.get_block_number().await?;
+    if head < end_block {
+        println!(
+            "Skipping test: chain head {} is below required replay end {}",
+            head, end_block
+        );
+        return Ok(());
+    }
+
+    let seed_amm = AMM::CurveNGPool(CurveNGPool::new(POOL, CurveNGPoolType::StableSwap));
+    let manager = StateSpaceBuilder::new(provider.clone())
+        .block(INIT_BLOCK)
+        .with_amms(vec![seed_amm])
+        .sync()
+        .await?;
+
+    {
+        let guard = manager.state.read().await;
+        let pool = match guard.get(&POOL) {
+            Some(AMM::CurveNGPool(pool)) => pool,
+            other => return Err(eyre!("expected CurveNGPool in state, got {:?}", other)),
+        };
+        let chain = fetch_snapshot(&*provider, POOL, pool.n_coins as usize, INIT_BLOCK).await?;
+        assert_full_alignment(INIT_BLOCK, pool, &chain)?;
+    }
+
+    let sync_events = {
+        let guard = manager.state.read().await;
+        let pool = match guard.get(&POOL) {
+            Some(AMM::CurveNGPool(pool)) => pool,
+            other => return Err(eyre!("expected CurveNGPool in state, got {:?}", other)),
+        };
+        pool.sync_events()
+    };
+
+    let mut logs = fetch_logs_chunked(
+        &*provider,
+        POOL,
+        sync_events,
+        INIT_BLOCK + 1,
+        end_block,
+        replay_blocks,
+    )
+    .await?;
+    hydrate_block_timestamps(&*provider, &mut logs).await?;
+
+    if logs.is_empty() {
+        println!(
+            "Skipping StateSpace replay: no logs for pool {} in window {}..{}",
+            POOL,
+            INIT_BLOCK + 1,
+            end_block
+        );
+        return Ok(());
+    }
+
+    let mut processed = 0usize;
+    let mut block_count = 0usize;
+    let mut async_update_blocks = Vec::new();
+    let mut recovered_blocks = Vec::new();
+
+    for block in (INIT_BLOCK + 1)..=end_block {
+        let block_logs: Vec<Log> = logs
+            .iter()
+            .filter(|log| log.block_number == Some(block))
+            .cloned()
+            .collect();
+        if block_logs.is_empty() {
+            continue;
+        }
+
+        let (affected, needs_resync, needs_async_update) = {
+            let mut state = manager.state.write().await;
+            state.sync(&block_logs)?
+        };
+        processed += block_logs.len();
+        block_count += 1;
+
+        assert!(
+            affected.contains(&POOL),
+            "block {} did not report pool as affected; affected={:?}",
+            block,
+            affected
+        );
+        assert!(
+            needs_resync.is_empty(),
+            "block {} unexpectedly requested resync: {:?}",
+            block,
+            needs_resync
+        );
+
+        let chain = {
+            let guard = manager.state.read().await;
+            let pool = match guard.get(&POOL) {
+                Some(AMM::CurveNGPool(pool)) => pool,
+                other => return Err(eyre!("expected CurveNGPool in state, got {:?}", other)),
+            };
+            fetch_snapshot(&*provider, POOL, pool.n_coins as usize, block).await?
+        };
+
+        {
+            let guard = manager.state.read().await;
+            let pool = match guard.get(&POOL) {
+                Some(AMM::CurveNGPool(pool)) => pool,
+                other => return Err(eyre!("expected CurveNGPool in state, got {:?}", other)),
+            };
+            assert_full_alignment(block, pool, &chain)?;
+            assert_admin_balance_alignment(block, pool, &chain)?;
+        }
+
+        if needs_async_update.contains(&POOL) {
+            async_update_blocks.push(block);
+            {
+                let mut state = manager.state.write().await;
+                let pool = match state.get_mut(&POOL) {
+                    Some(AMM::CurveNGPool(pool)) => pool,
+                    other => {
+                        return Err(eyre!(
+                            "expected mutable CurveNGPool in state, got {:?}",
+                            other
+                        ))
+                    }
+                };
+                CurveNGFactory::refresh_runtime_data_batch(
+                    std::slice::from_mut(pool),
+                    BlockId::from(block),
+                    provider.clone(),
+                )
+                .await?;
+            }
+
+            let guard = manager.state.read().await;
+            let pool = match guard.get(&POOL) {
+                Some(AMM::CurveNGPool(pool)) => pool,
+                other => return Err(eyre!("expected CurveNGPool in state, got {:?}", other)),
+            };
+            assert_full_alignment(block, pool, &chain)?;
+            recovered_blocks.push(block);
+        }
+    }
+
+    println!(
+        "[XLayer CurveNG Stable StateSpace replay] pool={} init={} window={}..{} blocks_with_logs={} logs={} async_update_blocks={:?} recovered_blocks={:?}",
+        POOL,
+        INIT_BLOCK,
+        INIT_BLOCK + 1,
+        end_block,
+        block_count,
+        processed,
+        async_update_blocks,
+        recovered_blocks
+    );
 
     Ok(())
 }
