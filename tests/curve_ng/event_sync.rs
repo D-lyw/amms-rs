@@ -275,6 +275,12 @@ async fn test_ng_stableswap_event_sync_actions() -> Result<()> {
         let mut pool = CurveNGPool::new(addr, CurveNGPoolType::StableSwap)
             .init(BlockId::from(init_block), provider.clone())
             .await?;
+        assert_eq!(
+            pool.admin_balances.len(),
+            pool.n_coins as usize,
+            "[StableSwap {}] admin_balances length invalid after init",
+            label
+        );
         let action = pool.sync(&log)?;
         assert_eq!(
             action, expected_action,
@@ -295,6 +301,12 @@ async fn test_ng_stableswap_event_sync_actions() -> Result<()> {
                 pool.rates.len(),
                 pool.n_coins as usize,
                 "[StableSwap {}] rates length invalid after update",
+                label
+            );
+            assert_eq!(
+                pool.admin_balances.len(),
+                pool.n_coins as usize,
+                "[StableSwap {}] admin_balances length invalid after update",
                 label
             );
         }

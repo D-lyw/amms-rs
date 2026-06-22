@@ -89,6 +89,7 @@ sol! {
     struct StableSwapRuntimeData {
         address poolAddress;
         uint256[] balances;
+        uint256[] adminBalances;
         uint256 amp;
         uint256 fee;
         uint256 adminFee;
@@ -164,6 +165,11 @@ impl CurveNGFactory {
         pool.n_coins = data.nCoins;
         pool.coins = data.coins.clone();
         pool.balances = data.balances.clone();
+        pool.admin_balances = if pool.pool_type.is_stable() {
+            vec![U256::ZERO; data.balances.len()]
+        } else {
+            Vec::new()
+        };
         pool.decimals = data.decimals.clone();
         pool.rates = if !data.rates.is_empty() {
             data.rates.clone()
@@ -236,6 +242,11 @@ impl CurveNGFactory {
 
         if !data.balances.is_empty() && data.balances.len() == pool.n_coins as usize {
             pool.balances = data.balances.clone();
+        }
+        if !data.adminBalances.is_empty() && data.adminBalances.len() == pool.n_coins as usize {
+            pool.admin_balances = data.adminBalances.clone();
+        } else if pool.admin_balances.len() != pool.n_coins as usize {
+            pool.admin_balances = vec![U256::ZERO; pool.n_coins as usize];
         }
 
         pool.amp = if data.amp > U256::ZERO {
@@ -603,6 +614,39 @@ impl CurveNGFactory {
                     }
                     pool.twocrypto_future_a_gamma_time = future_t;
                     pool.twocrypto_last_timestamp = last_t;
+                }
+            }
+        }
+
+        let mut stableswap_pools = amms_map
+            .values()
+            .filter_map(|amm| match amm {
+                AMM::CurveNGPool(pool)
+                    if pool.pool_type == CurveNGPoolType::StableSwap && pool.n_coins > 0 =>
+                {
+                    Some(pool.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        if !stableswap_pools.is_empty() {
+            match Self::refresh_runtime_data_batch(&mut stableswap_pools, block, provider.clone())
+                .await
+            {
+                Ok(()) => {
+                    for pool in stableswap_pools {
+                        if let Some(AMM::CurveNGPool(existing)) = amms_map.get_mut(&pool.address) {
+                            *existing = pool;
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "curve_ng::init_batch",
+                        error = %e,
+                        "StableSwap runtime refresh failed after initialization; admin_balances will start from zero"
+                    );
                 }
             }
         }

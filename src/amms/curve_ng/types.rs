@@ -65,6 +65,9 @@ pub struct CurveNGPool {
     pub coins: Vec<Address>,
     /// 各代币余额
     pub balances: Vec<U256>,
+    /// StableSwap NG 管理费余额；链上 `balances(i)` = stored balance - admin_balances(i)。
+    #[serde(default)]
+    pub admin_balances: Vec<U256>,
     /// 各代币精度
     pub decimals: Vec<u8>,
     /// 费率/汇率 (用于 rate provider, 如 wstETH)
@@ -171,6 +174,7 @@ impl CurveNGPool {
             n_coins: 0,
             coins: Vec::new(),
             balances: Vec::new(),
+            admin_balances: Vec::new(),
             decimals: Vec::new(),
             rates: Vec::new(),
             asset_types: Vec::new(),

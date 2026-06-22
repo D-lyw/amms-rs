@@ -14,6 +14,7 @@ interface ICurveNGStableRuntimePool {
     function A() external view returns (uint256);
     function fee() external view returns (uint256);
     function admin_fee() external view returns (uint256);
+    function admin_balances(uint256 i) external view returns (uint256);
     function offpeg_fee_multiplier() external view returns (uint256);
     function stored_rates() external view returns (uint256[] memory);
 }
@@ -27,6 +28,7 @@ contract GetCurveNGStableSwapRuntimeDataBatchRequest {
     struct RuntimePoolData {
         address poolAddress;
         uint256[] balances;
+        uint256[] adminBalances;
         uint256 amp;
         uint256 fee;
         uint256 adminFee;
@@ -48,6 +50,7 @@ contract GetCurveNGStableSwapRuntimeDataBatchRequest {
 
             address[] memory tempCoins = new address[](8);
             uint256[] memory tempBalances = new uint256[](8);
+            uint256[] memory tempAdminBalances = new uint256[](8);
             uint8 nCoins = 0;
             bool useInt128 = false;
 
@@ -88,11 +91,17 @@ contract GetCurveNGStableSwapRuntimeDataBatchRequest {
                         tempBalances[j] = balance;
                     } catch {}
                 }
+
+                try pool.admin_balances(j) returns (uint256 adminBalance) {
+                    tempAdminBalances[j] = adminBalance;
+                } catch {}
             }
 
             data.balances = new uint256[](nCoins);
+            data.adminBalances = new uint256[](nCoins);
             for (uint256 j = 0; j < nCoins; j++) {
                 data.balances[j] = tempBalances[j];
+                data.adminBalances[j] = tempAdminBalances[j];
             }
 
             data.amp = safeGetUint256(poolAddress, abi.encodeWithSelector(ICurveNGStableRuntimePool.A.selector));

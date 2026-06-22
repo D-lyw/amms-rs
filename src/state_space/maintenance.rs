@@ -46,11 +46,15 @@ struct ClProbeSnapshot {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CurveNGStableProbeSnapshot {
     balances: Vec<U256>,
+    admin_balances: Vec<U256>,
     rates: Option<Vec<U256>>,
     /// Per-rate asset type (0=Standard, 1=Oracle, 2=Rebasing, 3=ERC4626).
     /// Only populated when rates is Some. None means asset type unknown → compare all rates.
     rates_asset_types: Option<Vec<u8>>,
     amp: Option<U256>,
+    fee: U256,
+    admin_fee: U256,
+    offpeg_fee_multiplier: U256,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -98,7 +102,7 @@ impl DriftProbeKind {
 
 // Drift classification for CurveNG StableSwap pools.
 // Balances drift → Resync (event-driven, mismatch indicates real state error).
-// Rates/amp drift → AsyncUpdate (non-event-driven slow variables, lightweight refresh).
+// Admin balances/rates/amp drift → AsyncUpdate (runtime refresh is sufficient).
 // ERC4626 rates (type 3) are skipped — yield accrues every block via convertToAssets(),
 // comparison always produces false positives. Handled by rate sync task instead.
 fn classify_curve_ng_stable_drift(
@@ -110,6 +114,15 @@ fn classify_curve_ng_stable_drift(
     }
     if local.balances != remote.balances {
         return Some(PendingSyncAction::Resync);
+    }
+    if local.admin_balances != remote.admin_balances {
+        return Some(PendingSyncAction::AsyncUpdate);
+    }
+    if local.fee != remote.fee
+        || local.admin_fee != remote.admin_fee
+        || local.offpeg_fee_multiplier != remote.offpeg_fee_multiplier
+    {
+        return Some(PendingSyncAction::AsyncUpdate);
     }
     // Non-event-driven fields: silent drift is normal, lightweight refresh is sufficient.
     // rates: accrues via interest (rebasing tokens like stETH/weETH)
@@ -927,6 +940,7 @@ impl<N, P> StateSpaceManager<N, P> {
     fn curve_ng_stable_probe_snapshot_from_pool(pool: &CurveNGPool) -> CurveNGStableProbeSnapshot {
         CurveNGStableProbeSnapshot {
             balances: pool.balances.clone(),
+            admin_balances: pool.admin_balances.clone(),
             rates: if pool.supports_stored_rates {
                 Some(pool.rates.clone())
             } else {
@@ -938,6 +952,9 @@ impl<N, P> StateSpaceManager<N, P> {
                 None
             },
             amp: pool.amp,
+            fee: pool.fee,
+            admin_fee: pool.admin_fee,
+            offpeg_fee_multiplier: pool.offpeg_fee_multiplier,
         }
     }
 
@@ -2243,9 +2260,13 @@ mod tests {
     fn test_curve_ng_stable_drift_classification() {
         let make = |balances, rates, amp| CurveNGStableProbeSnapshot {
             balances,
+            admin_balances: vec![U256::from(1u64), U256::from(2u64)],
             rates,
             rates_asset_types: None,
             amp,
+            fee: U256::from(10u64),
+            admin_fee: U256::from(5u64),
+            offpeg_fee_multiplier: U256::from(1_000_000u64),
         };
 
         let base = make(
@@ -2300,6 +2321,52 @@ mod tests {
             Some(PendingSyncAction::Resync)
         );
 
+        let admin_balance_diff = CurveNGStableProbeSnapshot {
+            admin_balances: vec![U256::from(1u64), U256::from(3u64)],
+            ..base.clone()
+        };
+        assert_eq!(
+            classify_curve_ng_stable_drift(&base, &admin_balance_diff),
+            Some(PendingSyncAction::AsyncUpdate)
+        );
+
+        let fee_diff = CurveNGStableProbeSnapshot {
+            fee: U256::from(11u64),
+            ..base.clone()
+        };
+        assert_eq!(
+            classify_curve_ng_stable_drift(&base, &fee_diff),
+            Some(PendingSyncAction::AsyncUpdate)
+        );
+
+        let admin_fee_diff = CurveNGStableProbeSnapshot {
+            admin_fee: U256::from(6u64),
+            ..base.clone()
+        };
+        assert_eq!(
+            classify_curve_ng_stable_drift(&base, &admin_fee_diff),
+            Some(PendingSyncAction::AsyncUpdate)
+        );
+
+        let offpeg_diff = CurveNGStableProbeSnapshot {
+            offpeg_fee_multiplier: U256::from(2_000_000u64),
+            ..base.clone()
+        };
+        assert_eq!(
+            classify_curve_ng_stable_drift(&base, &offpeg_diff),
+            Some(PendingSyncAction::AsyncUpdate)
+        );
+
+        let balance_and_admin_diff = CurveNGStableProbeSnapshot {
+            balances: vec![U256::from(101u64), U256::from(200u64)],
+            admin_balances: vec![U256::from(1u64), U256::from(3u64)],
+            ..base.clone()
+        };
+        assert_eq!(
+            classify_curve_ng_stable_drift(&base, &balance_and_admin_diff),
+            Some(PendingSyncAction::Resync)
+        );
+
         // amp drift → AsyncUpdate
         let amp_diff = CurveNGStableProbeSnapshot {
             amp: Some(U256::from(200u64)),
@@ -2313,12 +2380,16 @@ mod tests {
         // ERC4626 token (type 3): rates drift should be SKIPPED (no false positive)
         let pool_with_4626 = CurveNGStableProbeSnapshot {
             balances: vec![U256::from(100u64), U256::from(200u64)],
+            admin_balances: vec![U256::from(1u64), U256::from(2u64)],
             rates: Some(vec![
                 U256::from(1_000_000_000_000_000_000u128),
                 U256::from(2_000_000_000_000_000_000u128),
             ]),
             rates_asset_types: Some(vec![0, 3]), // coin 1 is ERC4626
             amp: Some(U256::from(100u64)),
+            fee: U256::from(10u64),
+            admin_fee: U256::from(5u64),
+            offpeg_fee_multiplier: U256::from(1_000_000u64),
         };
         let remote_4626_drift = CurveNGStableProbeSnapshot {
             rates: Some(vec![

@@ -76,6 +76,14 @@ pub use factory::{
 };
 pub use types::{CurveIndexSignature, CurveNGPool, CurveNGPoolType, CurveNGTwoCryptoVariant};
 
+struct StableSwapExchangeComponents {
+    dy: U256,
+    admin_fee_out: U256,
+    dy_raw: U256,
+    out_rate: U256,
+    precision: U256,
+}
+
 // Curve NG 池合约 ABI (简化版)
 pub mod contracts {
     alloy::sol! {
@@ -499,9 +507,16 @@ impl AutomatedMarketMaker for CurveNGPool {
                     let event = ICurveNGPool::TokenExchange::decode_log(&log.inner)?;
                     let i = event.sold_id as usize;
                     let j = event.bought_id as usize;
-                    let (sim_dy, admin_fee_out) =
+                    let (sim_dy, simulated_admin_fee_out) =
                         self.stableswap_exchange_amounts(i, j, event.tokens_sold)?;
+                    let mut admin_fee_out = simulated_admin_fee_out;
                     if Self::abs_diff(sim_dy, event.tokens_bought) > U256::from(1u8) {
+                        admin_fee_out = self.stableswap_admin_fee_from_event_output(
+                            i,
+                            j,
+                            event.tokens_sold,
+                            event.tokens_bought,
+                        )?;
                         // For swaps involving ERC4626 tokens, rates drift every block via
                         // convertToAssets(). Use a relaxed tolerance (2000 wei) to absorb
                         // this normal drift while still catching genuine mismatches.
@@ -536,6 +551,7 @@ impl AutomatedMarketMaker for CurveNGPool {
                                 self.balances[j] = self.balances[j]
                                     .checked_sub(amount_out)
                                     .ok_or(AMMError::Msg("Balance underflow".into()))?;
+                                self.stableswap_add_admin_balance(j, admin_fee_out);
                             }
                             self.update_spot_prices();
                             return Ok(SyncAction::AsyncUpdate);
@@ -563,6 +579,7 @@ impl AutomatedMarketMaker for CurveNGPool {
                         self.balances[j] = self.balances[j]
                             .checked_sub(amount_out)
                             .ok_or(AMMError::Msg("Balance underflow".into()))?;
+                        self.stableswap_add_admin_balance(j, admin_fee_out);
                     }
 
                     tracing::info!(
@@ -573,6 +590,7 @@ impl AutomatedMarketMaker for CurveNGPool {
                         tokens_sold = ?event.tokens_sold,
                         tokens_bought = ?event.tokens_bought,
                         admin_fee_out = ?admin_fee_out,
+                        simulated_admin_fee_out = ?simulated_admin_fee_out,
                         "TokenExchange (StableSwap)"
                     );
 
@@ -587,6 +605,7 @@ impl AutomatedMarketMaker for CurveNGPool {
                             self.balances[i] = self.balances[i]
                                 .saturating_add(amount)
                                 .saturating_sub(admin_share);
+                            self.stableswap_add_admin_balance(i, admin_share);
                         }
                     }
                     tracing::info!(
@@ -631,6 +650,7 @@ impl AutomatedMarketMaker for CurveNGPool {
                             self.balances[i] = self.balances[i]
                                 .checked_sub(amount.saturating_add(admin_share))
                                 .ok_or(AMMError::Msg("Balance underflow".into()))?;
+                            self.stableswap_add_admin_balance(i, admin_share);
                         }
                     }
                     tracing::info!(
@@ -1761,12 +1781,61 @@ impl CurveNGPool {
         fee_amount * self.admin_fee / fee_denominator
     }
 
+    fn stableswap_add_admin_balance(&mut self, index: usize, amount: U256) {
+        if amount.is_zero() {
+            return;
+        }
+        if self.admin_balances.len() < self.balances.len() {
+            self.admin_balances.resize(self.balances.len(), U256::ZERO);
+        }
+        if let Some(balance) = self.admin_balances.get_mut(index) {
+            *balance = balance.saturating_add(amount);
+        }
+    }
+
     fn stableswap_exchange_amounts(
         &self,
         i: usize,
         j: usize,
         dx: U256,
     ) -> Result<(U256, U256), AMMError> {
+        let components = self.stableswap_exchange_components(i, j, dx)?;
+
+        Ok((components.dy, components.admin_fee_out))
+    }
+
+    fn stableswap_admin_fee_from_event_output(
+        &self,
+        i: usize,
+        j: usize,
+        dx: U256,
+        event_dy: U256,
+    ) -> Result<U256, AMMError> {
+        let components = self.stableswap_exchange_components(i, j, dx)?;
+        if components.out_rate.is_zero() {
+            return Err(AMMError::Msg("rates[j] is zero".into()));
+        }
+
+        // TokenExchange logs include the realized user output but not the admin
+        // fee. Anchor event replay to that realized output and infer the fee
+        // bucket from the same no-fee dy_raw used by the pool.
+        let event_scaled_dy = event_dy
+            .checked_mul(components.out_rate)
+            .ok_or_else(|| AMMError::Msg("event dy scaling overflow".into()))?
+            / components.precision;
+        let fee_amount = components.dy_raw.saturating_sub(event_scaled_dy);
+        let fee_denominator = U256::from(10).pow(U256::from(10));
+        let admin_fee_scaled = fee_amount * self.admin_fee / fee_denominator;
+
+        Ok(admin_fee_scaled * components.precision / components.out_rate)
+    }
+
+    fn stableswap_exchange_components(
+        &self,
+        i: usize,
+        j: usize,
+        dx: U256,
+    ) -> Result<StableSwapExchangeComponents, AMMError> {
         let amp = self
             .amp
             .ok_or(AMMError::Msg("A parameter not set".into()))?;
@@ -1874,7 +1943,13 @@ impl CurveNGPool {
         let dy = scaled_dy * precision / effective_rates[j];
         let admin_fee_out = admin_fee_scaled * precision / effective_rates[j];
 
-        Ok((dy, admin_fee_out))
+        Ok(StableSwapExchangeComponents {
+            dy,
+            admin_fee_out,
+            dy_raw,
+            out_rate: effective_rates[j],
+            precision,
+        })
     }
 
     /// StableSwap 交换模拟
@@ -2015,6 +2090,41 @@ mod tests {
     use alloy::rpc::client::ClientBuilder;
     use alloy::transports::layers::{RetryBackoffLayer, ThrottleLayer};
     use std::sync::Arc;
+
+    #[test]
+    fn test_stableswap_event_output_admin_fee_matches_simulated_output() -> eyre::Result<()> {
+        let mut pool = CurveNGPool::new(
+            address!("7EC81Ef12057008c0BB6B540127f88f917b4fC6c"),
+            CurveNGPoolType::StableSwap,
+        );
+        pool.n_coins = 2;
+        pool.coins = vec![
+            address!("1E4a5963aBFD975d8c9021ce480b42188849D41d"),
+            address!("779Ded0c9e1022225f8E0630b35a9b54bE713736"),
+        ];
+        pool.decimals = vec![6, 6];
+        pool.balances = vec![
+            U256::from(214_935_512_609u64),
+            U256::from(746_608_646_745u64),
+        ];
+        pool.rates = vec![
+            U256::from(10).pow(U256::from(30)),
+            U256::from(10).pow(U256::from(30)),
+        ];
+        pool.amp = Some(U256::from(5000u64));
+        pool.fee = U256::from(100_000u64);
+        pool.admin_fee = U256::from(5_000_000_000u64);
+        pool.offpeg_fee_multiplier = U256::from(200_000_000_000u64);
+
+        let dx = U256::from(188_089_000u64);
+        let (sim_dy, simulated_admin_fee_out) = pool.stableswap_exchange_amounts(1, 0, dx)?;
+        let event_anchored_admin_fee_out =
+            pool.stableswap_admin_fee_from_event_output(1, 0, dx, sim_dy)?;
+
+        assert_eq!(event_anchored_admin_fee_out, simulated_admin_fee_out);
+
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_curve_ng_stableswap_init() -> eyre::Result<()> {
