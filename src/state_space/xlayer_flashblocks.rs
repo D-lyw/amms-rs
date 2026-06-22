@@ -692,7 +692,7 @@ impl<N, P> StateSpaceManager<N, P> {
                     &pending_sync_queue,
                     &pending_sync_notify,
                     &applied_log_dedup,
-                    LogSource::XlayerFlashblock,
+                    LogSource::NewHeadsPull,
                     chain_id,
                 )
                 .await
@@ -813,6 +813,69 @@ impl<N, P> StateSpaceManager<N, P> {
 
                     let block_num = block_number
                         .unwrap_or_else(|| realtime_head.load(Ordering::Relaxed));
+
+                    let current_synced = realtime_head.load(Ordering::Relaxed);
+                    if block_num > current_synced.saturating_add(1) {
+                        match provider.get_block_number().await {
+                            Ok(chain_head) => {
+                                let from_block = current_synced.saturating_add(1);
+                                let to_block = chain_head.min(block_num.saturating_sub(1));
+                                if from_block <= to_block {
+                                    match Self::backfill_range(
+                                        &provider,
+                                        &state,
+                                        &hooks,
+                                        &query_chunks,
+                                        from_block,
+                                        to_block,
+                                        &realtime_head,
+                                        &canonical_head,
+                                        &pending_sync_queue,
+                                        &pending_sync_notify,
+                                        &applied_log_dedup,
+                                        LogSource::NewHeadsPull,
+                                        chain_id,
+                                    )
+                                    .await
+                                    {
+                                        Ok(results) => {
+                                            let affected_pools = results
+                                                .iter()
+                                                .map(|(_, affected)| affected.len())
+                                                .sum::<usize>();
+                                            if !results.is_empty() {
+                                                info!(
+                                                    from_block,
+                                                    to_block,
+                                                    live_block = block_num,
+                                                    backfilled_blocks = results.len(),
+                                                    affected_pools,
+                                                    "Xlayer flashblocks gap catch-up completed before applying live block"
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                from_block,
+                                                to_block,
+                                                live_block = block_num,
+                                                "Xlayer flashblocks gap catch-up failed before applying live block: {}",
+                                                e
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    current_synced,
+                                    live_block = block_num,
+                                    "Xlayer flashblocks gap catch-up skipped: failed to fetch chain head: {}",
+                                    e
+                                );
+                            }
+                        }
+                    }
 
                     // 7. 处理解析失败
                     if decode_fail_count > 0 {

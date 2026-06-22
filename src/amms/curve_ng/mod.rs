@@ -521,22 +521,7 @@ impl AutomatedMarketMaker for CurveNGPool {
                             || self.asset_types.get(j).copied().unwrap_or(0) == 3);
                     let mut needs_async_update = false;
 
-                    if !output_drift.is_zero() && !erc4626_involved {
-                        tracing::warn!(
-                            target = "amms::curve_ng::sync",
-                            pool = ?self.address,
-                            sold_id = i,
-                            bought_id = j,
-                            tokens_sold = ?event.tokens_sold,
-                            event_tokens_bought = ?event.tokens_bought,
-                            simulated_tokens_bought = ?sim_dy,
-                            drift_wei = ?output_drift,
-                            "TokenExchange (StableSwap) exact mismatch - Triggering AsyncUpdate"
-                        );
-                        return Ok(SyncAction::AsyncUpdate);
-                    }
-
-                    if output_drift > U256::from(1u8) {
+                    if !output_drift.is_zero() {
                         admin_fee_out = match self
                             .stableswap_admin_fee_from_event_output_at_timestamp(
                                 i,
@@ -550,21 +535,25 @@ impl AutomatedMarketMaker for CurveNGPool {
                                 tracing::warn!(
                                     target = "amms::curve_ng::sync",
                                     pool = ?self.address,
+                                    block_number = ?log.block_number,
+                                    tx_hash = ?log.transaction_hash,
+                                    tx_index = ?log.transaction_index,
+                                    log_index = ?log.log_index,
                                     sold_id = i,
                                     bought_id = j,
                                     tokens_sold = ?event.tokens_sold,
                                     event_tokens_bought = ?event.tokens_bought,
                                     simulated_tokens_bought = ?sim_dy,
                                     error = ?err,
-                                    "TokenExchange (StableSwap) admin fee inference failed - Triggering AsyncUpdate"
+                                    "TokenExchange (StableSwap) admin fee inference failed - applying simulated fee and scheduling AsyncUpdate"
                                 );
-                                return Ok(SyncAction::AsyncUpdate);
+                                simulated_admin_fee_out
                             }
                         };
                         // For swaps involving ERC4626 tokens, rates drift every block via
                         // convertToAssets(). Use a relaxed tolerance (2000 wei) to absorb
-                        // this normal drift while still catching genuine mismatches.
-                        // Base tolerance 10 wei absorbs math rounding differences.
+                        // this normal drift while still catching genuine mismatches. Standard
+                        // ERC20 pools should replay exactly; any drift schedules a refresh.
                         let threshold = if erc4626_involved {
                             U256::from(2000u64)
                         } else {
@@ -575,38 +564,35 @@ impl AutomatedMarketMaker for CurveNGPool {
                             tracing::warn!(
                                 target = "amms::curve_ng::sync",
                                 pool = ?self.address,
+                                block_number = ?log.block_number,
+                                tx_hash = ?log.transaction_hash,
+                                tx_index = ?log.transaction_index,
+                                log_index = ?log.log_index,
                                 sold_id = i,
                                 bought_id = j,
                                 tokens_sold = ?event.tokens_sold,
                                 event_tokens_bought = ?event.tokens_bought,
                                 simulated_tokens_bought = ?sim_dy,
                                 drift_wei = ?output_drift,
-                                "TokenExchange (StableSwap) mismatch - AsyncUpdate refreshes rates"
+                                "TokenExchange (StableSwap) mismatch - applying event output and scheduling AsyncUpdate"
                             );
-                            if i < self.balances.len() {
-                                self.balances[i] += event.tokens_sold;
-                            }
-                            if j < self.balances.len() {
-                                let amount_out = event.tokens_bought + admin_fee_out;
-                                self.balances[j] = self.balances[j]
-                                    .checked_sub(amount_out)
-                                    .ok_or(AMMError::Msg("Balance underflow".into()))?;
-                                self.stableswap_add_admin_balance(j, admin_fee_out)?;
-                            }
-                            self.update_spot_prices();
-                            return Ok(SyncAction::AsyncUpdate);
+                            needs_async_update = true;
+                        } else {
+                            // ERC4626 rate drift within relaxed threshold — use event data directly.
+                            needs_async_update = erc4626_involved;
+                            tracing::debug!(
+                                target = "amms::curve_ng::sync",
+                                pool = ?self.address,
+                                block_number = ?log.block_number,
+                                tx_hash = ?log.transaction_hash,
+                                tx_index = ?log.transaction_index,
+                                log_index = ?log.log_index,
+                                sold_id = i,
+                                bought_id = j,
+                                drift_wei = ?output_drift,
+                                "TokenExchange (StableSwap) ERC4626 drift within tolerance"
+                            );
                         }
-
-                        // ERC4626 rate drift within relaxed threshold — use event data directly.
-                        needs_async_update = erc4626_involved;
-                        tracing::debug!(
-                            target = "amms::curve_ng::sync",
-                            pool = ?self.address,
-                            sold_id = i,
-                            bought_id = j,
-                            drift_wei = ?output_drift,
-                            "TokenExchange (StableSwap) ERC4626 drift within tolerance"
-                        );
                     }
 
                     if i < self.balances.len() {
