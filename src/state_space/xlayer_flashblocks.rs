@@ -356,6 +356,18 @@ fn parse_hex_u64(s: &str) -> Option<u64> {
     u64::from_str_radix(raw, 16).ok()
 }
 
+fn xlayer_flashblock_block_number(fb: &XlayerFlashblockMessage<'_>) -> Option<u64> {
+    fb.metadata
+        .as_ref()
+        .and_then(|m| m.block_number)
+        .or_else(|| {
+            fb.base
+                .as_ref()
+                .and_then(|base| base.block_number.as_deref())
+                .and_then(parse_hex_u64)
+        })
+}
+
 // ─────────────────────────────────────────────
 // Log extraction
 // ─────────────────────────────────────────────
@@ -377,16 +389,7 @@ fn extract_logs_from_xlayer_flashblock(
     let mut decode_failed_addresses = HashSet::new();
 
     // 1. 获取 block_number（metadata 数值优先，base hex 备选）
-    let block_number = fb
-        .metadata
-        .as_ref()
-        .and_then(|m| m.block_number)
-        .or_else(|| {
-            fb.base
-                .as_ref()
-                .and_then(|base| base.block_number.as_deref())
-                .and_then(parse_hex_u64)
-        });
+    let block_number = xlayer_flashblock_block_number(fb);
 
     let Some(block_number) = block_number else {
         return (out, None, decode_fail, decode_failed_addresses);
@@ -622,7 +625,10 @@ fn extract_logs_from_xlayer_flashblock(
                 let raw_hex = raw_tx_hex.strip_prefix("0x").unwrap_or(raw_tx_hex);
                 if let Ok(raw_bytes) = alloy::hex::decode(raw_hex) {
                     let exact_hash = alloy::primitives::keccak256(&raw_bytes);
-                    real_tx_index_map.insert(exact_hash, real_idx as u64);
+                    // diff.transactions is slice-local on XLayer. Keep the
+                    // per-payload base so the corrected index remains
+                    // block-global across all flashblock slices.
+                    real_tx_index_map.insert(exact_hash, tx_base + real_idx as u64);
                 }
             }
         }
@@ -800,20 +806,8 @@ impl<N, P> StateSpaceManager<N, P> {
                         continue;
                     };
 
-                    // 6. 提取 logs
-                    let (logs, block_number, decode_fail_count, decode_failed_addresses) =
-                        extract_logs_from_xlayer_flashblock(
-                            &fb,
-                            &matcher,
-                            &mut dedup_cache,
-                            &mut parse_cache,
-                            &mut tx_tracker,
-                            &mut latest_block_timestamp,
-                        );
-
-                    let block_num = block_number
+                    let block_num = xlayer_flashblock_block_number(&fb)
                         .unwrap_or_else(|| realtime_head.load(Ordering::Relaxed));
-
                     let current_synced = realtime_head.load(Ordering::Relaxed);
                     if block_num > current_synced.saturating_add(1) {
                         match provider.get_block_number().await {
@@ -876,6 +870,20 @@ impl<N, P> StateSpaceManager<N, P> {
                             }
                         }
                     }
+
+                    // 6. 提取 logs
+                    let (logs, block_number, decode_fail_count, decode_failed_addresses) =
+                        extract_logs_from_xlayer_flashblock(
+                            &fb,
+                            &matcher,
+                            &mut dedup_cache,
+                            &mut parse_cache,
+                            &mut tx_tracker,
+                            &mut latest_block_timestamp,
+                        );
+
+                    let block_num =
+                        block_number.unwrap_or_else(|| realtime_head.load(Ordering::Relaxed));
 
                     // 7. 处理解析失败
                     if decode_fail_count > 0 {
@@ -949,5 +957,115 @@ impl<N, P> StateSpaceManager<N, P> {
                 sleep(STREAM_RECONNECT_DELAY).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::primitives::{address, keccak256, B256};
+    use serde_json::{json, Map};
+
+    fn hash_raw_tx(raw: &[u8]) -> String {
+        format!("{:#x}", keccak256(raw))
+    }
+
+    fn receipt(address: Address, topic0: B256, cumulative_gas: u64) -> serde_json::Value {
+        json!({
+            "cumulativeGasUsed": format!("0x{cumulative_gas:x}"),
+            "logs": [{
+                "address": format!("{address:#x}"),
+                "topics": [format!("{topic0:#x}")],
+                "data": "0x"
+            }]
+        })
+    }
+
+    fn flashblock<'a>(
+        payload_id: &'a str,
+        index: u64,
+        block_number: u64,
+        txs: Vec<Vec<u8>>,
+        receipts: Map<String, serde_json::Value>,
+    ) -> XlayerFlashblockMessage<'a> {
+        XlayerFlashblockMessage {
+            payload_id: Cow::Borrowed(payload_id),
+            index,
+            base: None,
+            diff: Some(XlayerFlashblockDiff {
+                block_hash: None,
+                transactions: txs
+                    .into_iter()
+                    .map(|tx| Cow::Owned(format!("0x{}", alloy::hex::encode(tx))))
+                    .collect(),
+            }),
+            metadata: Some(XlayerFlashblockMetadata {
+                block_number: Some(block_number),
+                receipts,
+            }),
+        }
+    }
+
+    #[test]
+    fn xlayer_lazy_tx_index_correction_preserves_payload_base_across_slices() {
+        let pool = address!("1111111111111111111111111111111111111111");
+        let topic0 = B256::repeat_byte(0x22);
+        let matcher = XlayerLogMatcher {
+            topic_addresses: HashSet::from([pool]),
+            topic_signatures: HashSet::from([topic0]),
+            address_only_addresses: HashSet::new(),
+        };
+        let mut dedup = XlayerDedupCache::new(XLAYER_DEDUP_PAYLOAD_WINDOW);
+        let mut parse_cache = XlayerParseCache::new();
+        let mut tx_tracker = XlayerTxCountTracker::new(XLAYER_TX_COUNT_WINDOW);
+        let mut latest_block_timestamp = None;
+
+        let payload_id = "0xpayload";
+        let block_number = 63368070;
+
+        let slice0_txs = vec![vec![0x01], vec![0x02]];
+        let mut slice0_receipts = Map::new();
+        slice0_receipts.insert(hash_raw_tx(&slice0_txs[0]), receipt(pool, topic0, 10));
+        slice0_receipts.insert(hash_raw_tx(&slice0_txs[1]), receipt(pool, topic0, 20));
+        let slice0 = flashblock(payload_id, 0, block_number, slice0_txs, slice0_receipts);
+
+        let (logs0, _, _, _) = extract_logs_from_xlayer_flashblock(
+            &slice0,
+            &matcher,
+            &mut dedup,
+            &mut parse_cache,
+            &mut tx_tracker,
+            &mut latest_block_timestamp,
+        );
+        assert_eq!(
+            logs0
+                .iter()
+                .map(|log| log.transaction_index.unwrap())
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+
+        let slice1_txs = vec![vec![0x03], vec![0x04]];
+        let mut slice1_receipts = Map::new();
+        slice1_receipts.insert(hash_raw_tx(&slice1_txs[0]), receipt(pool, topic0, 30));
+        slice1_receipts.insert(hash_raw_tx(&slice1_txs[1]), receipt(pool, topic0, 40));
+        let slice1 = flashblock(payload_id, 1, block_number, slice1_txs, slice1_receipts);
+
+        let (logs1, _, _, _) = extract_logs_from_xlayer_flashblock(
+            &slice1,
+            &matcher,
+            &mut dedup,
+            &mut parse_cache,
+            &mut tx_tracker,
+            &mut latest_block_timestamp,
+        );
+
+        assert_eq!(
+            logs1
+                .iter()
+                .map(|log| log.transaction_index.unwrap())
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
     }
 }
