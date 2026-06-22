@@ -153,6 +153,12 @@ const XLAYER_FLASHBLOCKS_RAW_WS_URL: &str = "wss://ws.xlayer.tech/flashblocks";
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const STREAM_RECONNECT_DELAY: Duration = Duration::from_secs(2);
 const APPLIED_LOG_DEDUP_CAPACITY: usize = 300_000;
+
+/// XLayer flashblock content_hash 去重集合的 LRU 容量。
+///
+/// 每个 block 匹配 ~5 条 log，1,000 覆盖 ~200 blocks ≈ 3.3 分钟，
+/// 远大于实际重复投递的延迟（实测 ~1 秒）。
+const CONTENT_HASH_DEDUP_CAPACITY: usize = 1_000;
 const DEFAULT_PENDING_SYNC_WORKER_INTERVAL: Duration = Duration::from_secs(2);
 const DEFAULT_DRIFT_PROBE_INTERVAL: Duration = Duration::from_secs(120);
 
@@ -282,6 +288,28 @@ struct AppliedLogDedupCache {
     order: VecDeque<AppliedLogKey>,
     cross_source_content_seen: HashSet<AppliedLogKey>,
     cross_source_content_order: VecDeque<AppliedLogKey>,
+    /// XLayer flashblock 专用：基于日志内容哈希 (keccak256) 的去重集合。
+    ///
+    /// ## 为什么需要这个集合
+    ///
+    /// XLayer flashblock 的同一个交易偶尔会被服务器以不同的
+    /// `payload_id` 重新投递。当重新投递发生时：
+    /// - `XlayerDedupCache` 按 `payload_id` 分组，拦截不到跨 payload 的重复
+    /// - `seen` 集合的 key 包含 `log_index`（枚举位置），而重新投递时
+    ///   同一交易可能拿到不同的 `log_index`（因为 receipt 上下文变化）
+    /// - 两层去重都失效 → 同一事件被 apply 两次 → state 损坏
+    ///
+    /// 这个集合使用 `build_log_content_hash()` 计算的哈希值做去重 key。
+    /// 该哈希包含了：`address + tx_hash + block_number + topics[] + data`，
+    /// 唯一标识一个事件，**不依赖 log_index**。
+    /// 同一交易的同一事件无论被投递多少次、log_index 如何变化，
+    /// 其 content_hash 不变，因此能可靠去重。
+    ///
+    /// 与 `cross_source_content_seen` 的区别：
+    /// - `cross_source_content_seen` 用于 flashblock vs canonical 之间的跨源去重
+    /// - `xlayer_content_seen` 用于 flashblock 自身的跨 payload 去重
+    content_hash_seen: HashSet<B256>,
+    content_hash_order: VecDeque<B256>,
 }
 
 impl AppliedLogDedupCache {
@@ -307,6 +335,19 @@ impl AppliedLogDedupCache {
         }
     }
 
+    /// 记录 content_hash 到 XLayer 专属去重集合。
+    /// 容量 1,000（~3.3 分钟窗口），远大于实际重复投递的秒级延迟。
+    fn remember_content_hash(&mut self, hash: B256) {
+        if self.content_hash_seen.insert(hash) {
+            self.content_hash_order.push_back(hash);
+        }
+        while self.content_hash_order.len() > CONTENT_HASH_DEDUP_CAPACITY {
+            if let Some(old) = self.content_hash_order.pop_front() {
+                self.content_hash_seen.remove(&old);
+            }
+        }
+    }
+
     fn insert_log_if_new(&mut self, log: &Log, source: LogSource) -> bool {
         let primary = build_applied_log_key(log);
         let content = build_applied_log_content_key(log);
@@ -323,7 +364,15 @@ impl AppliedLogDedupCache {
             if self.seen.contains(&primary) {
                 return false;
             }
+            // XLayer 专属的 content_hash 去重检查：
+            // 捕获同一交易以不同 payload_id/log_index 重新投递的情况。
+            // 不依赖 log_index，使用 keccak256(content_hash) 做唯一标识。
+            let content_hash = build_log_content_hash(log);
+            if self.content_hash_seen.contains(&content_hash) {
+                return false;
+            }
             self.remember(primary);
+            self.remember_content_hash(content_hash);
             return true;
         }
 
