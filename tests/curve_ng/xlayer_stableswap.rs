@@ -336,7 +336,7 @@ async fn test_xlayer_curve_ng_stableswap_swap_parity() -> Result<()> {
 
 #[tokio::test]
 async fn test_xlayer_curve_ng_stableswap_state_space_replay_window() -> Result<()> {
-    const INIT_BLOCK: u64 = 63_348_392;
+    let init_block = env_u64("CURVE_NG_XLAYER_STATE_SPACE_INIT_BLOCK", 63_348_392);
     let replay_blocks = env_u64("CURVE_NG_XLAYER_STATE_SPACE_REPLAY_BLOCKS", 100).max(1);
 
     let rpc_url = match xlayer_provider_url() {
@@ -357,7 +357,7 @@ async fn test_xlayer_curve_ng_stableswap_state_space_replay_window() -> Result<(
         return Ok(());
     }
 
-    let end_block = INIT_BLOCK + replay_blocks;
+    let end_block = init_block + replay_blocks;
     let head = provider.get_block_number().await?;
     if head < end_block {
         println!(
@@ -369,7 +369,7 @@ async fn test_xlayer_curve_ng_stableswap_state_space_replay_window() -> Result<(
 
     let seed_amm = AMM::CurveNGPool(CurveNGPool::new(POOL, CurveNGPoolType::StableSwap));
     let manager = StateSpaceBuilder::new(provider.clone())
-        .block(INIT_BLOCK)
+        .block(init_block)
         .with_amms(vec![seed_amm])
         .sync()
         .await?;
@@ -380,8 +380,8 @@ async fn test_xlayer_curve_ng_stableswap_state_space_replay_window() -> Result<(
             Some(AMM::CurveNGPool(pool)) => pool,
             other => return Err(eyre!("expected CurveNGPool in state, got {:?}", other)),
         };
-        let chain = fetch_snapshot(&*provider, POOL, pool.n_coins as usize, INIT_BLOCK).await?;
-        assert_full_alignment(INIT_BLOCK, pool, &chain)?;
+        let chain = fetch_snapshot(&*provider, POOL, pool.n_coins as usize, init_block).await?;
+        assert_full_alignment(init_block, pool, &chain)?;
     }
 
     let sync_events = {
@@ -397,9 +397,9 @@ async fn test_xlayer_curve_ng_stableswap_state_space_replay_window() -> Result<(
         &*provider,
         POOL,
         sync_events,
-        INIT_BLOCK + 1,
+        init_block + 1,
         end_block,
-        replay_blocks,
+        replay_blocks.min(100),
     )
     .await?;
     hydrate_block_timestamps(&*provider, &mut logs).await?;
@@ -408,7 +408,7 @@ async fn test_xlayer_curve_ng_stableswap_state_space_replay_window() -> Result<(
         println!(
             "Skipping StateSpace replay: no logs for pool {} in window {}..{}",
             POOL,
-            INIT_BLOCK + 1,
+            init_block + 1,
             end_block
         );
         return Ok(());
@@ -419,7 +419,7 @@ async fn test_xlayer_curve_ng_stableswap_state_space_replay_window() -> Result<(
     let mut async_update_blocks = Vec::new();
     let mut recovered_blocks = Vec::new();
 
-    for block in (INIT_BLOCK + 1)..=end_block {
+    for block in (init_block + 1)..=end_block {
         let block_logs: Vec<Log> = logs
             .iter()
             .filter(|log| log.block_number == Some(block))
@@ -502,8 +502,8 @@ async fn test_xlayer_curve_ng_stableswap_state_space_replay_window() -> Result<(
     println!(
         "[XLayer CurveNG Stable StateSpace replay] pool={} init={} window={}..{} blocks_with_logs={} logs={} async_update_blocks={:?} recovered_blocks={:?}",
         POOL,
-        INIT_BLOCK,
-        INIT_BLOCK + 1,
+        init_block,
+        init_block + 1,
         end_block,
         block_count,
         processed,

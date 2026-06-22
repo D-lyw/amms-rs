@@ -212,15 +212,11 @@ fn log_realtime_update_applied(meta: RealtimeUpdateMeta, affected_pools: usize, 
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) enum AppliedLogPosition {
-    // Prefer the log's own stable position when present:
-    // - canonical get_logs: block-global log_index
-    // - Base pendingLogs: provider-supplied log_index
-    // - flashblocks extractors: synthesized per-tx receipt log index
+    // Stable block-global log index used by canonical get_logs and providers
+    // whose realtime subscriptions expose canonical logIndex semantics.
     LogIndex(u64),
-    // Fallback for sources that do not expose log_index.
-    // We fingerprint the full event payload so singleton log delivery
-    // (like Base pendingLogs) does not collapse distinct logs that
-    // happen to share tx_hash/address/topic0.
+    // Stable event fingerprint used across canonical backfill and realtime
+    // flashblock/pendingLogs sources.
     ContentHash(B256),
 }
 
@@ -246,7 +242,6 @@ pub(super) fn build_log_content_hash(log: &Log) -> B256 {
     }
 
     bytes.extend_from_slice(&log.block_number.unwrap_or_default().to_be_bytes());
-    bytes.extend_from_slice(&log.transaction_index.unwrap_or_default().to_be_bytes());
     bytes.extend_from_slice(&(log.topics().len() as u64).to_be_bytes());
     for topic in log.topics() {
         bytes.extend_from_slice(topic.as_slice());
@@ -271,24 +266,75 @@ pub(super) fn build_applied_log_key(log: &Log) -> AppliedLogKey {
     }
 }
 
+fn build_applied_log_content_key(log: &Log) -> AppliedLogKey {
+    AppliedLogKey {
+        tx_hash: log.transaction_hash,
+        block_number: log.block_number,
+        position: AppliedLogPosition::ContentHash(build_log_content_hash(log)),
+        address: log.address(),
+        topic0: log.topics().first().copied(),
+    }
+}
+
 #[derive(Default)]
 struct AppliedLogDedupCache {
     seen: HashSet<AppliedLogKey>,
     order: VecDeque<AppliedLogKey>,
+    cross_source_content_seen: HashSet<AppliedLogKey>,
+    cross_source_content_order: VecDeque<AppliedLogKey>,
 }
 
 impl AppliedLogDedupCache {
-    fn insert_if_new(&mut self, key: AppliedLogKey) -> bool {
-        if self.seen.contains(&key) {
-            return false;
+    fn remember(&mut self, key: AppliedLogKey) {
+        if self.seen.insert(key.clone()) {
+            self.order.push_back(key);
         }
-        self.seen.insert(key.clone());
-        self.order.push_back(key);
         while self.order.len() > APPLIED_LOG_DEDUP_CAPACITY {
             if let Some(old) = self.order.pop_front() {
                 self.seen.remove(&old);
             }
         }
+    }
+
+    fn remember_cross_source_content(&mut self, key: AppliedLogKey) {
+        if self.cross_source_content_seen.insert(key.clone()) {
+            self.cross_source_content_order.push_back(key);
+        }
+        while self.cross_source_content_order.len() > APPLIED_LOG_DEDUP_CAPACITY {
+            if let Some(old) = self.cross_source_content_order.pop_front() {
+                self.cross_source_content_seen.remove(&old);
+            }
+        }
+    }
+
+    fn insert_log_if_new(&mut self, log: &Log, source: LogSource) -> bool {
+        let primary = build_applied_log_key(log);
+        let content = build_applied_log_content_key(log);
+
+        if matches!(source, LogSource::XlayerFlashblock) {
+            // XLayer flashblock logs synthesize receipt-local log_index values,
+            // while canonical get_logs returns block-global log_index values.
+            // Use only non-XLayer content aliases to suppress overlap with
+            // initial backfill; keep XLayer's receipt-local primary key so two
+            // legitimate identical-payload logs in one tx are not collapsed.
+            if self.cross_source_content_seen.contains(&content) {
+                return false;
+            }
+            if self.seen.contains(&primary) {
+                return false;
+            }
+            self.remember(primary);
+            return true;
+        }
+
+        // For canonical/provider logs, prefer the stable positional key so two
+        // legitimate same-payload events in one transaction are not collapsed.
+        if self.seen.contains(&primary) {
+            return false;
+        }
+        self.remember(primary);
+        // Also record the content alias so a later XLayer overlap can match it.
+        self.remember_cross_source_content(content);
         true
     }
 }
@@ -876,7 +922,7 @@ impl<N, P> StateSpaceManager<N, P> {
             let mut kept = Vec::with_capacity(logs.len());
 
             for log in logs {
-                if dedup.insert_if_new(build_applied_log_key(&log)) {
+                if dedup.insert_log_if_new(&log, source) {
                     kept.push(log);
                 }
             }
@@ -2257,27 +2303,41 @@ mod tests {
     }
 
     #[test]
-    fn applied_log_dedup_keeps_same_tx_same_topic_when_log_index_differs() {
-        let tx_hash = alloy::primitives::B256::from([0x11u8; 32]);
-        let address = address!("3333333333333333333333333333333333333333");
-        let topic0 = FixedBytes::<32>::from([0x22u8; 32]);
+    fn applied_log_builder_drops_same_event_when_indices_differ_across_sources() {
+        let tx_hash = alloy::primitives::B256::from([0x88u8; 32]);
+        let topic0 = FixedBytes::<32>::from([0x99u8; 32]);
+        let canonical_log = make_test_log(Some(tx_hash), Some(77), vec![topic0], vec![0xde, 0xad]);
+        let mut realtime_log =
+            make_test_log(Some(tx_hash), Some(0), vec![topic0], vec![0xde, 0xad]);
+        realtime_log.transaction_index = Some(12);
+
         let mut dedup = AppliedLogDedupCache::default();
+        assert!(dedup.insert_log_if_new(&canonical_log, LogSource::NewHeadsPull));
+        assert!(!dedup.insert_log_if_new(&realtime_log, LogSource::XlayerFlashblock));
+    }
 
-        assert!(dedup.insert_if_new(AppliedLogKey {
-            tx_hash: Some(tx_hash),
-            block_number: Some(123),
-            position: AppliedLogPosition::LogIndex(7),
-            address,
-            topic0: Some(topic0),
-        }));
+    #[test]
+    fn applied_log_builder_keeps_same_payload_events_when_canonical_indices_differ() {
+        let tx_hash = alloy::primitives::B256::from([0x12u8; 32]);
+        let topic0 = FixedBytes::<32>::from([0x34u8; 32]);
+        let log_a = make_test_log(Some(tx_hash), Some(77), vec![topic0], vec![0xde, 0xad]);
+        let log_b = make_test_log(Some(tx_hash), Some(78), vec![topic0], vec![0xde, 0xad]);
 
-        assert!(dedup.insert_if_new(AppliedLogKey {
-            tx_hash: Some(tx_hash),
-            block_number: Some(123),
-            position: AppliedLogPosition::LogIndex(8),
-            address,
-            topic0: Some(topic0),
-        }));
+        let mut dedup = AppliedLogDedupCache::default();
+        assert!(dedup.insert_log_if_new(&log_a, LogSource::NewHeadsPull));
+        assert!(dedup.insert_log_if_new(&log_b, LogSource::NewHeadsPull));
+    }
+
+    #[test]
+    fn applied_log_builder_keeps_same_payload_events_when_xlayer_local_indices_differ() {
+        let tx_hash = alloy::primitives::B256::from([0x56u8; 32]);
+        let topic0 = FixedBytes::<32>::from([0x78u8; 32]);
+        let log_a = make_test_log(Some(tx_hash), Some(0), vec![topic0], vec![0xde, 0xad]);
+        let log_b = make_test_log(Some(tx_hash), Some(1), vec![topic0], vec![0xde, 0xad]);
+
+        let mut dedup = AppliedLogDedupCache::default();
+        assert!(dedup.insert_log_if_new(&log_a, LogSource::XlayerFlashblock));
+        assert!(dedup.insert_log_if_new(&log_b, LogSource::XlayerFlashblock));
     }
 
     #[test]
@@ -2298,8 +2358,8 @@ mod tests {
         );
         let mut dedup = AppliedLogDedupCache::default();
 
-        assert!(dedup.insert_if_new(build_applied_log_key(&log_a)));
-        assert!(dedup.insert_if_new(build_applied_log_key(&log_b)));
+        assert!(dedup.insert_log_if_new(&log_a, LogSource::NewHeadsPull));
+        assert!(dedup.insert_log_if_new(&log_b, LogSource::NewHeadsPull));
     }
 
     #[test]
@@ -2314,8 +2374,8 @@ mod tests {
         );
         let mut dedup = AppliedLogDedupCache::default();
 
-        assert!(dedup.insert_if_new(build_applied_log_key(&log)));
-        assert!(!dedup.insert_if_new(build_applied_log_key(&log)));
+        assert!(dedup.insert_log_if_new(&log, LogSource::NewHeadsPull));
+        assert!(!dedup.insert_log_if_new(&log, LogSource::NewHeadsPull));
     }
 
     #[test]
