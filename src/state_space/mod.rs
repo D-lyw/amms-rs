@@ -98,7 +98,6 @@ pub enum RealtimeUpdateSource {
     XlayerFlashblock,
     ArbitrumFeed,
     NewHeads,
-    CanonicalReconcile,
     Maintenance,
 }
 
@@ -118,7 +117,6 @@ pub struct StateSpaceManager<N, P> {
     realtime_ws_endpoints: Option<Vec<String>>,
     pub realtime_head: Arc<AtomicU64>,
     pub canonical_head: Arc<AtomicU64>,
-    pub reconcile_cursor: Arc<AtomicU64>,
     update_seq: Arc<AtomicU64>,
     pending_sync_queue: Arc<Mutex<PendingSyncQueue>>,
     pending_sync_notify: Arc<Notify>,
@@ -168,7 +166,6 @@ enum LogSource {
     RealtimeFlashblock,
     XlayerFlashblock,
     ArbitrumFeedPull,
-    CanonicalReconcile,
     NewHeadsPull,
     Maintenance,
 }
@@ -179,7 +176,6 @@ impl RealtimeUpdateSource {
             LogSource::RealtimeFlashblock => Self::BaseFlashblock,
             LogSource::XlayerFlashblock => Self::XlayerFlashblock,
             LogSource::ArbitrumFeedPull => Self::ArbitrumFeed,
-            LogSource::CanonicalReconcile => Self::CanonicalReconcile,
             LogSource::NewHeadsPull => Self::NewHeads,
             LogSource::Maintenance => Self::Maintenance,
         }
@@ -550,7 +546,7 @@ impl<N, P> StateSpaceManager<N, P> {
 
     async fn ensure_background_tasks(
         &self,
-        query_chunks: Vec<LogQueryChunk>,
+        _query_chunks: Vec<LogQueryChunk>,
         chain_id: u64,
         selected: SelectedRealtimeSource,
     ) -> Result<(), StateSpaceError>
@@ -597,37 +593,6 @@ impl<N, P> StateSpaceManager<N, P> {
             )
             .await;
         });
-
-        if matches!(
-            selected,
-            SelectedRealtimeSource::BasePendingLogs | SelectedRealtimeSource::ArbitrumFeedPull
-        ) {
-            let provider = self.provider.clone();
-            let state = self.state.clone();
-            let hooks = self.hooks.clone();
-            let realtime_head = self.realtime_head.clone();
-            let canonical_head = self.canonical_head.clone();
-            let reconcile_cursor = self.reconcile_cursor.clone();
-            let queue = self.pending_sync_queue.clone();
-            let notify = self.pending_sync_notify.clone();
-            let dedup = self.applied_log_dedup.clone();
-            tokio::spawn(async move {
-                Self::run_reconcile_worker(
-                    provider,
-                    state,
-                    hooks,
-                    query_chunks,
-                    realtime_head,
-                    canonical_head,
-                    reconcile_cursor,
-                    queue,
-                    notify,
-                    dedup,
-                    chain_id,
-                )
-                .await;
-            });
-        }
 
         let provider = self.provider.clone();
         let state = self.state.clone();
@@ -972,7 +937,6 @@ impl<N, P> StateSpaceManager<N, P> {
             Self::store_monotonic_head(canonical_head, block_num);
             let guard = state.read().await;
             Self::store_monotonic_head(&guard.canonical_head, block_num);
-            Self::store_monotonic_head(&guard.reconcile_cursor, block_num);
         }
 
         if logs.is_empty() {
@@ -1796,10 +1760,8 @@ where
 
         let realtime_head = Arc::new(AtomicU64::new(self.initial_block));
         let canonical_head = Arc::new(AtomicU64::new(self.initial_block));
-        let reconcile_cursor = Arc::new(AtomicU64::new(self.initial_block));
         state_space.realtime_head = realtime_head.clone();
         state_space.canonical_head = canonical_head.clone();
-        state_space.reconcile_cursor = reconcile_cursor.clone();
         state_space.chain_id = chain_id;
 
         let state_space = Arc::new(RwLock::new(state_space));
@@ -1921,7 +1883,6 @@ where
             realtime_ws_endpoints: self.realtime_ws_endpoints,
             realtime_head,
             canonical_head,
-            reconcile_cursor,
             update_seq: Arc::new(AtomicU64::new(0)),
             state: state_space,
             block_filter,
@@ -1945,7 +1906,6 @@ pub struct StateSpace {
     pub state: HashMap<Address, Arc<AMM>>,
     pub realtime_head: Arc<AtomicU64>,
     pub canonical_head: Arc<AtomicU64>,
-    pub reconcile_cursor: Arc<AtomicU64>,
     pub chain_id: u64,
 }
 
@@ -2183,8 +2143,6 @@ pub struct SerializableStateSpace {
     pub realtime_head: u64,
     #[serde(default)]
     pub canonical_head: u64,
-    #[serde(default)]
-    pub reconcile_cursor: u64,
 }
 
 impl From<StateSpace> for SerializableStateSpace {
@@ -2197,7 +2155,6 @@ impl From<StateSpace> for SerializableStateSpace {
                 .collect(),
             realtime_head: ss.realtime_head.load(Ordering::Relaxed),
             canonical_head: ss.canonical_head.load(Ordering::Relaxed),
-            reconcile_cursor: ss.reconcile_cursor.load(Ordering::Relaxed),
         }
     }
 }
@@ -2507,7 +2464,6 @@ mod tests {
         state.insert_amm(make_v2_amm(pool_address, 123));
         state.realtime_head.store(300, Ordering::Relaxed);
         state.canonical_head.store(290, Ordering::Relaxed);
-        state.reconcile_cursor.store(280, Ordering::Relaxed);
 
         let serializable = SerializableStateSpace::from(state);
         let restored = StateSpace::from(serializable);
@@ -2519,7 +2475,6 @@ mod tests {
         );
         assert_eq!(restored.realtime_head.load(Ordering::Relaxed), 300);
         assert_eq!(restored.canonical_head.load(Ordering::Relaxed), 290);
-        assert_eq!(restored.reconcile_cursor.load(Ordering::Relaxed), 280);
     }
 }
 
@@ -2541,11 +2496,6 @@ impl From<SerializableStateSpace> for StateSpace {
         } else {
             val.canonical_head
         };
-        let reconcile_cursor = if val.reconcile_cursor == 0 {
-            inferred_head.max(canonical_head)
-        } else {
-            val.reconcile_cursor
-        };
         let state = val
             .state
             .into_iter()
@@ -2555,7 +2505,6 @@ impl From<SerializableStateSpace> for StateSpace {
             state,
             realtime_head: Arc::new(AtomicU64::new(realtime_head)),
             canonical_head: Arc::new(AtomicU64::new(canonical_head)),
-            reconcile_cursor: Arc::new(AtomicU64::new(reconcile_cursor)),
             chain_id: 0,
         }
     }

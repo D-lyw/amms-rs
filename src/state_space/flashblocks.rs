@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{Mutex, Notify, RwLock};
-use tokio::time::{sleep, Duration};
+use tokio::time::sleep;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tracing::{error, info, warn};
 
@@ -33,7 +33,6 @@ use tracing::{error, info, warn};
 const FLASHBLOCKS_DEDUP_PAYLOAD_WINDOW: usize = 4;
 const FLASHBLOCKS_HEX_CACHE_MAX: usize = 8192;
 const FLASHBLOCKS_BROTLI_READER_BUF_SIZE: usize = 64 * 1024;
-const BASE_RECONCILE_CHUNK_BLOCKS: u64 = 100;
 
 #[derive(Clone, Debug)]
 struct RawLogMatcher {
@@ -652,69 +651,6 @@ impl<N, P> StateSpaceManager<N, P> {
                 }
 
                 sleep(STREAM_RECONNECT_DELAY).await;
-            }
-        }
-    }
-
-    pub(super) async fn run_reconcile_worker(
-        provider: P,
-        state: Arc<RwLock<StateSpace>>,
-        hooks: HookRegistry<Vec<Address>>,
-        chunks: Vec<LogQueryChunk>,
-        realtime_head: Arc<AtomicU64>,
-        canonical_head: Arc<AtomicU64>,
-        reconcile_cursor: Arc<AtomicU64>,
-        pending_sync_queue: Arc<Mutex<PendingSyncQueue>>,
-        pending_sync_notify: Arc<Notify>,
-        applied_log_dedup: Arc<Mutex<AppliedLogDedupCache>>,
-        chain_id: u64,
-    ) where
-        P: Provider<N> + Clone + 'static,
-        N: Network + 'static,
-    {
-        loop {
-            let canonical = canonical_head.load(Ordering::Relaxed);
-            let cursor = reconcile_cursor.load(Ordering::Relaxed);
-
-            if canonical == 0 || cursor >= canonical {
-                sleep(Duration::from_secs(1)).await;
-                continue;
-            }
-
-            let start = cursor.saturating_add(1);
-            let end = (start + BASE_RECONCILE_CHUNK_BLOCKS - 1).min(canonical);
-
-            match Self::backfill_range(
-                &provider,
-                &state,
-                &hooks,
-                &chunks,
-                start,
-                end,
-                &realtime_head,
-                &canonical_head,
-                &pending_sync_queue,
-                &pending_sync_notify,
-                &applied_log_dedup,
-                LogSource::CanonicalReconcile,
-                chain_id,
-            )
-            .await
-            {
-                Ok(_) => {
-                    Self::store_monotonic_head(&reconcile_cursor, end);
-                    let guard = state.read().await;
-                    Self::store_monotonic_head(&guard.reconcile_cursor, end);
-                }
-                Err(e) => {
-                    warn!(
-                        from_block = start,
-                        to_block = end,
-                        "Canonical reconcile range failed: {}",
-                        e
-                    );
-                    sleep(STREAM_RECONNECT_DELAY).await;
-                }
             }
         }
     }
