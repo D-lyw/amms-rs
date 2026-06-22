@@ -288,27 +288,25 @@ struct AppliedLogDedupCache {
     order: VecDeque<AppliedLogKey>,
     cross_source_content_seen: HashSet<AppliedLogKey>,
     cross_source_content_order: VecDeque<AppliedLogKey>,
-    /// XLayer flashblock 专用：基于日志内容哈希 (keccak256) 的去重集合。
+    /// XLayer flashblock 专用：基于日志内容哈希 (keccak256) 的重叠计数。
     ///
-    /// ## 为什么需要这个集合
+    /// ## 为什么需要这个计数表
     ///
-    /// XLayer flashblock 的同一个交易偶尔会被服务器以不同的
-    /// `payload_id` 重新投递。当重新投递发生时：
-    /// - `XlayerDedupCache` 按 `payload_id` 分组，拦截不到跨 payload 的重复
-    /// - `seen` 集合的 key 包含 `log_index`（枚举位置），而重新投递时
-    ///   同一交易可能拿到不同的 `log_index`（因为 receipt 上下文变化）
-    /// - 两层去重都失效 → 同一事件被 apply 两次 → state 损坏
+    /// XLayer flashblock logs 使用本地合成的 receipt-local `log_index`，
+    /// canonical `get_logs` 使用 block-global `log_index`。同一条链上事件
+    /// 如果先从 XLayer raw stream 处理，稍后又从 canonical overlap/backfill
+    /// 处理，稳定位置 key 无法直接命中。
     ///
-    /// 这个集合使用 `build_log_content_hash()` 计算的哈希值做去重 key。
+    /// 这个计数表使用 `build_log_content_hash()` 计算的哈希值做 key。
     /// 该哈希包含了：`address + tx_hash + block_number + topics[] + data`，
     /// 唯一标识一个事件，**不依赖 log_index**。
-    /// 同一交易的同一事件无论被投递多少次、log_index 如何变化，
-    /// 其 content_hash 不变，因此能可靠去重。
+    /// 用计数而不是集合，是为了避免误杀同一交易内 payload 完全相同的
+    /// 多条合法日志。
     ///
     /// 与 `cross_source_content_seen` 的区别：
-    /// - `cross_source_content_seen` 用于 flashblock vs canonical 之间的跨源去重
-    /// - `xlayer_content_seen` 用于 flashblock 自身的跨 payload 去重
-    content_hash_seen: HashSet<B256>,
+    /// - `cross_source_content_seen` 用于 canonical -> flashblock 的跨源去重
+    /// - `content_hash_seen` 用于 flashblock -> canonical 的跨源去重
+    content_hash_seen: HashMap<B256, usize>,
     content_hash_order: VecDeque<B256>,
 }
 
@@ -335,17 +333,41 @@ impl AppliedLogDedupCache {
         }
     }
 
-    /// 记录 content_hash 到 XLayer 专属去重集合。
+    /// 记录 content_hash 到 XLayer 专属重叠计数表。
     /// 容量 1,000（~3.3 分钟窗口），远大于实际重复投递的秒级延迟。
     fn remember_content_hash(&mut self, hash: B256) {
-        if self.content_hash_seen.insert(hash) {
-            self.content_hash_order.push_back(hash);
-        }
+        *self.content_hash_seen.entry(hash).or_insert(0) += 1;
+        self.content_hash_order.push_back(hash);
         while self.content_hash_order.len() > CONTENT_HASH_DEDUP_CAPACITY {
             if let Some(old) = self.content_hash_order.pop_front() {
-                self.content_hash_seen.remove(&old);
+                Self::decrement_content_hash_count(&mut self.content_hash_seen, &old);
             }
         }
+    }
+
+    fn consume_content_hash(&mut self, hash: &B256) -> bool {
+        if !Self::decrement_content_hash_count(&mut self.content_hash_seen, hash) {
+            return false;
+        }
+        if let Some(pos) = self
+            .content_hash_order
+            .iter()
+            .position(|queued| queued == hash)
+        {
+            self.content_hash_order.remove(pos);
+        }
+        true
+    }
+
+    fn decrement_content_hash_count(counts: &mut HashMap<B256, usize>, hash: &B256) -> bool {
+        let Some(count) = counts.get_mut(hash) else {
+            return false;
+        };
+        *count -= 1;
+        if *count == 0 {
+            counts.remove(hash);
+        }
+        true
     }
 
     fn insert_log_if_new(&mut self, log: &Log, source: LogSource) -> bool {
@@ -364,13 +386,7 @@ impl AppliedLogDedupCache {
             if self.seen.contains(&primary) {
                 return false;
             }
-            // XLayer 专属的 content_hash 去重检查：
-            // 捕获同一交易以不同 payload_id/log_index 重新投递的情况。
-            // 不依赖 log_index，使用 keccak256(content_hash) 做唯一标识。
             let content_hash = build_log_content_hash(log);
-            if self.content_hash_seen.contains(&content_hash) {
-                return false;
-            }
             self.remember(primary);
             self.remember_content_hash(content_hash);
             return true;
@@ -379,6 +395,13 @@ impl AppliedLogDedupCache {
         // For canonical/provider logs, prefer the stable positional key so two
         // legitimate same-payload events in one transaction are not collapsed.
         if self.seen.contains(&primary) {
+            return false;
+        }
+        // XLayer flashblock logs use synthesized receipt-local log_index values.
+        // A later canonical/getLogs overlap for the same event will carry the
+        // block-global log_index, so the positional key above cannot match it.
+        if self.consume_content_hash(&build_log_content_hash(log)) {
+            self.remember(primary);
             return false;
         }
         self.remember(primary);
@@ -577,9 +600,7 @@ impl<N, P> StateSpaceManager<N, P> {
 
         if matches!(
             selected,
-            SelectedRealtimeSource::BasePendingLogs
-                | SelectedRealtimeSource::XlayerFlashblocksPull
-                | SelectedRealtimeSource::ArbitrumFeedPull
+            SelectedRealtimeSource::BasePendingLogs | SelectedRealtimeSource::ArbitrumFeedPull
         ) {
             let provider = self.provider.clone();
             let state = self.state.clone();
@@ -2363,6 +2384,20 @@ mod tests {
         let mut dedup = AppliedLogDedupCache::default();
         assert!(dedup.insert_log_if_new(&canonical_log, LogSource::NewHeadsPull));
         assert!(!dedup.insert_log_if_new(&realtime_log, LogSource::XlayerFlashblock));
+    }
+
+    #[test]
+    fn applied_log_builder_drops_canonical_overlap_after_xlayer_local_index() {
+        let tx_hash = alloy::primitives::B256::from([0x89u8; 32]);
+        let topic0 = FixedBytes::<32>::from([0x9au8; 32]);
+        let realtime_log = make_test_log(Some(tx_hash), Some(7), vec![topic0], vec![0xde, 0xad]);
+        let mut canonical_log =
+            make_test_log(Some(tx_hash), Some(79), vec![topic0], vec![0xde, 0xad]);
+        canonical_log.transaction_index = Some(12);
+
+        let mut dedup = AppliedLogDedupCache::default();
+        assert!(dedup.insert_log_if_new(&realtime_log, LogSource::XlayerFlashblock));
+        assert!(!dedup.insert_log_if_new(&canonical_log, LogSource::NewHeadsPull));
     }
 
     #[test]

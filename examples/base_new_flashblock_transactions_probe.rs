@@ -39,7 +39,12 @@ fn dedup_key(log: &Log) -> Option<(String, u64, u64, String)> {
     let tx_hash = log.transaction_hash.map(|h| format!("{h:?}"))?;
     let log_index = log.log_index?;
     let block_number = log.block_number?;
-    Some((tx_hash, log_index, block_number, format!("{:?}", log.address())))
+    Some((
+        tx_hash,
+        log_index,
+        block_number,
+        format!("{:?}", log.address()),
+    ))
 }
 
 fn normalize_log_value(raw_log: &Value, tx_hash: Option<&str>) -> Value {
@@ -98,7 +103,10 @@ async fn main() -> eyre::Result<()> {
         .unwrap_or(5);
 
     println!("=== Base newFlashblockTransactions(full=true) Probe ===");
-    println!("preconf_ws_candidates: {}", preconf_ws_candidates.join(", "));
+    println!(
+        "preconf_ws_candidates: {}",
+        preconf_ws_candidates.join(", ")
+    );
     println!("rpc_ws: {rpc_ws}");
     println!("graph_path: {graph_path}");
     println!("run_secs: {run_secs}, max_messages: {:?}", max_messages);
@@ -353,7 +361,11 @@ async fn main() -> eyre::Result<()> {
         sync_batches_total += 1;
         batch_sizes.push(logs.len() as u128);
 
-        let max_block = logs.iter().filter_map(|l| l.block_number).max().unwrap_or(0);
+        let max_block = logs
+            .iter()
+            .filter_map(|l| l.block_number)
+            .max()
+            .unwrap_or(0);
         let (affected, needs_resync, needs_async_update) = {
             let mut guard = manager.state.write().await;
             guard.sync(&logs)?
@@ -391,7 +403,10 @@ async fn main() -> eyre::Result<()> {
     println!("elapsed_ms: {}", elapsed.as_millis());
     println!("ws_messages: {}", ws_messages);
     println!("notifications: {}", notifications);
-    println!("notifications_per_sec: {:.2}", notifications as f64 / elapsed_s);
+    println!(
+        "notifications_per_sec: {:.2}",
+        notifications as f64 / elapsed_s
+    );
     println!("tx_without_logs: {}", tx_without_logs);
     println!("tx_with_logs: {}", tx_with_logs);
     println!("candidate_logs_total: {}", candidate_logs_total);
@@ -403,12 +418,30 @@ async fn main() -> eyre::Result<()> {
     println!("affected_pools_total: {}", affected_pools_total);
     println!("total_resync: {}", total_resync);
     println!("total_async_update: {}", total_async_update);
-    println!("msg_interval_p50_ms: {}", percentile(&mut iv50, 0.5).unwrap_or(0));
-    println!("msg_interval_p95_ms: {}", percentile(&mut iv95, 0.95).unwrap_or(0));
-    println!("batch_size_p50: {}", percentile(&mut bs50, 0.5).unwrap_or(0));
-    println!("batch_size_p95: {}", percentile(&mut bs95, 0.95).unwrap_or(0));
-    println!("affected_size_p50: {}", percentile(&mut af50, 0.5).unwrap_or(0));
-    println!("affected_size_p95: {}", percentile(&mut af95, 0.95).unwrap_or(0));
+    println!(
+        "msg_interval_p50_ms: {}",
+        percentile(&mut iv50, 0.5).unwrap_or(0)
+    );
+    println!(
+        "msg_interval_p95_ms: {}",
+        percentile(&mut iv95, 0.95).unwrap_or(0)
+    );
+    println!(
+        "batch_size_p50: {}",
+        percentile(&mut bs50, 0.5).unwrap_or(0)
+    );
+    println!(
+        "batch_size_p95: {}",
+        percentile(&mut bs95, 0.95).unwrap_or(0)
+    );
+    println!(
+        "affected_size_p50: {}",
+        percentile(&mut af50, 0.5).unwrap_or(0)
+    );
+    println!(
+        "affected_size_p95: {}",
+        percentile(&mut af95, 0.95).unwrap_or(0)
+    );
     println!("\n=== Assessment ===");
     println!("newFlashblockTransactions(full=true) can carry enough data to reconstruct logs, but it is transaction-shaped rather than log-shaped.");
     println!("That means more payload bytes, more decode work, and usually more local filtering before reaching amms::StateSpace::sync(logs).");

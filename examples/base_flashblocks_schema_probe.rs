@@ -65,7 +65,9 @@ async fn main() -> eyre::Result<()> {
         .with_context(|| format!("failed to connect raw ws: {raw_ws}"))?;
 
     let mut out_file = match out_path {
-        Some(path) => Some(File::create(&path).with_context(|| format!("failed to create {path}"))?),
+        Some(path) => {
+            Some(File::create(&path).with_context(|| format!("failed to create {path}"))?)
+        }
         None => None,
     };
 
