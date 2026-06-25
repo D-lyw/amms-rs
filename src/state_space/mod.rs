@@ -212,6 +212,15 @@ fn log_realtime_update_applied(meta: RealtimeUpdateMeta, affected_pools: usize, 
     );
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct ApplyLogsTiming {
+    pub sort_ms: u128,
+    pub dedup_ms: u128,
+    pub sync_ms: u128,
+    pub hooks_ms: u128,
+    pub total_ms: u128,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) enum AppliedLogPosition {
     // Stable block-global log index used by canonical get_logs and providers
@@ -904,11 +913,11 @@ impl<N, P> StateSpaceManager<N, P> {
     }
 
     async fn apply_logs_for_block(
-        _provider: &P,
+        provider: &P,
         state: &Arc<RwLock<StateSpace>>,
         hooks: &HookRegistry<Vec<Address>>,
         block_num: u64,
-        mut logs: Vec<Log>,
+        logs: Vec<Log>,
         realtime_head: &Arc<AtomicU64>,
         canonical_head: &Arc<AtomicU64>,
         pending_sync_queue: &Arc<Mutex<PendingSyncQueue>>,
@@ -920,6 +929,41 @@ impl<N, P> StateSpaceManager<N, P> {
         P: Provider<N> + Clone,
         N: Network,
     {
+        let (affected, _) = Self::apply_logs_for_block_timed(
+            provider,
+            state,
+            hooks,
+            block_num,
+            logs,
+            realtime_head,
+            canonical_head,
+            pending_sync_queue,
+            pending_sync_notify,
+            applied_log_dedup,
+            source,
+        )
+        .await?;
+        Ok(affected)
+    }
+
+    async fn apply_logs_for_block_timed(
+        _provider: &P,
+        state: &Arc<RwLock<StateSpace>>,
+        hooks: &HookRegistry<Vec<Address>>,
+        block_num: u64,
+        mut logs: Vec<Log>,
+        realtime_head: &Arc<AtomicU64>,
+        canonical_head: &Arc<AtomicU64>,
+        pending_sync_queue: &Arc<Mutex<PendingSyncQueue>>,
+        pending_sync_notify: &Arc<Notify>,
+        applied_log_dedup: &Arc<Mutex<AppliedLogDedupCache>>,
+        source: LogSource,
+    ) -> Result<(Vec<Address>, ApplyLogsTiming), StateSpaceError>
+    where
+        P: Provider<N> + Clone,
+        N: Network,
+    {
+        let t_apply_start = Instant::now();
         let mut prev = realtime_head.load(Ordering::Relaxed);
         while block_num > prev
             && realtime_head
@@ -940,9 +984,10 @@ impl<N, P> StateSpaceManager<N, P> {
         }
 
         if logs.is_empty() {
-            return Ok(vec![]);
+            return Ok((vec![], ApplyLogsTiming::default()));
         }
 
+        let t_sort_start = Instant::now();
         logs.sort_by_key(|log| {
             (
                 log.block_number.unwrap_or_default(),
@@ -950,7 +995,9 @@ impl<N, P> StateSpaceManager<N, P> {
                 log.log_index.unwrap_or_default(),
             )
         });
+        let sort_ms = t_sort_start.elapsed().as_millis();
 
+        let t_dedup_start = Instant::now();
         logs = {
             let mut dedup = applied_log_dedup.lock().await;
             let mut kept = Vec::with_capacity(logs.len());
@@ -963,12 +1010,23 @@ impl<N, P> StateSpaceManager<N, P> {
 
             kept
         };
+        let dedup_ms = t_dedup_start.elapsed().as_millis();
 
         if logs.is_empty() {
-            return Ok(vec![]);
+            return Ok((
+                vec![],
+                ApplyLogsTiming {
+                    sort_ms,
+                    dedup_ms,
+                    total_ms: t_apply_start.elapsed().as_millis(),
+                    ..ApplyLogsTiming::default()
+                },
+            ));
         }
 
+        let t_sync_start = Instant::now();
         let (affected, needs_resync, needs_async_update) = state.write().await.sync(&logs)?;
+        let sync_ms = t_sync_start.elapsed().as_millis();
 
         if !needs_resync.is_empty() || !needs_async_update.is_empty() {
             let mut queue = pending_sync_queue.lock().await;
@@ -992,11 +1050,22 @@ impl<N, P> StateSpaceManager<N, P> {
             pending_sync_notify.notify_one();
         }
 
+        let t_hooks_start = Instant::now();
         if !affected.is_empty() {
             hooks.notify(&affected).await;
         }
+        let hooks_ms = t_hooks_start.elapsed().as_millis();
 
-        Ok(affected)
+        Ok((
+            affected,
+            ApplyLogsTiming {
+                sort_ms,
+                dedup_ms,
+                sync_ms,
+                hooks_ms,
+                total_ms: t_apply_start.elapsed().as_millis(),
+            },
+        ))
     }
 
     async fn collect_logs_for_chunks(

@@ -59,6 +59,10 @@ const XLAYER_HEX_CACHE_MAX: usize = 8192;
 /// 单次可选的交易计数累计器最大跟踪 payload 数
 const XLAYER_TX_COUNT_WINDOW: usize = 8;
 
+/// 仅在慢样本上输出 warn，避免热路径日志过多。
+const XLAYER_FLASHBLOCKS_SLOW_TOTAL_MS_WARN: u128 = 8;
+const XLAYER_FLASHBLOCKS_SLOW_SYNC_MS_WARN: u128 = 5;
+
 // ─────────────────────────────────────────────
 // Message structs (Xlayer-specific)
 // ─────────────────────────────────────────────
@@ -764,6 +768,8 @@ impl<N, P> StateSpaceManager<N, P> {
 
                     let received_at = Instant::now();
 
+                    let t_decode_start = Instant::now();
+
                     // 4. 解析消息（decode_buf 在 stream 作用域内，保证生命周期覆盖返回值的借用）
                     decode_buf.clear();
                     let fb: Option<XlayerFlashblockMessage> = match message {
@@ -805,6 +811,7 @@ impl<N, P> StateSpaceManager<N, P> {
                     let Some(fb) = fb else {
                         continue;
                     };
+                    let decode_ms = t_decode_start.elapsed().as_millis();
 
                     let block_num = xlayer_flashblock_block_number(&fb)
                         .unwrap_or_else(|| realtime_head.load(Ordering::Relaxed));
@@ -871,6 +878,7 @@ impl<N, P> StateSpaceManager<N, P> {
                         }
                     }
 
+                    let t_extract_start = Instant::now();
                     // 6. 提取 logs
                     let (logs, block_number, decode_fail_count, decode_failed_addresses) =
                         extract_logs_from_xlayer_flashblock(
@@ -881,6 +889,7 @@ impl<N, P> StateSpaceManager<N, P> {
                             &mut tx_tracker,
                             &mut latest_block_timestamp,
                         );
+                    let extract_ms = t_extract_start.elapsed().as_millis();
 
                     let block_num =
                         block_number.unwrap_or_else(|| realtime_head.load(Ordering::Relaxed));
@@ -921,7 +930,7 @@ impl<N, P> StateSpaceManager<N, P> {
                     let log_count = logs.len();
 
                     // 9. 应用日志到池子状态
-                    match Self::apply_logs_for_block(
+                    match Self::apply_logs_for_block_timed(
                         &provider,
                         &state,
                         &hooks,
@@ -936,8 +945,29 @@ impl<N, P> StateSpaceManager<N, P> {
                     )
                     .await
                     {
-                        Ok(affected) => {
+                        Ok((affected, apply_timing)) => {
                             if !affected.is_empty() {
+                                let recv_to_apply_done_ms = received_at.elapsed().as_millis();
+                                if recv_to_apply_done_ms >= XLAYER_FLASHBLOCKS_SLOW_TOTAL_MS_WARN
+                                    || apply_timing.sync_ms >= XLAYER_FLASHBLOCKS_SLOW_SYNC_MS_WARN
+                                {
+                                    warn!(
+                                        block = block_num,
+                                        index = fb.index,
+                                        payload_id = %fb.payload_id,
+                                        log_count,
+                                        affected_pools = affected.len(),
+                                        ms_decode = decode_ms,
+                                        ms_extract = extract_ms,
+                                        ms_sort = apply_timing.sort_ms,
+                                        ms_dedup = apply_timing.dedup_ms,
+                                        ms_sync = apply_timing.sync_ms,
+                                        ms_hooks = apply_timing.hooks_ms,
+                                        ms_apply_total = apply_timing.total_ms,
+                                        ms_recv_to_apply_done = recv_to_apply_done_ms,
+                                        "xlayer_flashblocks_slow_path"
+                                    );
+                                }
                                 let meta = super::build_realtime_update_meta(
                                     &update_seq,
                                     block_num,
