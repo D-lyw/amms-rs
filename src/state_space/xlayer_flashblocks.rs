@@ -59,10 +59,6 @@ const XLAYER_HEX_CACHE_MAX: usize = 8192;
 /// 单次可选的交易计数累计器最大跟踪 payload 数
 const XLAYER_TX_COUNT_WINDOW: usize = 8;
 
-/// 仅在慢样本上输出 warn，避免热路径日志过多。
-const XLAYER_FLASHBLOCKS_SLOW_TOTAL_MS_WARN: u128 = 8;
-const XLAYER_FLASHBLOCKS_SLOW_SYNC_MS_WARN: u128 = 5;
-
 // ─────────────────────────────────────────────
 // Message structs (Xlayer-specific)
 // ─────────────────────────────────────────────
@@ -949,26 +945,21 @@ impl<N, P> StateSpaceManager<N, P> {
                         Ok((affected, apply_timing)) => {
                             if !affected.is_empty() {
                                 let recv_to_apply_done_ms = received_at.elapsed().as_millis();
-                                if recv_to_apply_done_ms >= XLAYER_FLASHBLOCKS_SLOW_TOTAL_MS_WARN
-                                    || apply_timing.sync_ms >= XLAYER_FLASHBLOCKS_SLOW_SYNC_MS_WARN
-                                {
-                                    warn!(
-                                        block = block_num,
-                                        index = fb.index,
-                                        payload_id = %fb.payload_id,
-                                        log_count,
-                                        affected_pools = affected.len(),
-                                        ms_decode = decode_ms,
-                                        ms_extract = extract_ms,
-                                        ms_sort = apply_timing.sort_ms,
-                                        ms_dedup = apply_timing.dedup_ms,
-                                        ms_sync = apply_timing.sync_ms,
-                                        ms_hooks = apply_timing.hooks_ms,
-                                        ms_apply_total = apply_timing.total_ms,
-                                        ms_recv_to_apply_done = recv_to_apply_done_ms,
-                                        "xlayer_flashblocks_slow_path"
-                                    );
-                                }
+                                warn!(
+                                    block = block_num,
+                                    index = fb.index,
+                                    log_count,
+                                    affected_pools = affected.len(),
+                                    ms_decode = decode_ms,
+                                    ms_extract = extract_ms,
+                                    ms_sort = apply_timing.sort_ms,
+                                    ms_dedup = apply_timing.dedup_ms,
+                                    ms_sync = apply_timing.sync_ms,
+                                    ms_hooks = apply_timing.hooks_ms,
+                                    ms_apply_total = apply_timing.total_ms,
+                                    ms_recv_to_apply_done = recv_to_apply_done_ms,
+                                    "xlayer_flashblocks_apply_timing"
+                                );
                                 let meta = super::build_realtime_update_meta(
                                     &update_seq,
                                     block_num,
