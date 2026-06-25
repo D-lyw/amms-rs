@@ -767,6 +767,7 @@ impl<N, P> StateSpaceManager<N, P> {
                     };
 
                     let received_at = Instant::now();
+                    let received_wall_unix_us = super::current_wall_unix_us();
 
                     let t_decode_start = Instant::now();
 
@@ -973,6 +974,8 @@ impl<N, P> StateSpaceManager<N, P> {
                                     block_num,
                                     LogSource::XlayerFlashblock,
                                     received_at,
+                                    received_wall_unix_us,
+                                    Some(fb.index),
                                 );
                                 super::log_realtime_update_applied(meta, affected.len(), log_count);
                                 yield Ok((meta, affected));

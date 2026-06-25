@@ -52,7 +52,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::{future::Future, marker::PhantomData, sync::Arc};
 use tokio::sync::{Mutex, Notify, RwLock};
 
@@ -107,6 +107,8 @@ pub struct RealtimeUpdateMeta {
     pub block_number: u64,
     pub source: RealtimeUpdateSource,
     pub received_at: Instant,
+    pub received_wall_unix_us: u64,
+    pub flashblock_index: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -191,13 +193,24 @@ fn build_realtime_update_meta(
     block_number: u64,
     source: LogSource,
     received_at: Instant,
+    received_wall_unix_us: u64,
+    flashblock_index: Option<u64>,
 ) -> RealtimeUpdateMeta {
     RealtimeUpdateMeta {
         seq: next_realtime_update_seq(update_seq),
         block_number,
         source: RealtimeUpdateSource::from_log_source(source),
         received_at,
+        received_wall_unix_us,
+        flashblock_index,
     }
+}
+
+fn current_wall_unix_us() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_micros() as u64)
+        .unwrap_or(0)
 }
 
 fn log_realtime_update_applied(meta: RealtimeUpdateMeta, affected_pools: usize, log_count: usize) {
