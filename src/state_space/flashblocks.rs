@@ -549,8 +549,6 @@ impl<N, P> StateSpaceManager<N, P> {
                     };
 
                     let received_at = Instant::now();
-                    let received_wall_unix_us = super::current_wall_unix_us();
-
                     let fb = match message {
                         Message::Text(text) => {
                             flashblocks_decode_buf.clear();
@@ -638,9 +636,7 @@ impl<N, P> StateSpaceManager<N, P> {
                                 let meta = super::build_realtime_update_meta(
                                     &update_seq,
                                     block_num,
-                                    LogSource::RealtimeFlashblock,
                                     received_at,
-                                    received_wall_unix_us,
                                     Some(fb.index),
                                 );
                                 super::log_realtime_update_applied(meta, affected.len(), log_count);

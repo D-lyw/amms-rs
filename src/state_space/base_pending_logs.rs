@@ -314,7 +314,6 @@ impl<N, P> StateSpaceManager<N, P> {
                     };
 
                     let received_at = Instant::now();
-                    let received_wall_unix_us = super::current_wall_unix_us();
                     let payload = match message {
                         Message::Text(text) => text.to_string(),
                         Message::Binary(bin) => String::from_utf8_lossy(bin.as_ref()).to_string(),
@@ -396,9 +395,7 @@ impl<N, P> StateSpaceManager<N, P> {
                                 let meta = super::build_realtime_update_meta(
                                     &update_seq,
                                     block_num,
-                                    LogSource::RealtimeFlashblock,
                                     received_at,
-                                    received_wall_unix_us,
                                     None,
                                 );
                                 super::log_realtime_update_applied(meta, affected.len(), 1);

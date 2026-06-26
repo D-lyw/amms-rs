@@ -763,10 +763,6 @@ impl<N, P> StateSpaceManager<N, P> {
                     };
 
                     let received_at = Instant::now();
-                    let received_wall_unix_us = super::current_wall_unix_us();
-
-                    let t_decode_start = Instant::now();
-
                     // 4. 解析消息（decode_buf 在 stream 作用域内，保证生命周期覆盖返回值的借用）
                     decode_buf.clear();
                     let fb: Option<XlayerFlashblockMessage> = match message {
@@ -808,7 +804,6 @@ impl<N, P> StateSpaceManager<N, P> {
                     let Some(fb) = fb else {
                         continue;
                     };
-                    let decode_ms = t_decode_start.elapsed().as_millis();
 
                     let block_num = xlayer_flashblock_block_number(&fb)
                         .unwrap_or_else(|| realtime_head.load(Ordering::Relaxed));
@@ -875,7 +870,6 @@ impl<N, P> StateSpaceManager<N, P> {
                         }
                     }
 
-                    let t_extract_start = Instant::now();
                     // 6. 提取 logs
                     let (logs, block_number, decode_fail_count, decode_failed_addresses) =
                         extract_logs_from_xlayer_flashblock(
@@ -886,7 +880,6 @@ impl<N, P> StateSpaceManager<N, P> {
                             &mut tx_tracker,
                             &mut latest_block_timestamp,
                         );
-                    let extract_ms = t_extract_start.elapsed().as_millis();
 
                     let block_num =
                         block_number.unwrap_or_else(|| realtime_head.load(Ordering::Relaxed));
@@ -942,30 +935,12 @@ impl<N, P> StateSpaceManager<N, P> {
                     )
                     .await
                     {
-                        Ok((affected, apply_timing)) => {
+                        Ok((affected, _apply_timing)) => {
                             if !affected.is_empty() {
-                                let recv_to_apply_done_ms = received_at.elapsed().as_millis();
-                                warn!(
-                                    block = block_num,
-                                    index = fb.index,
-                                    log_count,
-                                    affected_pools = affected.len(),
-                                    ms_decode = decode_ms,
-                                    ms_extract = extract_ms,
-                                    ms_sort = apply_timing.sort_ms,
-                                    ms_dedup = apply_timing.dedup_ms,
-                                    ms_sync = apply_timing.sync_ms,
-                                    ms_hooks = apply_timing.hooks_ms,
-                                    ms_apply_total = apply_timing.total_ms,
-                                    ms_recv_to_apply_done = recv_to_apply_done_ms,
-                                    "xlayer_flashblocks_apply_timing"
-                                );
                                 let meta = super::build_realtime_update_meta(
                                     &update_seq,
                                     block_num,
-                                    LogSource::XlayerFlashblock,
                                     received_at,
-                                    received_wall_unix_us,
                                     Some(fb.index),
                                 );
                                 super::log_realtime_update_applied(meta, affected.len(), log_count);

@@ -162,7 +162,6 @@ impl<N, P> StateSpaceManager<N, P> {
                 .from_block(next_block_to_sync)
                 .to_block(next_block_to_sync);
             let received_at = StdInstant::now();
-            let received_wall_unix_us = super::current_wall_unix_us();
             let logs = match provider.get_logs(&filter).await {
                 Ok(logs) => logs,
                 Err(e) => {
@@ -228,9 +227,7 @@ impl<N, P> StateSpaceManager<N, P> {
                 let meta = super::build_realtime_update_meta(
                     update_seq,
                     next_block_to_sync,
-                    LogSource::ArbitrumFeedPull,
                     received_at,
-                    received_wall_unix_us,
                     None,
                 );
                 super::log_realtime_update_applied(meta, affected.len(), log_count);

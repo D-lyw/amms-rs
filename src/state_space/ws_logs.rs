@@ -112,8 +112,6 @@ impl<N, P> StateSpaceManager<N, P> {
                             } else {
                                 if block_num > last_processed + 1 {
                                     let backfill_received_at = Instant::now();
-                                    let backfill_received_wall_unix_us =
-                                        super::current_wall_unix_us();
                                     match Self::backfill_range(
                                         &provider,
                                         &state,
@@ -137,9 +135,7 @@ impl<N, P> StateSpaceManager<N, P> {
                                                     let meta = super::build_realtime_update_meta(
                                                         &update_seq,
                                                         backfill_block_num,
-                                                        LogSource::NewHeadsPull,
                                                         backfill_received_at,
-                                                        backfill_received_wall_unix_us,
                                                         None,
                                                     );
                                                     super::log_realtime_update_applied(
@@ -174,7 +170,6 @@ impl<N, P> StateSpaceManager<N, P> {
                             }
 
                             let received_at = Instant::now();
-                            let received_wall_unix_us = super::current_wall_unix_us();
                             let logs = match Self::collect_logs_for_chunks(
                                 &provider,
                                 &query_chunks,
@@ -213,9 +208,7 @@ impl<N, P> StateSpaceManager<N, P> {
                                         let meta = super::build_realtime_update_meta(
                                             &update_seq,
                                             block_num,
-                                            LogSource::NewHeadsPull,
                                             received_at,
-                                            received_wall_unix_us,
                                             None,
                                         );
                                         super::log_realtime_update_applied(
