@@ -11,7 +11,7 @@ pub const A_PRECISION: U256 = U256::from_limbs([100, 0, 0, 0]);
 /// * `uses_a_precision` - 是否是新版池子 (使用 A_PRECISION=100)
 ///   - true: 新版 Vyper 0.3.x 池子 (如 FRAX/USDC)
 ///   - false: 旧版 Vyper 0.2.x 池子 (如 3pool)
-fn get_d(xp: &[U256], amp: U256, uses_a_precision: bool) -> Result<U256, AMMError> {
+pub fn get_d(xp: &[U256], amp: U256, uses_a_precision: bool) -> Result<U256, AMMError> {
     let n_coins = xp.len();
     let mut s = U256::ZERO;
     for &x in xp {
@@ -193,6 +193,79 @@ fn get_y(
     }
 
     Err(AMMError::Msg("get_y did not converge".into()))
+}
+
+/// Given target invariant `d`, solve the post-operation balance for coin `i`.
+pub fn get_y_d(
+    i: usize,
+    xp: &[U256],
+    amp: U256,
+    d: U256,
+    uses_a_precision: bool,
+) -> Result<U256, AMMError> {
+    let n_coins = xp.len();
+    let n_u256 = U256::from(n_coins);
+
+    let ann = if uses_a_precision {
+        amp * A_PRECISION * n_u256
+    } else {
+        amp * n_u256
+    };
+
+    if ann == U256::ZERO {
+        return Err(AMMError::Msg("get_y_d: ann is zero".into()));
+    }
+
+    let mut c = d;
+    let mut s = U256::ZERO;
+
+    for (k, &x) in xp.iter().enumerate() {
+        if k == i {
+            continue;
+        }
+        if x == U256::ZERO {
+            return Err(AMMError::Msg(format!("get_y_d: balance[{}] is zero", k)));
+        }
+        s += x;
+        let divisor = x * n_u256;
+        if divisor == U256::ZERO {
+            return Err(AMMError::Msg("get_y_d: divisor is zero".into()));
+        }
+        c = c * d / divisor;
+    }
+
+    let ann_divisor = ann * n_u256;
+    if ann_divisor == U256::ZERO {
+        return Err(AMMError::Msg("get_y_d: ann * n_coins is zero".into()));
+    }
+
+    let (c_final, b) = if uses_a_precision {
+        let c_val = c * d * A_PRECISION / ann_divisor;
+        let b_val = s + d * A_PRECISION / ann;
+        (c_val, b_val)
+    } else {
+        let c_val = c * d / ann_divisor;
+        let b_val = s + d / ann;
+        (c_val, b_val)
+    };
+
+    let mut y = d;
+    for _ in 0..255 {
+        let y_prev = y;
+        let numer = y * y + c_final;
+        let denom = U256::from(2) * y + b - d;
+        if denom == U256::ZERO {
+            return Err(AMMError::Msg("get_y_d: denom is zero".into()));
+        }
+        y = numer / denom;
+        if y > y_prev {
+            y = y_prev;
+        } else if y_prev - y <= U256::from(1) {
+            return Ok(y);
+        }
+    }
+
+    Err(AMMError::Msg("get_y_d did not converge".into()))
 }
 
 /// 计算交换输出金额

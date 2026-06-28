@@ -17,6 +17,7 @@ use alloy::{
 };
 use futures::{stream::FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 sol! {
     #[sol(rpc)]
@@ -82,6 +83,149 @@ pub struct CurveLegacyFactory {
 }
 
 impl CurveLegacyFactory {
+    async fn init_curve_legacy_amms<N, P>(
+        amms: Vec<AMM>,
+        block: BlockId,
+        provider: P,
+    ) -> (Vec<AMM>, u32, u32)
+    where
+        N: Network,
+        P: Provider<N> + Clone,
+    {
+        let mut chunks = Vec::new();
+        let chunk_size = 10;
+        let mut current_chunk = Vec::with_capacity(chunk_size);
+        for amm in amms {
+            current_chunk.push(amm);
+            if current_chunk.len() == chunk_size {
+                chunks.push(std::mem::take(&mut current_chunk));
+            }
+        }
+        if !current_chunk.is_empty() {
+            chunks.push(current_chunk);
+        }
+
+        let total = chunks.iter().map(|chunk| chunk.len()).sum();
+        let mut results: Vec<AMM> = Vec::with_capacity(total);
+        let mut success_count = 0u32;
+        let mut fail_count = 0u32;
+        let num_chunks = chunks.len();
+
+        for (i, chunk) in chunks.into_iter().enumerate() {
+            let mut tasks = FuturesUnordered::new();
+            for amm in chunk {
+                let provider = provider.clone();
+                tasks.push(async move {
+                    let addr = amm.address();
+                    match amm.init(block, provider).await {
+                        Ok(initialized) => {
+                            tracing::debug!(pool = ?addr, "Successfully initialized Curve Legacy pool");
+                            Some(initialized)
+                        }
+                        Err(e) => {
+                            tracing::warn!(pool = ?addr, error = %e, "Failed to initialize Curve Legacy pool, skipping");
+                            None
+                        }
+                    }
+                });
+            }
+
+            while let Some(result) = tasks.next().await {
+                if let Some(amm) = result {
+                    success_count += 1;
+                    results.push(amm);
+                } else {
+                    fail_count += 1;
+                }
+            }
+
+            if i < num_chunks.saturating_sub(1) {
+                tokio::time::sleep(tokio::time::Duration::from_millis(400)).await;
+            }
+        }
+
+        (results, success_count, fail_count)
+    }
+
+    fn collect_missing_base_pool_dependencies(
+        initialized: &[AMM],
+        known_addresses: &HashSet<Address>,
+    ) -> (Vec<AMM>, Vec<Address>) {
+        let mut synthesized = Vec::new();
+        let mut fallback_init_addresses = Vec::new();
+        let mut seen = known_addresses.clone();
+
+        for amm in initialized {
+            let AMM::CurveLegacyPool(pool) = amm else {
+                continue;
+            };
+
+            let Some(base_addr) = pool.base_pool_address else {
+                continue;
+            };
+
+            if !seen.insert(base_addr) {
+                continue;
+            }
+
+            if let Some(base_view) = pool.base_pool_view.as_ref() {
+                synthesized.push(AMM::CurveLegacyPool(base_view.to_curve_legacy_pool()));
+            } else {
+                tracing::warn!(
+                    meta_pool = ?pool.address,
+                    base_pool = ?base_addr,
+                    "Meta pool is missing base_pool_view during batch dependency expansion; falling back to direct base-pool init"
+                );
+                fallback_init_addresses.push(base_addr);
+            }
+        }
+
+        (synthesized, fallback_init_addresses)
+    }
+
+    fn filter_invalid_initialized_amms(results: &mut Vec<AMM>) -> usize {
+        let pre_filter = results.len();
+        results.retain(|amm| {
+            if let AMM::CurveLegacyPool(pool) = amm {
+                match pool.pool_type {
+                    CurveLegacyPoolType::CryptoSwap => {
+                        let valid = pool.d.is_some()
+                            && pool.gamma.is_some()
+                            && pool.mid_fee.is_some()
+                            && pool.out_fee.is_some()
+                            && pool.fee_gamma.is_some();
+                        if !valid {
+                            tracing::warn!(
+                                pool = ?pool.address,
+                                pool_type = ?pool.pool_type,
+                                has_d = pool.d.is_some(),
+                                has_gamma = pool.gamma.is_some(),
+                                has_mid_fee = pool.mid_fee.is_some(),
+                                has_out_fee = pool.out_fee.is_some(),
+                                has_fee_gamma = pool.fee_gamma.is_some(),
+                                "Removing CryptoSwap pool: missing required parameters"
+                            );
+                        }
+                        valid
+                    }
+                    CurveLegacyPoolType::StableSwap => {
+                        let valid = pool.amp.is_some();
+                        if !valid {
+                            tracing::warn!(
+                                pool = ?pool.address,
+                                "Removing StableSwap pool: missing amp parameter"
+                            );
+                        }
+                        valid
+                    }
+                }
+            } else {
+                true
+            }
+        });
+        pre_filter - results.len()
+    }
+
     pub fn new(address: Address, pool_type: CurveLegacyPoolType, creation_block: u64) -> Self {
         Self {
             address,
@@ -246,6 +390,8 @@ impl CurveLegacyFactory {
         );
 
         // 并发初始化所有池子，每个池使用独立的 RPC eth_call
+        // NOTE: 当前 Curve Legacy batch init 仍走逐池 init。后续如果恢复 dedicated batch
+        // path，Meta/Base 相关初始化字段也必须在 batch path 中完整覆盖，不能丢字段。
         // init() 内部会完整处理：
         //   - uint256/int128 双 ABI 兼容
         //   - Meta/Lending/Plain subtype 检测
@@ -253,117 +399,67 @@ impl CurveLegacyFactory {
         //   - stored_rates 获取
         //   - CryptoSwap 参数 (D, gamma, price_scale 等)
 
-        let mut chunks = Vec::new();
-        let chunk_size = 10;
-        let mut current_chunk = Vec::with_capacity(chunk_size);
-        for amm in amms {
-            current_chunk.push(amm);
-            if current_chunk.len() == chunk_size {
-                chunks.push(std::mem::take(&mut current_chunk));
-            }
-        }
-        if !current_chunk.is_empty() {
-            chunks.push(current_chunk);
+        let mut known_addresses: HashSet<Address> = amms.iter().map(AMM::address).collect();
+        let (mut results, mut success_count, mut fail_count) =
+            Self::init_curve_legacy_amms::<N, _>(amms, block, provider.clone()).await;
+
+        let (mut synthesized_deps, fallback_dep_addrs) =
+            Self::collect_missing_base_pool_dependencies(&results, &known_addresses);
+        for amm in &synthesized_deps {
+            known_addresses.insert(amm.address());
         }
 
-        let mut results: Vec<AMM> = Vec::with_capacity(total);
-        let mut success_count = 0u32;
-        let mut fail_count = 0u32;
+        if !fallback_dep_addrs.is_empty() {
+            let fallback_amms: Vec<AMM> = fallback_dep_addrs
+                .into_iter()
+                .filter(|addr| known_addresses.insert(*addr))
+                .map(|addr| {
+                    AMM::CurveLegacyPool(CurveLegacyPool::new(
+                        addr,
+                        CurveLegacyPoolType::StableSwap,
+                    ))
+                })
+                .collect();
 
-        let num_chunks = chunks.len();
-
-        for (i, chunk) in chunks.into_iter().enumerate() {
-            let mut tasks = FuturesUnordered::new();
-            for amm in chunk {
-                let provider = provider.clone();
-                tasks.push(async move {
-                    let addr = amm.address();
-                    match amm.init(block, provider).await {
-                        Ok(initialized) => {
-                            tracing::debug!(pool = ?addr, "Successfully initialized Curve Legacy pool");
-                            Some(initialized)
-                        }
-                        Err(e) => {
-                            tracing::warn!(pool = ?addr, error = %e, "Failed to initialize Curve Legacy pool, skipping");
-                            None
-                        }
-                    }
-                });
-            }
-
-            while let Some(result) = tasks.next().await {
-                if let Some(amm) = result {
-                    success_count += 1;
-                    results.push(amm);
-                } else {
-                    fail_count += 1;
-                }
-            }
-
-            // 批次间延迟，避免触发 RPC 限制
-            if i < num_chunks - 1 {
-                tokio::time::sleep(tokio::time::Duration::from_millis(400)).await;
+            if !fallback_amms.is_empty() {
+                let (mut fallback_results, dep_success, dep_fail) =
+                    Self::init_curve_legacy_amms::<N, _>(fallback_amms, block, provider).await;
+                success_count += dep_success;
+                fail_count += dep_fail;
+                results.append(&mut fallback_results);
             }
         }
 
-        // =========================================================================
-        // 验证必要参数：CryptoSwap 池必须有 d 和 gamma，StableSwap 池必须有 amp
-        // 无效池子将被移除，避免后续 simulate_swap 时 divide by zero
-        // =========================================================================
-        let pre_filter = results.len();
-        results.retain(|amm| {
-            if let AMM::CurveLegacyPool(pool) = amm {
-                let is_valid = match pool.pool_type {
-                    CurveLegacyPoolType::CryptoSwap => {
-                        // CryptoSwap 必须有 d, gamma, mid_fee, out_fee, fee_gamma
-                        let valid = pool.d.is_some()
-                            && pool.gamma.is_some()
-                            && pool.mid_fee.is_some()
-                            && pool.out_fee.is_some()
-                            && pool.fee_gamma.is_some();
-                        if !valid {
-                            tracing::warn!(
-                                pool = ?pool.address,
-                                pool_type = ?pool.pool_type,
-                                has_d = pool.d.is_some(),
-                                has_gamma = pool.gamma.is_some(),
-                                has_mid_fee = pool.mid_fee.is_some(),
-                                has_out_fee = pool.out_fee.is_some(),
-                                has_fee_gamma = pool.fee_gamma.is_some(),
-                                "Removing CryptoSwap pool: missing required parameters"
-                            );
-                        }
-                        valid
-                    }
-                    CurveLegacyPoolType::StableSwap => {
-                        // StableSwap 必须有 amp
-                        let valid = pool.amp.is_some();
-                        if !valid {
-                            tracing::warn!(
-                                pool = ?pool.address,
-                                "Removing StableSwap pool: missing amp parameter"
-                            );
-                        }
-                        valid
-                    }
-                };
-                is_valid
+        if !synthesized_deps.is_empty() {
+            tracing::info!(
+                synthesized = synthesized_deps.len(),
+                "Added synthesized Curve Legacy base-pool dependencies for MetaPools"
+            );
+            results.append(&mut synthesized_deps);
+        }
+
+        let filtered = Self::filter_invalid_initialized_amms(&mut results);
+
+        let mut deduped = Vec::with_capacity(results.len());
+        let mut emitted = HashSet::with_capacity(results.len());
+        for amm in results {
+            if emitted.insert(amm.address()) {
+                deduped.push(amm);
             } else {
-                true
+                tracing::debug!(pool = ?amm.address(), "Dropping duplicate Curve Legacy pool from batch init");
             }
-        });
-
-        let filtered = pre_filter - results.len();
+        }
 
         tracing::info!(
-            "Curve Legacy init complete: {}/{} succeeded, {} failed, {} filtered (invalid params)",
+            "Curve Legacy init complete: {}/{} requested succeeded, {} failed, {} filtered (invalid params), {} returned after dependency expansion",
             success_count,
             total,
             fail_count,
-            filtered
+            filtered,
+            deduped.len()
         );
 
-        Ok(results)
+        Ok(deduped)
     }
 
     pub async fn sync_all_pools<N, P>(

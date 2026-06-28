@@ -43,13 +43,15 @@ use alloy::{
     sol_types::SolEvent,
 };
 use eyre::Result;
+use std::sync::Arc;
 
 use crate::amms::{
     amm::{AutomatedMarketMaker, SyncAction},
     error::AMMError,
 };
 pub use types::{
-    CurveLegacyPool, CurveLegacyPoolType, CurveLegacyPoolType::*, LegacyStableSwapType,
+    CurveLegacyBaseView, CurveLegacyPool, CurveLegacyPoolType, CurveLegacyPoolType::*,
+    CurveLegacySwapRoute, LegacyStableSwapType,
 };
 
 // Multicall3 Address (Standard across chains)
@@ -93,6 +95,32 @@ sol! {
     #[sol(rpc)]
     interface ICurveLegacyPoolPriceScaleWithArgs {
         function price_scale(uint256 i) external view returns (uint256);
+    }
+    #[sol(rpc)]
+    interface ICurveLegacyTotalSupplyUpdate {
+        function totalSupply() external view returns (uint256);
+    }
+    #[sol(rpc)]
+    interface ICurveLegacyPoolMetaProbe {
+        function base_pool() external view returns (address);
+        function lp_token() external view returns (address);
+        function get_virtual_price() external view returns (uint256);
+    }
+    #[sol(rpc)]
+    interface ICurveLegacyPoolUnderlyingProbe {
+        function underlying_coins(uint256 i) external view returns (address);
+    }
+    #[sol(rpc)]
+    interface ICurveLegacyPoolUnderlyingInt128Probe {
+        function underlying_coins(int128 i) external view returns (address);
+    }
+    #[sol(rpc)]
+    interface ICurveLegacyPoolRatesProbe {
+        function rates(int128 i) external view returns (uint256);
+    }
+    #[sol(rpc)]
+    interface ICurveLegacyPoolStoredRatesArrayProbe {
+        function stored_rates() external view returns (uint256[2] memory);
     }
 }
 
@@ -353,7 +381,7 @@ impl AutomatedMarketMaker for CurveLegacyPool {
     }
 
     fn tokens(&self) -> Vec<Address> {
-        self.coins.clone()
+        self.routeable_tokens().to_vec()
     }
 
     fn has_sufficient_liquidity(&self) -> bool {
@@ -378,11 +406,7 @@ impl AutomatedMarketMaker for CurveLegacyPool {
     }
 
     fn decimals(&self, token: Address) -> u8 {
-        self.coins
-            .iter()
-            .position(|&t| t == token)
-            .and_then(|i| self.decimals.get(i).copied())
-            .unwrap_or(0)
+        self.token_decimals(token).unwrap_or(0)
     }
 
     /// Curve Legacy pools are deployed on multiple EVM chains
@@ -590,13 +614,16 @@ impl AutomatedMarketMaker for CurveLegacyPool {
         // === 5. Token Exchange Underlying ===
         } else if topic0 == ICurveLegacyPool::TokenExchangeUnderlying::SIGNATURE_HASH {
             let event = ICurveLegacyPool::TokenExchangeUnderlying::decode_log(&log.inner)?;
-            // Underlying events affect underlying coins, but sometimes pool holds wrapped tokens.
-            // Usually this event implies a change in balances if the pool holds the underlying or a wrapper.
-            // We'll update balances if indices match.
-
-            // NOTE: Underlying indices might map differently if using lending pools.
-            // For simple pools, it's same.
-            // Conservatively, we update balances if indices are within range.
+            if self.is_meta_pool() {
+                tracing::info!(
+                    target = "amms::curve_legacy::sync",
+                    pool = ?self.address,
+                    sold_id = event.sold_id,
+                    bought_id = event.bought_id,
+                    "TokenExchangeUnderlying on meta pool: forcing async refresh"
+                );
+                return Ok(SyncAction::AsyncUpdate);
+            }
 
             let i = event.sold_id as usize;
             let j = event.bought_id as usize;
@@ -657,17 +684,17 @@ impl AutomatedMarketMaker for CurveLegacyPool {
             || topic0 == ICurveStableSwap3Event::AddLiquidity::SIGNATURE_HASH
             || topic0 == ICurveStableSwap4Event::AddLiquidity::SIGNATURE_HASH
         {
-            // Determine amounts based on signature
-            let amounts: Vec<U256> =
+            // Determine amounts and new token_supply based on signature
+            let (amounts, token_supply): (Vec<U256>, U256) =
                 if topic0 == ICurveStableSwap2Event::AddLiquidity::SIGNATURE_HASH {
                     let e = ICurveStableSwap2Event::AddLiquidity::decode_log(&log.inner)?;
-                    e.token_amounts.to_vec()
+                    (e.token_amounts.to_vec(), e.token_supply)
                 } else if topic0 == ICurveStableSwap3Event::AddLiquidity::SIGNATURE_HASH {
                     let e = ICurveStableSwap3Event::AddLiquidity::decode_log(&log.inner)?;
-                    e.token_amounts.to_vec()
+                    (e.token_amounts.to_vec(), e.token_supply)
                 } else {
                     let e = ICurveStableSwap4Event::AddLiquidity::decode_log(&log.inner)?;
-                    e.token_amounts.to_vec()
+                    (e.token_amounts.to_vec(), e.token_supply)
                 };
 
             for (i, &amount) in amounts.iter().enumerate() {
@@ -675,6 +702,7 @@ impl AutomatedMarketMaker for CurveLegacyPool {
                     self.balances[i] = self.balances[i].saturating_add(amount);
                 }
             }
+            self.total_supply = Some(token_supply);
 
             tracing::info!(target = "amms::curve_legacy::sync", pool = ?self.address, "AddLiquidity (StableSwap)");
 
@@ -690,16 +718,16 @@ impl AutomatedMarketMaker for CurveLegacyPool {
             || topic0 == ICurveStableSwap3Event::RemoveLiquidity::SIGNATURE_HASH
             || topic0 == ICurveStableSwap4Event::RemoveLiquidity::SIGNATURE_HASH
         {
-            let amounts: Vec<U256> =
+            let (amounts, token_supply): (Vec<U256>, U256) =
                 if topic0 == ICurveStableSwap2Event::RemoveLiquidity::SIGNATURE_HASH {
                     let e = ICurveStableSwap2Event::RemoveLiquidity::decode_log(&log.inner)?;
-                    e.token_amounts.to_vec()
+                    (e.token_amounts.to_vec(), e.token_supply)
                 } else if topic0 == ICurveStableSwap3Event::RemoveLiquidity::SIGNATURE_HASH {
                     let e = ICurveStableSwap3Event::RemoveLiquidity::decode_log(&log.inner)?;
-                    e.token_amounts.to_vec()
+                    (e.token_amounts.to_vec(), e.token_supply)
                 } else {
                     let e = ICurveStableSwap4Event::RemoveLiquidity::decode_log(&log.inner)?;
-                    e.token_amounts.to_vec()
+                    (e.token_amounts.to_vec(), e.token_supply)
                 };
 
             for (i, &amount) in amounts.iter().enumerate() {
@@ -707,6 +735,7 @@ impl AutomatedMarketMaker for CurveLegacyPool {
                     self.balances[i] = self.balances[i].saturating_sub(amount);
                 }
             }
+            self.total_supply = Some(token_supply);
 
             tracing::info!(target = "amms::curve_legacy::sync", pool = ?self.address, "RemoveLiquidity (StableSwap)");
 
@@ -722,17 +751,17 @@ impl AutomatedMarketMaker for CurveLegacyPool {
             || topic0 == ICurveStableSwap3Event::RemoveLiquidityImbalance::SIGNATURE_HASH
             || topic0 == ICurveStableSwap4Event::RemoveLiquidityImbalance::SIGNATURE_HASH
         {
-            let amounts: Vec<U256> = if topic0
+            let (amounts, token_supply): (Vec<U256>, U256) = if topic0
                 == ICurveStableSwap2Event::RemoveLiquidityImbalance::SIGNATURE_HASH
             {
                 let e = ICurveStableSwap2Event::RemoveLiquidityImbalance::decode_log(&log.inner)?;
-                e.token_amounts.to_vec()
+                (e.token_amounts.to_vec(), e.token_supply)
             } else if topic0 == ICurveStableSwap3Event::RemoveLiquidityImbalance::SIGNATURE_HASH {
                 let e = ICurveStableSwap3Event::RemoveLiquidityImbalance::decode_log(&log.inner)?;
-                e.token_amounts.to_vec()
+                (e.token_amounts.to_vec(), e.token_supply)
             } else {
                 let e = ICurveStableSwap4Event::RemoveLiquidityImbalance::decode_log(&log.inner)?;
-                e.token_amounts.to_vec()
+                (e.token_amounts.to_vec(), e.token_supply)
             };
 
             for (i, &amount) in amounts.iter().enumerate() {
@@ -740,6 +769,7 @@ impl AutomatedMarketMaker for CurveLegacyPool {
                     self.balances[i] = self.balances[i].saturating_sub(amount);
                 }
             }
+            self.total_supply = Some(token_supply);
 
             tracing::info!(target = "amms::curve_legacy::sync", pool = ?self.address, "RemoveLiquidityImbalance (StableSwap)");
 
@@ -759,6 +789,11 @@ impl AutomatedMarketMaker for CurveLegacyPool {
                 pool = ?self.address,
                 "RemoveLiquidityOne (StableSwap) - No coin_index, triggering re-sync"
             );
+            if let Some(ts) = self.total_supply {
+                self.total_supply = Some(ts.saturating_sub(
+                    ICurveLegacyPool::RemoveLiquidityOne::decode_log(&log.inner)?.token_amount,
+                ));
+            }
             return Ok(SyncAction::Resync);
 
         // === 10. Remove Liquidity One (CryptoSwap - with coin_index) ===
@@ -769,6 +804,9 @@ impl AutomatedMarketMaker for CurveLegacyPool {
             if coin_index < self.balances.len() {
                 self.balances[coin_index] =
                     self.balances[coin_index].saturating_sub(event.coin_amount);
+            }
+            if let Some(ts) = self.total_supply {
+                self.total_supply = Some(ts.saturating_sub(event.token_amount));
             }
 
             tracing::info!(
@@ -786,13 +824,13 @@ impl AutomatedMarketMaker for CurveLegacyPool {
         } else if topic0 == ICurveCryptoSwap2Event::AddLiquidity::SIGNATURE_HASH
             || topic0 == ICurveCryptoSwap3Event::AddLiquidity::SIGNATURE_HASH
         {
-            let amounts: Vec<U256> =
+            let (amounts, token_supply): (Vec<U256>, U256) =
                 if topic0 == ICurveCryptoSwap2Event::AddLiquidity::SIGNATURE_HASH {
                     let e = ICurveCryptoSwap2Event::AddLiquidity::decode_log(&log.inner)?;
-                    e.token_amounts.to_vec()
+                    (e.token_amounts.to_vec(), e.token_supply)
                 } else {
                     let e = ICurveCryptoSwap3Event::AddLiquidity::decode_log(&log.inner)?;
-                    e.token_amounts.to_vec()
+                    (e.token_amounts.to_vec(), e.token_supply)
                 };
 
             for (i, &amount) in amounts.iter().enumerate() {
@@ -800,6 +838,7 @@ impl AutomatedMarketMaker for CurveLegacyPool {
                     self.balances[i] = self.balances[i].saturating_add(amount);
                 }
             }
+            self.total_supply = Some(token_supply);
 
             self.recalculate_crypto_state()?;
 
@@ -879,23 +918,19 @@ impl AutomatedMarketMaker for CurveLegacyPool {
     /// Update cached spot prices for all token pairs
 
     fn calculate_price(&self, base_token: Address, quote_token: Address) -> Result<f64, AMMError> {
-        let i = self
-            .coins
-            .iter()
-            .position(|c| *c == base_token)
+        let in_decimals = self
+            .token_decimals(base_token)
             .ok_or(AMMError::TokenNotFound(base_token))?;
-        let j = self
-            .coins
-            .iter()
-            .position(|c| *c == quote_token)
+        let out_decimals = self
+            .token_decimals(quote_token)
             .ok_or(AMMError::TokenNotFound(quote_token))?;
 
-        let amount_in = U256::from(10).pow(U256::from(self.decimals[i]));
+        let amount_in = U256::from(10).pow(U256::from(in_decimals));
         let amount_out = self.simulate_swap(base_token, quote_token, amount_in)?;
 
         use crate::amms::float::u256_to_float;
         let amount_out_f = u256_to_float(amount_out)?;
-        let precision_out = 10u64.pow(self.decimals[j] as u32) as f64;
+        let precision_out = 10u64.pow(out_decimals as u32) as f64;
         // precision_out 是 f64，amount_out_f 是 rug::Float，需要先将 Float 转为 f64
         let price = amount_out_f.to_f64() / precision_out;
         Ok(price)
@@ -923,20 +958,37 @@ impl AutomatedMarketMaker for CurveLegacyPool {
         quote_token: Address,
         amount_in: U256,
     ) -> Result<U256, AMMError> {
-        let i = self
-            .coins
-            .iter()
-            .position(|c| *c == base_token)
-            .ok_or(AMMError::TokenNotFound(base_token))?;
-        let j = self
-            .coins
-            .iter()
-            .position(|c| *c == quote_token)
-            .ok_or(AMMError::TokenNotFound(quote_token))?;
-
-        match self.pool_type {
-            StableSwap => self.simulate_stableswap(i, j, amount_in),
-            CryptoSwap => self.simulate_cryptoswap(i, j, amount_in),
+        match self
+            .resolve_swap_route(base_token, quote_token)
+            .ok_or(AMMError::TokenNotFound(quote_token))?
+        {
+            CurveLegacySwapRoute::Direct { i, j } => self.simulate_direct_swap(i, j, amount_in),
+            CurveLegacySwapRoute::BaseToBase { i, j } => self
+                .base_pool_view
+                .as_ref()
+                .ok_or_else(|| AMMError::Msg("Meta pool missing base_pool_view".into()))?
+                .simulate_direct_swap(i, j, amount_in),
+            CurveLegacySwapRoute::MetaToBase { meta_i, base_j } => {
+                let lp_idx = self
+                    .base_token_index
+                    .ok_or_else(|| AMMError::Msg("Meta pool missing base_token_index".into()))?;
+                let lp_out = self.simulate_direct_swap(meta_i, lp_idx, amount_in)?;
+                self.base_pool_view
+                    .as_ref()
+                    .ok_or_else(|| AMMError::Msg("Meta pool missing base_pool_view".into()))?
+                    .simulate_remove_liquidity_one_coin(lp_out, base_j)
+            }
+            CurveLegacySwapRoute::BaseToMeta { base_i, meta_j } => {
+                let lp_out = self
+                    .base_pool_view
+                    .as_ref()
+                    .ok_or_else(|| AMMError::Msg("Meta pool missing base_pool_view".into()))?
+                    .simulate_add_liquidity_one_coin(base_i, amount_in)?;
+                let lp_idx = self
+                    .base_token_index
+                    .ok_or_else(|| AMMError::Msg("Meta pool missing base_token_index".into()))?;
+                self.simulate_direct_swap(lp_idx, meta_j, lp_out)
+            }
         }
     }
 
@@ -946,31 +998,29 @@ impl AutomatedMarketMaker for CurveLegacyPool {
         quote_token: Address,
         amount_in: U256,
     ) -> Result<U256, AMMError> {
-        let amount_out = self.simulate_swap(base_token, quote_token, amount_in)?;
-
-        let i = self
-            .coins
-            .iter()
-            .position(|c| *c == base_token)
-            .ok_or(AMMError::TokenNotFound(base_token))?;
-        let j = self
-            .coins
-            .iter()
-            .position(|c| *c == quote_token)
-            .ok_or(AMMError::TokenNotFound(quote_token))?;
-
-        if i < self.balances.len() {
-            self.balances[i] += amount_in;
+        match self
+            .resolve_swap_route(base_token, quote_token)
+            .ok_or(AMMError::TokenNotFound(quote_token))?
+        {
+            CurveLegacySwapRoute::Direct { i, j } => {
+                let amount_out = self.simulate_direct_swap(i, j, amount_in)?;
+                if i < self.balances.len() {
+                    self.balances[i] += amount_in;
+                }
+                if j < self.balances.len() {
+                    self.balances[j] =
+                        self.balances[j]
+                            .checked_sub(amount_out)
+                            .ok_or(AMMError::Msg(
+                                "Balance underflow in simulate_swap_mut".into(),
+                            ))?;
+                }
+                Ok(amount_out)
+            }
+            _ => Err(AMMError::Msg(
+                "simulate_swap_mut is unsupported for Curve Legacy meta underlying routes".into(),
+            )),
         }
-        if j < self.balances.len() {
-            self.balances[j] = self.balances[j]
-                .checked_sub(amount_out)
-                .ok_or(AMMError::Msg(
-                    "Balance underflow in simulate_swap_mut".into(),
-                ))?;
-        }
-
-        Ok(amount_out)
     }
 
     fn simulate_swap_exact_out(
@@ -979,20 +1029,15 @@ impl AutomatedMarketMaker for CurveLegacyPool {
         quote_token: Address,
         amount_out: U256,
     ) -> Result<U256, AMMError> {
-        let i = self
-            .coins
-            .iter()
-            .position(|&c| c == base_token)
-            .ok_or(AMMError::TokenNotFound(base_token))?;
-        let j = self
-            .coins
-            .iter()
-            .position(|&c| c == quote_token)
-            .ok_or(AMMError::TokenNotFound(quote_token))?;
-
-        match self.pool_type {
-            StableSwap => self.simulate_stableswap_exact_out(i, j, amount_out),
-            CryptoSwap => self.simulate_cryptoswap_exact_out(i, j, amount_out),
+        match self
+            .resolve_swap_route(base_token, quote_token)
+            .ok_or(AMMError::TokenNotFound(quote_token))?
+        {
+            CurveLegacySwapRoute::Direct { i, j } if !self.is_meta_pool() => match self.pool_type {
+                StableSwap => self.simulate_stableswap_exact_out(i, j, amount_out),
+                CryptoSwap => self.simulate_cryptoswap_exact_out(i, j, amount_out),
+            },
+            _ => self.simulate_swap_exact_out_via_search(base_token, quote_token, amount_out),
         }
     }
 
@@ -1002,6 +1047,10 @@ impl AutomatedMarketMaker for CurveLegacyPool {
         N: Network,
         P: Provider<N> + Clone,
     {
+        // NOTE:
+        // Any Curve Legacy meta-pool initialization fields added here must also be reflected by any
+        // batch initialization path. The current codebase still uses this single-pool path during
+        // Curve Legacy batch init, but a future dedicated batch path must preserve the same fields.
         use alloy::sol;
 
         sol! {
@@ -1033,32 +1082,6 @@ impl AutomatedMarketMaker for CurveLegacyPool {
                 function balances(int128 i) external view returns (uint256);
             }
 
-            #[sol(rpc)]
-            interface ICurveLegacyPoolMeta {
-                function base_pool() external view returns (address);
-                function lp_token() external view returns (address);
-                function get_virtual_price() external view returns (uint256);
-            }
-
-            #[sol(rpc)]
-            interface ICurveLegacyPoolLending {
-                function underlying_coins(uint256 i) external view returns (address);
-            }
-
-            #[sol(rpc)]
-            interface ICurveLegacyPoolLendingInt128 {
-                function underlying_coins(int128 i) external view returns (address);
-            }
-
-            #[sol(rpc)]
-            interface ICurveLegacyPoolRates {
-                function rates(int128 i) external view returns (uint256);
-            }
-
-            #[sol(rpc)]
-            interface ICurveLegacyPoolStoredRatesArray {
-                function stored_rates() external view returns (uint256[2] memory);
-            }
         }
 
         let pool = ICurveLegacyPool::new(self.address, provider.clone());
@@ -1221,95 +1244,98 @@ impl AutomatedMarketMaker for CurveLegacyPool {
             }
         }
 
-        // === Subtype Detection (StableSwap) ===
+        // === Meta / Underlying Detection ===
+        self.load_underlying_coin_probes::<N, _>(block_number, provider.clone())
+            .await;
+
+        if let Some(base_pool_addr) = self
+            .probe_base_pool_address::<N, _>(block_number, provider.clone())
+            .await
+        {
+            tracing::debug!(
+                pool = ?self.address,
+                base_pool = ?base_pool_addr,
+                "Detected base_pool() on Curve Legacy pool"
+            );
+
+            let base_pool_state = Box::pin(
+                CurveLegacyPool::new(base_pool_addr, CurveLegacyPoolType::StableSwap)
+                    .init(block_number, provider.clone()),
+            )
+            .await?;
+            self.attach_base_pool_state::<N, _>(
+                base_pool_addr,
+                None,
+                None,
+                base_pool_state,
+                block_number,
+                provider.clone(),
+            )
+            .await?;
+        } else if let Some(base_idx) = self.coins.len().checked_sub(1) {
+            let candidate_addr = self.coins[base_idx];
+            if candidate_addr != Address::ZERO && candidate_addr != self.address {
+                if let Some(candidate_pool) = Self::try_init_stable_base_pool_candidate::<N, _>(
+                    candidate_addr,
+                    block_number,
+                    provider.clone(),
+                )
+                .await
+                {
+                    tracing::debug!(
+                        pool = ?self.address,
+                        candidate_base_pool = ?candidate_addr,
+                        candidate_index = base_idx,
+                        base_n_coins = candidate_pool.n_coins,
+                        "Detected meta pool via last-coin base-pool structure"
+                    );
+                    self.attach_base_pool_state::<N, _>(
+                        candidate_addr,
+                        Some(base_idx),
+                        Some(candidate_addr),
+                        candidate_pool,
+                        block_number,
+                        provider.clone(),
+                    )
+                    .await?;
+                }
+            }
+        }
+
+        // === Subtype Detection (StableSwap only) ===
         if self.pool_type == CurveLegacyPoolType::StableSwap {
-            let pool_meta = ICurveLegacyPoolMeta::new(self.address, provider.clone());
-            let pool_lending = ICurveLegacyPoolLending::new(self.address, provider.clone());
-            let pool_lending_int =
-                ICurveLegacyPoolLendingInt128::new(self.address, provider.clone());
-
-            // 1. Check for Metapool
-            if let Ok(base_pool_addr) = pool_meta.base_pool().block(block_number).call().await {
+            if self.is_meta_pool() {
                 self.stable_type = LegacyStableSwapType::Meta;
-                self.base_pool = Some(base_pool_addr);
-                tracing::debug!(pool = ?self.address, base_pool = ?base_pool_addr, "Identified as Metapool");
-
-                // Get Base Pool Virtual Price
-                // Note: We need to call get_virtual_price on the BASE POOL, not this pool (usually)
-                // But wait, the base pool's virtual price is needed for the conversion.
-                // Let's rely on base_pool address.
-                let base_pool_contract =
-                    ICurveLegacyPoolMeta::new(base_pool_addr, provider.clone());
-                if let Ok(vp) = base_pool_contract
-                    .get_virtual_price()
-                    .block(block_number)
-                    .call()
-                    .await
-                {
-                    self.base_virtual_price = Some(vp);
-                } else {
-                    tracing::warn!(pool = ?self.address, base_pool = ?base_pool_addr, "Failed to fetch base pool virtual price");
-                }
-
-                // Identify LP Token index
-                // Usually the Metapool holds the LP token of the base pool.
-                // We need to know which coin is the LP token.
-                // Approach: Check if any coin matches base_pool's LP token (if traceable) or try common heuristic?
-                // Better: Fetch base_pool's LP token address.
-                // Many base pools (like 3pool) have a separate LP token "3CRV".
-                // ICurveLegacyPoolMeta has lp_token() function.
-                if let Ok(lp_token_addr) = base_pool_contract
-                    .lp_token()
-                    .block(block_number)
-                    .call()
-                    .await
-                {
-                    self.lp_token = Some(lp_token_addr);
-                    if let Some(idx) = self.coins.iter().position(|c| *c == lp_token_addr) {
-                        self.base_token_index = Some(idx);
-                    }
-                } else {
-                    // Fallback: Check if base_pool address itself is in coins (some older pools?)
-                    // Or try to infer?
-                    // For now, if we can't find lp_token, we might fail simulation.
-                }
+                tracing::debug!(pool = ?self.address, "Identified as StableSwap Metapool");
+            } else if !self.underlying_coins.is_empty()
+                && (self.underlying_coins.len() != self.coins.len()
+                    || self.underlying_coins != self.coins)
+            {
+                self.stable_type = LegacyStableSwapType::Lending;
+                tracing::debug!(pool = ?self.address, "Identified as Lending Pool");
             } else {
-                // 2. Check for Lending Pool
-                // Heuristic: Check if underlying_coins exist and are different from coins
-                let mut underlying = Vec::new();
-                for i in 0..8 {
-                    let u_coin = match pool_lending
-                        .underlying_coins(U256::from(i))
-                        .block(block_number)
-                        .call()
-                        .await
-                    {
-                        Ok(c) => c,
-                        Err(_) => match pool_lending_int
-                            .underlying_coins(i as i128)
-                            .block(block_number)
-                            .call()
-                            .await
-                        {
-                            Ok(c) => c,
-                            Err(_) => break, // Stop if error (end of list)
-                        },
-                    };
-                    if u_coin == Address::ZERO {
-                        break;
-                    }
-                    underlying.push(u_coin);
-                }
+                self.stable_type = LegacyStableSwapType::Plain;
+            }
+        }
 
-                if !underlying.is_empty()
-                    && (underlying.len() != self.coins.len() || underlying != self.coins)
-                {
-                    self.stable_type = LegacyStableSwapType::Lending;
-                    self.underlying_coins = underlying;
-                    tracing::debug!(pool = ?self.address, "Identified as Lending Pool");
-                } else {
-                    self.stable_type = LegacyStableSwapType::Plain;
-                }
+        let total_supply_contract =
+            ICurveLegacyTotalSupplyUpdate::new(self.address, provider.clone());
+        if let Ok(ts) = total_supply_contract
+            .totalSupply()
+            .block(block_number)
+            .call()
+            .await
+        {
+            self.total_supply = Some(ts);
+        } else if let Ok(lp_addr) = ICurveLegacyPoolMetaProbe::new(self.address, provider.clone())
+            .lp_token()
+            .block(block_number)
+            .call()
+            .await
+        {
+            let lp_contract = ICurveLegacyTotalSupplyUpdate::new(lp_addr, provider.clone());
+            if let Ok(ts) = lp_contract.totalSupply().block(block_number).call().await {
+                self.total_supply = Some(ts);
             }
         }
 
@@ -1323,7 +1349,7 @@ impl AutomatedMarketMaker for CurveLegacyPool {
 
         // 1. Try stored_rates() -> uint256[2] first (Factory Plain Pools with LST)
         let pool_stored_rates_array =
-            ICurveLegacyPoolStoredRatesArray::new(self.address, provider.clone());
+            ICurveLegacyPoolStoredRatesArrayProbe::new(self.address, provider.clone());
         if let Ok(rates_array) = pool_stored_rates_array
             .stored_rates()
             .block(block_number)
@@ -1362,7 +1388,7 @@ impl AutomatedMarketMaker for CurveLegacyPool {
         // 3. If stored_rates failed or incomplete, try rates(int128) (Metapools)
         if custom_rates.len() != self.n_coins as usize {
             custom_rates.clear();
-            let pool_rates = ICurveLegacyPoolRates::new(self.address, provider.clone());
+            let pool_rates = ICurveLegacyPoolRatesProbe::new(self.address, provider.clone());
             if pool_rates.rates(0).block(block_number).call().await.is_ok() {
                 for i in 0..self.n_coins {
                     if let Ok(r) = pool_rates.rates(i as i128).block(block_number).call().await {
@@ -1637,8 +1663,8 @@ impl AutomatedMarketMaker for CurveLegacyPool {
                 }
             }
             // Metapool: base_virtual_price
-            if self.stable_type == LegacyStableSwapType::Meta {
-                if let Some(base_pool_addr) = self.base_pool {
+            if self.base_pool_address.is_some() {
+                if let Some(base_pool_addr) = self.base_pool_address {
                     calls.push(Call3 {
                         target: base_pool_addr,
                         allowFailure: true,
@@ -1805,9 +1831,334 @@ impl AutomatedMarketMaker for CurveLegacyPool {
 }
 
 impl CurveLegacyPool {
+    pub fn is_meta_pool(&self) -> bool {
+        self.is_meta || self.base_pool_address.is_some()
+    }
+
+    pub fn routeable_tokens(&self) -> &[Address] {
+        if self.is_meta_pool() && !self.underlying_coins.is_empty() {
+            &self.underlying_coins
+        } else {
+            &self.coins
+        }
+    }
+
+    pub fn direct_tokens(&self) -> &[Address] {
+        &self.coins
+    }
+
+    pub fn underlying_tokens(&self) -> &[Address] {
+        &self.underlying_coins
+    }
+
+    pub fn direct_token_index(&self, token: Address) -> Option<usize> {
+        self.coins.iter().position(|&t| t == token)
+    }
+
+    pub fn underlying_token_index(&self, token: Address) -> Option<usize> {
+        self.underlying_coins.iter().position(|&t| t == token)
+    }
+
+    pub fn token_decimals(&self, token: Address) -> Option<u8> {
+        if let Some(i) = self.direct_token_index(token) {
+            return self.decimals.get(i).copied();
+        }
+
+        let view = self.base_pool_view.as_ref()?;
+        let i = view.token_index(token)?;
+        view.decimals.get(i).copied()
+    }
+
+    pub fn build_base_view(&self) -> Option<Arc<CurveLegacyBaseView>> {
+        if self.pool_type != CurveLegacyPoolType::StableSwap || self.is_meta_pool() {
+            return None;
+        }
+
+        let total_supply = self.total_supply?;
+        Some(Arc::new(CurveLegacyBaseView {
+            address: self.address,
+            last_synced_block: self.last_synced_block,
+            pool_type: self.pool_type,
+            stable_type: self.stable_type,
+            n_coins: self.n_coins,
+            coins: self.coins.clone(),
+            balances: self.balances.clone(),
+            decimals: self.decimals.clone(),
+            rates: self.rates.clone(),
+            amp: self.amp,
+            uses_a_precision: self.uses_a_precision,
+            fee: self.fee,
+            admin_fee: self.admin_fee,
+            total_supply,
+        }))
+    }
+
+    async fn load_underlying_coin_probes<N, P>(&mut self, block_number: BlockId, provider: P)
+    where
+        N: Network,
+        P: Provider<N> + Clone,
+    {
+        let pool_lending = ICurveLegacyPoolUnderlyingProbe::new(self.address, provider.clone());
+        let pool_lending_int =
+            ICurveLegacyPoolUnderlyingInt128Probe::new(self.address, provider.clone());
+
+        let mut detected_underlying = Vec::new();
+        for i in 0..8 {
+            let u_coin = match pool_lending
+                .underlying_coins(U256::from(i))
+                .block(block_number)
+                .call()
+                .await
+            {
+                Ok(c) => c,
+                Err(_) => match pool_lending_int
+                    .underlying_coins(i as i128)
+                    .block(block_number)
+                    .call()
+                    .await
+                {
+                    Ok(c) => c,
+                    Err(_) => break,
+                },
+            };
+
+            if u_coin == Address::ZERO || detected_underlying.contains(&u_coin) {
+                break;
+            }
+            detected_underlying.push(u_coin);
+        }
+
+        if !detected_underlying.is_empty() {
+            self.underlying_coins = detected_underlying;
+        }
+    }
+
+    async fn probe_base_pool_address<N, P>(
+        &self,
+        block_number: BlockId,
+        provider: P,
+    ) -> Option<Address>
+    where
+        N: Network,
+        P: Provider<N> + Clone,
+    {
+        let pool_meta = ICurveLegacyPoolMetaProbe::new(self.address, provider);
+        pool_meta
+            .base_pool()
+            .block(block_number)
+            .call()
+            .await
+            .ok()
+            .filter(|addr| *addr != Address::ZERO)
+    }
+
+    async fn try_init_stable_base_pool_candidate<N, P>(
+        candidate_addr: Address,
+        block_number: BlockId,
+        provider: P,
+    ) -> Option<Self>
+    where
+        N: Network,
+        P: Provider<N> + Clone,
+    {
+        let candidate_result = Box::pin(
+            CurveLegacyPool::new(candidate_addr, CurveLegacyPoolType::StableSwap)
+                .init(block_number, provider),
+        )
+        .await
+        .ok()?;
+
+        if candidate_result.pool_type != CurveLegacyPoolType::StableSwap
+            || candidate_result.n_coins == 0
+            || candidate_result.coins.is_empty()
+        {
+            return None;
+        }
+
+        Some(candidate_result)
+    }
+
+    fn expand_underlying_with_base_pool(&mut self, base_idx: usize, base_pool_coins: &[Address]) {
+        if !(self.underlying_coins.is_empty() || self.underlying_coins.len() <= self.coins.len()) {
+            return;
+        }
+        if base_pool_coins.is_empty() {
+            return;
+        }
+
+        let mut expanded =
+            Vec::with_capacity(self.coins.len().saturating_sub(1) + base_pool_coins.len());
+        for (idx, &coin) in self.coins.iter().enumerate() {
+            if idx == base_idx {
+                expanded.extend(base_pool_coins.iter().copied());
+            } else {
+                expanded.push(coin);
+            }
+        }
+        self.underlying_coins = expanded;
+    }
+
+    async fn attach_base_pool_state<N, P>(
+        &mut self,
+        base_pool_addr: Address,
+        base_token_index_hint: Option<usize>,
+        base_lp_token_hint: Option<Address>,
+        mut base_pool_state: Self,
+        block_number: BlockId,
+        provider: P,
+    ) -> Result<(), AMMError>
+    where
+        N: Network,
+        P: Provider<N> + Clone,
+    {
+        let base_pool_contract = ICurveLegacyPoolMetaProbe::new(base_pool_addr, provider.clone());
+        if let Ok(vp) = base_pool_contract
+            .get_virtual_price()
+            .block(block_number)
+            .call()
+            .await
+        {
+            self.base_virtual_price = Some(vp);
+        } else {
+            tracing::warn!(
+                pool = ?self.address,
+                base_pool = ?base_pool_addr,
+                "Failed to fetch base pool virtual price"
+            );
+        }
+
+        let probed_lp_token = base_pool_contract
+            .lp_token()
+            .block(block_number)
+            .call()
+            .await
+            .ok()
+            .filter(|lp| *lp != Address::ZERO);
+
+        self.base_pool_address = Some(base_pool_addr);
+        self.base_lp_token = base_lp_token_hint.or(probed_lp_token);
+        self.base_token_index = base_token_index_hint
+            .or_else(|| self.coins.iter().position(|&c| c == base_pool_addr))
+            .or_else(|| {
+                self.base_lp_token
+                    .and_then(|lp| self.coins.iter().position(|&c| c == lp))
+            })
+            .or_else(|| self.coins.len().checked_sub(1));
+        if self.base_lp_token.is_none() {
+            self.base_lp_token = self.base_token_index.map(|idx| self.coins[idx]);
+        }
+
+        self.base_n_coins = base_pool_state.n_coins;
+        base_pool_state.base_pool_view = None;
+        let base_pool_coins = base_pool_state.coins.clone();
+        self.base_pool_view = base_pool_state.build_base_view();
+        if let Some(base_idx) = self.base_token_index {
+            self.expand_underlying_with_base_pool(base_idx, &base_pool_coins);
+        }
+        self.is_meta = true;
+
+        Ok(())
+    }
+
+    pub fn simulate_direct_swap(
+        &self,
+        i: usize,
+        j: usize,
+        amount_in: U256,
+    ) -> Result<U256, AMMError> {
+        match self.pool_type {
+            StableSwap => self.simulate_stableswap(i, j, amount_in),
+            CryptoSwap => self.simulate_cryptoswap(i, j, amount_in),
+        }
+    }
+
+    pub fn resolve_swap_route(
+        &self,
+        base_token: Address,
+        quote_token: Address,
+    ) -> Option<CurveLegacySwapRoute> {
+        if let (Some(i), Some(j)) = (
+            self.direct_token_index(base_token),
+            self.direct_token_index(quote_token),
+        ) {
+            return Some(CurveLegacySwapRoute::Direct { i, j });
+        }
+
+        let base_view = self.base_pool_view.as_ref()?;
+        let base_i = base_view.token_index(base_token);
+        let base_j = base_view.token_index(quote_token);
+
+        if let (Some(i), Some(j)) = (base_i, base_j) {
+            return Some(CurveLegacySwapRoute::BaseToBase { i, j });
+        }
+
+        if let (Some(meta_i), Some(base_j)) = (self.direct_token_index(base_token), base_j) {
+            if Some(meta_i) != self.base_token_index {
+                return Some(CurveLegacySwapRoute::MetaToBase { meta_i, base_j });
+            }
+        }
+
+        if let (Some(base_i), Some(meta_j)) = (base_i, self.direct_token_index(quote_token)) {
+            if Some(meta_j) != self.base_token_index {
+                return Some(CurveLegacySwapRoute::BaseToMeta { base_i, meta_j });
+            }
+        }
+
+        None
+    }
+
+    fn simulate_swap_exact_out_via_search(
+        &self,
+        base_token: Address,
+        quote_token: Address,
+        amount_out: U256,
+    ) -> Result<U256, AMMError> {
+        if amount_out.is_zero() {
+            return Ok(U256::ZERO);
+        }
+
+        let in_decimals = self.decimals(base_token);
+        if in_decimals == 0 {
+            return Err(AMMError::TokenNotFound(base_token));
+        }
+
+        let mut low = U256::ZERO;
+        let mut high = U256::from(10).pow(U256::from(in_decimals));
+
+        for _ in 0..32 {
+            let out = self.simulate_swap(base_token, quote_token, high)?;
+            if out >= amount_out {
+                break;
+            }
+            high = high.saturating_mul(U256::from(2));
+        }
+
+        for _ in 0..192 {
+            if low >= high {
+                break;
+            }
+            let mid = (low + high) / U256::from(2);
+            let out = self.simulate_swap(base_token, quote_token, mid)?;
+            if out >= amount_out {
+                high = mid;
+            } else {
+                low = mid + U256::from(1);
+            }
+        }
+
+        let final_out = self.simulate_swap(base_token, quote_token, high)?;
+        if final_out < amount_out {
+            return Err(AMMError::Msg(
+                "Exact-out search failed to find sufficient input".into(),
+            ));
+        }
+
+        Ok(high)
+    }
+
     /// Update cached spot prices for all token pairs
     pub(crate) fn update_spot_prices(&mut self) {
-        if self.coins.len() < 2 {
+        if self.routeable_tokens().len() < 2 {
             return;
         }
 
@@ -1823,21 +2174,23 @@ impl CurveLegacyPool {
             }
         }
 
-        for i in 0..self.coins.len() {
-            for j in 0..self.coins.len() {
+        let tokens = self.routeable_tokens().to_vec();
+        for i in 0..tokens.len() {
+            for j in 0..tokens.len() {
                 if i == j {
                     continue;
                 }
-                let base = self.coins[i];
-                let quote = self.coins[j];
-                let decimals_i = self.decimals[i];
-                let decimals_j = self.decimals[j];
+                let base = tokens[i];
+                let quote = tokens[j];
+                let Some(decimals_i) = self.token_decimals(base) else {
+                    continue;
+                };
+                let Some(decimals_j) = self.token_decimals(quote) else {
+                    continue;
+                };
                 let amount_in = U256::from(10).pow(U256::from(decimals_i));
 
-                let amount_out_res = match self.pool_type {
-                    CurveLegacyPoolType::StableSwap => self.simulate_stableswap(i, j, amount_in),
-                    CurveLegacyPoolType::CryptoSwap => self.simulate_cryptoswap(i, j, amount_in),
-                };
+                let amount_out_res = self.simulate_swap(base, quote, amount_in);
 
                 if let Ok(amount_out) = amount_out_res {
                     let price = amount_out.to_string().parse::<f64>().unwrap_or(0.0)
@@ -2102,7 +2455,6 @@ impl CurveLegacyPool {
 
         Ok(())
     }
-
     /// StableSwap Exact-Out simulation (binary search on dx).
     /// Given a target output amount, find the minimal input amount required.
     pub fn simulate_stableswap_exact_out(
@@ -2226,5 +2578,166 @@ impl CurveLegacyPool {
         }
 
         Ok(high)
+    }
+}
+
+const CURVE_RATE_PRECISION: U256 = U256::from_limbs([1_000_000_000_000_000_000, 0, 0, 0]);
+const CURVE_FEE_DENOMINATOR: U256 = U256::from_limbs([10_000_000_000, 0, 0, 0]);
+
+fn default_rates_from_decimals(decimals: &[u8]) -> Result<Vec<U256>, AMMError> {
+    decimals
+        .iter()
+        .map(|&dec| {
+            if dec > 18 {
+                Err(AMMError::Msg(format!("Decimals {} > 18", dec)))
+            } else {
+                Ok(U256::from(10).pow(U256::from(36 - dec as u32)))
+            }
+        })
+        .collect()
+}
+
+fn scale_balances_with_rates(balances: &[U256], rates: &[U256]) -> Result<Vec<U256>, AMMError> {
+    if balances.len() != rates.len() {
+        return Err(AMMError::Msg("Balances/rates length mismatch".into()));
+    }
+
+    Ok(balances
+        .iter()
+        .zip(rates.iter())
+        .map(|(&balance, &rate)| balance * rate / CURVE_RATE_PRECISION)
+        .collect())
+}
+
+impl CurveLegacyBaseView {
+    pub fn token_index(&self, token: Address) -> Option<usize> {
+        self.coins.iter().position(|&c| c == token)
+    }
+
+    fn rates_or_default(&self) -> Result<Vec<U256>, AMMError> {
+        if self.rates.len() == self.n_coins as usize {
+            Ok(self.rates.clone())
+        } else {
+            default_rates_from_decimals(&self.decimals)
+        }
+    }
+
+    pub fn simulate_direct_swap(&self, i: usize, j: usize, dx: U256) -> Result<U256, AMMError> {
+        if self.pool_type != CurveLegacyPoolType::StableSwap {
+            return Err(AMMError::Msg(
+                "Base view direct swap currently only supports StableSwap".into(),
+            ));
+        }
+
+        let amp = self
+            .amp
+            .ok_or(AMMError::Msg("Base view amp not set".into()))?;
+        let rates = self.rates_or_default()?;
+        if i >= self.balances.len() || j >= self.balances.len() {
+            return Err(AMMError::Msg("Base view token index out of bounds".into()));
+        }
+
+        let xp = scale_balances_with_rates(&self.balances, &rates)?;
+        let dx_scaled = dx * rates[i] / CURVE_RATE_PRECISION;
+        let dy_scaled =
+            math::stableswap::get_dy(&xp, amp, i, j, dx_scaled, self.fee, self.uses_a_precision)?;
+        let fee = dy_scaled * self.fee / CURVE_FEE_DENOMINATOR;
+        Ok(dy_scaled
+            .saturating_sub(fee)
+            .saturating_mul(CURVE_RATE_PRECISION)
+            / rates[j])
+    }
+
+    pub fn simulate_add_liquidity_one_coin(
+        &self,
+        coin_idx: usize,
+        amount_in: U256,
+    ) -> Result<U256, AMMError> {
+        if coin_idx >= self.balances.len() {
+            return Err(AMMError::Msg("Base view token index out of bounds".into()));
+        }
+        if self.total_supply.is_zero() {
+            return Err(AMMError::Msg("Base view total_supply is zero".into()));
+        }
+
+        let amp = self
+            .amp
+            .ok_or(AMMError::Msg("Base view amp not set".into()))?;
+        let rates = self.rates_or_default()?;
+        let old_balances = self.balances.clone();
+        let mut new_balances = old_balances.clone();
+        new_balances[coin_idx] = new_balances[coin_idx].saturating_add(amount_in);
+
+        let xp_old = scale_balances_with_rates(&old_balances, &rates)?;
+        let xp_new = scale_balances_with_rates(&new_balances, &rates)?;
+        let d0 = math::stableswap::get_d(&xp_old, amp, self.uses_a_precision)?;
+        let d1 = math::stableswap::get_d(&xp_new, amp, self.uses_a_precision)?;
+
+        if d0.is_zero() {
+            return Err(AMMError::Msg("Base view D0 is zero".into()));
+        }
+
+        let n = U256::from(self.n_coins as u64);
+        let base_fee = self.fee * n / (U256::from(4) * (n - U256::from(1)));
+
+        let mut reduced_balances = new_balances.clone();
+        for k in 0..reduced_balances.len() {
+            let ideal_balance = d1 * old_balances[k] / d0;
+            let difference = if ideal_balance > reduced_balances[k] {
+                ideal_balance - reduced_balances[k]
+            } else {
+                reduced_balances[k] - ideal_balance
+            };
+            let fee_amount = base_fee * difference / CURVE_FEE_DENOMINATOR;
+            reduced_balances[k] = reduced_balances[k].saturating_sub(fee_amount);
+        }
+
+        let xp_reduced = scale_balances_with_rates(&reduced_balances, &rates)?;
+        let d2 = math::stableswap::get_d(&xp_reduced, amp, self.uses_a_precision)?;
+        Ok(self.total_supply * d2.saturating_sub(d0) / d0)
+    }
+
+    pub fn simulate_remove_liquidity_one_coin(
+        &self,
+        lp_in: U256,
+        coin_idx: usize,
+    ) -> Result<U256, AMMError> {
+        if coin_idx >= self.balances.len() {
+            return Err(AMMError::Msg("Base view token index out of bounds".into()));
+        }
+        if self.total_supply.is_zero() {
+            return Err(AMMError::Msg("Base view total_supply is zero".into()));
+        }
+
+        let amp = self
+            .amp
+            .ok_or(AMMError::Msg("Base view amp not set".into()))?;
+        let rates = self.rates_or_default()?;
+        let xp = scale_balances_with_rates(&self.balances, &rates)?;
+        let d0 = math::stableswap::get_d(&xp, amp, self.uses_a_precision)?;
+        let d1 = d0.saturating_sub(lp_in * d0 / self.total_supply);
+        let new_y = math::stableswap::get_y_d(coin_idx, &xp, amp, d1, self.uses_a_precision)?;
+
+        let n = U256::from(self.n_coins as u64);
+        let base_fee = self.fee * n / (U256::from(4) * (n - U256::from(1)));
+        let mut xp_reduced = xp.clone();
+
+        for j in 0..xp.len() {
+            let dx_expected = if j == coin_idx {
+                xp[j] * d1 / d0 - new_y
+            } else {
+                xp[j] - xp[j] * d1 / d0
+            };
+            let fee_amount = base_fee * dx_expected / CURVE_FEE_DENOMINATOR;
+            xp_reduced[j] = xp_reduced[j].saturating_sub(fee_amount);
+        }
+
+        let y_after_fees =
+            math::stableswap::get_y_d(coin_idx, &xp_reduced, amp, d1, self.uses_a_precision)?;
+
+        let dy_scaled = xp_reduced[coin_idx]
+            .saturating_sub(y_after_fees)
+            .saturating_sub(U256::from(1));
+        Ok(dy_scaled * CURVE_RATE_PRECISION / rates[coin_idx])
     }
 }

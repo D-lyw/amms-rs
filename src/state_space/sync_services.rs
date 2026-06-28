@@ -679,6 +679,10 @@ pub async fn start_curve_rate_sync_task<N, P>(
             }
 
             if updated_count > 0 {
+                state.write().await.rebuild_curve_legacy_meta_views();
+            }
+
+            if updated_count > 0 {
                 info!(
                     "Updated StableSwap runtime data for {} Curve pools",
                     updated_count
@@ -778,6 +782,10 @@ pub async fn start_curve_rate_sync_task<N, P>(
                     }
                     _ => {}
                 }
+            }
+
+            if ps_updated_count > 0 {
+                state.write().await.rebuild_curve_legacy_meta_views();
             }
 
             if ps_updated_count > 0 {

@@ -1,6 +1,8 @@
 mod comprehensive;
 mod consistency_smoke;
 mod exact_out;
+mod meta_pool;
+mod meta_pool_fork;
 mod quote_parity;
 mod recalculate_precision;
 mod support;

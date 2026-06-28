@@ -1974,11 +1974,51 @@ impl StateSpace {
     }
 
     pub fn insert_amm(&mut self, amm: AMM) {
+        let is_curve_legacy = matches!(amm, AMM::CurveLegacyPool(_));
         self.state.insert(amm.address(), Arc::new(amm));
+        if is_curve_legacy {
+            self.rebuild_curve_legacy_meta_views();
+        }
     }
 
     pub fn insert_shared(&mut self, address: Address, amm: Arc<AMM>) {
         self.state.insert(address, amm);
+    }
+
+    pub fn rebuild_curve_legacy_meta_views(&mut self) {
+        let base_views: HashMap<Address, Arc<crate::amms::curve_legacy::CurveLegacyBaseView>> =
+            self.state
+                .iter()
+                .filter_map(|(address, amm)| match amm.as_ref() {
+                    AMM::CurveLegacyPool(pool) => {
+                        pool.build_base_view().map(|view| (*address, view))
+                    }
+                    _ => None,
+                })
+                .collect();
+
+        let legacy_addresses: Vec<Address> = self
+            .state
+            .iter()
+            .filter_map(|(address, amm)| match amm.as_ref() {
+                AMM::CurveLegacyPool(_) => Some(*address),
+                _ => None,
+            })
+            .collect();
+
+        for address in legacy_addresses {
+            let Some(AMM::CurveLegacyPool(pool)) = self.get_mut_cow(&address) else {
+                continue;
+            };
+
+            let rebuilt_view = pool
+                .base_pool_address
+                .and_then(|base_addr| base_views.get(&base_addr).cloned());
+            if rebuilt_view.is_some() {
+                pool.base_pool_view = rebuilt_view;
+            }
+            pool.update_spot_prices();
+        }
     }
 
     fn resolve_slipstream_fee_event_pool(&self, topics: &[FixedBytes<32>]) -> Option<Address> {
@@ -2167,6 +2207,15 @@ impl StateSpace {
                     }
                 }
             }
+        }
+
+        if affected_amms.iter().any(|addr| {
+            matches!(
+                self.state.get(addr).map(Arc::as_ref),
+                Some(AMM::CurveLegacyPool(_))
+            )
+        }) {
+            self.rebuild_curve_legacy_meta_views();
         }
 
         // Update realtime head internally to ensure consistency with state lock
