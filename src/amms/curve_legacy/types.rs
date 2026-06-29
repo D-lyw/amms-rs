@@ -115,6 +115,14 @@ pub struct CurveLegacyPool {
     /// Meta Pool 内部使用的 Base Pool 只读视图
     #[serde(skip)]
     pub base_pool_view: Option<Arc<CurveLegacyBaseView>>,
+    /// Crypto Meta Pool 的 Zap 合约地址（仅 CryptoSwap Meta 需要）
+    /// 构造后、sync 前必须主动设置：
+    ///   let mut pool = CurveLegacyPool::new(addr, CurveLegacyPoolType::CryptoSwap);
+    ///   pool.zap_address = Some(zap_addr);
+    ///   .with_amms(vec![pool.into()])
+    ///   .sync() ...
+    /// init() 阶段会校验其有效性，缺失或错误时会 fail fast。
+    pub zap_address: Option<Address>,
 
     // === CryptoSwap 额外参数 ===
     /// 价格缩放因子
@@ -171,6 +179,8 @@ impl CurveLegacyPool {
             base_token_index: None,
             base_pool_view: None,
 
+            zap_address: None,
+
             price_scale: None,
             d: None,
             gamma: None,
@@ -214,6 +224,7 @@ impl CurveLegacyBaseView {
             base_n_coins: 0,
             base_token_index: None,
             base_pool_view: None,
+            zap_address: None,
             price_scale: None,
             d: None,
             gamma: None,

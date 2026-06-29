@@ -367,6 +367,15 @@ sol! {
     }
 }
 
+sol! {
+    /// Zap 合约 probe — 校验 zap_address 是否绑定到当前池子
+    #[sol(rpc)]
+    interface ICurveMetaZapProbe {
+        function pool() external view returns (address);
+        function base_pool() external view returns (address);
+    }
+}
+
 impl AutomatedMarketMaker for CurveLegacyPool {
     fn address(&self) -> Address {
         self.address
@@ -1300,6 +1309,44 @@ impl AutomatedMarketMaker for CurveLegacyPool {
                     .await?;
                 }
             }
+        }
+
+        // === CryptoSwap Meta Pool 校验 ===
+        // CryptoSwap meta pool 需要 zap_address 且链上验证通过
+        if self.pool_type == CurveLegacyPoolType::CryptoSwap && self.is_meta_pool() {
+            let zap = match self.zap_address {
+                Some(z) if z != Address::ZERO => z,
+                _ => {
+                    return Err(AMMError::Msg(format!(
+                        "CryptoSwap meta pool {:?} requires zap_address; set before sync()",
+                        self.address
+                    )));
+                }
+            };
+            // 链上验证：zap.pool() 必须返回当前池子地址
+            let probe = ICurveMetaZapProbe::new(zap, provider.clone());
+            let reported_pool = probe
+                .pool()
+                .block(block_number)
+                .call()
+                .await
+                .map_err(|e| {
+                    AMMError::Msg(format!(
+                        "zap {:?} pool() probe failed for {:?}: {}",
+                        zap, self.address, e
+                    ))
+                })?;
+            if reported_pool != self.address {
+                return Err(AMMError::Msg(format!(
+                    "zap {:?} pool() returned {:?}, expected {:?}",
+                    zap, reported_pool, self.address
+                )));
+            }
+            tracing::debug!(
+                pool = ?self.address,
+                zap = ?zap,
+                "CryptoSwap meta pool zap_address verified on-chain"
+            );
         }
 
         // === Subtype Detection (StableSwap only) ===
