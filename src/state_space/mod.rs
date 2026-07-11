@@ -126,6 +126,7 @@ const BASE_CHAIN_ID: u64 = 8453;
 const ARBITRUM_CHAIN_ID: u64 = 42161;
 const ETHEREUM_MAINNET_CHAIN_ID: u64 = 1;
 const XLAYER_CHAIN_ID: u64 = 196;
+const ROBINHOOD_CHAIN_ID: u64 = 4663;
 /// Xlayer Flashblocks WebSocket 端点。
 ///
 /// 端点说明（由用户调研确认）:
@@ -1389,6 +1390,7 @@ impl<N, P> StateSpaceManager<N, P> {
             ARBITRUM_CHAIN_ID => 200,
             BASE_CHAIN_ID => 100,
             XLAYER_CHAIN_ID => 100,
+            ROBINHOOD_CHAIN_ID => 100,
             ETHEREUM_MAINNET_CHAIN_ID => 50,
             _ => 50,
         }

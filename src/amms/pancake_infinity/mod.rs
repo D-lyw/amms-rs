@@ -218,7 +218,7 @@ impl AutomatedMarketMaker for PancakeInfinityPool {
 
     /// PancakeSwap Infinity is currently only deployed on BNB Chain
     fn supported_chains(&self) -> Option<Vec<u64>> {
-        Some(vec![56]) // BNB Chain
+        Some(vec![56, 4663]) // BNB Chain, Robinhood Chain
     }
 
     fn calculate_price(&self, base_token: Address, _quote_token: Address) -> Result<f64, AMMError> {

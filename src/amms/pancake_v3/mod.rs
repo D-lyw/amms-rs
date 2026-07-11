@@ -368,6 +368,7 @@ impl AutomatedMarketMaker for PancakeV3Pool {
             10,    // Optimism
             43114, // Avalanche
             1101,  // Polygon zkEVM
+            4663,  // Robinhood Chain
         ])
     }
 

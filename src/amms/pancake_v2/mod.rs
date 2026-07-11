@@ -220,6 +220,7 @@ impl AutomatedMarketMaker for PancakeV2Pool {
             10,    // Optimism
             43114, // Avalanche
             100,   // Gnosis
+            4663,  // Robinhood Chain
         ])
     }
 
