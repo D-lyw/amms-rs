@@ -18,13 +18,36 @@ use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tracing::{error, info, warn};
 
 pub(crate) const ARBITRUM_FEED_WS_URL: &str = "wss://arb1-feed.arbitrum.io/feed";
+pub(crate) const ROBINHOOD_FEED_WS_URL: &str = "wss://feed.mainnet.chain.robinhood.com";
 pub(crate) const ARBITRUM_ONE_L2_OFFSET: u64 = 22_207_817;
+pub(crate) const ROBINHOOD_L2_OFFSET: u64 = 0;
 pub(crate) const ARBITRUM_FEED_SAFETY_BLOCKS: u64 = 1;
 pub(crate) const ARBITRUM_FEED_RETRY_BASE_MS: u64 = 50;
 pub(crate) const ARBITRUM_FEED_RETRY_MAX_MS: u64 = 1_000;
 const ARBITRUM_FEED_ALERT_RETRY_THRESHOLD: u32 = 8;
 const ARBITRUM_FEED_ALERT_RETRY_EVERY: u32 = 20;
 pub(crate) const ARBITRUM_FEED_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+pub(crate) fn feed_ws_url(chain_id: u64) -> &'static str {
+    match chain_id {
+        4663 => ROBINHOOD_FEED_WS_URL,
+        _ => ARBITRUM_FEED_WS_URL,
+    }
+}
+
+fn feed_l2_offset(chain_id: u64) -> u64 {
+    match chain_id {
+        4663 => ROBINHOOD_L2_OFFSET,
+        _ => ARBITRUM_ONE_L2_OFFSET,
+    }
+}
+
+fn feed_chain_label(chain_id: u64) -> &'static str {
+    match chain_id {
+        4663 => "robinhood",
+        _ => "arbitrum",
+    }
+}
 
 #[derive(Clone, Debug)]
 struct UnreadableBlockRetryState {
@@ -132,6 +155,7 @@ impl<N, P> StateSpaceManager<N, P> {
         pending_sync_notify: &Arc<Notify>,
         applied_log_dedup: &Arc<Mutex<AppliedLogDedupCache>>,
         max_seq: u64,
+        chain_id: u64,
         unreadable_block: &mut Option<UnreadableBlockRetryState>,
     ) -> Result<Vec<(super::RealtimeUpdateMeta, Vec<Address>)>, StateSpaceError>
     where
@@ -139,7 +163,7 @@ impl<N, P> StateSpaceManager<N, P> {
         N: Network,
     {
         let mut updates = Vec::new();
-        let raw_feed_head = max_seq.saturating_add(ARBITRUM_ONE_L2_OFFSET);
+        let raw_feed_head = max_seq.saturating_add(feed_l2_offset(chain_id));
         let candidate_l2_head = raw_feed_head.saturating_sub(ARBITRUM_FEED_SAFETY_BLOCKS);
 
         loop {
@@ -172,6 +196,7 @@ impl<N, P> StateSpaceManager<N, P> {
                             _ => UnreadableBlockRetryState::new(next_block_to_sync),
                         };
                         warn!(
+                            feed = feed_chain_label(chain_id),
                             unreadable_block = next.block,
                             retry_attempt = next.retry_attempt,
                             retry_delay_ms = unreadable_retry_delay(next.retry_attempt).as_millis(),
@@ -179,7 +204,7 @@ impl<N, P> StateSpaceManager<N, P> {
                             raw_feed_head,
                             candidate_l2_head,
                             safety_blocks = ARBITRUM_FEED_SAFETY_BLOCKS,
-                            "Arbitrum feed block not readable yet; scheduling retry"
+                            "Feed block not readable yet; scheduling retry"
                         );
                         if next.retry_attempt >= ARBITRUM_FEED_ALERT_RETRY_THRESHOLD
                             && ((next.retry_attempt - ARBITRUM_FEED_ALERT_RETRY_THRESHOLD)
@@ -188,14 +213,16 @@ impl<N, P> StateSpaceManager<N, P> {
                         {
                             error!(
                                 alert = "arbitrum_feed_block_retry_stuck",
+                                feed = feed_chain_label(chain_id),
                                 unreadable_block = next.block,
                                 retry_attempt = next.retry_attempt,
-                                retry_delay_ms = unreadable_retry_delay(next.retry_attempt).as_millis(),
+                                retry_delay_ms =
+                                    unreadable_retry_delay(next.retry_attempt).as_millis(),
                                 realtime_head = synced_head,
                                 raw_feed_head,
                                 candidate_l2_head,
                                 safety_blocks = ARBITRUM_FEED_SAFETY_BLOCKS,
-                                "ALERT: Arbitrum feed block repeatedly unreadable; fast-retry still failing"
+                                "ALERT: feed block repeatedly unreadable; fast-retry still failing"
                             );
                         }
                         *unreadable_block = Some(next);
@@ -260,10 +287,13 @@ impl<N, P> StateSpaceManager<N, P> {
             let mut last_seen_seq: Option<u64> = None;
             let mut seq_duplicate_count = 0u64;
             let mut seq_non_monotonic_count = 0u64;
+            let feed_offset = feed_l2_offset(chain_id);
+            let feed_url = feed_ws_url(chain_id);
+            let feed_label = feed_chain_label(chain_id);
             let mut max_seq = realtime_head
                 .load(Ordering::Relaxed)
                 .saturating_add(ARBITRUM_FEED_SAFETY_BLOCKS)
-                .saturating_sub(ARBITRUM_ONE_L2_OFFSET);
+                .saturating_sub(feed_offset);
             let mut last_metrics_log = Instant::now();
             let mut unreadable_block: Option<UnreadableBlockRetryState> = None;
 
@@ -302,22 +332,23 @@ impl<N, P> StateSpaceManager<N, P> {
                         }
                     }
                     Err(e) => {
-                        warn!("Initial backfill failed before Arbitrum feed subscribe: {}", e);
+                        warn!(feed = feed_label, "Initial backfill failed before feed subscribe: {}", e);
                     }
                 }
 
-                let connect = connect_async(ARBITRUM_FEED_WS_URL).await;
+                let connect = connect_async(feed_url).await;
                 let (mut socket, _) = match connect {
                     Ok(v) => v,
                     Err(e) => {
-                        warn!("Arbitrum feed ws connect failed: {}", e);
+                        warn!(feed = feed_label, "Feed ws connect failed: {}", e);
                         sleep(STREAM_RECONNECT_DELAY).await;
                         continue;
                     }
                 };
                 info!(
-                    ws_url = ARBITRUM_FEED_WS_URL,
-                    "Arbitrum feed connected"
+                    feed = feed_label,
+                    ws_url = feed_url,
+                    "Feed connected"
                 );
 
                 let mut last_feed_activity = Instant::now();
@@ -335,6 +366,7 @@ impl<N, P> StateSpaceManager<N, P> {
                         &pending_sync_notify,
                         &applied_log_dedup,
                         max_seq,
+                        chain_id,
                         &mut unreadable_block,
                     )
                     .await
@@ -354,9 +386,10 @@ impl<N, P> StateSpaceManager<N, P> {
 
                     if last_metrics_log.elapsed() >= Duration::from_secs(5) {
                         let realtime = realtime_head.load(Ordering::Relaxed);
-                        let raw_feed_head = max_seq.saturating_add(ARBITRUM_ONE_L2_OFFSET);
+                        let raw_feed_head = max_seq.saturating_add(feed_offset);
                         let candidate = raw_feed_head.saturating_sub(ARBITRUM_FEED_SAFETY_BLOCKS);
                         info!(
+                            feed = feed_label,
                             max_seq,
                             raw_feed_head,
                             candidate_l2_head = candidate,
@@ -365,13 +398,13 @@ impl<N, P> StateSpaceManager<N, P> {
                             head_lag = candidate.saturating_sub(realtime),
                             seq_duplicate_count,
                             seq_non_monotonic_count,
-                            "Arbitrum feed realtime heartbeat"
+                            "Feed realtime heartbeat"
                         );
                         last_metrics_log = Instant::now();
                     }
 
                     if last_feed_activity.elapsed() > STREAM_IDLE_TIMEOUT {
-                        warn!("Arbitrum feed stream timeout, reconnecting");
+                        warn!(feed = feed_label, "Feed stream timeout, reconnecting");
                         break;
                     }
 
@@ -382,14 +415,14 @@ impl<N, P> StateSpaceManager<N, P> {
                     };
 
                     let Some(message_result) = maybe_message_result else {
-                        warn!("Arbitrum feed stream ended");
+                        warn!(feed = feed_label, "Feed stream ended");
                         break;
                     };
 
                     let message = match message_result {
                         Ok(v) => v,
                         Err(e) => {
-                            warn!("Arbitrum feed stream receive error: {}", e);
+                            warn!(feed = feed_label, "Feed stream receive error: {}", e);
                             break;
                         }
                     };
@@ -507,5 +540,50 @@ mod tests {
             StateSpaceManager::<(), ()>::is_temporarily_unreadable_block_error(&err),
             "rpc internal errors should trigger fast retry path"
         );
+    }
+
+    #[test]
+    fn robinhood_feed_parameters() {
+        assert_eq!(feed_ws_url(4663), ROBINHOOD_FEED_WS_URL);
+        assert_eq!(feed_l2_offset(4663), 0);
+        assert_eq!(feed_chain_label(4663), "robinhood");
+    }
+
+    #[test]
+    fn robinhood_offset_zero_raw_feed_head_equals_max_seq() {
+        // Robinhood sequenceNumber == real L2 block number, offset = 0.
+        // verify that raw_feed_head == max_seq and candidate == max_seq - safety_blocks.
+        let max_seq = 100u64;
+        let offset = ROBINHOOD_L2_OFFSET;
+        let safety = ARBITRUM_FEED_SAFETY_BLOCKS;
+
+        let raw_feed_head = max_seq.saturating_add(offset);
+        let candidate_l2_head = raw_feed_head.saturating_sub(safety);
+
+        assert_eq!(raw_feed_head, 100);
+        assert_eq!(candidate_l2_head, 99);
+    }
+
+    #[test]
+    fn robinhood_max_seq_initialization_skips_already_synced() {
+        // Simulate subscribe_arbitrum_feed_stream's max_seq initialization
+        // for Robinhood (offset=0, safety_blocks=1).
+        // realtime_head already at block 50 → max_seq = 50 + 1 - 0 = 51.
+        // Then raw_feed_head = 51 + 0 = 51, candidate = 51 - 1 = 50.
+        // candidate <= realtime_head → drive_arbitrum_feed_progress should skip.
+        let realtime_head = 50u64;
+        let offset = ROBINHOOD_L2_OFFSET;
+        let safety = ARBITRUM_FEED_SAFETY_BLOCKS;
+
+        let max_seq = realtime_head
+            .saturating_add(safety)
+            .saturating_sub(offset);
+        let raw_feed_head = max_seq.saturating_add(offset);
+        let candidate_l2_head = raw_feed_head.saturating_sub(safety);
+
+        assert_eq!(max_seq, 51);
+        assert_eq!(raw_feed_head, 51);
+        assert_eq!(candidate_l2_head, 50);
+        assert!(candidate_l2_head <= realtime_head);
     }
 }

@@ -756,9 +756,9 @@ impl<N, P> StateSpaceManager<N, P> {
             }
             SelectedRealtimeSource::ArbitrumFeedPull => {
                 info!(
-                    "Starting Arbitrum feed + getLogs sync (chain_id={}, ws_url={}, {} query chunks)",
+                    "Starting Nitro feed + getLogs sync (chain_id={}, ws_url={}, {} query chunks)",
                     chain_id,
-                    arbitrum_feed::ARBITRUM_FEED_WS_URL,
+                    arbitrum_feed::feed_ws_url(chain_id),
                     query_chunks.len()
                 );
                 Ok(Box::pin(Self::subscribe_arbitrum_feed_stream(
@@ -788,7 +788,7 @@ impl<N, P> StateSpaceManager<N, P> {
                     SelectedRealtimeSource::BasePendingLogs
                 } else if chain_id == XLAYER_CHAIN_ID {
                     SelectedRealtimeSource::XlayerFlashblocksPull
-                } else if chain_id == ARBITRUM_CHAIN_ID {
+                } else if chain_id == ARBITRUM_CHAIN_ID || chain_id == ROBINHOOD_CHAIN_ID {
                     SelectedRealtimeSource::ArbitrumFeedPull
                 } else {
                     SelectedRealtimeSource::NewHeadsPull
