@@ -15,6 +15,7 @@ pub mod algebra_integral;
 pub mod amm;
 pub mod balancer_v2;
 pub mod balancer_v3;
+pub mod caliber_prop;
 pub mod consts;
 pub mod curve_legacy;
 pub mod curve_ng;

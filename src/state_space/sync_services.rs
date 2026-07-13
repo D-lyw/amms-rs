@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use crate::amms::aerodrome_slipstream::pool::FEE_MODULE_GLOBALS;
 use crate::amms::aerodrome_slipstream::pool::{
@@ -22,6 +22,7 @@ use crate::amms::curve_ng::{CurveNGFactory, ICurveNGStableSwap};
 use crate::amms::fluid_dex::{
     DexReservesResolver, FluidDexT1, FluidLiquidity, TokenLimitData, FLUID_DEX_RESOLVER,
 };
+use crate::amms::caliber_prop::CaliberPropPool;
 use crate::amms::pendle::PendlePool;
 use crate::amms::rocketpool::RocketPoolConverter;
 use crate::amms::uniswap_v3::GetUniswapV3PoolStaticMetaBatchRequest;
@@ -1139,6 +1140,77 @@ pub async fn start_pendle_sync_task<N, P>(
         for pool in target_pools {
             if let Some(existing_amm) = write_guard.get_mut_cow(&pool.address) {
                 if let AMM::PendlePool(existing) = existing_amm {
+                    *existing = pool;
+                }
+            }
+        }
+    }
+}
+
+/// Periodically refreshes Caliber propAMM pool ladder snapshots.
+///
+/// Caliber pools do not emit Swap events, so their pricing ladder cannot be
+/// tracked via event-driven sync. Instead, each refresh cycle calls
+/// `getPoolBalances` + `batchQuote` to rebuild the complete ladder state.
+///
+/// ## Frequency Trade-off
+///
+/// - **High frequency (<= 1s)**: Best for MEV/arbitrage use cases. The ladder
+///   reflects the market maker's latest off-chain pricing with minimal staleness.
+/// - **Medium frequency (10-60s)**: Sufficient for DEX aggregation use cases
+///   (matching KyberNetwork's approach).
+/// - **Low frequency (> 300s)**: Only suitable for display purposes; pricing
+///   accuracy degrades significantly.
+///
+/// Each pool refresh costs 2 RPC calls (getPoolBalances + batchQuote of 22 samples).
+pub async fn start_caliber_prop_ladder_sync_task<N, P>(
+    state: Arc<RwLock<StateSpace>>,
+    provider: P,
+    interval: Duration,
+) where
+    N: Network,
+    P: Provider<N> + Clone + 'static,
+{
+    let mut next_sleep = startup_delay_with_jitter(interval, "caliber_prop");
+    loop {
+        sleep(next_sleep).await;
+        next_sleep = interval;
+
+        let mut target_pools: Vec<CaliberPropPool> = {
+            let read_guard = state.read().await;
+            read_guard
+                .state
+                .values()
+                .filter_map(|amm| match amm.as_ref() {
+                    AMM::CaliberPropPool(pool) => Some(pool.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        if target_pools.is_empty() {
+            continue;
+        }
+
+        debug!(
+            "Updating ladder snapshots for {} Caliber propAMM pools",
+            target_pools.len()
+        );
+
+        for pool in &mut target_pools {
+            if let Err(e) = pool.update::<N, P>(provider.clone()).await {
+                error!(
+                    address = ?pool.virtual_address,
+                    error = ?e,
+                    "Failed to update Caliber propAMM ladder"
+                );
+            }
+        }
+
+        let mut write_guard = state.write().await;
+        for pool in target_pools {
+            if let Some(existing_amm) = write_guard.get_mut_cow(&pool.address()) {
+                if let AMM::CaliberPropPool(existing) = existing_amm {
                     *existing = pool;
                 }
             }
