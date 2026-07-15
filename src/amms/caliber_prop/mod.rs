@@ -64,16 +64,32 @@ use self::types::{CaliberLadderState, LadderPoint};
 const BASIS_POINTS: u64 = 10_000;
 
 /// Ladder 采样点（以 bps 为单位，每个点表示 reserve 的百分比）
-const SAMPLE_BPS: [u32; 11] = [
+///
+/// 低区（0-5%）密集覆盖典型 MM 断点位置，高区（5%+）逐步稀疏。
+/// 通过 batchQuote 一次 RPC 全部查询，增加点数不影响调用次数。
+const SAMPLE_BPS: [u32; 24] = [
     10,    // 0.1%
+    25,    // 0.25%
     50,    // 0.5%
+    75,    // 0.75%
+    100,   // 1.0%
+    150,   // 1.5%
+    200,   // 2.0%
     250,   // 2.5%
+    300,   // 3.0%
+    400,   // 4.0%
     500,   // 5.0%
+    750,   // 7.5%
     1000,  // 10.0%
+    1500,  // 15.0%
     2000,  // 20.0%
+    2500,  // 25.0%
     3000,  // 30.0%
+    4000,  // 40.0%
     5000,  // 50.0%
+    6000,  // 60.0%
     7000,  // 70.0%
+    8000,  // 80.0%
     9000,  // 90.0%
     9900,  // 99.0%
 ];
@@ -257,8 +273,7 @@ impl CaliberPropPool {
     fn refresh_prices(&mut self) {
         if let Some(first) = self.ladder.ladder_a_to_b.first() {
             if !first.amount_in.is_zero() && !first.amount_out.is_zero() {
-                let price = first.amount_out.as_limbs()[0] as f64
-                    / first.amount_in.as_limbs()[0] as f64;
+                let price = u256_to_f64(&first.amount_out) / u256_to_f64(&first.amount_in);
                 self.price_a_in_b =
                     price * 10f64.powi(self.token_a.decimals as i32 - self.token_b.decimals as i32);
                 if self.price_a_in_b > 0.0 {
@@ -285,6 +300,20 @@ impl CaliberPropPool {
 // ============================================================================
 // Ladder 插值计算
 // ============================================================================
+
+/// 将 U256 全精度转换为 f64
+///
+/// U256 使用 `[u64; 4]` 小端 limbs 表示。此函数将四个 limb
+/// 按权重 2^0, 2^64, 2^128, 2^192 累加为 f64，避免 `as_limbs()[0]`
+/// 的单 limb 截断问题。
+fn u256_to_f64(value: &U256) -> f64 {
+    let limbs = value.as_limbs();
+    let mut result = limbs[0] as f64;
+    result += (limbs[1] as f64) * (2.0f64.powi(64));
+    result += (limbs[2] as f64) * (2.0f64.powi(128));
+    result += (limbs[3] as f64) * (2.0f64.powi(192));
+    result
+}
 
 /// 通过分段线性插值计算给定 `amount_in` 对应的 `amount_out`
 ///
@@ -540,8 +569,8 @@ impl AutomatedMarketMaker for CaliberPropPool {
             self.pair_id,
             self.token_a.address,
             self.token_b.address,
-            &reserveX,
-            &reserveY,
+            &self.reserve_a,
+            &self.reserve_b,
             block_number,
         )
         .await?;
@@ -590,8 +619,8 @@ impl AutomatedMarketMaker for CaliberPropPool {
             self.pair_id,
             self.token_a.address,
             self.token_b.address,
-            &reserveX,
-            &reserveY,
+            &self.reserve_a,
+            &self.reserve_b,
             BlockId::latest(),
         )
         .await?;
@@ -621,14 +650,17 @@ impl AutomatedMarketMaker for CaliberPropPool {
 ///
 /// 对每个方向分别在 11 个采样点（reserve 的 SAMPLE_BPS 百分比）查询报价，
 /// 构建完整的 Ladder。
+///
+/// `reserve_a` / `reserve_b` 必须是已按 token 地址排序后的 reserve 值
+/// （即 `CaliberPropPool.reserve_a` / `.reserve_b`），而非合约原生顺序。
 async fn probe_ladder<N, P>(
     provider: &P,
     contract_address: Address,
     pair_id: B256,
     token_a: Address,
     token_b: Address,
-    reserve_x: &U256,
-    reserve_y: &U256,
+    reserve_a: &U256,
+    reserve_b: &U256,
     block: BlockId,
 ) -> Result<(Vec<LadderPoint>, Vec<LadderPoint>), AMMError>
 where
@@ -636,10 +668,10 @@ where
     P: Provider<N> + Clone,
 {
     let caliber = ICaliberPropAMM::new(contract_address, provider.clone());
-    // 构建 a→b 方向的采样输入量
-    let grid_ab = build_sample_grid(reserve_x);
-    // 构建 b→a 方向的采样输入量
-    let grid_ba = build_sample_grid(reserve_y);
+    // 构建 a→b 方向的采样输入量（基于 token_a 的 reserve）
+    let grid_ab = build_sample_grid(reserve_a);
+    // 构建 b→a 方向的采样输入量（基于 token_b 的 reserve）
+    let grid_ba = build_sample_grid(reserve_b);
 
     // 组装 batchQuote 请求（所有采样点合并到一个调用中）
     let mut requests = Vec::with_capacity(grid_ab.len() + grid_ba.len());

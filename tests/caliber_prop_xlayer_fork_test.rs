@@ -2,12 +2,11 @@
 //!
 //! 测试 CaliberPropPool 的池子发现、初始化、simulate_swap、with_amms 集成。
 //!
-//! ## 当前状态
-//! Base/Optimism/XLayer 上的 Caliber propAMM 池子已全部废弃（Ladder StalePrices）。
-//! 测试验证了模块在无活跃 Ladder 场景下的正确性（发现、初始化、错误处理），
-//! 但 Swap 精度对比（simulate_swap vs 链上 quote）无法执行。
+//! ## XLayer 真实池子
+//! Contract: 0x154586b2479b9a11e3d4db90024dc0e26f097312
+//! OKLink: https://www.oklink.com/zh-hans/x-layer/evm/address/0x154586b2479b9a11e3d4db90024dc0e26f097312
 //!
-//! 环境变量: BASE_PROVIDER
+//! 环境变量: XLAYER_PROVIDER 或 XLAYER_RPC_URL
 
 use alloy::{
     eips::BlockId,
@@ -32,8 +31,8 @@ use std::sync::Arc;
 // Constants
 // ============================================================
 
-const BASE_CHAIN_ID: u64 = 8453;
-const CALIBER_CONTRACT: Address = address!("f639CF213b63F7E77D699FF686d591C0Ba55Fc63");
+const XLAYER_CHAIN_ID: u64 = 196;
+const CALIBER_CONTRACT: Address = address!("154586b2479b9a11e3d4db90024dc0e26f097312");
 
 // ERC20 metadata ABI for reading decimals
 sol! {
@@ -48,10 +47,10 @@ sol! {
 // Helper: RPC URL
 // ============================================================
 
-fn base_provider_url() -> Option<String> {
+fn xlayer_provider_url() -> Option<String> {
     dotenv::dotenv().ok();
-    env::var("BASE_PROVIDER")
-        .or_else(|_| env::var("BASE_RPC_URL"))
+    env::var("XLAYER_PROVIDER")
+        .or_else(|_| env::var("XLAYER_RPC_URL"))
         .ok()
 }
 
@@ -121,10 +120,10 @@ where
 
 #[tokio::test]
 async fn test_caliber_prop_discover_and_init() -> Result<()> {
-    let rpc_url = match base_provider_url() {
+    let rpc_url = match xlayer_provider_url() {
         Some(url) => url,
         None => {
-            println!("SKIP: BASE_PROVIDER not set");
+            println!("SKIP: XLAYER_PROVIDER not set");
             return Ok(());
         }
     };
@@ -133,15 +132,15 @@ async fn test_caliber_prop_discover_and_init() -> Result<()> {
 
     // 验证链 ID
     let chain_id = provider.get_chain_id().await?;
-    if chain_id != BASE_CHAIN_ID {
+    if chain_id != XLAYER_CHAIN_ID {
         println!(
-            "SKIP: expected Base chain_id {}, got {}",
-            BASE_CHAIN_ID, chain_id
+            "SKIP: expected XLayer chain_id {}, got {}",
+            XLAYER_CHAIN_ID, chain_id
         );
         return Ok(());
     }
 
-    println!("=== Caliber propAMM Base Fork Test ===");
+    println!("=== Caliber propAMM XLayer Fork Test ===");
     println!("Contract: {}", CALIBER_CONTRACT);
 
     let caliber = ICaliberPropAMM::new(CALIBER_CONTRACT, provider.clone());
@@ -457,10 +456,10 @@ where
 
 #[tokio::test]
 async fn test_caliber_prop_with_amms() -> Result<()> {
-    let rpc_url = match base_provider_url() {
+    let rpc_url = match xlayer_provider_url() {
         Some(url) => url,
         None => {
-            println!("SKIP: BASE_PROVIDER not set");
+            println!("SKIP: XLAYER_PROVIDER not set");
             return Ok(());
         }
     };
@@ -468,7 +467,7 @@ async fn test_caliber_prop_with_amms() -> Result<()> {
     let provider = Arc::new(ProviderBuilder::new().connect_http(rpc_url.parse()?));
 
     let chain_id = provider.get_chain_id().await?;
-    if chain_id != BASE_CHAIN_ID {
+    if chain_id != XLAYER_CHAIN_ID {
         println!("SKIP: wrong chain_id {chain_id}");
         return Ok(());
     }
