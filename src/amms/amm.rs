@@ -3,6 +3,7 @@ use crate::amms::aerodrome_v2::AerodromeV2Pool;
 use crate::amms::algebra_integral::AlgebraIntegralPool;
 use crate::amms::balancer_v2::BalancerV2Pool;
 use crate::amms::balancer_v3::BalancerV3Pool;
+use crate::amms::caliber_prop::CaliberPropPool;
 use crate::amms::curve_legacy::CurveLegacyPool;
 use crate::amms::curve_ng::CurveNGPool;
 use crate::amms::ekubo::EkuboPool;
@@ -315,4 +316,5 @@ amm!(
     RocketPoolConverter,
     SkyConverter,
     PendlePool,
+    CaliberPropPool,
 );

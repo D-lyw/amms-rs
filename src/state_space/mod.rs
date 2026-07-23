@@ -1471,6 +1471,8 @@ pub struct StateSpaceBuilder<N, P> {
     /// Dedicated interval for Slipstream fee refresh.
     pub slipstream_fee_sync_interval: Option<Duration>,
     pub curve_sync_interval: Option<Duration>,
+    /// Dedicated interval for Caliber propAMM Ladder refresh.
+    pub caliber_ladder_sync_interval: Option<Duration>,
     pub pending_sync_worker_interval: Duration,
     pub drift_probe_interval: Duration,
     pub maintenance_interval: Option<Duration>,
@@ -1498,6 +1500,7 @@ where
             rate_sync_interval: None,
             slipstream_fee_sync_interval: None,
             curve_sync_interval: None,
+            caliber_ladder_sync_interval: None,
             pending_sync_worker_interval: DEFAULT_PENDING_SYNC_WORKER_INTERVAL,
             drift_probe_interval: DEFAULT_DRIFT_PROBE_INTERVAL,
             maintenance_interval: None,
@@ -1595,6 +1598,15 @@ where
     pub fn with_curve_sync_interval(self, interval: Duration) -> StateSpaceBuilder<N, P> {
         StateSpaceBuilder {
             curve_sync_interval: Some(interval),
+            ..self
+        }
+    }
+
+    /// Set a dedicated interval for Caliber propAMM Ladder refresh.
+    /// Falls back to `non_event_sync_interval` when not set.
+    pub fn with_caliber_ladder_sync_interval(self, interval: Duration) -> StateSpaceBuilder<N, P> {
+        StateSpaceBuilder {
+            caliber_ladder_sync_interval: Some(interval),
             ..self
         }
     }
@@ -1922,6 +1934,15 @@ where
         // Curve pools: StableSwap runtime refresh plus CryptoSwap oracle/runtime refresh
         if let Some(interval) = self.curve_sync_interval.or(non_event_interval) {
             tokio::spawn(sync_services::start_curve_rate_sync_task(
+                state_space.clone(),
+                self.provider.clone(),
+                interval,
+            ));
+        }
+
+        // Caliber propAMM pools: periodic Ladder pricing refresh (no on-chain events)
+        if let Some(interval) = self.caliber_ladder_sync_interval.or(non_event_interval) {
+            tokio::spawn(sync_services::start_caliber_prop_ladder_sync_task(
                 state_space.clone(),
                 self.provider.clone(),
                 interval,

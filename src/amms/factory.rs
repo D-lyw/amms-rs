@@ -1,6 +1,8 @@
 use crate::amms::aerodrome_slipstream::AerodromeSlipstreamFactory;
 use crate::amms::aerodrome_v2::AerodromeV2Factory;
 use crate::amms::algebra_integral::AlgebraIntegralFactory;
+use crate::amms::caliber_prop::factory::CaliberPropFactory;
+use crate::amms::caliber_prop::CaliberPropPool;
 use crate::amms::curve_legacy::factory::CurveLegacyFactory;
 use crate::amms::curve_ng::factory::CurveNGFactory;
 use crate::amms::ekubo::EkuboFactory;
@@ -150,6 +152,9 @@ impl Variant {
                 SkyConverter::init_batch::<N, _>(amms, to_block, provider).await
             }
             Variant::PendlePool => PendlePool::init_batch::<N, _>(amms, to_block, provider).await,
+            Variant::CaliberPropPool => {
+                CaliberPropPool::init_batch::<N, _>(amms, to_block, provider).await
+            }
         }
     }
 
@@ -228,6 +233,9 @@ impl Variant {
                 SkyConverter::init_batch::<N, _>(amms, to_block, provider).await
             }
             Variant::PendlePool => PendlePool::init_batch::<N, _>(amms, to_block, provider).await,
+            Variant::CaliberPropPool => {
+                CaliberPropPool::init_batch::<N, _>(amms, to_block, provider).await
+            }
         }
     }
 }
@@ -336,7 +344,8 @@ factory!(
     CurveLegacyFactory,
     AlgebraIntegralFactory,
     AerodromeV2Factory,
-    AerodromeSlipstreamFactory
+    AerodromeSlipstreamFactory,
+    CaliberPropFactory
 );
 
 #[derive(Default)]

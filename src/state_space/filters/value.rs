@@ -110,6 +110,7 @@ where
                     AMM::RocketPoolConverter(_) => 0, // Protocol redemption edge, skip in pool value filter
                     AMM::SkyConverter(_) => 0, // SKY converters use fixed rates, skip in value filter
                     AMM::PendlePool(_) => 2,   // Pendle uses PT/SY AMM like concentrated liquidity
+                    AMM::CaliberPropPool(_) => 1, // Caliber propAMM uses Ladder pricing, similar to CPMM
                 };
 
                 PoolInfo {
