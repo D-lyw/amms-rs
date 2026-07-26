@@ -5,8 +5,8 @@
 //! ## 架构
 //! - **Ladder 定价模型**: 做市商通过链下引擎上传分段线性定价阶梯，链上合约不 emit Swap/Liquidity 事件。
 //! - **同步策略**: `sync_events()` 返回空（无事件），数据更新完全依赖周期性 `sync_services::start_caliber_prop_ladder_sync_task`
-//!   → 调用 `update()` → `probe_ladder()` → `batchQuote()` 获取最新 Ladder。
-//! - **本地 Swap 模拟**: 基于 Ladder 11 个采样点做分段线性插值 (`simulate_swap`)。
+//!   → 调用 `update()` → `GetCaliberPropLadderBatchRequest` reader 合约一次性拉取完整快照。
+//! - **本地 Swap 模拟**: 基于链上 `quote()` 采样出的 Ladder 做分段线性插值 (`simulate_swap`)。
 //!
 //! ## 已知合约地址
 //!
@@ -24,7 +24,7 @@
 //!
 //! | 验证项 | 结果 | 说明 |
 //! |---|---|---|
-//! | 池子发现 & 初始化 | ✅ | getAllPairIds + getPoolBalances + batchQuote |
+//! | 池子发现 & 初始化 | ✅ | getAllPairIds + Ladder batch reader |
 //! | 插值精度（非采样点） | **≤ 1.58 BPS** | 8 个 off-grid 点位 × 2 方向，目标 200 BPS |
 //! | 前向推算（before-first） | **返回 0** | 不可准确估算，`simulate_swap` 返回 0 → 上层视为无利可图 |
 //! | 后向越界（beyond-last） | ✅ | 正确报错 |
@@ -35,7 +35,7 @@
 //!
 //! ### 安全策略
 //!
-//! - **Before-first 区域（`amount_in <` 首采样点 ≈ 0.1% reserve）**：
+//! - **Before-first 区域（`amount_in <` 首采样点 ≈ 0.01% reserve）**：
 //!   `simulate_swap` 返回 `U256::ZERO`，确保外层套利系统不会产生虚假路径。
 //!   `simulate_swap_mut` 返回错误，拒绝变更 consumed/储备状态。
 //! - **插值区域（`amount_in` 在采样点之间）**：分段线性插值，偏差 ≤ 2 BPS。
@@ -72,39 +72,6 @@ use self::types::{CaliberLadderState, LadderPoint};
 // ============================================================================
 
 /// 完整比例的分母（basis points）
-const BASIS_POINTS: u64 = 10_000;
-
-/// Ladder 采样点（以 bps 为单位，每个点表示 reserve 的百分比）
-///
-/// 低区（0-5%）密集覆盖典型 MM 断点位置，高区（5%+）逐步稀疏。
-/// 通过 batchQuote 一次 RPC 全部查询，增加点数不影响调用次数。
-const SAMPLE_BPS: [u32; 24] = [
-    10,    // 0.1%
-    25,    // 0.25%
-    50,    // 0.5%
-    75,    // 0.75%
-    100,   // 1.0%
-    150,   // 1.5%
-    200,   // 2.0%
-    250,   // 2.5%
-    300,   // 3.0%
-    400,   // 4.0%
-    500,   // 5.0%
-    750,   // 7.5%
-    1000,  // 10.0%
-    1500,  // 15.0%
-    2000,  // 20.0%
-    2500,  // 25.0%
-    3000,  // 30.0%
-    4000,  // 40.0%
-    5000,  // 50.0%
-    6000,  // 60.0%
-    7000,  // 70.0%
-    8000,  // 80.0%
-    9000,  // 90.0%
-    9900,  // 99.0%
-];
-
 /// 每个 `getAllPairIds` 调用获取的最大 pair 数量
 pub const MAX_PAIRS_PER_CALL: u64 = 20;
 
@@ -157,6 +124,12 @@ sol! {
     }
 }
 
+sol! {
+    #[sol(rpc)]
+    GetCaliberPropLadderBatchRequest,
+    "src/amms/abi/GetCaliberPropLadderBatchRequest.json",
+}
+
 // ============================================================================
 // CaliberPropPool
 // ============================================================================
@@ -170,8 +143,8 @@ sol! {
 /// ## 同步策略
 ///
 /// 由于无可订阅事件，本池子完全依赖周期性 `update()` 调用来刷新状态：
-/// 1. `getPoolBalances(pairId)` 读取最新储备
-/// 2. `batchQuote(22)` 在 11 个采样点探测定价曲线，构建新的 Ladder
+/// 1. 调用 `GetCaliberPropLadderBatchRequest` 一次性读取最新储备和完整 Ladder
+/// 2. 本地替换快照
 /// 3. 重置 consumed 计数器（因为 Ladder 快照变更后旧消费量无意义）
 ///
 /// ## Swap 模拟
@@ -282,6 +255,11 @@ impl CaliberPropPool {
 
     /// 根据 ladder 的第一个点刷新缓存价格
     fn refresh_prices(&mut self) {
+        // Empty ladder means the maker currently provides no usable quote.
+        // Clear cached spot prices so upstream price filters won't reuse stale data.
+        self.price_a_in_b = 0.0;
+        self.price_b_in_a = 0.0;
+
         if let Some(first) = self.ladder.ladder_a_to_b.first() {
             if !first.amount_in.is_zero() && !first.amount_out.is_zero() {
                 let price = u256_to_f64(&first.amount_out) / u256_to_f64(&first.amount_in);
@@ -340,7 +318,9 @@ pub fn quote_amount_out(ladder: &[LadderPoint], amount_in: &U256) -> Result<U256
     }
 
     if ladder.is_empty() {
-        return Err(AMMError::Msg("caliber: no liquidity (empty ladder)".to_string()));
+        return Err(AMMError::Msg(
+            "caliber: no liquidity (empty ladder)".to_string(),
+        ));
     }
 
     match ladder.binary_search_by(|point| point.amount_in.cmp(amount_in)) {
@@ -355,7 +335,9 @@ pub fn quote_amount_out(ladder: &[LadderPoint], amount_in: &U256) -> Result<U256
         }
         Err(i) if i >= ladder.len() => {
             // amount_in 超过 ladder 范围
-            Err(AMMError::Msg("caliber: amount in exceeds ladder range".to_string()))
+            Err(AMMError::Msg(
+                "caliber: amount in exceeds ladder range".to_string(),
+            ))
         }
         Err(i) => {
             // amount_in 在 ladder[i-1] 和 ladder[i] 之间 → 线性插值
@@ -378,7 +360,7 @@ fn swap_amount_out(
     consumed_in: &U256,
     consumed_out: &U256,
     amount_in: U256,
-    reserve_out: &U256,
+    _reserve_out: &U256,
 ) -> Result<U256, AMMError> {
     if amount_in.is_zero() {
         return Err(AMMError::Msg("caliber: zero amount in".to_string()));
@@ -395,10 +377,6 @@ fn swap_amount_out(
 
     if amount_out.is_zero() {
         return Err(AMMError::Msg("caliber: zero amount out".to_string()));
-    }
-
-    if amount_out > *reserve_out {
-        return Err(AMMError::Msg("caliber: insufficient reserve".to_string()));
     }
 
     Ok(amount_out)
@@ -437,19 +415,11 @@ impl AutomatedMarketMaker for CaliberPropPool {
         vec![self.token_a.address, self.token_b.address]
     }
 
-    fn calculate_price(
-        &self,
-        base_token: Address,
-        quote_token: Address,
-    ) -> Result<f64, AMMError> {
+    fn calculate_price(&self, base_token: Address, quote_token: Address) -> Result<f64, AMMError> {
         self.spot_price(base_token, quote_token)
     }
 
-    fn spot_price(
-        &self,
-        base_token: Address,
-        quote_token: Address,
-    ) -> Result<f64, AMMError> {
+    fn spot_price(&self, base_token: Address, quote_token: Address) -> Result<f64, AMMError> {
         if base_token == self.token_a.address && quote_token == self.token_b.address {
             Ok(self.price_a_in_b)
         } else if base_token == self.token_b.address && quote_token == self.token_a.address {
@@ -492,6 +462,13 @@ impl AutomatedMarketMaker for CaliberPropPool {
         let (ladder, _reserve_out) = self.get_ladder_and_reserve_out(index_in as usize)?;
         let (consumed_in, consumed_out) = self.get_consumed_refs(index_in as usize);
 
+        // If the current snapshot has no ladder, treat the pool as temporarily unquotable.
+        // Returning zero is safer for upstream route search than bubbling an error, because
+        // many call sites interpret zero-output as "not profitable / skip this path".
+        if ladder.is_empty() {
+            return Ok(U256::ZERO);
+        }
+
         // amount_in < 首采样点 → 无法准确估算（线性推算精度无保证），
         // 返回 0 让上层视为"无利可图"而非虚假套利机会。
         if let Some(first) = ladder.first() {
@@ -522,7 +499,9 @@ impl AutomatedMarketMaker for CaliberPropPool {
         // before-first 区域无法准确估算产出，拒绝变更 consumed/储备状态
         if let Some(first) = ladder.first() {
             if amount_in < first.amount_in {
-                return Err(AMMError::Msg("caliber: amount_in below quoting threshold".to_string()));
+                return Err(AMMError::Msg(
+                    "caliber: amount_in below quoting threshold".to_string(),
+                ));
             }
         }
 
@@ -538,10 +517,18 @@ impl AutomatedMarketMaker for CaliberPropPool {
         // 更新储备
         if idx == 0 {
             self.reserve_a += amount_in;
-            self.reserve_b -= amount_out;
+            self.reserve_b = if amount_out > self.reserve_b {
+                U256::ZERO
+            } else {
+                self.reserve_b - amount_out
+            };
         } else {
             self.reserve_b += amount_in;
-            self.reserve_a -= amount_out;
+            self.reserve_a = if amount_out > self.reserve_a {
+                U256::ZERO
+            } else {
+                self.reserve_a - amount_out
+            };
         }
 
         Ok(amount_out)
@@ -558,48 +545,25 @@ impl AutomatedMarketMaker for CaliberPropPool {
     }
 
     #[instrument(skip_all, fields(pool = %self.virtual_address))]
-    async fn init<N, P>(
-        mut self,
-        block_number: BlockId,
-        provider: P,
-    ) -> Result<Self, AMMError>
+    async fn init<N, P>(mut self, block_number: BlockId, provider: P) -> Result<Self, AMMError>
     where
         N: Network,
         P: Provider<N> + Clone,
     {
-        let caliber = ICaliberPropAMM::new(self.contract_address, provider.clone());
-
-        // 1. 读取储备
-        let ICaliberPropAMM::getPoolBalancesReturn { reserveX, reserveY } =
-            caliber
-                .getPoolBalances(self.pair_id)
-                .block(block_number)
-                .call()
-                .await?;
-
-        self.reserve_a = if self.token_x == self.token_a.address {
-            reserveX
-        } else {
-            reserveY
-        };
-        self.reserve_b = if self.token_x == self.token_b.address {
-            reserveX
-        } else {
-            reserveY
-        };
-
-        // 2. 构建采样网格并批量探测定价曲线
-        let (ladder_a_to_b, ladder_b_to_a) = probe_ladder(
+        let token_a_is_reserve_x = self.token_x == self.token_a.address;
+        let (reserve_a, reserve_b, ladder_a_to_b, ladder_b_to_a) = fetch_ladder_snapshot(
             &provider,
             self.contract_address,
             self.pair_id,
             self.token_a.address,
             self.token_b.address,
-            &self.reserve_a,
-            &self.reserve_b,
+            token_a_is_reserve_x,
             block_number,
         )
         .await?;
+
+        self.reserve_a = reserve_a;
+        self.reserve_b = reserve_b;
 
         self.ladder = CaliberLadderState {
             ladder_a_to_b,
@@ -621,37 +585,22 @@ impl AutomatedMarketMaker for CaliberPropPool {
         N: Network,
         P: Provider<N> + Clone,
     {
-        let caliber = ICaliberPropAMM::new(self.contract_address, provider.clone());
-
-        // 1. 读取最新储备
-        let ICaliberPropAMM::getPoolBalancesReturn { reserveX, reserveY } =
-            caliber.getPoolBalances(self.pair_id).call().await?;
-
-        self.reserve_a = if self.token_x == self.token_a.address {
-            reserveX
-        } else {
-            reserveY
-        };
-        self.reserve_b = if self.token_x == self.token_b.address {
-            reserveX
-        } else {
-            reserveY
-        };
-
-        // 2. 重建 Ladder
-        let (ladder_a_to_b, ladder_b_to_a) = probe_ladder(
+        let token_a_is_reserve_x = self.token_x == self.token_a.address;
+        let (reserve_a, reserve_b, ladder_a_to_b, ladder_b_to_a) = fetch_ladder_snapshot(
             &provider,
             self.contract_address,
             self.pair_id,
             self.token_a.address,
             self.token_b.address,
-            &self.reserve_a,
-            &self.reserve_b,
+            token_a_is_reserve_x,
             BlockId::latest(),
         )
         .await?;
 
-        // 3. 重置 consumed（ladder 快照变更后旧值无意义）
+        self.reserve_a = reserve_a;
+        self.reserve_b = reserve_b;
+
+        // 2. 重置 consumed（ladder 快照变更后旧值无意义）
         self.ladder = CaliberLadderState {
             ladder_a_to_b,
             ladder_b_to_a,
@@ -661,7 +610,7 @@ impl AutomatedMarketMaker for CaliberPropPool {
             consumed_out_ba: U256::ZERO,
         };
 
-        // 4. 重新计算价格
+        // 3. 重新计算价格
         self.refresh_prices();
 
         Ok(())
@@ -672,105 +621,59 @@ impl AutomatedMarketMaker for CaliberPropPool {
 // Ladder 探测
 // ============================================================================
 
-/// 通过 batchQuote 探测定价曲线
-///
-/// 对每个方向分别在 11 个采样点（reserve 的 SAMPLE_BPS 百分比）查询报价，
-/// 构建完整的 Ladder。
-///
-/// `reserve_a` / `reserve_b` 必须是已按 token 地址排序后的 reserve 值
-/// （即 `CaliberPropPool.reserve_a` / `.reserve_b`），而非合约原生顺序。
-async fn probe_ladder<N, P>(
+/// 通过自定义 batch reader 一次性读取储备和 Ladder 快照。
+async fn fetch_ladder_snapshot<N, P>(
     provider: &P,
     contract_address: Address,
     pair_id: B256,
     token_a: Address,
     token_b: Address,
-    reserve_a: &U256,
-    reserve_b: &U256,
+    token_a_is_reserve_x: bool,
     block: BlockId,
-) -> Result<(Vec<LadderPoint>, Vec<LadderPoint>), AMMError>
+) -> Result<(U256, U256, Vec<LadderPoint>, Vec<LadderPoint>), AMMError>
 where
     N: Network,
     P: Provider<N> + Clone,
 {
-    let caliber = ICaliberPropAMM::new(contract_address, provider.clone());
-    // 构建 a→b 方向的采样输入量（基于 token_a 的 reserve）
-    let grid_ab = build_sample_grid(reserve_a);
-    // 构建 b→a 方向的采样输入量（基于 token_b 的 reserve）
-    let grid_ba = build_sample_grid(reserve_b);
+    use alloy::sol_types::SolType;
 
-    // 组装 batchQuote 请求（所有采样点合并到一个调用中）
-    let mut requests = Vec::with_capacity(grid_ab.len() + grid_ba.len());
+    type CaliberLadderSnapshot =
+        sol!((uint256, uint256, (uint256, uint256)[], (uint256, uint256)[]));
 
-    for amt in &grid_ab {
-        requests.push(ICaliberPropAMM::QuoteRequest {
-            pairId: pair_id,
-            tokenIn: token_a,
-            tokenOut: token_b,
-            amountIn: *amt,
-        });
-    }
-    for amt in &grid_ba {
-        requests.push(ICaliberPropAMM::QuoteRequest {
-            pairId: pair_id,
-            tokenIn: token_b,
-            tokenOut: token_a,
-            amountIn: *amt,
-        });
-    }
+    let return_data = GetCaliberPropLadderBatchRequest::deploy_builder(
+        provider.clone(),
+        contract_address,
+        pair_id,
+        token_a,
+        token_b,
+        token_a_is_reserve_x,
+    )
+    .call_raw()
+    .block(block)
+    .await?;
 
-    if requests.is_empty() {
-        return Ok((vec![], vec![]));
-    }
+    let (reserve_a, reserve_b, ladder_ab_raw, ladder_ba_raw) =
+        CaliberLadderSnapshot::abi_decode(&return_data).map_err(|e| {
+            AMMError::Msg(format!(
+                "caliber: failed to decode ladder snapshot, len={}, err={}",
+                return_data.len(),
+                e
+            ))
+        })?;
 
-    let results = caliber.batchQuote(requests).block(block).call().await?;
-
-    // 收集 a→b 方向的 ladder
-    let ladder_ab = collect_ladder_points(&grid_ab, &results);
-    // 收集 b→a 方向的 ladder
-    let ladder_ba = collect_ladder_points(&grid_ba, &results[grid_ab.len()..]);
-
-    Ok((ladder_ab, ladder_ba))
+    Ok((
+        reserve_a,
+        reserve_b,
+        decode_ladder_points(&ladder_ab_raw),
+        decode_ladder_points(&ladder_ba_raw),
+    ))
 }
 
-/// 根据储备和采样点构建 amountIn 网格
-fn build_sample_grid(reserve: &U256) -> Vec<U256> {
-    if reserve.is_zero() {
-        return vec![];
-    }
-
-    let mut grid = Vec::with_capacity(SAMPLE_BPS.len());
-    let mut last = U256::ZERO;
-
-    for &bps in &SAMPLE_BPS {
-        let amt = *reserve * U256::from(bps) / U256::from(BASIS_POINTS);
-        // 跳过零值和重复值
-        if amt.is_zero() || (amt <= last && !last.is_zero()) {
-            continue;
-        }
-        grid.push(amt);
-        last = amt;
-    }
-
-    grid
-}
-
-/// 从 batchQuote 结果中提取有效的 Ladder 点
-fn collect_ladder_points(
-    grid: &[U256],
-    results: &[ICaliberPropAMM::QuoteResult],
-) -> Vec<LadderPoint> {
-    grid.iter()
-        .zip(results.iter())
-        .filter_map(|(amt, result)| {
-            if result.success && !result.amountOut.is_zero() {
-                Some(LadderPoint {
-                    amount_in: *amt,
-                    amount_out: result.amountOut,
-                })
-            } else {
-                None
-            }
+fn decode_ladder_points(raw: &[(U256, U256)]) -> Vec<LadderPoint> {
+    raw.iter()
+        .map(|(amount_in, amount_out)| LadderPoint {
+            amount_in: *amount_in,
+            amount_out: *amount_out,
         })
         .collect()
 }
@@ -865,21 +768,66 @@ mod tests {
     }
 
     #[test]
-    fn test_build_sample_grid() {
-        let reserve = U256::from(1_000_000_000_000_000_000u128); // 1 ETH
-        let grid = build_sample_grid(&reserve);
+    fn test_decode_ladder_points() {
+        let raw = vec![
+            (U256::from(100), U256::from(200)),
+            (U256::from(150), U256::from(260)),
+        ];
 
-        // 应至少有部分采样点非零
-        assert!(!grid.is_empty(), "grid should have points for non-zero reserve");
-        // 每个点都大于前一个
-        for pair in grid.windows(2) {
-            assert!(pair[0] < pair[1], "grid must be strictly increasing");
-        }
+        let decoded = decode_ladder_points(&raw);
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].amount_in, U256::from(100));
+        assert_eq!(decoded[0].amount_out, U256::from(200));
+        assert_eq!(decoded[1].amount_in, U256::from(150));
+        assert_eq!(decoded[1].amount_out, U256::from(260));
     }
 
     #[test]
-    fn test_build_sample_grid_zero_reserve() {
-        let grid = build_sample_grid(&U256::ZERO);
-        assert!(grid.is_empty());
+    fn test_simulate_swap_empty_ladder_returns_zero() {
+        let pool = CaliberPropPool {
+            contract_address: Address::ZERO,
+            pair_id: B256::ZERO,
+            virtual_address: Address::ZERO,
+            token_x: Address::from([1u8; 20]),
+            token_y: Address::from([2u8; 20]),
+            token_a: Token::new_with_decimals(Address::from([1u8; 20]), 18),
+            token_b: Token::new_with_decimals(Address::from([2u8; 20]), 18),
+            created_block: 0,
+            last_synced_block: 0,
+            reserve_a: U256::from(1_000),
+            reserve_b: U256::from(1_000),
+            ladder: Default::default(),
+            price_a_in_b: 1.0,
+            price_b_in_a: 1.0,
+        };
+
+        let out = pool
+            .simulate_swap(pool.token_a.address, pool.token_b.address, U256::from(100))
+            .unwrap();
+        assert_eq!(out, U256::ZERO);
+    }
+
+    #[test]
+    fn test_refresh_prices_clears_stale_cache_on_empty_ladder() {
+        let mut pool = CaliberPropPool {
+            contract_address: Address::ZERO,
+            pair_id: B256::ZERO,
+            virtual_address: Address::ZERO,
+            token_x: Address::from([1u8; 20]),
+            token_y: Address::from([2u8; 20]),
+            token_a: Token::new_with_decimals(Address::from([1u8; 20]), 18),
+            token_b: Token::new_with_decimals(Address::from([2u8; 20]), 18),
+            created_block: 0,
+            last_synced_block: 0,
+            reserve_a: U256::from(1_000),
+            reserve_b: U256::from(1_000),
+            ladder: Default::default(),
+            price_a_in_b: 123.0,
+            price_b_in_a: 456.0,
+        };
+
+        pool.refresh_prices();
+        assert_eq!(pool.price_a_in_b, 0.0);
+        assert_eq!(pool.price_b_in_a, 0.0);
     }
 }

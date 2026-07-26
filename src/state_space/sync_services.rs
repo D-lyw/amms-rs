@@ -18,11 +18,11 @@ use crate::amms::aerodrome_slipstream::pool::{
 use crate::amms::amm::{AutomatedMarketMaker, AMM};
 use crate::amms::balancer_v2::BalancerV2Pool;
 use crate::amms::balancer_v3::BalancerV3Pool;
+use crate::amms::caliber_prop::CaliberPropPool;
 use crate::amms::curve_ng::{CurveNGFactory, ICurveNGStableSwap};
 use crate::amms::fluid_dex::{
     DexReservesResolver, FluidDexT1, FluidLiquidity, TokenLimitData, FLUID_DEX_RESOLVER,
 };
-use crate::amms::caliber_prop::CaliberPropPool;
 use crate::amms::pendle::PendlePool;
 use crate::amms::rocketpool::RocketPoolConverter;
 use crate::amms::uniswap_v3::GetUniswapV3PoolStaticMetaBatchRequest;
@@ -1150,8 +1150,8 @@ pub async fn start_pendle_sync_task<N, P>(
 /// Periodically refreshes Caliber propAMM pool ladder snapshots.
 ///
 /// Caliber pools do not emit Swap events, so their pricing ladder cannot be
-/// tracked via event-driven sync. Instead, each refresh cycle calls
-/// `getPoolBalances` + `batchQuote` to rebuild the complete ladder state.
+/// tracked via event-driven sync. Instead, each refresh cycle calls the
+/// Caliber ladder batch reader contract to rebuild the complete ladder state.
 ///
 /// ## Frequency Trade-off
 ///
@@ -1162,7 +1162,9 @@ pub async fn start_pendle_sync_task<N, P>(
 /// - **Low frequency (> 300s)**: Only suitable for display purposes; pricing
 ///   accuracy degrades significantly.
 ///
-/// Each pool refresh costs 2 RPC calls (getPoolBalances + batchQuote of 22 samples).
+/// Each pool refresh now costs one `eth_call` per pool; the reader contract
+/// internally performs `getPoolBalances`, base sampling, and one midpoint
+/// refinement pass before returning the final ladder snapshot.
 pub async fn start_caliber_prop_ladder_sync_task<N, P>(
     state: Arc<RwLock<StateSpace>>,
     provider: P,

@@ -74,10 +74,9 @@ impl CaliberPropFactory {
         // pairConfigBaseSlot = keccak256(abi.encode(uint256(6)))
         // 等价于：keccak256(bytes32(0x6))
         // 实际计算：keccak256(0x0000000000000000000000000000000000000000000000000000000000000006)
-        let base_slot = B256::from_hex(
-            "0x0000000000000000000000000000000000000000000000000000000000000006",
-        )
-        .map_err(|e| AMMError::Msg(format!("caliber: invalid hex: {e}")))?;
+        let base_slot =
+            B256::from_hex("0x0000000000000000000000000000000000000000000000000000000000000006")
+                .map_err(|e| AMMError::Msg(format!("caliber: invalid hex: {e}")))?;
 
         // 计算每个 pairId 的 token 存储槽
         // slot_token0 = keccak256(pairId . base_slot)
@@ -144,10 +143,7 @@ impl DiscoverySync for CaliberPropFactory {
 
             loop {
                 let pair_ids = caliber
-                    .getAllPairIds(
-                        U256::from(start),
-                        U256::from(super::MAX_PAIRS_PER_CALL),
-                    )
+                    .getAllPairIds(U256::from(start), U256::from(super::MAX_PAIRS_PER_CALL))
                     .block(to_block)
                     .call()
                     .await?;
@@ -194,10 +190,8 @@ impl DiscoverySync for CaliberPropFactory {
                     (token1_raw, token0_raw)
                 };
 
-                let virtual_address = CaliberPropPool::virtual_address_from_pair_id(
-                    pair_id,
-                    contract_address,
-                );
+                let virtual_address =
+                    CaliberPropPool::virtual_address_from_pair_id(pair_id, contract_address);
 
                 let pool = CaliberPropPool {
                     contract_address,
@@ -287,12 +281,12 @@ impl AutomatedMarketMakerFactory for CaliberPropFactory {
 
 /// 批量初始化 Caliber propAMM 池子
 ///
-/// 对于 Caliber，由于无可用的批量合约（协议较新、池子少），
-/// 使用逐池 RPC 方式初始化。后续可以通过部署专用批量合约来优化。
+/// 对于 Caliber，初始化仍按池子逐个进行，但每个池子的核心快照读取
+/// 已通过自定义 batch reader 合约压缩为单次 eth_call。
 ///
 /// 每个池子的初始化调用：
 /// 1. get_token_decimals (2 次 eth_call)
-/// 2. CaliberPropPool::init() → getPoolBalances + batchQuote
+/// 2. CaliberPropPool::init() → GetCaliberPropLadderBatchRequest
 pub(super) async fn init_batch<N, P>(
     amms: Vec<AMM>,
     block_number: BlockId,
@@ -342,17 +336,14 @@ where
             .unwrap_or(18);
     }
 
-    // 2. 逐池初始化（getPoolBalances + batchQuote）
+    // 2. 逐池初始化（reader 合约一次性拉取储备 + Ladder）
     let mut initialized = Vec::with_capacity(pools.len());
     for pool in pools {
         let virt = pool.virtual_address;
         match pool.init::<N, P>(block_number, provider.clone()).await {
             Ok(p) => initialized.push(AMM::CaliberPropPool(p)),
             Err(e) => {
-                debug!(
-                    "caliber: failed to init pool {}: {}",
-                    virt, e
-                );
+                debug!("caliber: failed to init pool {}: {}", virt, e);
             }
         }
     }
@@ -412,11 +403,7 @@ where
 // ============================================================================
 
 /// 通过 alloy Provider 发送 `eth_getStorageAt` JSON-RPC 请求
-async fn get_storage_at<N, P>(
-    provider: &P,
-    address: Address,
-    slot: B256,
-) -> Result<B256, AMMError>
+async fn get_storage_at<N, P>(provider: &P, address: Address, slot: B256) -> Result<B256, AMMError>
 where
     N: Network,
     P: Provider<N>,
@@ -481,10 +468,9 @@ mod tests {
     #[test]
     fn test_storage_slot_computation() {
         // 验证 pairConfigBaseSlot = keccak256(uint256(6))
-        let base = B256::from_hex(
-            "0x0000000000000000000000000000000000000000000000000000000000000006",
-        )
-        .unwrap();
+        let base =
+            B256::from_hex("0x0000000000000000000000000000000000000000000000000000000000000006")
+                .unwrap();
 
         // 模拟一个 pairId
         let pair_id = B256::from([0xAAu8; 32]);
