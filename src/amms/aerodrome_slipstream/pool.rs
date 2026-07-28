@@ -946,8 +946,9 @@ impl AutomatedMarketMaker for AerodromeSlipstreamPool {
 
             step.tick_next = step.tick_next.clamp(MIN_TICK, MAX_TICK);
 
-            step.sqrt_price_next_x96 = crate::amms::sqrt_ratio_at_tick_cached(step.tick_next)
-                .map_err(AerodromeSlipstreamError::from)?;
+            step.sqrt_price_next_x96 =
+                crate::amms::tick_math_cache::sqrt_ratio_at_tick_cached_or_compute(step.tick_next)
+                    .map_err(AerodromeSlipstreamError::from)?;
 
             let swap_target_sqrt_ratio = if zero_for_one {
                 if step.sqrt_price_next_x96 < sqrt_price_limit_x_96 {
@@ -1082,8 +1083,9 @@ impl AutomatedMarketMaker for AerodromeSlipstreamPool {
 
             step.tick_next = step.tick_next.clamp(MIN_TICK, MAX_TICK);
 
-            step.sqrt_price_next_x96 = crate::amms::sqrt_ratio_at_tick_cached(step.tick_next)
-                .map_err(AerodromeSlipstreamError::from)?;
+            step.sqrt_price_next_x96 =
+                crate::amms::tick_math_cache::sqrt_ratio_at_tick_cached_or_compute(step.tick_next)
+                    .map_err(AerodromeSlipstreamError::from)?;
 
             let swap_target_sqrt_ratio = if zero_for_one {
                 if step.sqrt_price_next_x96 < sqrt_price_limit_x_96 {
@@ -1235,8 +1237,9 @@ impl AutomatedMarketMaker for AerodromeSlipstreamPool {
 
             step.tick_next = step.tick_next.clamp(MIN_TICK, MAX_TICK);
 
-            step.sqrt_price_next_x96 = crate::amms::sqrt_ratio_at_tick_cached(step.tick_next)
-                .map_err(AerodromeSlipstreamError::from)?;
+            step.sqrt_price_next_x96 =
+                crate::amms::tick_math_cache::sqrt_ratio_at_tick_cached_or_compute(step.tick_next)
+                    .map_err(AerodromeSlipstreamError::from)?;
 
             let swap_target_sqrt_ratio = if zero_for_one {
                 if step.sqrt_price_next_x96 < sqrt_price_limit_x_96 {

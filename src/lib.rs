@@ -2,3 +2,5 @@
 
 pub mod amms;
 pub mod state_space;
+
+pub use amms::tick_math_cache;
