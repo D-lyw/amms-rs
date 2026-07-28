@@ -1,13 +1,20 @@
 use std::{
     collections::HashMap,
     hash::{Hash, Hasher},
-    sync::Arc,
+    sync::{Arc, OnceLock, RwLock},
 };
 
-use alloy::{dyn_abi::DynSolType, network::Network, primitives::Address, providers::Provider, sol};
+use alloy::{
+    dyn_abi::DynSolType,
+    network::Network,
+    primitives::{Address, U256},
+    providers::Provider,
+    sol,
+};
 use error::{AMMError, BatchContractError};
 use futures::{stream::FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
+use uniswap_v3_math::{error::UniswapV3MathError, tick_math};
 
 pub mod aerodrome_slipstream;
 pub mod aerodrome_v2;
@@ -35,6 +42,45 @@ pub mod sushi_v2;
 pub mod uniswap_v2;
 pub mod uniswap_v3;
 pub mod uniswap_v4;
+
+fn tick_sqrt_ratio_cache() -> &'static RwLock<HashMap<i32, U256>> {
+    static CACHE: OnceLock<RwLock<HashMap<i32, U256>>> = OnceLock::new();
+    CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+pub(crate) fn sqrt_ratio_at_tick_cached(tick: i32) -> Result<U256, UniswapV3MathError> {
+    {
+        let cache = tick_sqrt_ratio_cache()
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(cached) = cache.get(&tick).copied() {
+            return Ok(cached);
+        }
+    }
+
+    let sqrt_ratio = tick_math::get_sqrt_ratio_at_tick(tick)?;
+    let mut cache = tick_sqrt_ratio_cache()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    Ok(*cache.entry(tick).or_insert(sqrt_ratio))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sqrt_ratio_at_tick_cached;
+
+    #[test]
+    fn cached_sqrt_ratio_matches_tick_math() {
+        for tick in [-100, -1, 0, 1, 100, 887_272, -887_272] {
+            let expected = uniswap_v3_math::tick_math::get_sqrt_ratio_at_tick(tick).unwrap();
+            let cached_once = sqrt_ratio_at_tick_cached(tick).unwrap();
+            let cached_twice = sqrt_ratio_at_tick_cached(tick).unwrap();
+
+            assert_eq!(cached_once, expected);
+            assert_eq!(cached_twice, expected);
+        }
+    }
+}
 
 sol! {
     #[sol(rpc)]

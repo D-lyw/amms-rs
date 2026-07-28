@@ -404,9 +404,8 @@ impl AutomatedMarketMaker for UniswapV3Pool {
             step.tick_next = step.tick_next.clamp(MIN_TICK, MAX_TICK);
 
             // Get the next sqrt price from the input amount
-            step.sqrt_price_next_x96 =
-                uniswap_v3_math::tick_math::get_sqrt_ratio_at_tick(step.tick_next)
-                    .map_err(UniswapV3Error::from)?;
+            step.sqrt_price_next_x96 = crate::amms::sqrt_ratio_at_tick_cached(step.tick_next)
+                .map_err(UniswapV3Error::from)?;
 
             // Target spot price
             let swap_target_sqrt_ratio = if zero_for_one {
@@ -569,9 +568,8 @@ impl AutomatedMarketMaker for UniswapV3Pool {
             step.tick_next = step.tick_next.clamp(MIN_TICK, MAX_TICK);
 
             // Get the next sqrt price from the input amount
-            step.sqrt_price_next_x96 =
-                uniswap_v3_math::tick_math::get_sqrt_ratio_at_tick(step.tick_next)
-                    .map_err(UniswapV3Error::from)?;
+            step.sqrt_price_next_x96 = crate::amms::sqrt_ratio_at_tick_cached(step.tick_next)
+                .map_err(UniswapV3Error::from)?;
 
             // Target spot price
             let swap_target_sqrt_ratio = if zero_for_one {
@@ -740,9 +738,8 @@ impl AutomatedMarketMaker for UniswapV3Pool {
             step.tick_next = step.tick_next.clamp(MIN_TICK, MAX_TICK);
 
             // Get the next sqrt price from the input amount
-            step.sqrt_price_next_x96 =
-                uniswap_v3_math::tick_math::get_sqrt_ratio_at_tick(step.tick_next)
-                    .map_err(UniswapV3Error::from)?;
+            step.sqrt_price_next_x96 = crate::amms::sqrt_ratio_at_tick_cached(step.tick_next)
+                .map_err(UniswapV3Error::from)?;
 
             // Target spot price
             let swap_target_sqrt_ratio = if zero_for_one {
