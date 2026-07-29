@@ -162,6 +162,8 @@ pub struct UniswapV4Pool {
     pub liquidity: u128,
     pub tick: i32,
     pub tick_spacing: i32,
+    /// Packed protocol fee from V4 slot0:
+    /// low 12 bits are 0->1 (zeroForOne), high 12 bits are 1->0 (oneForZero).
     pub protocol_fee: u32,
     pub lp_fee: u32,
     pub tick_bitmap: HashMap<i16, U256>,
@@ -299,7 +301,8 @@ impl AutomatedMarketMaker for UniswapV4Pool {
         _quote_token: Address,
         amount_in: U256,
     ) -> Result<U256, AMMError> {
-        let (_final_state, amount_out) = self.simulate_swap_exact_in_state(base_token, amount_in)?;
+        let (_final_state, amount_out) =
+            self.simulate_swap_exact_in_state(base_token, amount_in)?;
         Ok(amount_out)
     }
 
@@ -309,7 +312,8 @@ impl AutomatedMarketMaker for UniswapV4Pool {
         _quote_token: Address,
         amount_in: U256,
     ) -> Result<U256, AMMError> {
-        let (current_state, amount_out) = self.simulate_swap_exact_in_state(base_token, amount_in)?;
+        let (current_state, amount_out) =
+            self.simulate_swap_exact_in_state(base_token, amount_in)?;
 
         self.liquidity = current_state.liquidity;
         self.sqrt_price = current_state.sqrt_price_x_96;
@@ -410,11 +414,7 @@ impl AutomatedMarketMaker for UniswapV4Pool {
                 amount_out = U256::ZERO;
                 fee_amount = U256::ZERO;
             } else {
-                // V4 dynamic fee calculation
-                let fee_pips: u32 = ((self.protocol_fee as u64)
-                    + ((self.lp_fee as u64) * (1_000_000u64 - self.protocol_fee as u64))
-                        .div_ceil(1_000_000u64))
-                .min(1_000_000u64) as u32;
+                let fee_pips = self.effective_fee_pips(zero_for_one);
 
                 (sqrt_price_x_96, amount_in, amount_out, fee_amount) = compute_swap_step(
                     current_state.sqrt_price_x_96,
@@ -700,11 +700,21 @@ impl UniswapV4Pool {
     }
 
     #[inline]
-    fn effective_fee_pips(&self) -> u32 {
-        ((self.protocol_fee as u64)
-            + ((self.lp_fee as u64) * (1_000_000u64 - self.protocol_fee as u64))
-                .div_ceil(1_000_000u64))
-        .min(1_000_000u64) as u32
+    fn protocol_fee_for_direction(&self, zero_for_one: bool) -> u32 {
+        if zero_for_one {
+            self.protocol_fee & 0x0fff
+        } else {
+            (self.protocol_fee >> 12) & 0x0fff
+        }
+    }
+
+    #[inline]
+    fn effective_fee_pips(&self, zero_for_one: bool) -> u32 {
+        let protocol_fee = self.protocol_fee_for_direction(zero_for_one) as u64;
+        let lp_fee = self.lp_fee as u64;
+
+        // Matches Uniswap v4 ProtocolFeeLibrary::calculateSwapFee.
+        (protocol_fee + lp_fee - (protocol_fee * lp_fee / 1_000_000)).min(1_000_000u64) as u32
     }
 
     fn simulate_swap_exact_in_state(
@@ -733,7 +743,7 @@ impl UniswapV4Pool {
         } else {
             MAX_SQRT_RATIO - U256_1
         };
-        let fee_pips = self.effective_fee_pips();
+        let fee_pips = self.effective_fee_pips(zero_for_one);
 
         let mut current_state = CurrentState {
             amount_specified_remaining: I256::from_raw(amount_in),
@@ -933,9 +943,9 @@ impl UniswapV4Pool {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::amms::Token;
     use crate::amms::uniswap_v4::lense::{get_liquidity_slot, get_pool_state_slot};
     use crate::amms::uniswap_v4::IPoolManager::IPoolManagerInstance;
+    use crate::amms::Token;
     use dotenv::dotenv;
 
     use alloy::sol_types::SolValue;
@@ -950,6 +960,27 @@ mod test {
         transports::layers::{RetryBackoffLayer, ThrottleLayer},
     };
     use std::str::FromStr;
+
+    #[test]
+    fn test_effective_fee_pips_decodes_packed_protocol_fee_by_direction() {
+        let manager = address!("0000000000000000000000000000000000000abc");
+        let key = IPoolManager::PoolKey {
+            currency0: address!("0000000000000000000000000000000000000001"),
+            currency1: address!("0000000000000000000000000000000000000002"),
+            fee: U24::from(3000u64),
+            tickSpacing: I24::try_from(1).unwrap(),
+            hooks: Address::ZERO,
+        };
+
+        let mut pool = UniswapV4Pool::new(manager, key);
+        pool.protocol_fee = (700u32 << 12) | 500u32;
+        pool.lp_fee = 3000;
+
+        assert_eq!(pool.protocol_fee_for_direction(true), 500);
+        assert_eq!(pool.protocol_fee_for_direction(false), 700);
+        assert_eq!(pool.effective_fee_pips(true), 3499);
+        assert_eq!(pool.effective_fee_pips(false), 3698);
+    }
 
     #[test]
     fn test_simulate_swap_mut_advances_local_pool_state() {
@@ -993,7 +1024,9 @@ mod test {
         let out_mut = pool.simulate_swap_mut(token0, token1, amount_in).unwrap();
         assert_eq!(out_mut, out_read);
         assert!(
-            pool.sqrt_price != before_sqrt || pool.tick != before_tick || pool.liquidity != before_liquidity,
+            pool.sqrt_price != before_sqrt
+                || pool.tick != before_tick
+                || pool.liquidity != before_liquidity,
             "simulate_swap_mut should advance local pool state"
         );
         assert!(pool.token_a_price.is_finite() && pool.token_a_price > 0.0);

@@ -1126,11 +1126,6 @@ impl AutomatedMarketMaker for CurveNGPool {
                 pool.detect_twocrypto_variant(block_number, provider.clone())
                     .await;
             }
-            // Log for debugging
-            println!(
-                "DEBUG: CurveNG Init Batch Success: {:?}, Coins: {:?}, Rates: {:?}",
-                pool.address, pool.coins, pool.rates
-            );
             Ok(pool)
         } else {
             // If filtered out or failed
