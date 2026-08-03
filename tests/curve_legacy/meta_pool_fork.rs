@@ -64,7 +64,8 @@ async fn test_curve_legacy_meta_pool_detection_on_arbitrum_fork() -> Result<()> 
     let manager = StateSpaceBuilder::new(provider.clone())
         .block(fork_block)
         .with_amms({
-            let mut pool = CurveLegacyPool::new(EURS_2CRV_META_POOL, CurveLegacyPoolType::CryptoSwap);
+            let mut pool =
+                CurveLegacyPool::new(EURS_2CRV_META_POOL, CurveLegacyPoolType::CryptoSwap);
             pool.zap_address = Some(EURS_2CRV_ZAP);
             vec![AMM::CurveLegacyPool(pool)]
         })
@@ -122,7 +123,8 @@ async fn test_curve_legacy_meta_pool_underlying_quote_parity_on_arbitrum_fork() 
     let manager = StateSpaceBuilder::new(provider.clone())
         .block(fork_block)
         .with_amms({
-            let mut pool = CurveLegacyPool::new(EURS_2CRV_META_POOL, CurveLegacyPoolType::CryptoSwap);
+            let mut pool =
+                CurveLegacyPool::new(EURS_2CRV_META_POOL, CurveLegacyPoolType::CryptoSwap);
             pool.zap_address = Some(EURS_2CRV_ZAP);
             vec![AMM::CurveLegacyPool(pool)]
         })

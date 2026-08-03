@@ -56,6 +56,10 @@ pub use types::{
 
 // Multicall3 Address (Standard across chains)
 const MULTICALL_ADDRESS: Address = address!("cA11bde05977b3631167028862bE2a173976CA11");
+// Curve Registry bootstrap entry used only for old StableMeta fallback detection.
+const CURVE_ADDRESS_PROVIDER: Address = address!("0000000022D53366457F9d5E68Ec105046FC4383");
+const ETHEREUM_CHAIN_ID: u64 = 1;
+const CURVE_LEGACY_FATAL_INIT_PREFIX: &str = "curve_legacy_fatal_init:";
 
 // Multicall3 Structs and Interface
 sol! {
@@ -114,6 +118,13 @@ sol! {
     interface ICurveLegacyPoolUnderlyingInt128Probe {
         function underlying_coins(int128 i) external view returns (address);
     }
+    /// Probe to discover a Curve LP token's base pool via minter().
+    /// Curve LP tokens (Vyper ERC20) expose minter() → the contract authorized to mint,
+    /// which is the base pool address for meta pool LP tokens.
+    #[sol(rpc)]
+    interface ICurveLpTokenMinterProbe {
+        function minter() external view returns (address);
+    }
     #[sol(rpc)]
     interface ICurveLegacyPoolRatesProbe {
         function rates(int128 i) external view returns (uint256);
@@ -122,6 +133,65 @@ sol! {
     interface ICurveLegacyPoolStoredRatesArrayProbe {
         function stored_rates() external view returns (uint256[2] memory);
     }
+    #[sol(rpc)]
+    interface ICurveAddressProviderProbe {
+        function get_registry() external view returns (address);
+    }
+    #[sol(rpc)]
+    interface ICurveMainRegistryMetaProbe {
+        function is_meta(address pool) external view returns (bool);
+        function get_n_coins(address pool) external view returns (uint256[2] memory);
+        function get_underlying_coins(address pool) external view returns (address[8] memory);
+        function get_pool_from_lp_token(address lp_token) external view returns (address);
+        function get_lp_token(address pool) external view returns (address);
+    }
+    #[sol(rpc)]
+    interface ICurveLegacyInitPool {
+        function coins(uint256 i) external view returns (address);
+        function balances(uint256 i) external view returns (uint256);
+        function A() external view returns (uint256);
+        function A_precise() external view returns (uint256);
+        function fee() external view returns (uint256);
+        function admin_fee() external view returns (uint256);
+        function stored_rates(uint256 i) external view returns (uint256);
+        function D() external view returns (uint256);
+        function gamma() external view returns (uint256);
+        function mid_fee() external view returns (uint256);
+        function out_fee() external view returns (uint256);
+        function fee_gamma() external view returns (uint256);
+        function allowed_extra_profit() external view returns (uint256);
+        function adjustment_step() external view returns (uint256);
+        function ma_half_time() external view returns (uint256);
+        function price_scale(uint256 i) external view returns (uint256);
+    }
+    #[sol(rpc)]
+    interface ICurveLegacyInitPoolInt128 {
+        function coins(int128 i) external view returns (address);
+        function balances(int128 i) external view returns (uint256);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CurveLegacyDetectedFamily {
+    StableSwap,
+    CryptoSwap,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetaDetectionSource {
+    DirectBasePoolMethod,
+    LastCoinIsBasePool,
+    LpTokenMinter,
+    RegistryFallback,
+}
+
+#[derive(Debug, Clone)]
+struct MetaTopology {
+    source: MetaDetectionSource,
+    base_pool_address: Address,
+    base_lp_token: Option<Address>,
+    base_token_index: usize,
+    underlying_coins: Option<Vec<Address>>,
 }
 
 // Curve Legacy 池合约 ABI (事件定义)
@@ -988,11 +1058,21 @@ impl AutomatedMarketMaker for CurveLegacyPool {
                     .simulate_remove_liquidity_one_coin(lp_out, base_j)
             }
             CurveLegacySwapRoute::BaseToMeta { base_i, meta_j } => {
-                let lp_out = self
+                let base_view = self
                     .base_pool_view
                     .as_ref()
-                    .ok_or_else(|| AMMError::Msg("Meta pool missing base_pool_view".into()))?
-                    .simulate_add_liquidity_one_coin(base_i, amount_in)?;
+                    .ok_or_else(|| AMMError::Msg("Meta pool missing base_pool_view".into()))?;
+                let lp_out = if self.pool_type == CurveLegacyPoolType::StableSwap
+                    && self.stable_type == LegacyStableSwapType::Meta
+                {
+                    let minted_lp =
+                        base_view.simulate_calc_token_amount_one_coin(base_i, amount_in)?;
+                    minted_lp.saturating_sub(
+                        minted_lp * base_view.fee / (U256::from(2) * CURVE_FEE_DENOMINATOR),
+                    )
+                } else {
+                    base_view.simulate_add_liquidity_one_coin(base_i, amount_in)?
+                };
                 let lp_idx = self
                     .base_token_index
                     .ok_or_else(|| AMMError::Msg("Meta pool missing base_token_index".into()))?;
@@ -1060,41 +1140,8 @@ impl AutomatedMarketMaker for CurveLegacyPool {
         // Any Curve Legacy meta-pool initialization fields added here must also be reflected by any
         // batch initialization path. The current codebase still uses this single-pool path during
         // Curve Legacy batch init, but a future dedicated batch path must preserve the same fields.
-        use alloy::sol;
-
-        sol! {
-            #[sol(rpc)]
-            interface ICurveLegacyPool {
-                function coins(uint256 i) external view returns (address);
-                function balances(uint256 i) external view returns (uint256);
-                function A() external view returns (uint256);
-                function A_precise() external view returns (uint256);
-                function fee() external view returns (uint256);
-                function admin_fee() external view returns (uint256);
-                function stored_rates(uint256 i) external view returns (uint256);
-
-                // Crypto V2 params
-                function D() external view returns (uint256);
-                function gamma() external view returns (uint256);
-                function mid_fee() external view returns (uint256);
-                function out_fee() external view returns (uint256);
-                function fee_gamma() external view returns (uint256);
-                function allowed_extra_profit() external view returns (uint256);
-                function adjustment_step() external view returns (uint256);
-                function ma_half_time() external view returns (uint256);
-                function price_scale(uint256 i) external view returns (uint256);
-            }
-
-            #[sol(rpc)]
-            interface ICurveLegacyPoolInt128 {
-                function coins(int128 i) external view returns (address);
-                function balances(int128 i) external view returns (uint256);
-            }
-
-        }
-
-        let pool = ICurveLegacyPool::new(self.address, provider.clone());
-        let pool_int = ICurveLegacyPoolInt128::new(self.address, provider.clone());
+        let pool = ICurveLegacyInitPool::new(self.address, provider.clone());
+        let pool_int = ICurveLegacyInitPoolInt128::new(self.address, provider.clone());
 
         // 1. Fetch Coins, Decimals, Balances
         // Assuming max 8 coins
@@ -1209,110 +1256,54 @@ impl AutomatedMarketMaker for CurveLegacyPool {
             self.admin_fee = admin_fee;
         }
 
-        // === Auto-detect pool_type ===
-        // Curve Registry 可能同时包含 StableSwap 和 CryptoSwap 池子，
-        // 但 Factory 构造时只传入单一 pool_type，导致所有池子被赋予同一类型。
-        // 通过尝试调用 gamma() 自动纠偏：
-        // - gamma() 存在 => CryptoSwap
-        // - gamma() revert/不存在 => StableSwap
-        // 这样可以同时修正 Stable->Crypto 和 Crypto->Stable 的误分类。
-        match pool.gamma().block(block_number).call().await {
-            Ok(gamma_val) => {
-                if self.pool_type != CurveLegacyPoolType::CryptoSwap {
-                    tracing::info!(
-                        pool = ?self.address,
-                        gamma = ?gamma_val,
-                        "Auto-detected CryptoSwap pool (gamma() exists), overriding pool_type to CryptoSwap"
-                    );
-                }
-                self.pool_type = CurveLegacyPoolType::CryptoSwap;
-            }
-            Err(e) => {
-                let err_text = e.to_string().to_ascii_lowercase();
-                let is_revert_like = err_text.contains("execution reverted")
-                    || err_text.contains("reverted")
-                    || err_text.contains("revert");
-
-                if is_revert_like {
-                    if self.pool_type != CurveLegacyPoolType::StableSwap {
-                        tracing::info!(
-                            pool = ?self.address,
-                            error = %e,
-                            "Auto-detected StableSwap pool (gamma() reverted/missing), overriding pool_type to StableSwap"
-                        );
-                    }
-                    self.pool_type = CurveLegacyPoolType::StableSwap;
-                } else {
-                    tracing::warn!(
-                        pool = ?self.address,
-                        error = %e,
-                        pool_type = ?self.pool_type,
-                        "gamma() probe failed with non-revert error, keeping existing pool_type"
-                    );
-                }
-            }
-        }
+        // === Initialization classification pipeline ===
+        //
+        // Keep the ordering here stable unless the whole detection design is revisited:
+        //
+        // 1. Family classification
+        //    Decide whether the pool behaves like StableSwap or CryptoSwap from on-chain
+        //    capabilities instead of trusting the constructor hint.
+        //
+        // 2. Underlying/meta topology detection
+        //    First collect any directly exposed underlying coins, then try to materialize
+        //    meta-pool topology (base pool address, LP token, expanded underlying space,
+        //    local base-pool view) via the ordered fallback chain in `detect_meta_topology()`.
+        //
+        // 3. Subtype/supportability validation
+        //    Stable pools are further classified into Plain / Lending / Meta, and any pool
+        //    that looks like a MetaPool but cannot be simulated locally must fail closed.
+        //
+        // This ordering matters.  For example, the Ethereum old-factory StableMeta fallback
+        // intentionally runs only after the family is known to be StableSwap.
+        let detected_family = self
+            .classify_pool_family::<N, _>(block_number, provider.clone())
+            .await?;
+        self.pool_type = match detected_family {
+            CurveLegacyDetectedFamily::StableSwap => CurveLegacyPoolType::StableSwap,
+            CurveLegacyDetectedFamily::CryptoSwap => CurveLegacyPoolType::CryptoSwap,
+        };
 
         // === Meta / Underlying Detection ===
         self.load_underlying_coin_probes::<N, _>(block_number, provider.clone())
             .await;
-
-        if let Some(base_pool_addr) = self
-            .probe_base_pool_address::<N, _>(block_number, provider.clone())
-            .await
+        if let Some((topology, base_pool_state)) = self
+            .detect_meta_topology::<N, _>(block_number, provider.clone())
+            .await?
         {
-            tracing::debug!(
-                pool = ?self.address,
-                base_pool = ?base_pool_addr,
-                "Detected base_pool() on Curve Legacy pool"
-            );
-
-            let base_pool_state = Box::pin(
-                CurveLegacyPool::new(base_pool_addr, CurveLegacyPoolType::StableSwap)
-                    .init(block_number, provider.clone()),
-            )
-            .await?;
-            self.attach_base_pool_state::<N, _>(
-                base_pool_addr,
-                None,
-                None,
+            self.apply_meta_topology_state::<N, _>(
+                topology,
                 base_pool_state,
                 block_number,
                 provider.clone(),
             )
             .await?;
-        } else if let Some(base_idx) = self.coins.len().checked_sub(1) {
-            let candidate_addr = self.coins[base_idx];
-            if candidate_addr != Address::ZERO && candidate_addr != self.address {
-                if let Some(candidate_pool) = Self::try_init_stable_base_pool_candidate::<N, _>(
-                    candidate_addr,
-                    block_number,
-                    provider.clone(),
-                )
-                .await
-                {
-                    tracing::debug!(
-                        pool = ?self.address,
-                        candidate_base_pool = ?candidate_addr,
-                        candidate_index = base_idx,
-                        base_n_coins = candidate_pool.n_coins,
-                        "Detected meta pool via last-coin base-pool structure"
-                    );
-                    self.attach_base_pool_state::<N, _>(
-                        candidate_addr,
-                        Some(base_idx),
-                        Some(candidate_addr),
-                        candidate_pool,
-                        block_number,
-                        provider.clone(),
-                    )
-                    .await?;
-                }
-            }
         }
 
         // === CryptoSwap Meta Pool 校验 ===
-        // CryptoSwap meta pool 需要 zap_address 且链上验证通过
+        // CryptoSwap meta pool 需要 zap_address 且链上验证通过。
+        // 新版 zap (Arbitrum 等) 暴露 pool() → 应返回 meta pool 自身。
+        // 旧版 zap (Ethereum mainnet 旧工厂) 暴露 base_pool() → 应返回 base pool，
+        // 需与 meta detection 阶段设置的 base_pool_address 一致。
         if self.pool_type == CurveLegacyPoolType::CryptoSwap && self.is_meta_pool() {
             let zap = match self.zap_address {
                 Some(z) if z != Address::ZERO => z,
@@ -1323,24 +1314,49 @@ impl AutomatedMarketMaker for CurveLegacyPool {
                     )));
                 }
             };
-            // 链上验证：zap.pool() 必须返回当前池子地址
             let probe = ICurveMetaZapProbe::new(zap, provider.clone());
-            let reported_pool = probe
+
+            // Try pool() first (newer zaps, returns meta pool)
+            if let Some(reported_pool) = probe
                 .pool()
                 .block(block_number)
                 .call()
                 .await
-                .map_err(|e| {
+                .ok()
+                .filter(|a| *a != Address::ZERO)
+            {
+                if reported_pool != self.address {
+                    return Err(AMMError::Msg(format!(
+                        "zap {:?} pool() returned {:?}, expected {:?}",
+                        zap, reported_pool, self.address
+                    )));
+                }
+            } else {
+                // Fall back to base_pool() (older zaps, returns base pool)
+                let reported_base =
+                    probe
+                        .base_pool()
+                        .block(block_number)
+                        .call()
+                        .await
+                        .map_err(|e| {
+                            AMMError::Msg(format!(
+                            "zap {:?}: both pool() and base_pool() probes failed for pool {:?}: {}",
+                            zap, self.address, e
+                        ))
+                        })?;
+                let expected_base = self.base_pool_address.ok_or_else(|| {
                     AMMError::Msg(format!(
-                        "zap {:?} pool() probe failed for {:?}: {}",
-                        zap, self.address, e
+                        "zap {:?} base_pool() returned {:?} but base_pool_address not set",
+                        zap, reported_base
                     ))
                 })?;
-            if reported_pool != self.address {
-                return Err(AMMError::Msg(format!(
-                    "zap {:?} pool() returned {:?}, expected {:?}",
-                    zap, reported_pool, self.address
-                )));
+                if reported_base != expected_base {
+                    return Err(AMMError::Msg(format!(
+                        "zap {:?} base_pool() returned {:?}, expected {:?}",
+                        zap, reported_base, expected_base
+                    )));
+                }
             }
             tracing::debug!(
                 pool = ?self.address,
@@ -1349,21 +1365,11 @@ impl AutomatedMarketMaker for CurveLegacyPool {
             );
         }
 
-        // === Subtype Detection (StableSwap only) ===
+        // === Subtype / Supportability Detection ===
         if self.pool_type == CurveLegacyPoolType::StableSwap {
-            if self.is_meta_pool() {
-                self.stable_type = LegacyStableSwapType::Meta;
-                tracing::debug!(pool = ?self.address, "Identified as StableSwap Metapool");
-            } else if !self.underlying_coins.is_empty()
-                && (self.underlying_coins.len() != self.coins.len()
-                    || self.underlying_coins != self.coins)
-            {
-                self.stable_type = LegacyStableSwapType::Lending;
-                tracing::debug!(pool = ?self.address, "Identified as Lending Pool");
-            } else {
-                self.stable_type = LegacyStableSwapType::Plain;
-            }
+            self.classify_stable_subtype();
         }
+        self.validate_supported_topology()?;
 
         let total_supply_contract =
             ICurveLegacyTotalSupplyUpdate::new(self.address, provider.clone());
@@ -1878,6 +1884,21 @@ impl AutomatedMarketMaker for CurveLegacyPool {
 }
 
 impl CurveLegacyPool {
+    fn fatal_init_error(message: impl Into<String>) -> AMMError {
+        AMMError::Msg(format!(
+            "{}{}",
+            CURVE_LEGACY_FATAL_INIT_PREFIX,
+            message.into()
+        ))
+    }
+
+    pub(crate) fn is_fatal_init_error(error: &AMMError) -> bool {
+        match error {
+            AMMError::Msg(message) => message.starts_with(CURVE_LEGACY_FATAL_INIT_PREFIX),
+            _ => false,
+        }
+    }
+
     pub fn is_meta_pool(&self) -> bool {
         self.is_meta || self.base_pool_address.is_some()
     }
@@ -1940,6 +1961,71 @@ impl CurveLegacyPool {
         }))
     }
 
+    /// Determine whether the pool should be treated as Legacy StableSwap or Legacy CryptoSwap.
+    ///
+    /// We intentionally do *not* trust the constructor's `pool_type` hint here because
+    /// registry/factory discovery paths can feed mixed or stale classifications.
+    ///
+    /// Current rule:
+    /// - all 5 crypto capabilities present => CryptoSwap
+    /// - any partial crypto capability set => fatal init error (fail closed)
+    /// - otherwise, if `A()` exists => StableSwap
+    ///
+    /// The fail-closed branch is deliberate: a half-detected CryptoSwap is more dangerous than
+    /// a skipped pool because local quote math would run with an incoherent parameter set.
+    async fn classify_pool_family<N, P>(
+        &self,
+        block_number: BlockId,
+        provider: P,
+    ) -> Result<CurveLegacyDetectedFamily, AMMError>
+    where
+        N: Network,
+        P: Provider<N> + Clone,
+    {
+        let pool = ICurveLegacyInitPool::new(self.address, provider);
+        let gamma = pool.gamma().block(block_number).call().await.ok();
+        let d = pool.D().block(block_number).call().await.ok();
+        let mid_fee = pool.mid_fee().block(block_number).call().await.ok();
+        let out_fee = pool.out_fee().block(block_number).call().await.ok();
+        let fee_gamma = pool.fee_gamma().block(block_number).call().await.ok();
+
+        let crypto_capability_count = [
+            gamma.is_some(),
+            d.is_some(),
+            mid_fee.is_some(),
+            out_fee.is_some(),
+            fee_gamma.is_some(),
+        ]
+        .into_iter()
+        .filter(|supported| *supported)
+        .count();
+
+        if crypto_capability_count == 5 {
+            return Ok(CurveLegacyDetectedFamily::CryptoSwap);
+        }
+
+        if crypto_capability_count > 0 {
+            return Err(Self::fatal_init_error(format!(
+                "pool {:?} exposes an ambiguous crypto capability set (gamma={}, D={}, mid_fee={}, out_fee={}, fee_gamma={})",
+                self.address,
+                gamma.is_some(),
+                d.is_some(),
+                mid_fee.is_some(),
+                out_fee.is_some(),
+                fee_gamma.is_some(),
+            )));
+        }
+
+        if self.amp.is_some() {
+            return Ok(CurveLegacyDetectedFamily::StableSwap);
+        }
+
+        Err(Self::fatal_init_error(format!(
+            "pool {:?} could not be classified as StableSwap or CryptoSwap from on-chain capabilities",
+            self.address
+        )))
+    }
+
     async fn load_underlying_coin_probes<N, P>(&mut self, block_number: BlockId, provider: P)
     where
         N: Network,
@@ -1980,6 +2066,58 @@ impl CurveLegacyPool {
         }
     }
 
+    fn classify_stable_subtype(&mut self) {
+        if self.is_meta_pool() {
+            self.stable_type = LegacyStableSwapType::Meta;
+        } else if !self.underlying_coins.is_empty()
+            && (self.underlying_coins.len() != self.coins.len()
+                || self.underlying_coins != self.coins)
+        {
+            self.stable_type = LegacyStableSwapType::Lending;
+        } else {
+            self.stable_type = LegacyStableSwapType::Plain;
+        }
+    }
+
+    fn validate_supported_topology(&self) -> Result<(), AMMError> {
+        if !self.is_meta_pool() {
+            return Ok(());
+        }
+
+        if self.base_pool_address.is_none()
+            || self.base_lp_token.is_none()
+            || self.base_token_index.is_none()
+        {
+            return Err(Self::fatal_init_error(format!(
+                "meta pool {:?} is missing base-pool topology fields",
+                self.address
+            )));
+        }
+
+        if self.underlying_coins.len() <= self.coins.len() {
+            return Err(Self::fatal_init_error(format!(
+                "meta pool {:?} failed to materialize expanded underlying coins",
+                self.address
+            )));
+        }
+
+        let Some(base_view) = self.base_pool_view.as_ref() else {
+            return Err(Self::fatal_init_error(format!(
+                "meta pool {:?} is unsupported for local simulation because its base pool view could not be materialized as a StableSwap snapshot",
+                self.address
+            )));
+        };
+
+        if base_view.pool_type != CurveLegacyPoolType::StableSwap {
+            return Err(Self::fatal_init_error(format!(
+                "meta pool {:?} resolved to non-StableSwap base pool {:?}, which CurveLegacy local simulation does not support",
+                self.address, base_view.address
+            )));
+        }
+
+        Ok(())
+    }
+
     async fn probe_base_pool_address<N, P>(
         &self,
         block_number: BlockId,
@@ -1997,6 +2135,220 @@ impl CurveLegacyPool {
             .await
             .ok()
             .filter(|addr| *addr != Address::ZERO)
+    }
+
+    /// Probe a Curve LP token to discover its base pool address.
+    ///
+    /// Old-factory Curve meta pools store the base LP token (not the pool) as the
+    /// last coin.  Curve LP tokens expose `minter()` → the pool contract that mints
+    /// them (a.k.a. the base pool).  We identify the token as a Curve LP via
+    /// `get_virtual_price()` (present on newer Vyper LP tokens) or fall back to
+    /// trying `minter()` directly for older Vyper versions.
+    ///
+    /// Returns `None` when the address is not a recognisable Curve LP token.
+    async fn probe_lp_token_minter<N, P>(
+        lp_token: Address,
+        block_number: BlockId,
+        provider: P,
+    ) -> Option<Address>
+    where
+        N: Network,
+        P: Provider<N> + Clone,
+    {
+        // Path 1: newer Vyper LP tokens have get_virtual_price()
+        {
+            let probe = ICurveLegacyPoolMetaProbe::new(lp_token, provider.clone());
+            if probe
+                .get_virtual_price()
+                .block(block_number)
+                .call()
+                .await
+                .is_ok()
+            {
+                let minter_probe = ICurveLpTokenMinterProbe::new(lp_token, provider.clone());
+                if let Ok(addr) = minter_probe.minter().block(block_number).call().await {
+                    if addr != Address::ZERO {
+                        return Some(addr);
+                    }
+                }
+            }
+        }
+
+        // Path 2: older Vyper LP tokens — try minter() directly.
+        {
+            let minter_probe = ICurveLpTokenMinterProbe::new(lp_token, provider);
+            if let Ok(addr) = minter_probe.minter().block(block_number).call().await {
+                if addr != Address::ZERO {
+                    return Some(addr);
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Ethereum old-factory StableMeta fallback.
+    ///
+    /// This path exists for the oldest StableMeta pools whose pool contracts do not expose
+    /// modern `base_pool()` / `underlying_coins()` probes and whose last coin is an LP token
+    /// rather than a base-pool contract.
+    ///
+    /// Important maintenance rules:
+    /// - Only enabled on Ethereum mainnet.
+    /// - This is a fail-fast path once entered: AddressProvider / Registry resolution errors
+    ///   are treated as fatal init errors rather than silently downgrading the pool to plain.
+    /// - The hardcoded AddressProvider is the canonical Curve bootstrap entry used only to
+    ///   discover the main registry for this fallback case.
+    async fn detect_stable_meta_via_registry_fallback<N, P>(
+        &self,
+        block_number: BlockId,
+        provider: P,
+    ) -> Result<Option<MetaTopology>, AMMError>
+    where
+        N: Network,
+        P: Provider<N> + Clone,
+    {
+        let Some(base_token_index) = self.coins.len().checked_sub(1) else {
+            return Ok(None);
+        };
+
+        let chain_id = provider.get_chain_id().await.map_err(|e| {
+            Self::fatal_init_error(format!(
+                "pool {:?}: failed to read chain id before StableMeta registry fallback: {}",
+                self.address, e
+            ))
+        })?;
+        if chain_id != ETHEREUM_CHAIN_ID {
+            return Ok(None);
+        }
+
+        let base_lp_token = self.coins[base_token_index];
+        if base_lp_token == Address::ZERO || base_lp_token == self.address {
+            return Ok(None);
+        }
+
+        let address_provider =
+            ICurveAddressProviderProbe::new(CURVE_ADDRESS_PROVIDER, provider.clone());
+        let registry_addr = address_provider
+            .get_registry()
+            .block(block_number)
+            .call()
+            .await
+            .map_err(|e| {
+                Self::fatal_init_error(format!(
+                    "pool {:?}: Curve AddressProvider {:?} get_registry() failed during StableMeta fallback: {}",
+                    self.address, CURVE_ADDRESS_PROVIDER, e
+                ))
+            })?;
+        if registry_addr == Address::ZERO {
+            return Err(Self::fatal_init_error(format!(
+                "pool {:?}: Curve AddressProvider {:?} returned zero registry during StableMeta fallback",
+                self.address, CURVE_ADDRESS_PROVIDER
+            )));
+        }
+
+        let registry = ICurveMainRegistryMetaProbe::new(registry_addr, provider.clone());
+        let is_meta = registry
+            .is_meta(self.address)
+            .block(block_number)
+            .call()
+            .await
+            .map_err(|e| {
+                Self::fatal_init_error(format!(
+                    "pool {:?}: registry {:?} is_meta() probe failed during StableMeta fallback: {}",
+                    self.address, registry_addr, e
+                ))
+            })?;
+        if !is_meta {
+            return Ok(None);
+        }
+
+        let n_coins = registry
+            .get_n_coins(self.address)
+            .block(block_number)
+            .call()
+            .await
+            .map_err(|e| {
+                Self::fatal_init_error(format!(
+                    "pool {:?}: registry {:?} get_n_coins() failed: {}",
+                    self.address, registry_addr, e
+                ))
+            })?;
+        let wrapped_n = n_coins[0].to::<usize>();
+        let underlying_n = n_coins[1].to::<usize>();
+        if wrapped_n != self.coins.len() || underlying_n <= wrapped_n {
+            return Err(Self::fatal_init_error(format!(
+                "pool {:?}: registry fallback returned invalid coin counts wrapped={} underlying={} local_wrapped={}",
+                self.address, wrapped_n, underlying_n, self.coins.len()
+            )));
+        }
+
+        let underlying_raw = registry
+            .get_underlying_coins(self.address)
+            .block(block_number)
+            .call()
+            .await
+            .map_err(|e| {
+                Self::fatal_init_error(format!(
+                    "pool {:?}: registry {:?} get_underlying_coins() failed: {}",
+                    self.address, registry_addr, e
+                ))
+            })?;
+        let underlying_coins: Vec<Address> = underlying_raw
+            .into_iter()
+            .take(underlying_n)
+            .take_while(|coin| *coin != Address::ZERO)
+            .collect();
+        if underlying_coins.len() != underlying_n {
+            return Err(Self::fatal_init_error(format!(
+                "pool {:?}: registry fallback returned incomplete underlying coin list (expected {}, got {})",
+                self.address, underlying_n, underlying_coins.len()
+            )));
+        }
+
+        let base_pool_address = registry
+            .get_pool_from_lp_token(base_lp_token)
+            .block(block_number)
+            .call()
+            .await
+            .map_err(|e| {
+                Self::fatal_init_error(format!(
+                    "pool {:?}: registry {:?} get_pool_from_lp_token({:?}) failed: {}",
+                    self.address, registry_addr, base_lp_token, e
+                ))
+            })?;
+        if base_pool_address == Address::ZERO {
+            return Err(Self::fatal_init_error(format!(
+                "pool {:?}: registry fallback could not resolve base pool from LP token {:?}",
+                self.address, base_lp_token
+            )));
+        }
+
+        let expected_lp_token = registry
+            .get_lp_token(base_pool_address)
+            .block(block_number)
+            .call()
+            .await
+            .map_err(|e| {
+                Self::fatal_init_error(format!(
+                    "pool {:?}: registry {:?} get_lp_token({:?}) failed: {}",
+                    self.address, registry_addr, base_pool_address, e
+                ))
+            })?;
+        if expected_lp_token != Address::ZERO && expected_lp_token != base_lp_token {
+            return Err(Self::fatal_init_error(format!(
+                "pool {:?}: registry fallback LP mismatch, pool coin {:?} but base pool {:?} reports {:?}",
+                self.address, base_lp_token, base_pool_address, expected_lp_token
+            )));
+        }
+
+        Ok(Some(MetaTopology {
+            source: MetaDetectionSource::RegistryFallback,
+            base_pool_address,
+            base_lp_token: Some(base_lp_token),
+            base_token_index,
+            underlying_coins: Some(underlying_coins),
+        }))
     }
 
     async fn try_init_stable_base_pool_candidate<N, P>(
@@ -2082,8 +2434,9 @@ impl CurveLegacyPool {
             .ok()
             .filter(|lp| *lp != Address::ZERO);
 
+        let resolved_base_lp_token = base_lp_token_hint.or(probed_lp_token);
         self.base_pool_address = Some(base_pool_addr);
-        self.base_lp_token = base_lp_token_hint.or(probed_lp_token);
+        self.base_lp_token = resolved_base_lp_token;
         self.base_token_index = base_token_index_hint
             .or_else(|| self.coins.iter().position(|&c| c == base_pool_addr))
             .or_else(|| {
@@ -2095,6 +2448,16 @@ impl CurveLegacyPool {
             self.base_lp_token = self.base_token_index.map(|idx| self.coins[idx]);
         }
 
+        if base_pool_state.total_supply.is_none() {
+            if let Some(lp_token) = self.base_lp_token {
+                let lp_contract = ICurveLegacyTotalSupplyUpdate::new(lp_token, provider.clone());
+                if let Ok(total_supply) = lp_contract.totalSupply().block(block_number).call().await
+                {
+                    base_pool_state.total_supply = Some(total_supply);
+                }
+            }
+        }
+
         self.base_n_coins = base_pool_state.n_coins;
         base_pool_state.base_pool_view = None;
         let base_pool_coins = base_pool_state.coins.clone();
@@ -2103,6 +2466,156 @@ impl CurveLegacyPool {
             self.expand_underlying_with_base_pool(base_idx, &base_pool_coins);
         }
         self.is_meta = true;
+
+        Ok(())
+    }
+
+    /// Detect whether this pool is a MetaPool and, if so, materialize the base-pool topology.
+    ///
+    /// Ordered detection chain:
+    /// 1. `base_pool()` on the pool itself
+    /// 2. last coin is directly a base-pool contract
+    /// 3. last coin is a Curve LP token, resolve base pool via `minter()`
+    /// 4. Ethereum-only StableMeta registry fallback
+    ///
+    /// The order is intentional:
+    /// - newer explicit probes are cheaper and less ambiguous;
+    /// - the LP-token path is needed for old factory pools;
+    /// - the registry fallback is the most special-case path and should remain last.
+    ///
+    /// Returned `MetaTopology` contains only detection output; attaching it to the live pool
+    /// state is handled separately by `apply_meta_topology_state()`.
+    async fn detect_meta_topology<N, P>(
+        &self,
+        block_number: BlockId,
+        provider: P,
+    ) -> Result<Option<(MetaTopology, Self)>, AMMError>
+    where
+        N: Network,
+        P: Provider<N> + Clone,
+    {
+        if let Some(base_pool_addr) = self
+            .probe_base_pool_address::<N, _>(block_number, provider.clone())
+            .await
+        {
+            let base_pool_state = Box::pin(
+                CurveLegacyPool::new(base_pool_addr, CurveLegacyPoolType::StableSwap)
+                    .init(block_number, provider.clone()),
+            )
+            .await?;
+            return Ok(Some((
+                MetaTopology {
+                    source: MetaDetectionSource::DirectBasePoolMethod,
+                    base_pool_address: base_pool_addr,
+                    base_lp_token: None,
+                    base_token_index: self.coins.len().saturating_sub(1),
+                    underlying_coins: None,
+                },
+                base_pool_state,
+            )));
+        }
+
+        let Some(base_token_index) = self.coins.len().checked_sub(1) else {
+            return Ok(None);
+        };
+        let candidate_addr = self.coins[base_token_index];
+        if candidate_addr == Address::ZERO || candidate_addr == self.address {
+            return Ok(None);
+        }
+
+        if let Some(candidate_pool) = Self::try_init_stable_base_pool_candidate::<N, _>(
+            candidate_addr,
+            block_number,
+            provider.clone(),
+        )
+        .await
+        {
+            return Ok(Some((
+                MetaTopology {
+                    source: MetaDetectionSource::LastCoinIsBasePool,
+                    base_pool_address: candidate_addr,
+                    base_lp_token: Some(candidate_addr),
+                    base_token_index,
+                    underlying_coins: None,
+                },
+                candidate_pool,
+            )));
+        }
+
+        if let Some(base_pool_addr) =
+            Self::probe_lp_token_minter::<N, _>(candidate_addr, block_number, provider.clone())
+                .await
+        {
+            let base_pool_state = Box::pin(
+                CurveLegacyPool::new(base_pool_addr, CurveLegacyPoolType::StableSwap)
+                    .init(block_number, provider.clone()),
+            )
+            .await?;
+            return Ok(Some((
+                MetaTopology {
+                    source: MetaDetectionSource::LpTokenMinter,
+                    base_pool_address: base_pool_addr,
+                    base_lp_token: Some(candidate_addr),
+                    base_token_index,
+                    underlying_coins: None,
+                },
+                base_pool_state,
+            )));
+        }
+
+        if self.pool_type == CurveLegacyPoolType::StableSwap {
+            if let Some(topology) = self
+                .detect_stable_meta_via_registry_fallback::<N, _>(block_number, provider.clone())
+                .await?
+            {
+                let base_pool_state = Box::pin(
+                    CurveLegacyPool::new(
+                        topology.base_pool_address,
+                        CurveLegacyPoolType::StableSwap,
+                    )
+                    .init(block_number, provider.clone()),
+                )
+                .await?;
+                return Ok(Some((topology, base_pool_state)));
+            }
+        }
+
+        Ok(None)
+    }
+
+    async fn apply_meta_topology_state<N, P>(
+        &mut self,
+        topology: MetaTopology,
+        base_pool_state: Self,
+        block_number: BlockId,
+        provider: P,
+    ) -> Result<(), AMMError>
+    where
+        N: Network,
+        P: Provider<N> + Clone,
+    {
+        tracing::debug!(
+            pool = ?self.address,
+            source = ?topology.source,
+            base_pool = ?topology.base_pool_address,
+            base_lp_token = ?topology.base_lp_token,
+            base_token_index = topology.base_token_index,
+            "Applying detected Curve Legacy meta topology"
+        );
+
+        self.attach_base_pool_state::<N, _>(
+            topology.base_pool_address,
+            Some(topology.base_token_index),
+            topology.base_lp_token,
+            base_pool_state,
+            block_number,
+            provider,
+        )
+        .await?;
+
+        if let Some(underlying_coins) = topology.underlying_coins {
+            self.underlying_coins = underlying_coins;
+        }
 
         Ok(())
     }
@@ -2415,7 +2928,24 @@ impl CurveLegacyPool {
             .fee_gamma
             .ok_or(AMMError::Msg("Fee gamma not set".into()))?;
 
-        // 3. Call get_dy (Legacy V2) - now using confirmed state for Dynamic Fee
+        if n == 2 {
+            return math::cryptoswap::get_dy_twocrypto_raw(
+                &xp,
+                amp,
+                gamma,
+                d,
+                i,
+                j,
+                dx_scaled,
+                mid_fee,
+                out_fee,
+                fee_gamma,
+                precisions[j],
+                price_scale[0],
+            );
+        }
+
+        // 3. Call get_dy (Legacy 3-coin CryptoSwap)
         let dy_scaled = math::cryptoswap::get_dy(
             &xp,
             amp,
@@ -2742,6 +3272,38 @@ impl CurveLegacyBaseView {
         let xp_reduced = scale_balances_with_rates(&reduced_balances, &rates)?;
         let d2 = math::stableswap::get_d(&xp_reduced, amp, self.uses_a_precision)?;
         Ok(self.total_supply * d2.saturating_sub(d0) / d0)
+    }
+
+    pub fn simulate_calc_token_amount_one_coin(
+        &self,
+        coin_idx: usize,
+        amount_in: U256,
+    ) -> Result<U256, AMMError> {
+        if coin_idx >= self.balances.len() {
+            return Err(AMMError::Msg("Base view token index out of bounds".into()));
+        }
+        if self.total_supply.is_zero() {
+            return Err(AMMError::Msg("Base view total_supply is zero".into()));
+        }
+
+        let amp = self
+            .amp
+            .ok_or(AMMError::Msg("Base view amp not set".into()))?;
+        let rates = self.rates_or_default()?;
+        let old_balances = self.balances.clone();
+        let mut new_balances = old_balances.clone();
+        new_balances[coin_idx] = new_balances[coin_idx].saturating_add(amount_in);
+
+        let xp_old = scale_balances_with_rates(&old_balances, &rates)?;
+        let xp_new = scale_balances_with_rates(&new_balances, &rates)?;
+        let d0 = math::stableswap::get_d(&xp_old, amp, self.uses_a_precision)?;
+        let d1 = math::stableswap::get_d(&xp_new, amp, self.uses_a_precision)?;
+
+        if d0.is_zero() {
+            return Err(AMMError::Msg("Base view D0 is zero".into()));
+        }
+
+        Ok(self.total_supply * d1.saturating_sub(d0) / d0)
     }
 
     pub fn simulate_remove_liquidity_one_coin(

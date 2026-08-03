@@ -1,8 +1,11 @@
 mod comprehensive;
 mod consistency_smoke;
+mod db_snapshot_matrix;
 mod exact_out;
 mod meta_pool;
 mod meta_pool_fork;
+mod meta_pool_fork_ethereum;
+mod pool_index_ethereum;
 mod quote_parity;
 mod recalculate_precision;
 mod support;

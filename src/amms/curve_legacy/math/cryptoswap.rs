@@ -118,3 +118,54 @@ pub fn get_dy(
 
     Ok(dy_final)
 }
+
+/// Legacy 2-coin CryptoSwap quote path mirrors old `CurveCryptoSwap2ETH.vy::get_dy`:
+/// 1. solve `y` in the scaled xp domain
+/// 2. downscale `dy` back into the token's native decimals
+/// 3. apply dynamic fee on the downscaled `dy`
+///
+/// The fee application order matters for low-decimal outputs like USDC and can
+/// shift the result by 1 wei if fee is applied while still in the scaled domain.
+pub fn get_dy_twocrypto_raw(
+    xp: &[U256],
+    amp: U256,
+    gamma: U256,
+    d: U256,
+    i: usize,
+    j: usize,
+    dx: U256,
+    mid_fee: U256,
+    out_fee: U256,
+    fee_gamma: U256,
+    precision_j: U256,
+    price_scale_0: U256,
+) -> Result<U256, AMMError> {
+    if xp.len() != 2 {
+        return Err(AMMError::Msg(
+            "get_dy_twocrypto_raw requires exactly 2 coins".into(),
+        ));
+    }
+
+    let mut y_cast = xp.to_vec();
+    y_cast[i] += dx;
+
+    let y_out = newton_y(amp, gamma, &y_cast, d, j)?;
+    y_cast[j] = y_out;
+
+    let mut dy = xp[j]
+        .checked_sub(y_out)
+        .ok_or(AMMError::Msg("dy underflow".into()))?;
+    dy = dy.checked_sub(U256::from(1)).unwrap_or(U256::ZERO);
+
+    let precision_const = U256::from(1_000_000_000_000_000_000u64);
+    dy = if j == 0 {
+        dy / precision_j
+    } else {
+        dy * precision_const / (precision_j * price_scale_0)
+    };
+
+    let fee_rate = fee_calc(&y_cast, d, mid_fee, out_fee, fee_gamma)?;
+    let fee_amount = dy * fee_rate / U256::from(10_000_000_000u64);
+
+    Ok(dy - fee_amount)
+}

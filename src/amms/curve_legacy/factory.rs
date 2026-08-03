@@ -87,7 +87,7 @@ impl CurveLegacyFactory {
         amms: Vec<AMM>,
         block: BlockId,
         provider: P,
-    ) -> (Vec<AMM>, u32, u32)
+    ) -> Result<(Vec<AMM>, u32, u32), AMMError>
     where
         N: Network,
         P: Provider<N> + Clone,
@@ -115,22 +115,33 @@ impl CurveLegacyFactory {
             let mut tasks = FuturesUnordered::new();
             for amm in chunk {
                 let provider = provider.clone();
+                let is_curve_legacy = matches!(&amm, AMM::CurveLegacyPool(_));
                 tasks.push(async move {
                     let addr = amm.address();
                     match amm.init(block, provider).await {
                         Ok(initialized) => {
                             tracing::debug!(pool = ?addr, "Successfully initialized Curve Legacy pool");
-                            Some(initialized)
+                            Ok(Some(initialized))
                         }
                         Err(e) => {
-                            tracing::warn!(pool = ?addr, error = %e, "Failed to initialize Curve Legacy pool, skipping");
-                            None
+                            if is_curve_legacy && CurveLegacyPool::is_fatal_init_error(&e) {
+                                tracing::error!(
+                                    pool = ?addr,
+                                    error = %e,
+                                    "Fatal Curve Legacy initialization error"
+                                );
+                                Err(e)
+                            } else {
+                                tracing::warn!(pool = ?addr, error = %e, "Failed to initialize Curve Legacy pool, skipping");
+                                Ok(None)
+                            }
                         }
                     }
                 });
             }
 
             while let Some(result) = tasks.next().await {
+                let result = result?;
                 if let Some(amm) = result {
                     success_count += 1;
                     results.push(amm);
@@ -144,7 +155,7 @@ impl CurveLegacyFactory {
             }
         }
 
-        (results, success_count, fail_count)
+        Ok((results, success_count, fail_count))
     }
 
     fn collect_missing_base_pool_dependencies(
@@ -393,15 +404,20 @@ impl CurveLegacyFactory {
         // NOTE: 当前 Curve Legacy batch init 仍走逐池 init。后续如果恢复 dedicated batch
         // path，Meta/Base 相关初始化字段也必须在 batch path 中完整覆盖，不能丢字段。
         // init() 内部会完整处理：
+        //   - family 分类 (StableSwap / CryptoSwap)
         //   - uint256/int128 双 ABI 兼容
-        //   - Meta/Lending/Plain subtype 检测
+        //   - Meta topology 检测与 base_pool_view 物化
+        //   - Stable subtype 分类 (Meta / Lending / Plain)
         //   - A_precision 版本检测
         //   - stored_rates 获取
         //   - CryptoSwap 参数 (D, gamma, price_scale 等)
+        //
+        // 另外，batch init 还要负责把 MetaPool 依赖的 base pool 作为顶级池补回结果集中，
+        // 这样上层 state-space / graph / execution 才能把 base pool 当作独立一等池同步维护。
 
         let mut known_addresses: HashSet<Address> = amms.iter().map(AMM::address).collect();
         let (mut results, mut success_count, mut fail_count) =
-            Self::init_curve_legacy_amms::<N, _>(amms, block, provider.clone()).await;
+            Self::init_curve_legacy_amms::<N, _>(amms, block, provider.clone()).await?;
 
         let (mut synthesized_deps, fallback_dep_addrs) =
             Self::collect_missing_base_pool_dependencies(&results, &known_addresses);
@@ -423,7 +439,7 @@ impl CurveLegacyFactory {
 
             if !fallback_amms.is_empty() {
                 let (mut fallback_results, dep_success, dep_fail) =
-                    Self::init_curve_legacy_amms::<N, _>(fallback_amms, block, provider).await;
+                    Self::init_curve_legacy_amms::<N, _>(fallback_amms, block, provider).await?;
                 success_count += dep_success;
                 fail_count += dep_fail;
                 results.append(&mut fallback_results);

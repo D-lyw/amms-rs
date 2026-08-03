@@ -238,6 +238,40 @@ async fn run_single_pool_precision_test(pool_spec: &PoolSpec, block: u64) -> eyr
 }
 
 #[tokio::test]
+async fn test_curve_legacy_twocrypto_ldo_usdc_rounding_regression() -> eyre::Result<()> {
+    dotenv::dotenv().ok();
+
+    let rpc_url = std::env::var("ETHEREUM_PROVIDER")?;
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    let block = 25_672_086u64;
+    let block_id = BlockId::from(block);
+    let pool_spec = TEST_POOLS
+        .iter()
+        .find(|pool| pool.name == "Eth-LDO-USDC")
+        .expect("Eth-LDO-USDC spec must exist");
+
+    let pool = CurveLegacyPool::new(pool_spec.address, pool_spec.pool_type)
+        .init(block_id, provider.clone())
+        .await?;
+    let contract = ICurveCryptoPool::new(pool_spec.address, provider);
+    let amount_in = U256::from(10).pow(U256::from(pool_spec.decimals[0] as u64 - 1));
+
+    let local_out = pool.simulate_swap(pool.coins[0], pool.coins[1], amount_in)?;
+    let chain_out = contract
+        .get_dy(U256::ZERO, U256::from(1u8), amount_in)
+        .block(block_id)
+        .call()
+        .await?;
+
+    assert_eq!(
+        local_out, chain_out,
+        "Legacy 2-coin CryptoSwap rounding should match on-chain get_dy exactly"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_curve_legacy_recalculate_precision() -> eyre::Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
