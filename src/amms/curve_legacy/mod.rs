@@ -50,7 +50,8 @@ use crate::amms::{
     error::AMMError,
 };
 pub use types::{
-    CurveLegacyBaseView, CurveLegacyPool, CurveLegacyPoolType, CurveLegacyPoolType::*,
+    CurveLegacyBaseView, CurveLegacyBatchInitContext, CurveLegacyBatchInitHints,
+    CurveLegacyBatchPrefetch, CurveLegacyPool, CurveLegacyPoolType, CurveLegacyPoolType::*,
     CurveLegacySwapRoute, LegacyStableSwapType,
 };
 
@@ -60,6 +61,21 @@ const MULTICALL_ADDRESS: Address = address!("cA11bde05977b3631167028862bE2a17397
 const CURVE_ADDRESS_PROVIDER: Address = address!("0000000022D53366457F9d5E68Ec105046FC4383");
 const ETHEREUM_CHAIN_ID: u64 = 1;
 const CURVE_LEGACY_FATAL_INIT_PREFIX: &str = "curve_legacy_fatal_init:";
+
+#[derive(Debug, Clone, Copy)]
+struct CurveLegacyCachedCryptoParams {
+    d: U256,
+    gamma: U256,
+    mid_fee: U256,
+    out_fee: U256,
+    fee_gamma: U256,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CurveLegacyFamilyClassification {
+    family: CurveLegacyDetectedFamily,
+    cached_crypto: Option<CurveLegacyCachedCryptoParams>,
+}
 
 // Multicall3 Structs and Interface
 sol! {
@@ -1143,87 +1159,97 @@ impl AutomatedMarketMaker for CurveLegacyPool {
         let pool = ICurveLegacyInitPool::new(self.address, provider.clone());
         let pool_int = ICurveLegacyInitPoolInt128::new(self.address, provider.clone());
 
+        if let Some(prefetch) = self.batch_prefetch().cloned() {
+            self.apply_prefetched_common_fields(&prefetch);
+        }
+
         // 1. Fetch Coins, Decimals, Balances
         // Assuming max 8 coins
-        for i in 0..8 {
-            // Try uint256 first, then int128
-            let coin = match pool.coins(U256::from(i)).block(block_number).call().await {
-                Ok(c) => c,
-                Err(_) => match pool_int.coins(i as i128).block(block_number).call().await {
+        if self.coins.is_empty() || self.balances.is_empty() || self.decimals.is_empty() {
+            self.coins.clear();
+            self.balances.clear();
+            self.decimals.clear();
+
+            for i in 0..8 {
+                // Try uint256 first, then int128
+                let coin = match pool.coins(U256::from(i)).block(block_number).call().await {
                     Ok(c) => c,
-                    Err(e) => {
-                        tracing::debug!(
-                            pool = ?self.address,
-                            index = i,
-                            error = %e,
-                            "Stopped fetching coins (likely end of list)"
-                        );
-                        break;
-                    }
-                },
-            };
+                    Err(_) => match pool_int.coins(i as i128).block(block_number).call().await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::debug!(
+                                pool = ?self.address,
+                                index = i,
+                                error = %e,
+                                "Stopped fetching coins (likely end of list)"
+                            );
+                            break;
+                        }
+                    },
+                };
 
-            if coin == Address::ZERO {
-                break;
-            }
+                if coin == Address::ZERO {
+                    break;
+                }
 
-            // Check for duplicates (some pools wrap around or return same coin for out-of-bounds index)
-            if self.coins.contains(&coin) {
-                tracing::debug!(
-                    pool = ?self.address,
-                    coin = ?coin,
-                    "Duplicate coin detected in init loop, stopping"
-                );
-                break;
-            }
-            self.coins.push(coin);
+                // Check for duplicates (some pools wrap around or return same coin for out-of-bounds index)
+                if self.coins.contains(&coin) {
+                    tracing::debug!(
+                        pool = ?self.address,
+                        coin = ?coin,
+                        "Duplicate coin detected in init loop, stopping"
+                    );
+                    break;
+                }
+                self.coins.push(coin);
 
-            // Balance
-            let balance = match pool
-                .balances(U256::from(i))
-                .block(block_number)
-                .call()
-                .await
-            {
-                Ok(b) => b,
-                Err(_) => pool_int
-                    .balances(i as i128)
+                // Balance
+                let balance = match pool
+                    .balances(U256::from(i))
                     .block(block_number)
                     .call()
                     .await
-                    .map_err(|e| {
-                        tracing::error!(
-                            pool = ?self.address,
-                            coin_index = i,
-                            error = %e,
-                            "Failed to fetch balance"
-                        );
-                        AMMError::SyncError(self.address)
-                    })?,
-            };
-            self.balances.push(balance);
+                {
+                    Ok(b) => b,
+                    Err(_) => pool_int
+                        .balances(i as i128)
+                        .block(block_number)
+                        .call()
+                        .await
+                        .map_err(|e| {
+                            tracing::error!(
+                                pool = ?self.address,
+                                coin_index = i,
+                                error = %e,
+                                "Failed to fetch balance"
+                            );
+                            AMMError::SyncError(self.address)
+                        })?,
+                };
+                self.balances.push(balance);
 
-            // Decimals
-            let decimals = if coin == Address::repeat_byte(0xee) {
-                18
-            } else {
-                let token = crate::amms::IERC20::new(coin, provider.clone());
-                token
-                    .decimals()
-                    .block(block_number)
-                    .call()
-                    .await
-                    .map_err(|e| {
-                        tracing::error!(
-                            pool = ?self.address,
-                            coin = ?coin,
-                            error = %e,
-                            "Failed to fetch decimals"
-                        );
-                        AMMError::SyncError(self.address)
-                    })?
-            };
-            self.decimals.push(decimals);
+                // Decimals
+                let decimals = if coin == Address::repeat_byte(0xee) {
+                    18
+                } else {
+                    let token = crate::amms::IERC20::new(coin, provider.clone());
+                    token
+                        .decimals()
+                        .block(block_number)
+                        .call()
+                        .await
+                        .map_err(|e| {
+                            tracing::error!(
+                                pool = ?self.address,
+                                coin = ?coin,
+                                error = %e,
+                                "Failed to fetch decimals"
+                            );
+                            AMMError::SyncError(self.address)
+                        })?
+                };
+                self.decimals.push(decimals);
+            }
         }
 
         self.n_coins = self.coins.len() as u8;
@@ -1234,9 +1260,12 @@ impl AutomatedMarketMaker for CurveLegacyPool {
         // 新版池子 (Vyper 0.3.x) 有 A_precise() 方法，返回 A * 100
         // 旧版池子 (Vyper 0.2.x) 没有此方法
         // 检测方法：尝试调用 A_precise()，如果成功且返回值是 A() * 100，则是新版
-        if let Ok(amp) = pool.A().block(block_number).call().await {
-            self.amp = Some(amp);
-
+        if self.amp.is_none() || self.amp == Some(U256::ZERO) {
+            if let Ok(amp) = pool.A().block(block_number).call().await {
+                self.amp = Some(amp);
+            }
+        }
+        if let Some(amp) = self.amp {
             // 尝试调用 A_precise 检测版本
             if let Ok(amp_precise) = pool.A_precise().block(block_number).call().await {
                 // 新版池子: A_precise() = A() * 100
@@ -1278,10 +1307,17 @@ impl AutomatedMarketMaker for CurveLegacyPool {
         let detected_family = self
             .classify_pool_family::<N, _>(block_number, provider.clone())
             .await?;
-        self.pool_type = match detected_family {
+        self.pool_type = match detected_family.family {
             CurveLegacyDetectedFamily::StableSwap => CurveLegacyPoolType::StableSwap,
             CurveLegacyDetectedFamily::CryptoSwap => CurveLegacyPoolType::CryptoSwap,
         };
+        if let Some(cached_crypto) = detected_family.cached_crypto {
+            self.d = Some(cached_crypto.d);
+            self.gamma = Some(cached_crypto.gamma);
+            self.mid_fee = Some(cached_crypto.mid_fee);
+            self.out_fee = Some(cached_crypto.out_fee);
+            self.fee_gamma = Some(cached_crypto.fee_gamma);
+        }
 
         // === Meta / Underlying Detection ===
         self.load_underlying_coin_probes::<N, _>(block_number, provider.clone())
@@ -1462,114 +1498,130 @@ impl AutomatedMarketMaker for CurveLegacyPool {
         // 这些参数缺失会导致 simulate_cryptoswap 中 divide by zero
         if self.pool_type == CryptoSwap {
             // D 值 - 必须成功获取
-            match pool.D().block(block_number).call().await {
-                Ok(d) => {
-                    if d == U256::ZERO {
-                        tracing::warn!(
-                            pool = ?self.address,
-                            "CryptoSwap pool D() returned zero, pool may be empty or invalid"
-                        );
+            if self.d.is_none() {
+                match pool.D().block(block_number).call().await {
+                    Ok(d) => {
+                        self.d = Some(d);
                     }
-                    self.d = Some(d);
+                    Err(e) => {
+                        tracing::error!(
+                            pool = ?self.address,
+                            error = %e,
+                            "CryptoSwap pool failed to fetch D(), cannot initialize"
+                        );
+                        return Err(AMMError::Msg(format!(
+                            "CryptoSwap pool {:?} failed to fetch D(): {}",
+                            self.address, e
+                        )));
+                    }
                 }
-                Err(e) => {
-                    tracing::error!(
-                        pool = ?self.address,
-                        error = %e,
-                        "CryptoSwap pool failed to fetch D(), cannot initialize"
-                    );
-                    return Err(AMMError::Msg(format!(
-                        "CryptoSwap pool {:?} failed to fetch D(): {}",
-                        self.address, e
-                    )));
-                }
+            }
+            if self.d == Some(U256::ZERO) {
+                tracing::warn!(
+                    pool = ?self.address,
+                    "CryptoSwap pool D() returned zero, pool may be empty or invalid"
+                );
             }
 
             // gamma 值 - 必须成功获取
-            match pool.gamma().block(block_number).call().await {
-                Ok(gamma) => {
-                    if gamma == U256::ZERO {
+            if self.gamma.is_none() {
+                match pool.gamma().block(block_number).call().await {
+                    Ok(gamma) => {
+                        self.gamma = Some(gamma);
+                    }
+                    Err(e) => {
                         tracing::error!(
                             pool = ?self.address,
-                            "CryptoSwap pool gamma() returned zero, this will cause divide by zero"
+                            error = %e,
+                            "CryptoSwap pool failed to fetch gamma(), cannot initialize"
                         );
                         return Err(AMMError::Msg(format!(
-                            "CryptoSwap pool {:?} has gamma=0, cannot initialize",
-                            self.address
+                            "CryptoSwap pool {:?} failed to fetch gamma(): {}",
+                            self.address, e
                         )));
                     }
-                    self.gamma = Some(gamma);
                 }
-                Err(e) => {
-                    tracing::error!(
-                        pool = ?self.address,
-                        error = %e,
-                        "CryptoSwap pool failed to fetch gamma(), cannot initialize"
-                    );
-                    return Err(AMMError::Msg(format!(
-                        "CryptoSwap pool {:?} failed to fetch gamma(): {}",
-                        self.address, e
-                    )));
-                }
+            }
+            if self.gamma == Some(U256::ZERO) {
+                tracing::error!(
+                    pool = ?self.address,
+                    "CryptoSwap pool gamma() returned zero, this will cause divide by zero"
+                );
+                return Err(AMMError::Msg(format!(
+                    "CryptoSwap pool {:?} has gamma=0, cannot initialize",
+                    self.address
+                )));
             }
 
             // mid_fee - 必须成功获取
-            match pool.mid_fee().block(block_number).call().await {
-                Ok(v) => self.mid_fee = Some(v),
-                Err(e) => {
-                    tracing::error!(
-                        pool = ?self.address,
-                        error = %e,
-                        "CryptoSwap pool failed to fetch mid_fee()"
-                    );
-                    return Err(AMMError::Msg(format!(
-                        "CryptoSwap pool {:?} failed to fetch mid_fee(): {}",
-                        self.address, e
-                    )));
+            if self.mid_fee.is_none() {
+                match pool.mid_fee().block(block_number).call().await {
+                    Ok(v) => self.mid_fee = Some(v),
+                    Err(e) => {
+                        tracing::error!(
+                            pool = ?self.address,
+                            error = %e,
+                            "CryptoSwap pool failed to fetch mid_fee()"
+                        );
+                        return Err(AMMError::Msg(format!(
+                            "CryptoSwap pool {:?} failed to fetch mid_fee(): {}",
+                            self.address, e
+                        )));
+                    }
                 }
             }
 
             // out_fee - 必须成功获取
-            match pool.out_fee().block(block_number).call().await {
-                Ok(v) => self.out_fee = Some(v),
-                Err(e) => {
-                    tracing::error!(
-                        pool = ?self.address,
-                        error = %e,
-                        "CryptoSwap pool failed to fetch out_fee()"
-                    );
-                    return Err(AMMError::Msg(format!(
-                        "CryptoSwap pool {:?} failed to fetch out_fee(): {}",
-                        self.address, e
-                    )));
+            if self.out_fee.is_none() {
+                match pool.out_fee().block(block_number).call().await {
+                    Ok(v) => self.out_fee = Some(v),
+                    Err(e) => {
+                        tracing::error!(
+                            pool = ?self.address,
+                            error = %e,
+                            "CryptoSwap pool failed to fetch out_fee()"
+                        );
+                        return Err(AMMError::Msg(format!(
+                            "CryptoSwap pool {:?} failed to fetch out_fee(): {}",
+                            self.address, e
+                        )));
+                    }
                 }
             }
 
             // fee_gamma - 必须成功获取
-            match pool.fee_gamma().block(block_number).call().await {
-                Ok(v) => self.fee_gamma = Some(v),
-                Err(e) => {
-                    tracing::error!(
-                        pool = ?self.address,
-                        error = %e,
-                        "CryptoSwap pool failed to fetch fee_gamma()"
-                    );
-                    return Err(AMMError::Msg(format!(
-                        "CryptoSwap pool {:?} failed to fetch fee_gamma(): {}",
-                        self.address, e
-                    )));
+            if self.fee_gamma.is_none() {
+                match pool.fee_gamma().block(block_number).call().await {
+                    Ok(v) => self.fee_gamma = Some(v),
+                    Err(e) => {
+                        tracing::error!(
+                            pool = ?self.address,
+                            error = %e,
+                            "CryptoSwap pool failed to fetch fee_gamma()"
+                        );
+                        return Err(AMMError::Msg(format!(
+                            "CryptoSwap pool {:?} failed to fetch fee_gamma(): {}",
+                            self.address, e
+                        )));
+                    }
                 }
             }
 
             // 以下参数可选，静默忽略错误
-            if let Ok(v) = pool.allowed_extra_profit().block(block_number).call().await {
-                self.allowed_extra_profit = Some(v);
+            if self.allowed_extra_profit.is_none() {
+                if let Ok(v) = pool.allowed_extra_profit().block(block_number).call().await {
+                    self.allowed_extra_profit = Some(v);
+                }
             }
-            if let Ok(v) = pool.adjustment_step().block(block_number).call().await {
-                self.adjustment_step = Some(v);
+            if self.adjustment_step.is_none() {
+                if let Ok(v) = pool.adjustment_step().block(block_number).call().await {
+                    self.adjustment_step = Some(v);
+                }
             }
-            if let Ok(v) = pool.ma_half_time().block(block_number).call().await {
-                self.ma_half_time = Some(v);
+            if self.ma_half_time.is_none() {
+                if let Ok(v) = pool.ma_half_time().block(block_number).call().await {
+                    self.ma_half_time = Some(v);
+                }
             }
 
             // Fetch price_scale
@@ -1578,16 +1630,18 @@ impl AutomatedMarketMaker for CurveLegacyPool {
             // - Three-coin pools: price_scale(uint256 i) returns price at index i
 
             // Try price_scale() without arguments first (two-coin pools)
-            let pool_ps_no_args =
-                ICurveLegacyPoolPriceScaleNoArgs::new(self.address, provider.clone());
-            if let Ok(ps) = pool_ps_no_args
-                .price_scale()
-                .block(block_number)
-                .call()
-                .await
-            {
-                self.price_scale = Some(vec![ps]);
-                tracing::debug!(pool = ?self.address, ps = ?ps, "Got price_scale() (no args)");
+            if self.price_scale.is_none() {
+                let pool_ps_no_args =
+                    ICurveLegacyPoolPriceScaleNoArgs::new(self.address, provider.clone());
+                if let Ok(ps) = pool_ps_no_args
+                    .price_scale()
+                    .block(block_number)
+                    .call()
+                    .await
+                {
+                    self.price_scale = Some(vec![ps]);
+                    tracing::debug!(pool = ?self.address, ps = ?ps, "Got price_scale() (no args)");
+                }
             }
 
             // If price_scale() didn't work, try price_scale(uint256) (three-coin pools like Tricrypto2)
@@ -1611,6 +1665,7 @@ impl AutomatedMarketMaker for CurveLegacyPool {
 
         self.last_synced_block = block_number.as_u64().unwrap_or(0);
         self.update_spot_prices();
+        self.batch_init_hints = None;
         Ok(self)
     }
 
@@ -1961,6 +2016,89 @@ impl CurveLegacyPool {
         }))
     }
 
+    fn batch_init_context(&self) -> Option<&CurveLegacyBatchInitContext> {
+        self.batch_init_hints.as_ref().map(|hints| &hints.context)
+    }
+
+    fn batch_prefetch(&self) -> Option<&CurveLegacyBatchPrefetch> {
+        self.batch_init_hints
+            .as_ref()
+            .and_then(|hints| hints.prefetch.as_ref())
+    }
+
+    fn apply_prefetched_common_fields(&mut self, prefetch: &CurveLegacyBatchPrefetch) {
+        if !prefetch.has_common_fields() {
+            return;
+        }
+
+        self.n_coins = prefetch.n_coins;
+        self.coins = prefetch.coins.clone();
+        self.balances = prefetch.balances.clone();
+        self.decimals = prefetch.decimals.clone();
+
+        if let Some(amp) = prefetch.amp.filter(|amp| *amp != U256::ZERO) {
+            self.amp = Some(amp);
+        }
+        if let Some(fee) = prefetch.fee {
+            self.fee = fee;
+        }
+        if let Some(admin_fee) = prefetch.admin_fee {
+            self.admin_fee = admin_fee;
+        }
+        if prefetch.has_complete_rates() {
+            self.rates = prefetch.rates.clone();
+        }
+        if prefetch.has_complete_crypto_params() {
+            self.d = prefetch.d;
+            self.gamma = prefetch.gamma;
+            self.mid_fee = prefetch.mid_fee;
+            self.out_fee = prefetch.out_fee;
+            self.fee_gamma = prefetch.fee_gamma;
+        }
+        if let Some(v) = prefetch.allowed_extra_profit {
+            self.allowed_extra_profit = Some(v);
+        }
+        if let Some(v) = prefetch.adjustment_step {
+            self.adjustment_step = Some(v);
+        }
+        if let Some(v) = prefetch.ma_half_time {
+            self.ma_half_time = Some(v);
+        }
+        if let Some(price_scale) = prefetch.price_scale.as_ref().filter(|v| !v.is_empty()) {
+            self.price_scale = Some(price_scale.clone());
+        }
+    }
+
+    fn seed_curve_legacy_pool_from_batch_context(
+        &self,
+        address: Address,
+        pool_type: CurveLegacyPoolType,
+    ) -> Self {
+        let mut pool = CurveLegacyPool::new(address, pool_type);
+        if let Some(context) = self.batch_init_context().cloned() {
+            let prefetch = context.get_prefetch(address);
+            pool.batch_init_hints = Some(CurveLegacyBatchInitHints { context, prefetch });
+        }
+        pool
+    }
+
+    fn should_try_stable_meta_registry_fallback(&self) -> bool {
+        if self.pool_type != CurveLegacyPoolType::StableSwap || self.is_meta_pool() {
+            return false;
+        }
+
+        let Some(&last_coin) = self.coins.last() else {
+            return false;
+        };
+        if last_coin == Address::ZERO || last_coin == self.address {
+            return false;
+        }
+
+        self.underlying_coins.is_empty()
+            || (self.underlying_coins.len() == self.coins.len()
+                && self.underlying_coins == self.coins)
+    }
+
     /// Determine whether the pool should be treated as Legacy StableSwap or Legacy CryptoSwap.
     ///
     /// We intentionally do *not* trust the constructor's `pool_type` hint here because
@@ -1977,11 +2115,26 @@ impl CurveLegacyPool {
         &self,
         block_number: BlockId,
         provider: P,
-    ) -> Result<CurveLegacyDetectedFamily, AMMError>
+    ) -> Result<CurveLegacyFamilyClassification, AMMError>
     where
         N: Network,
         P: Provider<N> + Clone,
     {
+        if let Some(prefetch) = self.batch_prefetch() {
+            if prefetch.has_complete_crypto_params() {
+                return Ok(CurveLegacyFamilyClassification {
+                    family: CurveLegacyDetectedFamily::CryptoSwap,
+                    cached_crypto: Some(CurveLegacyCachedCryptoParams {
+                        d: prefetch.d.expect("prefetch checked"),
+                        gamma: prefetch.gamma.expect("prefetch checked"),
+                        mid_fee: prefetch.mid_fee.expect("prefetch checked"),
+                        out_fee: prefetch.out_fee.expect("prefetch checked"),
+                        fee_gamma: prefetch.fee_gamma.expect("prefetch checked"),
+                    }),
+                });
+            }
+        }
+
         let pool = ICurveLegacyInitPool::new(self.address, provider);
         let gamma = pool.gamma().block(block_number).call().await.ok();
         let d = pool.D().block(block_number).call().await.ok();
@@ -2001,7 +2154,16 @@ impl CurveLegacyPool {
         .count();
 
         if crypto_capability_count == 5 {
-            return Ok(CurveLegacyDetectedFamily::CryptoSwap);
+            return Ok(CurveLegacyFamilyClassification {
+                family: CurveLegacyDetectedFamily::CryptoSwap,
+                cached_crypto: Some(CurveLegacyCachedCryptoParams {
+                    d: d.expect("count checked"),
+                    gamma: gamma.expect("count checked"),
+                    mid_fee: mid_fee.expect("count checked"),
+                    out_fee: out_fee.expect("count checked"),
+                    fee_gamma: fee_gamma.expect("count checked"),
+                }),
+            });
         }
 
         if crypto_capability_count > 0 {
@@ -2017,7 +2179,10 @@ impl CurveLegacyPool {
         }
 
         if self.amp.is_some() {
-            return Ok(CurveLegacyDetectedFamily::StableSwap);
+            return Ok(CurveLegacyFamilyClassification {
+                family: CurveLegacyDetectedFamily::StableSwap,
+                cached_crypto: None,
+            });
         }
 
         Err(Self::fatal_init_error(format!(
@@ -2212,12 +2377,21 @@ impl CurveLegacyPool {
             return Ok(None);
         };
 
-        let chain_id = provider.get_chain_id().await.map_err(|e| {
-            Self::fatal_init_error(format!(
-                "pool {:?}: failed to read chain id before StableMeta registry fallback: {}",
-                self.address, e
-            ))
-        })?;
+        let chain_id = if let Some(context) = self.batch_init_context() {
+            context.chain_id.ok_or_else(|| {
+                Self::fatal_init_error(format!(
+                    "pool {:?}: batch init context missing chain id before StableMeta registry fallback",
+                    self.address
+                ))
+            })?
+        } else {
+            provider.get_chain_id().await.map_err(|e| {
+                Self::fatal_init_error(format!(
+                    "pool {:?}: failed to read chain id before StableMeta registry fallback: {}",
+                    self.address, e
+                ))
+            })?
+        };
         if chain_id != ETHEREUM_CHAIN_ID {
             return Ok(None);
         }
@@ -2227,19 +2401,44 @@ impl CurveLegacyPool {
             return Ok(None);
         }
 
-        let address_provider =
-            ICurveAddressProviderProbe::new(CURVE_ADDRESS_PROVIDER, provider.clone());
-        let registry_addr = address_provider
-            .get_registry()
-            .block(block_number)
-            .call()
-            .await
-            .map_err(|e| {
-                Self::fatal_init_error(format!(
-                    "pool {:?}: Curve AddressProvider {:?} get_registry() failed during StableMeta fallback: {}",
-                    self.address, CURVE_ADDRESS_PROVIDER, e
-                ))
-            })?;
+        let registry_addr = if let Some(context) = self.batch_init_context() {
+            let registry_result = context
+                .ethereum_main_registry
+                .get_or_init(|| async {
+                    let address_provider =
+                        ICurveAddressProviderProbe::new(CURVE_ADDRESS_PROVIDER, provider.clone());
+                    address_provider
+                        .get_registry()
+                        .block(block_number)
+                        .call()
+                        .await
+                        .map_err(|e| e.to_string())
+                })
+                .await;
+            match registry_result {
+                Ok(addr) => *addr,
+                Err(err) => {
+                    return Err(Self::fatal_init_error(format!(
+                        "pool {:?}: Curve AddressProvider {:?} get_registry() failed during StableMeta fallback: {}",
+                        self.address, CURVE_ADDRESS_PROVIDER, err
+                    )));
+                }
+            }
+        } else {
+            let address_provider =
+                ICurveAddressProviderProbe::new(CURVE_ADDRESS_PROVIDER, provider.clone());
+            address_provider
+                .get_registry()
+                .block(block_number)
+                .call()
+                .await
+                .map_err(|e| {
+                    Self::fatal_init_error(format!(
+                        "pool {:?}: Curve AddressProvider {:?} get_registry() failed during StableMeta fallback: {}",
+                        self.address, CURVE_ADDRESS_PROVIDER, e
+                    ))
+                })?
+        };
         if registry_addr == Address::ZERO {
             return Err(Self::fatal_init_error(format!(
                 "pool {:?}: Curve AddressProvider {:?} returned zero registry during StableMeta fallback",
@@ -2352,7 +2551,7 @@ impl CurveLegacyPool {
     }
 
     async fn try_init_stable_base_pool_candidate<N, P>(
-        candidate_addr: Address,
+        candidate_pool: Self,
         block_number: BlockId,
         provider: P,
     ) -> Option<Self>
@@ -2360,12 +2559,9 @@ impl CurveLegacyPool {
         N: Network,
         P: Provider<N> + Clone,
     {
-        let candidate_result = Box::pin(
-            CurveLegacyPool::new(candidate_addr, CurveLegacyPoolType::StableSwap)
-                .init(block_number, provider),
-        )
-        .await
-        .ok()?;
+        let candidate_result = Box::pin(candidate_pool.init(block_number, provider))
+            .await
+            .ok()?;
 
         if candidate_result.pool_type != CurveLegacyPoolType::StableSwap
             || candidate_result.n_coins == 0
@@ -2499,7 +2695,10 @@ impl CurveLegacyPool {
             .await
         {
             let base_pool_state = Box::pin(
-                CurveLegacyPool::new(base_pool_addr, CurveLegacyPoolType::StableSwap)
+                self.seed_curve_legacy_pool_from_batch_context(
+                    base_pool_addr,
+                    CurveLegacyPoolType::StableSwap,
+                )
                     .init(block_number, provider.clone()),
             )
             .await?;
@@ -2524,7 +2723,10 @@ impl CurveLegacyPool {
         }
 
         if let Some(candidate_pool) = Self::try_init_stable_base_pool_candidate::<N, _>(
-            candidate_addr,
+            self.seed_curve_legacy_pool_from_batch_context(
+                candidate_addr,
+                CurveLegacyPoolType::StableSwap,
+            ),
             block_number,
             provider.clone(),
         )
@@ -2547,7 +2749,10 @@ impl CurveLegacyPool {
                 .await
         {
             let base_pool_state = Box::pin(
-                CurveLegacyPool::new(base_pool_addr, CurveLegacyPoolType::StableSwap)
+                self.seed_curve_legacy_pool_from_batch_context(
+                    base_pool_addr,
+                    CurveLegacyPoolType::StableSwap,
+                )
                     .init(block_number, provider.clone()),
             )
             .await?;
@@ -2563,13 +2768,13 @@ impl CurveLegacyPool {
             )));
         }
 
-        if self.pool_type == CurveLegacyPoolType::StableSwap {
+        if self.should_try_stable_meta_registry_fallback() {
             if let Some(topology) = self
                 .detect_stable_meta_via_registry_fallback::<N, _>(block_number, provider.clone())
                 .await?
             {
                 let base_pool_state = Box::pin(
-                    CurveLegacyPool::new(
+                    self.seed_curve_legacy_pool_from_batch_context(
                         topology.base_pool_address,
                         CurveLegacyPoolType::StableSwap,
                     )

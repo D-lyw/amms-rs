@@ -1,9 +1,12 @@
 //! Curve Legacy Factory
 //!
 //! 通过 Curve AddressProvider 和 Registry 发现 Legacy 池子。
-//! 使用并发 init() 调用初始化池子数据 (不使用 Solidity 批量合约，原因见 init_batch 文档注释)。
+//! 批量预取可安全复用的公共字段，再保留逐池 `init()` 完成完整的类型识别与 Meta 拓扑初始化。
 
-use super::types::{CurveLegacyPool, CurveLegacyPoolType};
+use super::types::{
+    CurveLegacyBatchInitContext, CurveLegacyBatchInitHints, CurveLegacyBatchPrefetch,
+    CurveLegacyPool, CurveLegacyPoolType,
+};
 use crate::amms::amm::{AutomatedMarketMaker, AMM};
 use crate::amms::error::AMMError;
 use crate::amms::factory::{AutomatedMarketMakerFactory, DiscoverySync};
@@ -14,6 +17,7 @@ use alloy::{
     providers::Provider,
     rpc::types::eth::Log,
     sol,
+    sol_types::SolValue,
 };
 use futures::{stream::FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -21,6 +25,9 @@ use std::collections::HashSet;
 
 const CURVE_LEGACY_INIT_CHUNK_SIZE: usize = 6;
 const CURVE_LEGACY_INTER_CHUNK_SLEEP_MS: u64 = 600;
+const CURVE_LEGACY_PREFETCH_STEP: usize = 6;
+const CURVE_LEGACY_PREFETCH_SLEEP_MS: u64 = 200;
+const ETHEREUM_CHAIN_ID: u64 = 1;
 
 sol! {
     #[sol(rpc)]
@@ -76,6 +83,8 @@ sol!(
     "src/amms/abi/GetCurveLegacyPoolDataBatchRequest.json"
 );
 
+use GetCurveLegacyPoolDataBatchRequest::PoolInput;
+
 // 从 JSON 生成的模块导入 PoolInput 类型
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Hash, PartialEq, Eq)]
@@ -86,15 +95,219 @@ pub struct CurveLegacyFactory {
 }
 
 impl CurveLegacyFactory {
-    async fn init_curve_legacy_amms<N, P>(
-        amms: Vec<AMM>,
+    fn pool_type_to_u8(pool_type: CurveLegacyPoolType) -> u8 {
+        match pool_type {
+            CurveLegacyPoolType::StableSwap => 0,
+            CurveLegacyPoolType::CryptoSwap => 1,
+        }
+    }
+
+    async fn resolve_batch_init_context<N, P>(provider: P) -> Result<CurveLegacyBatchInitContext, AMMError>
+    where
+        N: Network,
+        P: Provider<N> + Clone,
+    {
+        let chain_id = provider
+            .get_chain_id()
+            .await
+            .map_err(|e| AMMError::Msg(format!("Curve Legacy batch init failed to read chain id: {}", e)))?;
+        let context = CurveLegacyBatchInitContext::new(Some(chain_id));
+
+        if chain_id != ETHEREUM_CHAIN_ID {
+            return Ok(context);
+        }
+
+        Ok(context)
+    }
+
+    fn pool_data_to_prefetch(data: &PoolData) -> CurveLegacyBatchPrefetch {
+        let price_scale = if data.priceScale.is_empty() {
+            None
+        } else {
+            Some(data.priceScale.clone())
+        };
+
+        CurveLegacyBatchPrefetch {
+            n_coins: data.nCoins,
+            coins: data.coins.clone(),
+            balances: data.balances.clone(),
+            decimals: data.decimals.clone(),
+            amp: (data.amp != U256::ZERO).then_some(data.amp),
+            fee: Some(data.fee),
+            admin_fee: Some(data.adminFee),
+            rates: data
+                .rates
+                .iter()
+                .copied()
+                .filter(|rate| *rate != U256::ZERO)
+                .collect(),
+            d: (data.d != U256::ZERO).then_some(data.d),
+            gamma: (data.gamma != U256::ZERO).then_some(data.gamma),
+            mid_fee: (data.midFee != U256::ZERO).then_some(data.midFee),
+            out_fee: (data.outFee != U256::ZERO).then_some(data.outFee),
+            fee_gamma: (data.feeGamma != U256::ZERO).then_some(data.feeGamma),
+            allowed_extra_profit: (data.allowedExtraProfit != U256::ZERO)
+                .then_some(data.allowedExtraProfit),
+            adjustment_step: (data.adjustmentStep != U256::ZERO).then_some(data.adjustmentStep),
+            ma_half_time: (data.maHalfTime != U256::ZERO).then_some(data.maHalfTime),
+            price_scale,
+        }
+    }
+
+    fn attach_batch_context(amms: &mut [AMM], context: &CurveLegacyBatchInitContext) {
+        for amm in amms {
+            if let AMM::CurveLegacyPool(pool) = amm {
+                pool.batch_init_hints = Some(CurveLegacyBatchInitHints {
+                    context: context.clone(),
+                    prefetch: context.get_prefetch(pool.address),
+                });
+            }
+        }
+    }
+
+    fn apply_prefetch_to_pool(
+        pool: &mut CurveLegacyPool,
+        context: &CurveLegacyBatchInitContext,
+        prefetch: CurveLegacyBatchPrefetch,
+    ) {
+        context.insert_prefetch(pool.address, prefetch.clone());
+        pool.batch_init_hints = Some(CurveLegacyBatchInitHints {
+            context: context.clone(),
+            prefetch: Some(prefetch),
+        });
+    }
+
+    async fn prefetch_curve_legacy_pool_data<N, P>(
+        amms: &mut [AMM],
         block: BlockId,
         provider: P,
+        context: &CurveLegacyBatchInitContext,
+    ) -> Result<(), AMMError>
+    where
+        N: Network,
+        P: Provider<N> + Clone,
+    {
+        Self::attach_batch_context(amms, context);
+
+        let indexed_inputs = amms
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, amm)| match amm {
+                AMM::CurveLegacyPool(pool) => Some((
+                    idx,
+                    PoolInput {
+                        pool: pool.address,
+                        poolType: Self::pool_type_to_u8(pool.pool_type),
+                    },
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        for chunk in indexed_inputs.chunks(CURVE_LEGACY_PREFETCH_STEP) {
+            let mut inputs = Vec::with_capacity(chunk.len());
+            for (_, input) in chunk.iter() {
+                inputs.push(input.clone());
+            }
+            let deployer = GetCurveLegacyPoolDataBatchRequest::deploy_builder(provider.clone(), inputs);
+
+            let chunk_failed = match deployer.call_raw().block(block).await {
+                Ok(res) => match <Vec<PoolData> as SolValue>::abi_decode(&res) {
+                    Ok(pool_data_list) if pool_data_list.len() == chunk.len() => {
+                        for ((idx, _), data) in chunk.iter().zip(pool_data_list.iter()) {
+                            if let Some(AMM::CurveLegacyPool(pool)) = amms.get_mut(*idx) {
+                                Self::apply_prefetch_to_pool(
+                                    pool,
+                                    context,
+                                    Self::pool_data_to_prefetch(data),
+                                );
+                            }
+                        }
+                        false
+                    }
+                    Ok(pool_data_list) => {
+                        tracing::warn!(
+                            target: "amms::curve_legacy::init_batch",
+                            expected = chunk.len(),
+                            actual = pool_data_list.len(),
+                            "Curve Legacy batch prefetch returned mismatched pool count; retrying individually"
+                        );
+                        true
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "amms::curve_legacy::init_batch",
+                            error = %e,
+                            "Curve Legacy batch prefetch decode failed; retrying individually"
+                        );
+                        true
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        target: "amms::curve_legacy::init_batch",
+                        error = %e,
+                        "Curve Legacy batch prefetch RPC failed; retrying individually"
+                    );
+                    true
+                }
+            };
+
+            if chunk_failed {
+                for (idx, input) in chunk {
+                    let deployer = GetCurveLegacyPoolDataBatchRequest::deploy_builder(
+                        provider.clone(),
+                        vec![input.clone()],
+                    );
+                    match deployer.call_raw().block(block).await {
+                        Ok(res) => {
+                            if let Ok(pool_data_list) = <Vec<PoolData> as SolValue>::abi_decode(&res) {
+                                if let Some(data) = pool_data_list.first() {
+                                    if let Some(AMM::CurveLegacyPool(pool)) = amms.get_mut(*idx) {
+                                        Self::apply_prefetch_to_pool(
+                                            pool,
+                                            context,
+                                            Self::pool_data_to_prefetch(data),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "amms::curve_legacy::init_batch",
+                                pool = ?input.pool,
+                                error = %e,
+                                "Curve Legacy individual prefetch failed; pool will fall back to full init() RPC path"
+                            );
+                        }
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                }
+            }
+
+            tokio::time::sleep(tokio::time::Duration::from_millis(
+                CURVE_LEGACY_PREFETCH_SLEEP_MS,
+            ))
+            .await;
+        }
+
+        Ok(())
+    }
+
+    async fn init_curve_legacy_amms<N, P>(
+        mut amms: Vec<AMM>,
+        block: BlockId,
+        provider: P,
+        context: &CurveLegacyBatchInitContext,
     ) -> Result<(Vec<AMM>, u32, u32), AMMError>
     where
         N: Network,
         P: Provider<N> + Clone,
     {
+        Self::prefetch_curve_legacy_pool_data::<N, _>(&mut amms, block, provider.clone(), context)
+            .await?;
+
         let mut chunks = Vec::new();
         let mut current_chunk = Vec::with_capacity(CURVE_LEGACY_INIT_CHUNK_SIZE);
         for amm in amms {
@@ -371,10 +584,10 @@ impl CurveLegacyFactory {
 
     /// 批量初始化池子
     ///
-    /// # 设计说明：为什么不使用 Solidity 批量合约
+    /// # 设计说明：为什么不是“纯 Solidity 全量批量初始化”
     ///
     /// 与 UniswapV2/V3 等标准化协议不同，Curve Legacy 池存在大量非标行为，
-    /// 使得 Solidity 批量合约不可靠：
+    /// 使得“把完整初始化逻辑全部塞进一个 Solidity 批量合约”并不可靠：
     ///
     /// 1. **调用隔离问题**：Solidity 构造函数中所有外部调用共享 gas 上下文，
     ///    部分老 Vyper 池的 `coins()` 使用 `assert` 做边界检查，失败时消耗全部
@@ -384,12 +597,17 @@ impl CurveLegacyFactory {
     ///    无法获取 `base_pool`, `virtual_price`, `lp_token`, `underlying_coins` 等
     ///    Metapool/Lending 池必需的字段，导致这些池无法正确模拟 swap。
     ///
-    /// 3. **int128 接口 fallback 不完整**：Solidity 合约仅对 StableSwap 尝试 int128
-    ///    fallback，CryptoSwap 池缺失此路径。
+    /// 3. **int128 接口 fallback 不完整**：完整初始化需要按池子能力做 uint256/int128、
+    ///    Stable/Crypto、Meta/base-pool 递归探测，纯批量合约难以优雅覆盖这套分支。
     ///
-    /// 因此，对于 CurveLegacy（通常只有 ~12 个池），直接并发调用 Rust `init()` 方法，
-    /// 每个池使用独立的 RPC `eth_call`（各自有完整的 30M gas 额度），
-    /// 既能处理所有非标边界情况，性能开销也完全可接受。
+    /// 因此当前实现采用混合策略：
+    ///
+    /// 1. 先用 Solidity batch 合约预取 `coins/balances/decimals/A/fee` 以及可直接拿到的
+    ///    Crypto 参数，尽量压缩重复 RPC。
+    /// 2. 再保留 Rust 逐池 `init()` 作为唯一完整初始化路径，负责 family 分类、
+    ///    Meta 检测、StableMeta registry fallback、base-pool 递归初始化等复杂逻辑。
+    ///
+    /// 这样既能减少生产环境的 RPC 压力，又不牺牲 Curve Legacy 各类老池子的兼容性。
     pub async fn init_batch<N, P>(
         amms: Vec<AMM>,
         block: BlockId,
@@ -405,7 +623,7 @@ impl CurveLegacyFactory {
 
         let total = amms.len();
         tracing::info!(
-            "Initializing {} Curve Legacy pools via individual init...",
+            "Initializing {} Curve Legacy pools via batch-prefetch + per-pool init...",
             total
         );
 
@@ -424,9 +642,16 @@ impl CurveLegacyFactory {
         // 另外，batch init 还要负责把 MetaPool 依赖的 base pool 作为顶级池补回结果集中，
         // 这样上层 state-space / graph / execution 才能把 base pool 当作独立一等池同步维护。
 
+        let batch_context = Self::resolve_batch_init_context::<N, _>(provider.clone()).await?;
         let mut known_addresses: HashSet<Address> = amms.iter().map(AMM::address).collect();
         let (mut results, mut success_count, mut fail_count) =
-            Self::init_curve_legacy_amms::<N, _>(amms, block, provider.clone()).await?;
+            Self::init_curve_legacy_amms::<N, _>(
+                amms,
+                block,
+                provider.clone(),
+                &batch_context,
+            )
+            .await?;
 
         let (mut synthesized_deps, fallback_dep_addrs) =
             Self::collect_missing_base_pool_dependencies(&results, &known_addresses);
@@ -448,7 +673,13 @@ impl CurveLegacyFactory {
 
             if !fallback_amms.is_empty() {
                 let (mut fallback_results, dep_success, dep_fail) =
-                    Self::init_curve_legacy_amms::<N, _>(fallback_amms, block, provider).await?;
+                    Self::init_curve_legacy_amms::<N, _>(
+                        fallback_amms,
+                        block,
+                        provider,
+                        &batch_context,
+                    )
+                    .await?;
                 success_count += dep_success;
                 fail_count += dep_fail;
                 results.append(&mut fallback_results);

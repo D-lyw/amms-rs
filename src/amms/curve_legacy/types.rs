@@ -4,6 +4,8 @@ use alloy::primitives::{Address, U256};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::RwLock;
+use tokio::sync::OnceCell;
 
 /// Curve Legacy 池类型枚举
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
@@ -31,6 +33,95 @@ pub enum LegacyStableSwapType {
     Plain,
     Lending,
     Meta,
+}
+
+/// Batch-prefetched static/dynamic fields that can safely seed Curve Legacy `init()`.
+#[derive(Debug, Clone, Default)]
+pub struct CurveLegacyBatchPrefetch {
+    pub n_coins: u8,
+    pub coins: Vec<Address>,
+    pub balances: Vec<U256>,
+    pub decimals: Vec<u8>,
+    pub amp: Option<U256>,
+    pub fee: Option<U256>,
+    pub admin_fee: Option<U256>,
+    pub rates: Vec<U256>,
+    pub d: Option<U256>,
+    pub gamma: Option<U256>,
+    pub mid_fee: Option<U256>,
+    pub out_fee: Option<U256>,
+    pub fee_gamma: Option<U256>,
+    pub allowed_extra_profit: Option<U256>,
+    pub adjustment_step: Option<U256>,
+    pub ma_half_time: Option<U256>,
+    pub price_scale: Option<Vec<U256>>,
+}
+
+impl CurveLegacyBatchPrefetch {
+    pub fn has_common_fields(&self) -> bool {
+        let n = self.n_coins as usize;
+        n > 0
+            && self.coins.len() == n
+            && self.balances.len() == n
+            && self.decimals.len() == n
+            && self.coins.iter().all(|coin| *coin != Address::ZERO)
+    }
+
+    pub fn has_complete_rates(&self) -> bool {
+        self.rates.len() == self.n_coins as usize && self.rates.iter().all(|rate| *rate != U256::ZERO)
+    }
+
+    pub fn has_complete_crypto_params(&self) -> bool {
+        self.d.is_some()
+            && self.gamma.is_some_and(|v| v != U256::ZERO)
+            && self.mid_fee.is_some()
+            && self.out_fee.is_some()
+            && self.fee_gamma.is_some()
+    }
+}
+
+/// Shared runtime context for one Curve Legacy batch-init wave.
+#[derive(Debug, Clone)]
+pub struct CurveLegacyBatchInitContext {
+    pub chain_id: Option<u64>,
+    pub ethereum_main_registry: Arc<OnceCell<Result<Address, String>>>,
+    pub prefetched_pools: Arc<RwLock<HashMap<Address, CurveLegacyBatchPrefetch>>>,
+}
+
+impl Default for CurveLegacyBatchInitContext {
+    fn default() -> Self {
+        Self::new(None)
+    }
+}
+
+impl CurveLegacyBatchInitContext {
+    pub fn new(chain_id: Option<u64>) -> Self {
+        Self {
+            chain_id,
+            ethereum_main_registry: Arc::new(OnceCell::new()),
+            prefetched_pools: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    pub fn insert_prefetch(&self, address: Address, prefetch: CurveLegacyBatchPrefetch) {
+        if let Ok(mut guard) = self.prefetched_pools.write() {
+            guard.insert(address, prefetch);
+        }
+    }
+
+    pub fn get_prefetch(&self, address: Address) -> Option<CurveLegacyBatchPrefetch> {
+        self.prefetched_pools
+            .read()
+            .ok()
+            .and_then(|guard| guard.get(&address).cloned())
+    }
+}
+
+/// Runtime-only hints attached to one pool during batch initialization.
+#[derive(Debug, Clone, Default)]
+pub struct CurveLegacyBatchInitHints {
+    pub context: CurveLegacyBatchInitContext,
+    pub prefetch: Option<CurveLegacyBatchPrefetch>,
 }
 
 /// Curve Legacy Base Pool 的只读共享视图
@@ -149,6 +240,9 @@ pub struct CurveLegacyPool {
     /// 缓存的现货价格 (base_token, quote_token) -> price
     #[serde(skip)]
     pub spot_prices: std::collections::HashMap<(Address, Address), f64>,
+    /// Batch-init-only runtime hints; never persisted.
+    #[serde(skip)]
+    pub batch_init_hints: Option<CurveLegacyBatchInitHints>,
 }
 
 impl CurveLegacyPool {
@@ -191,6 +285,7 @@ impl CurveLegacyPool {
             adjustment_step: None,
             ma_half_time: None,
             spot_prices: std::collections::HashMap::new(),
+            batch_init_hints: None,
         }
     }
 }
@@ -235,6 +330,7 @@ impl CurveLegacyBaseView {
             adjustment_step: None,
             ma_half_time: None,
             spot_prices: HashMap::new(),
+            batch_init_hints: None,
         }
     }
 }
