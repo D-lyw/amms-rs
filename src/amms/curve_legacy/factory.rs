@@ -19,6 +19,9 @@ use futures::{stream::FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
+const CURVE_LEGACY_INIT_CHUNK_SIZE: usize = 6;
+const CURVE_LEGACY_INTER_CHUNK_SLEEP_MS: u64 = 600;
+
 sol! {
     #[sol(rpc)]
     interface IAddressProvider {
@@ -93,11 +96,10 @@ impl CurveLegacyFactory {
         P: Provider<N> + Clone,
     {
         let mut chunks = Vec::new();
-        let chunk_size = 10;
-        let mut current_chunk = Vec::with_capacity(chunk_size);
+        let mut current_chunk = Vec::with_capacity(CURVE_LEGACY_INIT_CHUNK_SIZE);
         for amm in amms {
             current_chunk.push(amm);
-            if current_chunk.len() == chunk_size {
+            if current_chunk.len() == CURVE_LEGACY_INIT_CHUNK_SIZE {
                 chunks.push(std::mem::take(&mut current_chunk));
             }
         }
@@ -151,7 +153,14 @@ impl CurveLegacyFactory {
             }
 
             if i < num_chunks.saturating_sub(1) {
-                tokio::time::sleep(tokio::time::Duration::from_millis(400)).await;
+                // Curve Legacy per-pool init can fan out into many RPC eth_call probes
+                // (ABI fallbacks, subtype detection, Meta/base-pool resolution). Keep
+                // batch concurrency conservative and sleep between chunks to avoid
+                // provider-side RPS throttling in production.
+                tokio::time::sleep(tokio::time::Duration::from_millis(
+                    CURVE_LEGACY_INTER_CHUNK_SLEEP_MS,
+                ))
+                .await;
             }
         }
 
