@@ -3,6 +3,7 @@ use super::{
     consts::{MIN_POOL_RESERVE, MPFR_T_PRECISION, U128_0X10000000000000000, U256_100000},
     error::AMMError,
     factory::{AutomatedMarketMakerFactory, DiscoverySync},
+    fot,
     uniswap_v2::{
         div_uu, IGetUniswapV2PoolDataBatchRequestInstance, IUniswapV2Factory, IUniswapV2Pair,
         UniswapV2Factory,
@@ -196,6 +197,20 @@ impl SushiV2Pool {
         .abi_encode()
         .into())
     }
+
+    /// 确定输出侧 token：`quote_token` 优先；若无效（未传入池中任一 token），
+    /// 取 `base_token` 之外的另一个 token。
+    fn output_token(&self, base_token: Address, quote_token: Address) -> &Token {
+        if quote_token == self.token_a.address {
+            &self.token_a
+        } else if quote_token == self.token_b.address {
+            &self.token_b
+        } else if self.token_a.address == base_token {
+            &self.token_b
+        } else {
+            &self.token_a
+        }
+    }
 }
 
 impl AutomatedMarketMaker for SushiV2Pool {
@@ -334,6 +349,8 @@ impl AutomatedMarketMaker for SushiV2Pool {
         }
         self.token_a = Token::new_with_decimals(pool_data.0, pool_data.4 as u8);
         self.token_b = Token::new_with_decimals(pool_data.1, pool_data.5 as u8);
+        fot::apply_to_token(&mut self.token_a);
+        fot::apply_to_token(&mut self.token_b);
         self.reserve_0 = pool_data.2;
         self.reserve_1 = pool_data.3;
         // SushiV2 uses fixed 0.3% fee (same as Uniswap V2)
@@ -346,39 +363,47 @@ impl AutomatedMarketMaker for SushiV2Pool {
     fn simulate_swap(
         &self,
         base_token: Address,
-        _quote_token: Address,
+        quote_token: Address,
         amount_in: U256,
     ) -> Result<U256, AMMError> {
-        if self.token_a.address == base_token {
-            Ok(self.get_amount_out(
+        // 输入侧（in_token 为 FoT）：全额入池、不扣税（to = pool 方向无税）
+        // 池子 math 输出 gross（reserve 保持 gross 口径，与链上 Sync 一致）
+        let gross = if self.token_a.address == base_token {
+            self.get_amount_out(
                 amount_in,
                 U256::from(self.reserve_0),
                 U256::from(self.reserve_1),
-            ))
+            )
         } else {
-            Ok(self.get_amount_out(
+            self.get_amount_out(
                 amount_in,
                 U256::from(self.reserve_1),
                 U256::from(self.reserve_0),
-            ))
-        }
+            )
+        };
+        // 输出侧 FoT：transfer hook 扣税后实际到手 net
+        Ok(self.output_token(base_token, quote_token).fot_net(gross))
     }
 
     fn simulate_swap_exact_out(
         &self,
         base_token: Address,
-        _quote_token: Address,
+        quote_token: Address,
         amount_out: U256,
     ) -> Result<U256, AMMError> {
+        // amount_out 是接收方到手 net；池子 math 必须先输出 gross，
+        // transfer 扣税后接收方才能拿到 net，因此先 gross-up。
+        // 输入侧（in_token 为 FoT）全额入池、不扣税（to = pool 方向无税）
+        let gross_out = self.output_token(base_token, quote_token).fot_gross_up(amount_out);
         if self.token_a.address == base_token {
             self.get_amount_in(
-                amount_out,
+                gross_out,
                 U256::from(self.reserve_0),
                 U256::from(self.reserve_1),
             )
         } else {
             self.get_amount_in(
-                amount_out,
+                gross_out,
                 U256::from(self.reserve_1),
                 U256::from(self.reserve_0),
             )
@@ -388,9 +413,11 @@ impl AutomatedMarketMaker for SushiV2Pool {
     fn simulate_swap_mut(
         &mut self,
         base_token: Address,
-        _quote_token: Address,
+        quote_token: Address,
         amount_in: U256,
     ) -> Result<U256, AMMError> {
+        // 输入侧（in_token 为 FoT）：全额入池、不扣税（to = pool 方向无税）
+        // reserve 更新保持 gross（与链上 Sync 事件一致），返回值为扣税后 net
         if self.token_a.address == base_token {
             let amount_out = self.get_amount_out(
                 amount_in,
@@ -414,7 +441,7 @@ impl AutomatedMarketMaker for SushiV2Pool {
                 .checked_sub(amount_out_u128)
                 .ok_or(AMMError::Msg("reserve_1 underflow".to_string()))?;
 
-            Ok(amount_out)
+            Ok(self.output_token(base_token, quote_token).fot_net(amount_out))
         } else {
             let amount_out = self.get_amount_out(
                 amount_in,
@@ -438,7 +465,7 @@ impl AutomatedMarketMaker for SushiV2Pool {
                 .checked_add(amount_in_u128)
                 .ok_or(AMMError::Msg("reserve_1 overflow".to_string()))?;
 
-            Ok(amount_out)
+            Ok(self.output_token(base_token, quote_token).fot_net(amount_out))
         }
     }
 }
@@ -524,6 +551,8 @@ impl SushiV2Factory {
                 if pool.token_a.address.is_zero() || pool.token_b.address.is_zero() {
                     pool.token_a = Token::new_with_decimals(pool_data.0, pool_data.4 as u8);
                     pool.token_b = Token::new_with_decimals(pool_data.1, pool_data.5 as u8);
+                    fot::apply_to_token(&mut pool.token_a);
+                    fot::apply_to_token(&mut pool.token_b);
                 } else {
                     if pool.token_a.decimals == 0 {
                         pool.token_a.decimals = pool_data.4 as u8;
@@ -627,6 +656,8 @@ impl SushiV2Factory {
 
                 pool.token_a = Token::new_with_decimals(pool_data.0, pool_data.4 as u8);
                 pool.token_b = Token::new_with_decimals(pool_data.1, pool_data.5 as u8);
+                fot::apply_to_token(&mut pool.token_a);
+                fot::apply_to_token(&mut pool.token_b);
                 pool.reserve_0 = pool_data.2;
                 pool.reserve_1 = pool_data.3;
 

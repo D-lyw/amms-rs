@@ -206,12 +206,14 @@ impl DiscoverySync for CaliberPropFactory {
                         decimals: 0, // 在 init_batch 中填充
                         symbol: String::new(),
                         chain_id,
+                        fot_tax: None,
                     },
                     token_b: Token {
                         address: token_b_addr,
                         decimals: 0, // 在 init_batch 中填充
                         symbol: String::new(),
                         chain_id,
+                        fot_tax: None,
                     },
                     reserve_a: U256::ZERO,
                     reserve_b: U256::ZERO,
@@ -444,12 +446,14 @@ impl Default for CaliberPropPool {
                 decimals: 0,
                 symbol: String::new(),
                 chain_id: 0,
+                fot_tax: None,
             },
             token_b: Token {
                 address: Address::ZERO,
                 decimals: 0,
                 symbol: String::new(),
                 chain_id: 0,
+                fot_tax: None,
             },
             reserve_a: U256::ZERO,
             reserve_b: U256::ZERO,

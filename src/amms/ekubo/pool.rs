@@ -725,6 +725,7 @@ impl EkuboPool {
                 decimals: 18,
                 symbol: "ETH".to_string(),
                 chain_id: 1,
+                fot_tax: None,
             }
         } else {
             Token::new(self.pool_key.token0, provider.clone()).await?
@@ -736,6 +737,7 @@ impl EkuboPool {
                 decimals: 18,
                 symbol: "ETH".to_string(),
                 chain_id: 1,
+                fot_tax: None,
             }
         } else {
             Token::new(self.pool_key.token1, provider.clone()).await?

@@ -4,7 +4,13 @@ use std::{
     sync::Arc,
 };
 
-use alloy::{dyn_abi::DynSolType, network::Network, primitives::Address, providers::Provider, sol};
+use alloy::{
+    dyn_abi::DynSolType,
+    network::Network,
+    primitives::{Address, U256},
+    providers::Provider,
+    sol,
+};
 use error::{AMMError, BatchContractError};
 use futures::{stream::FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -24,6 +30,7 @@ pub mod erc_4626;
 pub mod error;
 pub mod factory;
 pub mod float;
+pub mod fot;
 pub mod fluid_dex;
 pub mod pancake_infinity;
 pub mod pancake_v2;
@@ -57,6 +64,16 @@ pub struct Token {
     pub decimals: u8,
     pub symbol: String,
     pub chain_id: u64,
+    /// FoT（fee-on-transfer）税率，`None` 表示普通 token。
+    ///
+    /// 不会自动检测，需在初始化阶段通过 `fot::register_fot_token` 注入，
+    /// 或直接在序列化数据中标注（显式标注优先级更高）。
+    ///
+    /// 注意：当前 `FotTaxType::FlatRate` 表示 **池子转出该 token 时扣税**
+    /// （单侧，输出侧），即模拟输出返回 net、exact-out 输入需 gross-up；
+    /// 池子 reserve / Sync 保持 gross 口径。to = pool（卖出）方向不扣税。
+    #[serde(default)]
+    pub fot_tax: Option<fot::FotTaxType>,
 }
 
 impl Token {
@@ -74,6 +91,7 @@ impl Token {
             decimals,
             chain_id: provider.get_chain_id().await?,
             symbol,
+            fot_tax: None,
         })
     }
 
@@ -83,11 +101,33 @@ impl Token {
             decimals,
             symbol: String::new(),
             chain_id: 0,
+            fot_tax: None,
         }
     }
 
     pub const fn address(&self) -> &Address {
         &self.address
+    }
+
+    /// 扣除 FoT 税后实际到手金额（net）。无 FoT 时返回原值。
+    ///
+    /// 链上语义：池子 swap math 输出 gross，transfer hook 扣税后接收方到手 net。
+    pub fn fot_net(&self, gross: U256) -> U256 {
+        match self.fot_tax {
+            Some(tax) => tax.net_of_gross(gross),
+            None => gross,
+        }
+    }
+
+    /// 反算：接收方到手 `net` 所需的 gross 金额（向上取整）。无 FoT 时返回原值。
+    ///
+    /// 用于 exact-out 场景：池子 math 必须先输出 gross，transfer 扣税后
+    /// 接收方才能拿到 net。
+    pub fn fot_gross_up(&self, net: U256) -> U256 {
+        match self.fot_tax {
+            Some(tax) => tax.gross_up(net),
+            None => net,
+        }
     }
 
     pub const fn decimals(&self) -> u8 {

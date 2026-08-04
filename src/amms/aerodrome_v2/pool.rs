@@ -29,6 +29,7 @@ use crate::amms::{
     consts::{MIN_POOL_RESERVE, MPFR_T_PRECISION},
     error::AMMError,
     factory::{AutomatedMarketMakerFactory, DiscoverySync},
+    fot,
     Token,
 };
 use rug::ops::Pow;
@@ -588,6 +589,20 @@ impl AerodromeV2Pool {
         };
         call.abi_encode().into()
     }
+
+    /// 确定输出侧 token：`quote_token` 优先；若无效（未传入池中任一 token），
+    /// 取 `base_token` 之外的另一个 token。
+    fn output_token(&self, base_token: Address, quote_token: Address) -> &Token {
+        if quote_token == self.token_a.address {
+            &self.token_a
+        } else if quote_token == self.token_b.address {
+            &self.token_b
+        } else if self.token_a.address == base_token {
+            &self.token_b
+        } else {
+            &self.token_a
+        }
+    }
 }
 
 // ============================================================================
@@ -649,50 +664,52 @@ impl AutomatedMarketMaker for AerodromeV2Pool {
     fn simulate_swap(
         &self,
         base_token: Address,
-        _quote_token: Address,
+        quote_token: Address,
         amount_in: U256,
     ) -> Result<U256, AMMError> {
-        if self.token_a.address == base_token {
+        // 池子 math 输出 gross（reserve 保持 gross 口径，与链上 Sync 一致）
+        let gross = if self.token_a.address == base_token {
             if self.stable {
-                Ok(self.get_amount_out_stable_with_decimals(
+                self.get_amount_out_stable_with_decimals(
                     amount_in,
                     U256::from(self.reserve_0),
                     U256::from(self.reserve_1),
                     Self::decimals_scale(self.token_a.decimals),
                     Self::decimals_scale(self.token_b.decimals),
-                ))
+                )
             } else {
-                Ok(self.get_amount_out_volatile(
+                self.get_amount_out_volatile(
                     amount_in,
                     U256::from(self.reserve_0),
                     U256::from(self.reserve_1),
-                ))
+                )
             }
+        } else if self.stable {
+            self.get_amount_out_stable_with_decimals(
+                amount_in,
+                U256::from(self.reserve_1),
+                U256::from(self.reserve_0),
+                Self::decimals_scale(self.token_b.decimals),
+                Self::decimals_scale(self.token_a.decimals),
+            )
         } else {
-            if self.stable {
-                Ok(self.get_amount_out_stable_with_decimals(
-                    amount_in,
-                    U256::from(self.reserve_1),
-                    U256::from(self.reserve_0),
-                    Self::decimals_scale(self.token_b.decimals),
-                    Self::decimals_scale(self.token_a.decimals),
-                ))
-            } else {
-                Ok(self.get_amount_out_volatile(
-                    amount_in,
-                    U256::from(self.reserve_1),
-                    U256::from(self.reserve_0),
-                ))
-            }
-        }
+            self.get_amount_out_volatile(
+                amount_in,
+                U256::from(self.reserve_1),
+                U256::from(self.reserve_0),
+            )
+        };
+        // 输出侧 FoT：transfer hook 扣税后实际到手 net
+        Ok(self.output_token(base_token, quote_token).fot_net(gross))
     }
 
     fn simulate_swap_mut(
         &mut self,
         base_token: Address,
-        _quote_token: Address,
+        quote_token: Address,
         amount_in: U256,
     ) -> Result<U256, AMMError> {
+        // reserve 更新保持 gross（与链上 Sync 事件一致），返回值为扣税后 net
         if self.token_a.address == base_token {
             let amount_out = if self.stable {
                 self.get_amount_out_stable_with_decimals(
@@ -730,7 +747,7 @@ impl AutomatedMarketMaker for AerodromeV2Pool {
                     "simulate_swap_mut: reserve_1 underflow".to_string(),
                 ))?;
 
-            Ok(amount_out)
+            Ok(self.output_token(base_token, quote_token).fot_net(amount_out))
         } else {
             let amount_out = if self.stable {
                 self.get_amount_out_stable_with_decimals(
@@ -768,16 +785,19 @@ impl AutomatedMarketMaker for AerodromeV2Pool {
                     "simulate_swap_mut: reserve_1 overflow".to_string(),
                 ))?;
 
-            Ok(amount_out)
+            Ok(self.output_token(base_token, quote_token).fot_net(amount_out))
         }
     }
 
     fn simulate_swap_exact_out(
         &self,
         base_token: Address,
-        _quote_token: Address,
+        quote_token: Address,
         amount_out: U256,
     ) -> Result<U256, AMMError> {
+        // amount_out 是接收方到手 net；池子 math 必须先输出 gross，
+        // transfer 扣税后接收方才能拿到 net，因此先 gross-up
+        let gross_out = self.output_token(base_token, quote_token).fot_gross_up(amount_out);
         let (reserve_in, reserve_out) = if self.token_a.address == base_token {
             (U256::from(self.reserve_0), U256::from(self.reserve_1))
         } else {
@@ -797,14 +817,14 @@ impl AutomatedMarketMaker for AerodromeV2Pool {
                 )
             };
             self.get_amount_in_stable_with_decimals(
-                amount_out,
+                gross_out,
                 reserve_in,
                 reserve_out,
                 decimals_in,
                 decimals_out,
             )
         } else {
-            self.get_amount_in_volatile(amount_out, reserve_in, reserve_out)
+            self.get_amount_in_volatile(gross_out, reserve_in, reserve_out)
         }
     }
 
@@ -918,6 +938,8 @@ impl AutomatedMarketMaker for AerodromeV2Pool {
             provider.clone(),
         )
         .await?;
+        fot::apply_to_token(&mut self.token_a);
+        fot::apply_to_token(&mut self.token_b);
 
         // Fetch reserves at the specified block
         let reserves = pool.getReserves().call().block(block_number).await?;
@@ -1181,6 +1203,8 @@ impl AerodromeV2Factory {
 
                     pool.token_a = Token::new_with_decimals(*token_a, decimals_a);
                     pool.token_b = Token::new_with_decimals(*token_b, decimals_b);
+                    fot::apply_to_token(&mut pool.token_a);
+                    fot::apply_to_token(&mut pool.token_b);
                     pool.reserve_0 = *reserve_0;
                     pool.reserve_1 = *reserve_1;
                     pool.stable = *stable;

@@ -204,12 +204,14 @@ async fn test_fluid_dex_boundary_revert() -> Result<()> {
         decimals: 18,
         symbol: "T0".to_string(),
         chain_id: 1,
+        fot_tax: None,
     };
     pool.token_b = crate::amms::Token {
         address: address!("0000000000000000000000000000000000000002"),
         decimals: 18,
         symbol: "T1".to_string(),
         chain_id: 1,
+        fot_tax: None,
     };
     pool.token0_imag_reserves_1e12 = U256::from(1000_000_000u64);
     pool.token1_imag_reserves_1e12 = U256::from(1000_000_000u64);
@@ -252,12 +254,14 @@ fn test_pool_not_initialized_returns_zero() {
         decimals: 18,
         symbol: "T0".to_string(),
         chain_id: 1,
+        fot_tax: None,
     };
     pool.token_b = crate::amms::Token {
         address: address!("0000000000000000000000000000000000000002"),
         decimals: 18,
         symbol: "T1".to_string(),
         chain_id: 1,
+        fot_tax: None,
     };
     pool.is_swap_paused = false;
     pool.is_smart_collateral_enabled = false;
@@ -283,12 +287,14 @@ fn test_amount_limits_return_zero() {
         decimals: 18,
         symbol: "T0".to_string(),
         chain_id: 1,
+        fot_tax: None,
     };
     pool.token_b = crate::amms::Token {
         address: address!("0000000000000000000000000000000000000002"),
         decimals: 18,
         symbol: "T1".to_string(),
         chain_id: 1,
+        fot_tax: None,
     };
     pool.is_swap_paused = false;
     pool.is_smart_collateral_enabled = true;
@@ -324,12 +330,14 @@ async fn test_fluid_dex_dust_protection() -> eyre::Result<()> {
         decimals: 18,
         symbol: "T0".to_string(),
         chain_id: 1,
+        fot_tax: None,
     };
     pool.token_b = crate::amms::Token {
         address: address!("0000000000000000000000000000000000000002"),
         decimals: 18,
         symbol: "T1".to_string(),
         chain_id: 1,
+        fot_tax: None,
     };
     pool.token0_imag_reserves_1e12 = U256::from(1000_000_000u64);
     pool.token1_imag_reserves_1e12 = U256::from(1000_000_000u64);
@@ -371,12 +379,14 @@ async fn test_fluid_dex_utilization_limit() -> eyre::Result<()> {
         decimals: 18,
         symbol: "T0".to_string(),
         chain_id: 1,
+        fot_tax: None,
     };
     pool.token_b = crate::amms::Token {
         address: address!("0000000000000000000000000000000000000002"),
         decimals: 18,
         symbol: "T1".to_string(),
         chain_id: 1,
+        fot_tax: None,
     };
     pool.token0_imag_reserves_1e12 = U256::from(10u64).pow(U256::from(18));
     pool.token1_imag_reserves_1e12 = U256::from(10u64).pow(U256::from(18));
@@ -414,12 +424,14 @@ async fn test_fluid_dex_oseth_eth_panic_repro() -> Result<()> {
         decimals: 18,
         symbol: "ETH".to_string(),
         chain_id: 1,
+        fot_tax: None,
     };
     pool.token_b = crate::amms::Token {
         address: OSETH_TOKEN,
         decimals: 18,
         symbol: "osETH".to_string(),
         chain_id: 1,
+        fot_tax: None,
     };
 
     // Set reserves from screenshot (1e12 scale)
@@ -476,12 +488,14 @@ async fn test_reproduce_0xc065_panic() -> Result<()> {
         decimals: 18,
         symbol: "osETH".to_string(),
         chain_id: 1,
+        fot_tax: None,
     };
     pool.token_b = crate::amms::Token {
         address: eth,
         decimals: 18,
         symbol: "ETH".to_string(),
         chain_id: 1,
+        fot_tax: None,
     };
 
     // Higher reserves to pass basic check
@@ -547,12 +561,14 @@ async fn test_fluid_dex_exact_out_zero_amount() -> Result<()> {
         decimals: 18,
         symbol: "T0".to_string(),
         chain_id: 1,
+        fot_tax: None,
     };
     pool.token_b = crate::amms::Token {
         address: address!("0000000000000000000000000000000000000002"),
         decimals: 18,
         symbol: "T1".to_string(),
         chain_id: 1,
+        fot_tax: None,
     };
 
     // Zero amount_out should return 0
