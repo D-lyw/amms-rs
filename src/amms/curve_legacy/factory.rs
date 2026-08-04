@@ -23,7 +23,7 @@ use futures::{stream::FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-const CURVE_LEGACY_INIT_CHUNK_SIZE: usize = 6;
+const CURVE_LEGACY_INIT_CHUNK_SIZE: usize = 2;
 const CURVE_LEGACY_INTER_CHUNK_SLEEP_MS: u64 = 600;
 const CURVE_LEGACY_PREFETCH_STEP: usize = 6;
 const CURVE_LEGACY_PREFETCH_SLEEP_MS: u64 = 200;
