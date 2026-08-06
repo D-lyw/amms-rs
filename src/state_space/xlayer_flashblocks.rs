@@ -24,6 +24,8 @@ use super::{
     AppliedLogDedupCache, HookRegistry, LogQueryChunk, LogSource, PendingSyncQueue, StateSpace,
     StateSpaceError, StateSpaceManager,
 };
+use crate::amms::amm::AMM;
+use crate::amms::binaryfi_prop::{enrich_update_log_data, BINARYFI_UPDATE_EVENT};
 use crate::state_space::{
     STREAM_IDLE_TIMEOUT, STREAM_RECONNECT_DELAY, XLAYER_FLASHBLOCKS_RAW_WS_URL,
 };
@@ -379,6 +381,7 @@ fn xlayer_flashblock_block_number(fb: &XlayerFlashblockMessage<'_>) -> Option<u6
 fn extract_logs_from_xlayer_flashblock(
     fb: &XlayerFlashblockMessage,
     matcher: &XlayerLogMatcher,
+    binaryfi_engines: &HashSet<Address>,
     dedup_cache: &mut XlayerDedupCache,
     parse_cache: &mut XlayerParseCache,
     tx_tracker: &mut XlayerTxCountTracker,
@@ -567,7 +570,9 @@ fn extract_logs_from_xlayer_flashblock(
                 }
             };
 
-            // 5g. 构造 LogData
+            // 5g. 构造 LogData（engine 地址按已注册池子实例配置匹配）
+            let is_binaryfi_update_log =
+                binaryfi_engines.contains(&address) && topics.first() == Some(&BINARYFI_UPDATE_EVENT);
             let Some(log_data) = LogData::new(topics, data) else {
                 decode_fail += 1;
                 decode_failed_addresses.insert(address);
@@ -577,11 +582,25 @@ fn extract_logs_from_xlayer_flashblock(
             // 5h. 解析 tx_hash
             let tx_hash_parsed = _tx_hash.parse::<B256>().ok();
 
+            // 5h1. BinaryFi 引擎 update 日志增强：raw tx 解析 price 注入 data
+            //       （找不到 raw bytes 或解码失败时保留原始日志）
+            let final_log_data = if is_binaryfi_update_log {
+                let raw_txs = fb
+                    .diff
+                    .as_ref()
+                    .map(|d| d.transactions.as_slice())
+                    .unwrap_or(&[]);
+                enrich_update_log_data(raw_txs, tx_hash_parsed, &log_data, address)
+                    .unwrap_or(log_data)
+            } else {
+                log_data
+            };
+
             // 5i. 构造 Alloy Log
             let log = Log {
                 inner: alloy::primitives::Log {
                     address,
-                    data: log_data,
+                    data: final_log_data,
                 },
                 block_hash,
                 block_number: Some(block_number),
@@ -679,6 +698,18 @@ impl<N, P> StateSpaceManager<N, P> {
         let matcher = XlayerLogMatcher::from_query_chunks(&query_chunks);
 
         stream! {
+            // 已注册 BinaryFi 池子的 engine 地址（update 日志 raw-tx 增强用，配置化支持多部署）
+            let binaryfi_engines: HashSet<Address> = {
+                let read_guard = state.read().await;
+                read_guard
+                    .state
+                    .values()
+                    .filter_map(|amm| match amm.as_ref() {
+                        AMM::BinaryFiPropPool(p) => Some(p.engine_address),
+                        _ => None,
+                    })
+                    .collect()
+            };
             let mut dedup_cache = XlayerDedupCache::new(XLAYER_DEDUP_PAYLOAD_WINDOW);
             let mut parse_cache = XlayerParseCache::new();
             let mut tx_tracker = XlayerTxCountTracker::new(XLAYER_TX_COUNT_WINDOW);
@@ -875,6 +906,7 @@ impl<N, P> StateSpaceManager<N, P> {
                         extract_logs_from_xlayer_flashblock(
                             &fb,
                             &matcher,
+                            &binaryfi_engines,
                             &mut dedup_cache,
                             &mut parse_cache,
                             &mut tx_tracker,
@@ -1031,6 +1063,7 @@ mod tests {
         let (logs0, _, _, _) = extract_logs_from_xlayer_flashblock(
             &slice0,
             &matcher,
+            &HashSet::new(),
             &mut dedup,
             &mut parse_cache,
             &mut tx_tracker,
@@ -1053,6 +1086,7 @@ mod tests {
         let (logs1, _, _, _) = extract_logs_from_xlayer_flashblock(
             &slice1,
             &matcher,
+            &HashSet::new(),
             &mut dedup,
             &mut parse_cache,
             &mut tx_tracker,

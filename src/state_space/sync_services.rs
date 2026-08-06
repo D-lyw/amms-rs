@@ -19,6 +19,7 @@ use crate::amms::amm::{AutomatedMarketMaker, AMM};
 use crate::amms::balancer_v2::BalancerV2Pool;
 use crate::amms::balancer_v3::BalancerV3Pool;
 use crate::amms::caliber_prop::CaliberPropPool;
+use crate::amms::binaryfi_prop::BinaryFiPropPool;
 use crate::amms::curve_ng::{CurveNGFactory, ICurveNGStableSwap};
 use crate::amms::fluid_dex::{
     DexReservesResolver, FluidDexT1, FluidLiquidity, TokenLimitData, FLUID_DEX_RESOLVER,
@@ -1213,6 +1214,77 @@ pub async fn start_caliber_prop_ladder_sync_task<N, P>(
         for pool in target_pools {
             if let Some(existing_amm) = write_guard.get_mut_cow(&pool.address()) {
                 if let AMM::CaliberPropPool(existing) = existing_amm {
+                    *existing = pool;
+                }
+            }
+        }
+    }
+
+}
+
+/// BinaryFi propAMM 周期全量校正任务。
+///
+/// 与 Caliber 不同，BinaryFi 的价格/费率完全由事件驱动（L2 raw-tx 注入，
+/// 逐位精确），本任务只负责重新锚定**事件不可观测**的引擎状态：
+/// `maxIn/maxOut`（会被 swap 消耗、重置时机引擎内部决定）、买入禁用/冻结态、
+/// 金库外部转账引起的余额漂移。
+///
+/// 更新方式与 caliber 周期任务一致：直接复用池子的 `update()`（批量快照路径）。
+/// BinaryFi 的 `update()` 是 stale 驱动（AsyncUpdate 事件触发时标记局部 stale），
+/// 周期任务先把全部 pair 标记 stale，再调 `update()` 即等价于全量快照校正，
+/// 不新增任何 fetch 逻辑（一次批量静态调用覆盖全部 132 条费率 + 大额 cap + 余额）。
+pub async fn start_binaryfi_prop_sync_task<N, P>(
+    state: Arc<RwLock<StateSpace>>,
+    provider: P,
+    interval: Duration,
+) where
+    N: Network,
+    P: Provider<N> + Clone + 'static,
+{
+    let mut next_sleep = startup_delay_with_jitter(interval, "binaryfi_prop");
+    loop {
+        sleep(next_sleep).await;
+        next_sleep = interval;
+
+        let mut target_pools: Vec<BinaryFiPropPool> = {
+            let read_guard = state.read().await;
+            read_guard
+                .state
+                .values()
+                .filter_map(|amm| match amm.as_ref() {
+                    AMM::BinaryFiPropPool(pool) => Some(pool.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        if target_pools.is_empty() {
+            continue;
+        }
+
+        debug!(
+            "Re-anchoring {} BinaryFi propAMM pool(s) via full snapshot",
+            target_pools.len()
+        );
+
+        for pool in &mut target_pools {
+            // 全部 pair 标记 stale → update() 走全量批量快照
+            for j in 1..pool.assets.len() {
+                pool.mark_stale_for_asset(j);
+            }
+            if let Err(e) = pool.update::<N, P>(provider.clone()).await {
+                error!(
+                    address = ?pool.pool_address,
+                    error = ?e,
+                    "Failed to refresh BinaryFi propAMM full snapshot"
+                );
+            }
+        }
+
+        let mut write_guard = state.write().await;
+        for pool in target_pools {
+            if let Some(existing_amm) = write_guard.get_mut_cow(&pool.address()) {
+                if let AMM::BinaryFiPropPool(existing) = existing_amm {
                     *existing = pool;
                 }
             }

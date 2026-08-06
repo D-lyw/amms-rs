@@ -1258,6 +1258,12 @@ impl<N, P> StateSpaceManager<N, P> {
                         }
                     }
                 }
+                AMM::BinaryFiPropPool(p) => {
+                    if has_events {
+                        topic_addresses.insert(p.pool_address);
+                        topic_addresses.insert(p.engine_address);
+                    }
+                }
                 _ => {
                     if has_events {
                         topic_addresses.insert(amm.address());
@@ -1473,6 +1479,9 @@ pub struct StateSpaceBuilder<N, P> {
     pub curve_sync_interval: Option<Duration>,
     /// Dedicated interval for Caliber propAMM Ladder refresh.
     pub caliber_ladder_sync_interval: Option<Duration>,
+    /// Dedicated interval for BinaryFi propAMM full-snapshot re-anchor
+    /// (cap/disabled states are not observable from events).
+    pub binaryfi_sync_interval: Option<Duration>,
     pub pending_sync_worker_interval: Duration,
     pub drift_probe_interval: Duration,
     pub maintenance_interval: Option<Duration>,
@@ -1501,6 +1510,7 @@ where
             slipstream_fee_sync_interval: None,
             curve_sync_interval: None,
             caliber_ladder_sync_interval: None,
+            binaryfi_sync_interval: None,
             pending_sync_worker_interval: DEFAULT_PENDING_SYNC_WORKER_INTERVAL,
             drift_probe_interval: DEFAULT_DRIFT_PROBE_INTERVAL,
             maintenance_interval: None,
@@ -1607,6 +1617,15 @@ where
     pub fn with_caliber_ladder_sync_interval(self, interval: Duration) -> StateSpaceBuilder<N, P> {
         StateSpaceBuilder {
             caliber_ladder_sync_interval: Some(interval),
+            ..self
+        }
+    }
+
+    /// Set a dedicated interval for BinaryFi propAMM full-snapshot re-anchor.
+    /// Falls back to `non_event_sync_interval` when not set.
+    pub fn with_binaryfi_sync_interval(self, interval: Duration) -> StateSpaceBuilder<N, P> {
+        StateSpaceBuilder {
+            binaryfi_sync_interval: Some(interval),
             ..self
         }
     }
@@ -1949,6 +1968,16 @@ where
             ));
         }
 
+        // BinaryFi propAMM pools: periodic full-snapshot re-anchor
+        // (maxIn/maxOut & disabled states are not observable from calldata/events)
+        if let Some(interval) = self.binaryfi_sync_interval.or(non_event_interval) {
+            tokio::spawn(sync_services::start_binaryfi_prop_sync_task(
+                state_space.clone(),
+                self.provider.clone(),
+                interval,
+            ));
+        }
+
         Ok(StateSpaceManager {
             realtime_ws_endpoints: self.realtime_ws_endpoints,
             realtime_head,
@@ -2081,6 +2110,23 @@ impl StateSpace {
             .collect()
     }
 
+    fn resolve_binaryfi_update_pool(
+        &self,
+        log_address: Address,
+        topics: &[FixedBytes<32>],
+    ) -> Option<Address> {
+        if topics.first() != Some(&crate::amms::binaryfi_prop::BINARYFI_UPDATE_EVENT) {
+            return None;
+        }
+        // engine 地址按池子实例配置匹配（支持跨链/多部署，不依赖模块常量）
+        self.state
+            .iter()
+            .find_map(|(pool_address, amm)| match amm.as_ref() {
+                AMM::BinaryFiPropPool(p) if p.engine_address == log_address => Some(*pool_address),
+                _ => None,
+            })
+    }
+
     pub fn sync(
         &mut self,
         logs: &[Log],
@@ -2149,6 +2195,10 @@ impl StateSpace {
                     if self.state.contains_key(&pool_address) {
                         target_addresses.push(pool_address);
                     }
+                } else if let Some(pool_address) =
+                    self.resolve_binaryfi_update_pool(address, log.topics())
+                {
+                    target_addresses.push(pool_address);
                 } else if let Some(pool_address) =
                     self.resolve_slipstream_fee_event_pool(log.topics())
                 {

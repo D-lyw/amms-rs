@@ -51,6 +51,7 @@ const TARGET_CONTRACTS: &[&str] = &[
     "GetPendlePoolDataBatchRequest",
     // Caliber
     "GetCaliberPropLadderBatchRequest",
+    "GetBinaryFiPropStateBatchRequest",
 ];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
