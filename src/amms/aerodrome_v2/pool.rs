@@ -29,8 +29,7 @@ use crate::amms::{
     consts::{MIN_POOL_RESERVE, MPFR_T_PRECISION},
     error::AMMError,
     factory::{AutomatedMarketMakerFactory, DiscoverySync},
-    fot,
-    Token,
+    fot, Token,
 };
 use rug::ops::Pow;
 use rug::Float;
@@ -747,7 +746,9 @@ impl AutomatedMarketMaker for AerodromeV2Pool {
                     "simulate_swap_mut: reserve_1 underflow".to_string(),
                 ))?;
 
-            Ok(self.output_token(base_token, quote_token).fot_net(amount_out))
+            Ok(self
+                .output_token(base_token, quote_token)
+                .fot_net(amount_out))
         } else {
             let amount_out = if self.stable {
                 self.get_amount_out_stable_with_decimals(
@@ -785,7 +786,9 @@ impl AutomatedMarketMaker for AerodromeV2Pool {
                     "simulate_swap_mut: reserve_1 overflow".to_string(),
                 ))?;
 
-            Ok(self.output_token(base_token, quote_token).fot_net(amount_out))
+            Ok(self
+                .output_token(base_token, quote_token)
+                .fot_net(amount_out))
         }
     }
 
@@ -797,7 +800,9 @@ impl AutomatedMarketMaker for AerodromeV2Pool {
     ) -> Result<U256, AMMError> {
         // amount_out 是接收方到手 net；池子 math 必须先输出 gross，
         // transfer 扣税后接收方才能拿到 net，因此先 gross-up
-        let gross_out = self.output_token(base_token, quote_token).fot_gross_up(amount_out);
+        let gross_out = self
+            .output_token(base_token, quote_token)
+            .fot_gross_up(amount_out);
         let (reserve_in, reserve_out) = if self.token_a.address == base_token {
             (U256::from(self.reserve_0), U256::from(self.reserve_1))
         } else {

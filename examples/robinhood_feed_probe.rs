@@ -66,12 +66,11 @@ struct FlashblockMessage {
 fn parse_u64(v: &Value) -> Option<u64> {
     match v {
         Value::Number(n) => n.as_u64(),
-        Value::String(s) => {
-            s.strip_prefix("0x")
-                .or_else(|| s.strip_prefix("0X"))
-                .and_then(|h| u64::from_str_radix(h, 16).ok())
-                .or_else(|| s.parse().ok())
-        }
+        Value::String(s) => s
+            .strip_prefix("0x")
+            .or_else(|| s.strip_prefix("0X"))
+            .and_then(|h| u64::from_str_radix(h, 16).ok())
+            .or_else(|| s.parse().ok()),
         _ => None,
     }
 }
@@ -139,8 +138,9 @@ async fn main() -> Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(30);
-    let max_messages: Option<usize> =
-        std::env::var("MAX_MESSAGES").ok().and_then(|v| v.parse().ok());
+    let max_messages: Option<usize> = std::env::var("MAX_MESSAGES")
+        .ok()
+        .and_then(|v| v.parse().ok());
 
     println!("================================================");
     println!("  Robinhood Chain Feed Protocol Probe");
@@ -259,7 +259,10 @@ async fn main() -> Result<()> {
 
             // 打印前 5 条
             if total_messages <= 5 {
-                println!("\n--- Arbitrum Message #{total_messages} ({msg_type_label}, {} bytes) ---", payload.len());
+                println!(
+                    "\n--- Arbitrum Message #{total_messages} ({msg_type_label}, {} bytes) ---",
+                    payload.len()
+                );
                 for (i, feed_msg) in arb_msg.messages.iter().enumerate() {
                     println!("  messages[{i}]:");
                     println!("    sequence_number: {:?}", feed_msg.sequence_number);
@@ -269,7 +272,10 @@ async fn main() -> Result<()> {
                     if let Some(ref msg) = feed_msg.message {
                         println!("    message: {}", format_preview(msg, 1));
                     }
-                    println!("    signature: {:?}", feed_msg.signature.as_ref().map(|_| "<present>"));
+                    println!(
+                        "    signature: {:?}",
+                        feed_msg.signature.as_ref().map(|_| "<present>")
+                    );
                 }
                 if let Some(ref confirmed) = arb_msg.confirmed_sequence_number_message {
                     println!("  confirmed_sequence_number_message: {confirmed:?}");
@@ -288,7 +294,10 @@ async fn main() -> Result<()> {
             flashblock_messages += 1;
 
             if total_messages <= 5 {
-                println!("\n--- Flashblock Message #{total_messages} ({msg_type_label}, {} bytes) ---", payload.len());
+                println!(
+                    "\n--- Flashblock Message #{total_messages} ({msg_type_label}, {} bytes) ---",
+                    payload.len()
+                );
                 println!("  payload_id: {:?}", fb_msg.payload_id);
                 println!("  index: {:?}", fb_msg.index);
                 if let Some(base) = fb_msg.base {
@@ -343,7 +352,10 @@ async fn main() -> Result<()> {
     println!("================================================");
     println!("Elapsed:             {:.1}s", elapsed.as_secs_f64());
     println!("Total messages:      {total_messages}");
-    println!("Message rate:        {:.1}/s", total_messages as f64 / elapsed.as_secs_f64().max(0.001));
+    println!(
+        "Message rate:        {:.1}/s",
+        total_messages as f64 / elapsed.as_secs_f64().max(0.001)
+    );
     println!("Message size (P50):  {p50_size} bytes");
     println!("Message size (P95):  {p95_size} bytes");
     println!("Msg interval (P50):  {p50_int}ms");
@@ -353,7 +365,10 @@ async fn main() -> Result<()> {
     println!("Flashblock format:   {flashblock_messages} msgs");
     println!("Unknown format:      {unknown_format} msgs");
     if let (Some(min), Some(max)) = (min_seq, max_seq) {
-        println!("Sequence range:      {min} .. {max} ({} total)", max - min + 1);
+        println!(
+            "Sequence range:      {min} .. {max} ({} total)",
+            max - min + 1
+        );
     }
 
     println!("\n--- FORMAT CONCLUSION ---");

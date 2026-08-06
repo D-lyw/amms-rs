@@ -575,9 +575,7 @@ mod tests {
         let offset = ROBINHOOD_L2_OFFSET;
         let safety = ARBITRUM_FEED_SAFETY_BLOCKS;
 
-        let max_seq = realtime_head
-            .saturating_add(safety)
-            .saturating_sub(offset);
+        let max_seq = realtime_head.saturating_add(safety).saturating_sub(offset);
         let raw_feed_head = max_seq.saturating_add(offset);
         let candidate_l2_head = raw_feed_head.saturating_sub(safety);
 

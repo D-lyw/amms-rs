@@ -55,9 +55,7 @@ pub enum FotTaxType {
     /// 需新增独立变体并实现输入侧扣税逻辑，不能复用本变体。
     ///
     /// `fee_bps` 以 basis points 计（1 bps = 0.01%），例如 3% 税 = 300。
-    FlatRate {
-        fee_bps: u64,
-    },
+    FlatRate { fee_bps: u64 },
     // 未来扩展（示例，变体命名用 snake_case 与 serde rename_all 保持一致）：
     // /// 买入/卖出分离税率
     // BuySell { buy_fee_bps: u64, sell_fee_bps: u64 },

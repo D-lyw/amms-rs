@@ -2699,7 +2699,7 @@ impl CurveLegacyPool {
                     base_pool_addr,
                     CurveLegacyPoolType::StableSwap,
                 )
-                    .init(block_number, provider.clone()),
+                .init(block_number, provider.clone()),
             )
             .await?;
             return Ok(Some((
@@ -2753,7 +2753,7 @@ impl CurveLegacyPool {
                     base_pool_addr,
                     CurveLegacyPoolType::StableSwap,
                 )
-                    .init(block_number, provider.clone()),
+                .init(block_number, provider.clone()),
             )
             .await?;
             return Ok(Some((

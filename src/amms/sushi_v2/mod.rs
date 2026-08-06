@@ -394,7 +394,9 @@ impl AutomatedMarketMaker for SushiV2Pool {
         // amount_out 是接收方到手 net；池子 math 必须先输出 gross，
         // transfer 扣税后接收方才能拿到 net，因此先 gross-up。
         // 输入侧（in_token 为 FoT）全额入池、不扣税（to = pool 方向无税）
-        let gross_out = self.output_token(base_token, quote_token).fot_gross_up(amount_out);
+        let gross_out = self
+            .output_token(base_token, quote_token)
+            .fot_gross_up(amount_out);
         if self.token_a.address == base_token {
             self.get_amount_in(
                 gross_out,
@@ -441,7 +443,9 @@ impl AutomatedMarketMaker for SushiV2Pool {
                 .checked_sub(amount_out_u128)
                 .ok_or(AMMError::Msg("reserve_1 underflow".to_string()))?;
 
-            Ok(self.output_token(base_token, quote_token).fot_net(amount_out))
+            Ok(self
+                .output_token(base_token, quote_token)
+                .fot_net(amount_out))
         } else {
             let amount_out = self.get_amount_out(
                 amount_in,
@@ -465,7 +469,9 @@ impl AutomatedMarketMaker for SushiV2Pool {
                 .checked_add(amount_in_u128)
                 .ok_or(AMMError::Msg("reserve_1 overflow".to_string()))?;
 
-            Ok(self.output_token(base_token, quote_token).fot_net(amount_out))
+            Ok(self
+                .output_token(base_token, quote_token)
+                .fot_net(amount_out))
         }
     }
 }

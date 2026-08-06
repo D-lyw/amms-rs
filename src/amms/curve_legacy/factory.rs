@@ -102,15 +102,19 @@ impl CurveLegacyFactory {
         }
     }
 
-    async fn resolve_batch_init_context<N, P>(provider: P) -> Result<CurveLegacyBatchInitContext, AMMError>
+    async fn resolve_batch_init_context<N, P>(
+        provider: P,
+    ) -> Result<CurveLegacyBatchInitContext, AMMError>
     where
         N: Network,
         P: Provider<N> + Clone,
     {
-        let chain_id = provider
-            .get_chain_id()
-            .await
-            .map_err(|e| AMMError::Msg(format!("Curve Legacy batch init failed to read chain id: {}", e)))?;
+        let chain_id = provider.get_chain_id().await.map_err(|e| {
+            AMMError::Msg(format!(
+                "Curve Legacy batch init failed to read chain id: {}",
+                e
+            ))
+        })?;
         let context = CurveLegacyBatchInitContext::new(Some(chain_id));
 
         if chain_id != ETHEREUM_CHAIN_ID {
@@ -209,7 +213,8 @@ impl CurveLegacyFactory {
             for (_, input) in chunk.iter() {
                 inputs.push(input.clone());
             }
-            let deployer = GetCurveLegacyPoolDataBatchRequest::deploy_builder(provider.clone(), inputs);
+            let deployer =
+                GetCurveLegacyPoolDataBatchRequest::deploy_builder(provider.clone(), inputs);
 
             let chunk_failed = match deployer.call_raw().block(block).await {
                 Ok(res) => match <Vec<PoolData> as SolValue>::abi_decode(&res) {
@@ -261,7 +266,9 @@ impl CurveLegacyFactory {
                     );
                     match deployer.call_raw().block(block).await {
                         Ok(res) => {
-                            if let Ok(pool_data_list) = <Vec<PoolData> as SolValue>::abi_decode(&res) {
+                            if let Ok(pool_data_list) =
+                                <Vec<PoolData> as SolValue>::abi_decode(&res)
+                            {
                                 if let Some(data) = pool_data_list.first() {
                                     if let Some(AMM::CurveLegacyPool(pool)) = amms.get_mut(*idx) {
                                         Self::apply_prefetch_to_pool(
@@ -645,13 +652,8 @@ impl CurveLegacyFactory {
         let batch_context = Self::resolve_batch_init_context::<N, _>(provider.clone()).await?;
         let mut known_addresses: HashSet<Address> = amms.iter().map(AMM::address).collect();
         let (mut results, mut success_count, mut fail_count) =
-            Self::init_curve_legacy_amms::<N, _>(
-                amms,
-                block,
-                provider.clone(),
-                &batch_context,
-            )
-            .await?;
+            Self::init_curve_legacy_amms::<N, _>(amms, block, provider.clone(), &batch_context)
+                .await?;
 
         let (mut synthesized_deps, fallback_dep_addrs) =
             Self::collect_missing_base_pool_dependencies(&results, &known_addresses);

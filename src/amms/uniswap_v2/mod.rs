@@ -8,8 +8,7 @@ use super::{
     },
     error::AMMError,
     factory::{AutomatedMarketMakerFactory, DiscoverySync},
-    fot,
-    Token,
+    fot, Token,
 };
 use alloy::{
     eips::BlockId,
@@ -204,7 +203,9 @@ impl AutomatedMarketMaker for UniswapV2Pool {
                 .checked_sub(amount_out_u128)
                 .ok_or(AMMError::Msg("reserve_1 underflow".to_string()))?;
 
-            Ok(self.output_token(base_token, quote_token).fot_net(amount_out))
+            Ok(self
+                .output_token(base_token, quote_token)
+                .fot_net(amount_out))
         } else {
             let amount_out = self.get_amount_out(
                 amount_in,
@@ -228,7 +229,9 @@ impl AutomatedMarketMaker for UniswapV2Pool {
                 .checked_add(amount_in_u128)
                 .ok_or(AMMError::Msg("reserve_1 overflow".to_string()))?;
 
-            Ok(self.output_token(base_token, quote_token).fot_net(amount_out))
+            Ok(self
+                .output_token(base_token, quote_token)
+                .fot_net(amount_out))
         }
     }
 
@@ -241,7 +244,9 @@ impl AutomatedMarketMaker for UniswapV2Pool {
         // amount_out 是接收方到手 net；池子 math 必须先输出 gross，
         // transfer 扣税后接收方才能拿到 net，因此先 gross-up。
         // 输入侧（in_token 为 FoT）全额入池、不扣税（to = pool 方向无税）
-        let gross_out = self.output_token(base_token, quote_token).fot_gross_up(amount_out);
+        let gross_out = self
+            .output_token(base_token, quote_token)
+            .fot_gross_up(amount_out);
         if self.token_a.address == base_token {
             self.get_amount_in(
                 gross_out,
@@ -1186,7 +1191,7 @@ mod tests {
                 fot_tax: Some(crate::amms::fot::FotTaxType::FlatRate { fee_bps: 300 }),
                 ..Default::default()
             }, // XLS (3% FoT)
-            reserve_0: 5_000_000_000_000, // 5M USDT
+            reserve_0: 5_000_000_000_000,          // 5M USDT
             reserve_1: 5_000_000 * 10u128.pow(18), // 5M XLS
             fee: 300,
             token_a_price: 0.0,
@@ -1211,7 +1216,10 @@ mod tests {
         let net = pool
             .simulate_swap(pool.token_a.address, pool.token_b.address, amount_in)
             .unwrap();
-        assert_eq!(net, gross - gross * U256::from(300u16) / U256::from(10000u16));
+        assert_eq!(
+            net,
+            gross - gross * U256::from(300u16) / U256::from(10000u16)
+        );
         assert!(net < gross);
 
         // 无 FoT 时回归：返回 gross（不打折）
@@ -1240,7 +1248,10 @@ mod tests {
         let net = pool
             .simulate_swap_mut(pool.token_a.address, pool.token_b.address, amount_in)
             .unwrap();
-        assert_eq!(net, gross - gross * U256::from(300u16) / U256::from(10000u16));
+        assert_eq!(
+            net,
+            gross - gross * U256::from(300u16) / U256::from(10000u16)
+        );
 
         // reserve 变化量 = gross（与链上 Sync 口径一致，扣税不反映在池子余额上）
         let gross_u128: u128 = gross.try_into().unwrap();
@@ -1275,11 +1286,16 @@ mod tests {
         let nf = no_fot
             .simulate_swap_exact_out(pool.token_a.address, pool.token_b.address, target_net)
             .unwrap();
-        assert_eq!(nf, no_fot.get_amount_in(
-            target_net,
-            U256::from(no_fot.reserve_0),
-            U256::from(no_fot.reserve_1),
-        ).unwrap());
+        assert_eq!(
+            nf,
+            no_fot
+                .get_amount_in(
+                    target_net,
+                    U256::from(no_fot.reserve_0),
+                    U256::from(no_fot.reserve_1),
+                )
+                .unwrap()
+        );
     }
 
     #[test]

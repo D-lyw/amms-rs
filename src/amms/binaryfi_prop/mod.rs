@@ -214,6 +214,11 @@ impl BinaryFiPropPool {
 
     /// bid = price - bid_offset（引擎卖方向偏移独立于买方向，见 apply_l2_update）
     pub fn bid_price(&self, i: usize) -> Option<U256> {
+        // SELL 容量权威为 0（快照观测 j→0 quote=0）时，卖出价视为不可用，
+        // 防止残留价格继续驱动该方向费率/报价（engine_quote 由 maxIn=0 兜底）
+        if self.max_inputs.get(i).copied().flatten() == Some(U256::ZERO) {
+            return None;
+        }
         let p = self.prices.get(i).copied().filter(|p| !p.is_zero())?;
         let off = self
             .bid_offsets
@@ -299,10 +304,8 @@ impl BinaryFiPropPool {
         if let Some(s) = self.spreads.get_mut(asset_idx) {
             *s = ask_off.saturating_add(bid_off);
         }
-        // 引擎收到新报价说明该资产已活跃：清掉初始化期残留的 SELL 0-cap（未注资假象）
-        if self.max_inputs.get(asset_idx) == Some(&Some(U256::ZERO)) {
-            self.max_inputs[asset_idx] = None;
-        }
+        // update 只携带价格与 ladder 点差，不携带容量；SELL 0-cap（max_inputs=Some(0)）
+        // 来自快照权威观测，不能被价格更新复活；容量恢复由下一次快照重新观测。
         self.apply_price_update(asset_idx, price, block_number);
     }
 
@@ -677,7 +680,7 @@ impl BinaryFiPropPool {
     /// bid/ask（含点差），再由 bid/ask 推导全部费率（不做 quote 锚定，避免
     /// 1-ulp 放大误差）；同时从大额 probe 恢复 BUY maxOut（饱和型直接取 q_big，
     /// 归零型标记 `buy_zero_over_vault`）与 SELL maxIn（100 整枚 probe 反推）。
-    fn apply_snapshot(&mut self, snap: &Snapshot) -> usize {
+    fn apply_snapshot(&mut self, snap: &Snapshot, snap_block: u64) -> usize {
         let mut derived = 0usize;
         if !snap.assets.is_empty() {
             self.assets = snap
@@ -788,11 +791,24 @@ impl BinaryFiPropPool {
             } else {
                 None
             };
+            // 保鲜判断（日志优先、快照补缺）：该资产 update 日志已给出 >= 快照块的
+            // 价格时，快照 quote 不覆盖本地（防止旧块 quote 回退新日志价格）；
+            // 容量/禁用状态仍以快照为准（见 1.5 节）
+            let log_fresh = snap_block != 0
+                && self.price_updated_block.get(j).copied().unwrap_or(0) >= snap_block;
             if disabled {
                 self.buy_disabled[j] = true;
                 if let Some(b) = bid {
-                    // 卖出仍可用：price = bid，点差 0（买入费率为 0）
-                    self.prices[j] = b;
+                    if !log_fresh {
+                        self.prices[j] = b;
+                        self.spreads[j] = 0;
+                        self.bid_offsets[j] = 0;
+                        self.ask_offsets[j] = 0;
+                    }
+                } else if !log_fresh {
+                    // 卖出同不可用（j→0 quote 为 0/缺失）：清掉残留 bid，
+                    // 避免旧价格 + 无上限继续产生幻影卖出报价
+                    self.prices[j] = U256::ZERO;
                     self.spreads[j] = 0;
                     self.bid_offsets[j] = 0;
                     self.ask_offsets[j] = 0;
@@ -802,7 +818,7 @@ impl BinaryFiPropPool {
             match (bid, ask) {
                 (Some(b), Some(a)) => {
                     self.buy_disabled[j] = false;
-                    if a > b && (a - b) <= U256::from(u64::MAX) {
+                    if !log_fresh && a > b && (a - b) <= U256::from(u64::MAX) {
                         let sh = (a - b).to::<u64>();
                         self.spreads[j] = sh;
                         // 参考价 = bid + spread/2（floor），bid/ask 偏移独立保存，
@@ -813,20 +829,33 @@ impl BinaryFiPropPool {
                     }
                 }
                 (Some(b), None) => {
-                    // 仅 bid 可用（0→j 缺失/恢复失败）：默认点差
-                    self.spreads[j] = BINARYFI_DEFAULT_SPREAD;
-                    self.prices[j] = b + U256::from(BINARYFI_DEFAULT_SPREAD / 2);
-                    self.bid_offsets[j] = BINARYFI_DEFAULT_SPREAD / 2;
-                    self.ask_offsets[j] = BINARYFI_DEFAULT_SPREAD / 2;
+                    if !log_fresh {
+                        // 仅 bid 可用（0→j 缺失/恢复失败）：默认点差
+                        self.spreads[j] = BINARYFI_DEFAULT_SPREAD;
+                        self.prices[j] = b + U256::from(BINARYFI_DEFAULT_SPREAD / 2);
+                        self.bid_offsets[j] = BINARYFI_DEFAULT_SPREAD / 2;
+                        self.ask_offsets[j] = BINARYFI_DEFAULT_SPREAD / 2;
+                    }
                 }
                 (None, Some(a)) => {
-                    self.spreads[j] = BINARYFI_DEFAULT_SPREAD;
-                    self.prices[j] =
-                        a.saturating_sub(U256::from((BINARYFI_DEFAULT_SPREAD + 1) / 2));
-                    self.bid_offsets[j] = (BINARYFI_DEFAULT_SPREAD + 1) / 2;
-                    self.ask_offsets[j] = (BINARYFI_DEFAULT_SPREAD + 1) / 2;
+                    if !log_fresh {
+                        self.spreads[j] = BINARYFI_DEFAULT_SPREAD;
+                        self.prices[j] =
+                            a.saturating_sub(U256::from((BINARYFI_DEFAULT_SPREAD + 1) / 2));
+                        self.bid_offsets[j] = (BINARYFI_DEFAULT_SPREAD + 1) / 2;
+                        self.ask_offsets[j] = (BINARYFI_DEFAULT_SPREAD + 1) / 2;
+                    }
                 }
-                (None, None) => {}
+                (None, None) => {
+                    if !log_fresh {
+                        // 两侧报价均缺失/为 0：清掉旧价格，防止残留 bid/ask
+                        // 继续驱动费率（下一次快照恢复）
+                        self.prices[j] = U256::ZERO;
+                        self.spreads[j] = 0;
+                        self.bid_offsets[j] = 0;
+                        self.ask_offsets[j] = 0;
+                    }
+                }
             }
         }
 
@@ -856,26 +885,32 @@ impl BinaryFiPropPool {
             }
             // SELL 侧：j→0 100 整枚 quote 被截断（q < q_small·10^6）时
             // maxIn = q·10^di / (q_small·10^4)（q_small = bid·10^(d0-2)/10^4）。
-            // qb == 0 表示资产尚未注资（引擎 maxIn = ladderWeight×reserve = 0），
-            // 保持 unknown（None），避免把所有卖出截成 0；未截断时同样清除旧值。
-            if let (Some(qs), Some(qb)) = (j0_out[j], big_sell_out[j]) {
-                if !qs.is_zero() {
-                    let lin = qs.checked_mul(U256::from(1_000_000)).unwrap_or(U256::MAX);
-                    if qb.is_zero() || qb >= lin {
-                        self.max_inputs[j] = None;
-                    } else {
-                        let dj = self.assets[j].decimals as u32;
-                        let den = qs.checked_mul(U256::from(10_000)).unwrap_or(U256::ZERO);
-                        if dj <= 30 && !den.is_zero() {
-                            let num = qb.checked_mul(U256::from(10u64).pow(U256::from(dj)));
-                            if let Some(v) = num {
-                                // maxIn_real = ceil(q_big·10^di / (q_small·10^4))：
-                                // floor 会低估 1 单位，导致饱和区输出 sim = chain - 1
-                                self.max_inputs[j] = Some((v + den - U256::from(1)) / den);
+            // j→0 小额 quote 权威为 0 → 引擎 SELL 容量为 0（ladder×reserve=0），
+            // 写死 Some(0) 上限；update 日志只更新价格、不复活该方向容量。
+            match j0_out[j] {
+                Some(qs) if qs.is_zero() => {
+                    self.max_inputs[j] = Some(U256::ZERO);
+                }
+                Some(qs) => {
+                    if let Some(qb) = big_sell_out[j] {
+                        let lin = qs.checked_mul(U256::from(1_000_000)).unwrap_or(U256::MAX);
+                        if qb.is_zero() || qb >= lin {
+                            self.max_inputs[j] = None;
+                        } else {
+                            let dj = self.assets[j].decimals as u32;
+                            let den = qs.checked_mul(U256::from(10_000)).unwrap_or(U256::ZERO);
+                            if dj <= 30 && !den.is_zero() {
+                                let num = qb.checked_mul(U256::from(10u64).pow(U256::from(dj)));
+                                if let Some(v) = num {
+                                    // maxIn_real = ceil(q_big·10^di / (q_small·10^4))：
+                                    // floor 会低估 1 单位，导致饱和区输出 sim = chain - 1
+                                    self.max_inputs[j] = Some((v + den - U256::from(1)) / den);
+                                }
                             }
                         }
                     }
                 }
+                None => {}
             }
         }
 
@@ -1038,6 +1073,11 @@ impl AutomatedMarketMaker for BinaryFiPropPool {
                 // 真实 bid（链上 bid 与 calldata mid 的偏移随更新变化），走批量
                 // 快照从 j→0 quote 精确恢复 bid + spread=0。
                 if self.buy_disabled.get(asset_idx).copied().unwrap_or(false) {
+                    // 卖出方向同样被禁（快照权威观测 j→0 quote=0 → maxIn=0，bid 不可用）：
+                    // 资产完全不可交易，本次价格更新无意义，直接忽略，避免无谓 AsyncUpdate。
+                    if self.max_inputs.get(asset_idx).copied().flatten() == Some(U256::ZERO) {
+                        return Ok(SyncAction::None);
+                    }
                     self.mark_stale_for_asset(asset_idx);
                     return Ok(SyncAction::AsyncUpdate);
                 }
@@ -1063,7 +1103,9 @@ impl AutomatedMarketMaker for BinaryFiPropPool {
     }
 
     fn set_last_synced_block(&mut self, block_number: u64) {
-        self.last_synced_block = block_number;
+        // 单调不回退（与 UniswapV3 一致）：防止周期任务/AsyncUpdate
+        // 用更旧块号覆盖本地已推进的日志状态
+        self.last_synced_block = self.last_synced_block.max(block_number);
     }
 
     fn tokens(&self) -> Vec<Address> {
@@ -1270,6 +1312,13 @@ impl AutomatedMarketMaker for BinaryFiPropPool {
                 2 * BINARYFI_ASSET_COUNT * BINARYFI_ASSET_COUNT + j,
             ));
         }
+        // 固定到具体块号：快照 quote 与保鲜判断（日志价格 >= snap_block 不覆盖）同块一致，
+        // 且避免 provider 被 fetch_snapshot 移动后再使用
+        let snap_block = match block_number {
+            BlockId::Number(alloy::eips::BlockNumberOrTag::Number(num)) => num,
+            _ => provider.get_block_number().await?,
+        };
+        let block = BlockId::Number(alloy::eips::BlockNumberOrTag::Number(snap_block));
         let snap = Self::fetch_snapshot(
             provider,
             self.pool_address,
@@ -1279,16 +1328,14 @@ impl AutomatedMarketMaker for BinaryFiPropPool {
             quote_pairs,
             big_quote_pairs,
             big_sell_pairs,
-            block_number,
+            block,
         )
         .await?;
-        let derived = self.apply_snapshot(&snap);
+        let derived = self.apply_snapshot(&snap, snap_block);
         if derived == 0 {
             tracing::warn!(target: "amms::binaryfi_prop", pool = %self.pool_address, "binaryfi: init snapshot derived 0 rates");
         }
-        if let BlockId::Number(alloy::eips::BlockNumberOrTag::Number(num)) = block_number {
-            self.last_synced_block = num;
-        }
+        self.last_synced_block = snap_block;
         Ok(self)
     }
 
@@ -1314,6 +1361,13 @@ impl BinaryFiPropPool {
             return Ok(());
         }
         let assets: Vec<Address> = self.assets.iter().map(|t| t.address).collect();
+        // 固定到具体块号：快照 quote 与保鲜判断（日志价格 >= snap_block 不覆盖）同块一致，
+        // 避免 BlockId::latest() 的隐式取数块与本地日志推进产生竞态
+        let snap_block: u64 = match block {
+            BlockId::Number(alloy::eips::BlockNumberOrTag::Number(num)) => num,
+            _ => provider.get_block_number().await?,
+        };
+        let block = BlockId::Number(alloy::eips::BlockNumberOrTag::Number(snap_block));
         let quote_pairs: Vec<U256> = self.stale_pairs.iter().map(|&p| U256::from(p)).collect();
         // stale 资产涉及的 (0→j) 方向附带大额报价，锁定 ask + BUY maxOut
         let mut big_quote_pairs: Vec<U256> = Vec::new();
@@ -1340,7 +1394,7 @@ impl BinaryFiPropPool {
             block,
         )
         .await?;
-        self.apply_snapshot(&snap);
+        self.apply_snapshot(&snap, snap_block);
         if !snap.quotePairs.is_empty() {
             let refreshed: Vec<usize> = snap.quotePairs.iter().map(|p| p.to::<usize>()).collect();
             self.clear_stale_pairs(&refreshed);
@@ -1476,4 +1530,3 @@ pub fn enrich_update_log_data(
     }
     LogData::new(log_data.topics().to_vec(), Bytes::from(words))
 }
-

@@ -68,7 +68,8 @@ impl CurveLegacyBatchPrefetch {
     }
 
     pub fn has_complete_rates(&self) -> bool {
-        self.rates.len() == self.n_coins as usize && self.rates.iter().all(|rate| *rate != U256::ZERO)
+        self.rates.len() == self.n_coins as usize
+            && self.rates.iter().all(|rate| *rate != U256::ZERO)
     }
 
     pub fn has_complete_crypto_params(&self) -> bool {
