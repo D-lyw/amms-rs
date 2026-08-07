@@ -55,12 +55,13 @@ use alloy::{
     eips::BlockId,
     network::{BlockResponse, Network},
     primitives::{keccak256, Address, B256, U256},
-    providers::Provider,
+    providers::{DynProvider, Provider, ProviderBuilder},
     rpc::types::Log,
     sol,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::sync::OnceLock;
 use tracing::instrument;
 
 use crate::amms::{
@@ -988,6 +989,38 @@ struct CaliberSnapshot {
 /// `too many RPC calls in batch request`），取安全值 10。
 const STORAGE_BATCH_SIZE: usize = 10;
 
+/// caliber 存储读取专用 HTTP RPC。
+///
+/// XLayer 生产 WS 网关（`wss://ws.xlayer.tech`）不开放 `eth_getStorageAt`
+/// （`-32601: rpc method is not whitelisted`），而初始化/周期对账必须直读
+/// 合约 storage `cfg`/`data`/`ladder` 槽位；因此本模块的存储读取统一走
+/// 该 HTTP RPC。实时报价更新仍由 flashblocks 原始交易流驱动，不受影响。
+///
+/// ⚠️ 临时方案（2026-08-07）：为快速解决生产 WS 网关拒绝 `eth_getStorageAt`
+/// 的问题，此处硬编码了 `rpc.xlayer.tech` 公共端点。后续迭代应改为：
+/// 1. 由上层（dex-arbitrage chain 配置 `http_rpc_url`）显式传入 HTTP RPC，而不是
+///    在库内硬编码公共端点（公共端点有 rate limit，且多环境不可移植）；
+/// 2. 或改用合约自带 view 函数（`getPoolBalances(pairId)` / `quote()`，WS 上
+///    `eth_call` 可用）替代直读存储槽，从而完全摆脱对 `eth_getStorageAt` 的依赖。
+const CALIBER_STORAGE_HTTP_RPC: &str = "https://rpc.xlayer.tech";
+
+/// 懒初始化的 HTTP provider（进程内复用，避免每次对账重连）。
+static CALIBER_STORAGE_PROVIDER: OnceLock<DynProvider> = OnceLock::new();
+
+fn caliber_storage_provider() -> Result<&'static DynProvider, AMMError> {
+    if let Some(provider) = CALIBER_STORAGE_PROVIDER.get() {
+        return Ok(provider);
+    }
+    let url: alloy::transports::http::reqwest::Url = CALIBER_STORAGE_HTTP_RPC
+        .parse()
+        .map_err(|e| AMMError::Msg(format!("caliber: invalid storage rpc url: {e}")))?;
+    let provider: DynProvider = ProviderBuilder::new().connect_http(url).erased();
+    let _ = CALIBER_STORAGE_PROVIDER.set(provider);
+    Ok(CALIBER_STORAGE_PROVIDER
+        .get()
+        .expect("caliber storage provider just initialized"))
+}
+
 /// batch 回退告警只输出一次（避免每周期每 chunk 刷屏）
 static BATCH_FALLBACK_WARNED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -1011,7 +1044,7 @@ fn warn_batch_fallback(e: &AMMError) {
 /// 与逐槽 `eth_getStorageAt` 完全等价（同一 `block`、同一序列化参数），
 /// 仅把 N 次 RPC 往返折叠为 1 次。所有请求必须指向同一区块。
 async fn storage_at_batch<N, P>(
-    provider: &P,
+    _provider: &P,
     reads: &[(Address, B256)],
     block: BlockId,
 ) -> Result<Vec<U256>, AMMError>
@@ -1019,10 +1052,12 @@ where
     N: Network,
     P: Provider<N>,
 {
+    // 存储读取统一走硬编码 HTTP RPC（WS 网关不开放 eth_getStorageAt）。
     // 先尝试 JSON-RPC batch（一个 HTTP 请求）；若网关拒绝 batch
     // （如 -32601 method not whitelisted、大小超限截断等），回退逐槽读取。
     // batch 只是优化路径，逐槽是可靠基线，保证任意网关下可用。
-    let mut batch = alloy::rpc::client::BatchRequest::new(provider.client());
+    let http_provider = caliber_storage_provider()?;
+    let mut batch = alloy::rpc::client::BatchRequest::new(http_provider.client());
     let mut waiters = Vec::with_capacity(reads.len());
     for (address, slot) in reads {
         let key = U256::from_be_bytes(slot.0);
@@ -1056,7 +1091,7 @@ where
         out.clear();
         for (address, slot) in reads {
             let key = U256::from_be_bytes(slot.0);
-            let value = provider
+            let value = http_provider
                 .get_storage_at(*address, key)
                 .block_id(block)
                 .await
