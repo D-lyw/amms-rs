@@ -86,8 +86,10 @@ pub const BINARYFI_POOL_ADDRESS: Address = address!("0x2d651e3fe9470db52d211569a
 pub const BINARYFI_ENGINE_ADDRESS: Address = address!("0xeacf260a16a4e16a758fc1bd126d49d8e02f9996");
 /// XLayer 默认部署：金库合约（持有资产）
 pub const BINARYFI_VAULT_ADDRESS: Address = address!("0x9b169052Ee1569Ec5bDF51DbF48D2962526cF6D9");
-/// XLayer 默认部署：quote 的 recipient（Router，从真实交易获取）
-pub const BINARYFI_ROUTER_ADDRESS: Address = address!("0xa1945aa291a99ea996b9c41cc645e30c1c01d190");
+/// XLayer 默认部署：quote 的 recipient（Router）。
+/// 官方 Router 为 PAmm1010Router（= 池子地址 0x2d651e，与 poolindex 配置一致）；
+/// 该常量仅作 `Default` 兜底初值，生产路径由 loader 从 ndjson config 覆盖。
+pub const BINARYFI_ROUTER_ADDRESS: Address = address!("0x2d651e3fe9470db52d211569a0ab7266c5180de7");
 /// 池子 Swap 事件签名
 pub const BINARYFI_SWAP_EVENT: B256 =
     b256!("cd3829a3813dc3cdd188fd3d01dcf3268c16be2fdd2dd21d0665418816e46062");
@@ -718,7 +720,7 @@ impl BinaryFiPropPool {
     /// bid/ask（含点差），再由 bid/ask 推导全部费率（不做 quote 锚定，避免
     /// 1-ulp 放大误差）；同时从大额 probe 恢复 BUY maxOut（饱和型直接取 q_big，
     /// 归零型标记 `buy_zero_over_vault`）与 SELL maxIn（100 整枚 probe 反推）。
-    fn apply_snapshot(&mut self, snap: &Snapshot, snap_block: u64) -> usize {
+    pub(crate) fn apply_snapshot(&mut self, snap: &Snapshot, snap_block: u64) -> usize {
         let mut derived = 0usize;
         if !snap.assets.is_empty() {
             self.assets = snap
@@ -1093,9 +1095,11 @@ impl AutomatedMarketMaker for BinaryFiPropPool {
             if i == j {
                 return Ok(SyncAction::Resync);
             }
-            // 虚拟子池只处理涉及自身暴露 pair 的 Swap（解析层已按此扇出，此处防御性校验）
+            // 虚拟子池只处理完全落在自身 exposed pair 内的 Swap（与 simulate_swap
+            // 一致：两个资产都必须在本 pair，避免仅含单一资产时用他人 pair 的
+            // 成交锚定/影响自身 affected 判定）
             if let Some((a, b)) = self.exposed_pair {
-                if a != i && b != i && a != j && b != j {
+                if !((i == a || i == b) && (j == a || j == b)) {
                     return Ok(SyncAction::None);
                 }
             }
@@ -1445,7 +1449,6 @@ impl BinaryFiPropPool {
         if n == 0 {
             return Ok(());
         }
-        let assets: Vec<Address> = self.assets.iter().map(|t| t.address).collect();
         // 固定到具体块号：快照 quote 与保鲜判断（日志价格 >= snap_block 不覆盖）同块一致，
         // 避免 BlockId::latest() 的隐式取数块与本地日志推进产生竞态
         let snap_block: u64 = match block {
@@ -1453,6 +1456,30 @@ impl BinaryFiPropPool {
             _ => provider.get_block_number().await?,
         };
         let block = BlockId::Number(alloy::eips::BlockNumberOrTag::Number(snap_block));
+        let snap = self.fetch_stale_snapshot(provider, block).await?;
+        self.apply_snapshot(&snap, snap_block);
+        if !snap.quotePairs.is_empty() {
+            let refreshed: Vec<usize> = snap.quotePairs.iter().map(|p| p.to::<usize>()).collect();
+            self.clear_stale_pairs(&refreshed);
+        }
+        Ok(())
+    }
+
+    /// 按当前 stale_pairs 组装 quote 请求并发起批量快照（只读，不修改本地状态）。
+    ///
+    /// update_at 与 fetch_full_snapshot 共用：一次链上批量读取，避免两处重复
+    /// 组装 big_quote/big_sell 请求参数。
+    async fn fetch_stale_snapshot<N, P>(
+        &self,
+        provider: P,
+        block: BlockId,
+    ) -> Result<Snapshot, AMMError>
+    where
+        N: Network,
+        P: Provider<N> + Clone,
+    {
+        let n = self.assets.len();
+        let assets: Vec<Address> = self.assets.iter().map(|t| t.address).collect();
         let quote_pairs: Vec<U256> = self.stale_pairs.iter().map(|&p| U256::from(p)).collect();
         // stale 资产涉及的 (0→j) 方向附带大额报价，锁定 ask + BUY maxOut
         let mut big_quote_pairs: Vec<U256> = Vec::new();
@@ -1467,7 +1494,7 @@ impl BinaryFiPropPool {
                 big_sell_pairs.push(U256::from(2 * n * n + i));
             }
         }
-        let snap = Self::fetch_snapshot(
+        Self::fetch_snapshot(
             provider,
             self.pool_address,
             self.engine_address,
@@ -1478,13 +1505,43 @@ impl BinaryFiPropPool {
             big_sell_pairs,
             block,
         )
-        .await?;
-        self.apply_snapshot(&snap, snap_block);
-        if !snap.quotePairs.is_empty() {
-            let refreshed: Vec<usize> = snap.quotePairs.iter().map(|p| p.to::<usize>()).collect();
-            self.clear_stale_pairs(&refreshed);
+        .await
+    }
+
+    /// 拉取并返回全量快照（只读，不修改本地状态）：标记全部资产 stale 后做一次
+    /// 链上批量读取，返回 `(snapshot, snap_block)`。
+    ///
+    /// 供 state_space 周期任务按部署做"一次链上调用、多实例内存分发"：各虚拟子池
+    /// 实例自行调用 [`Self::apply_snapshot`]，利用实例自身的 `price_updated_block`
+    /// 保鲜判断（日志价格 >= snap_block 不覆盖），避免周期快照回退更新日志价格。
+    pub(crate) async fn fetch_full_snapshot<N, P>(
+        &mut self,
+        provider: P,
+    ) -> Result<(Snapshot, u64), AMMError>
+    where
+        N: Network,
+        P: Provider<N> + Clone,
+    {
+        let n = self.assets.len();
+        if n == 0 {
+            let empty = Snapshot {
+                assets: Vec::new(),
+                decimals: Vec::new(),
+                scales: Vec::new(),
+                poolBalances: Vec::new(),
+                vaultReserves: Vec::new(),
+                quotePairs: Vec::new(),
+                quotes: Vec::new(),
+            };
+            return Ok((empty, 0));
         }
-        Ok(())
+        for j in 1..n {
+            self.mark_stale_for_asset(j);
+        }
+        let snap_block = provider.get_block_number().await?;
+        let block = BlockId::Number(alloy::eips::BlockNumberOrTag::Number(snap_block));
+        let snap = self.fetch_stale_snapshot(provider, block).await?;
+        Ok((snap, snap_block))
     }
 
 }

@@ -2150,10 +2150,16 @@ impl StateSpace {
                         let Some((a, b)) = exposed else {
                             return None;
                         };
-                        let in_pair = [assets.get(a), assets.get(b)]
-                            .into_iter()
-                            .flatten()
-                            .any(|addr| *addr == token_in || *addr == token_out);
+                        // Swap 两资产都必须在本 exposed pair 内：Swap(0→8) 只命中
+                        // (0,8) 这一个虚拟子池，避免含 0/8 的其他实例被过度标记
+                        // affected（与 sync/simulate_swap 的 pair 守卫一致）。
+                        let in_pair = match (assets.get(a), assets.get(b)) {
+                            (Some(ta), Some(tb)) => {
+                                (ta == &token_in || tb == &token_in)
+                                    && (ta == &token_out || tb == &token_out)
+                            }
+                            _ => false,
+                        };
                         in_pair.then_some(key)
                     })
                     .collect();

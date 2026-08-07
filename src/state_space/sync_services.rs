@@ -1277,25 +1277,30 @@ pub async fn start_binaryfi_prop_sync_task<N, P>(
             let Some(mut seed) = group.first().cloned() else {
                 continue;
             };
-            // 全部 pair 标记 stale → update() 走全量批量快照
-            for j in 1..seed.assets.len() {
-                seed.mark_stale_for_asset(j);
-            }
-            if let Err(e) = seed.update::<N, P>(provider.clone()).await {
-                error!(
-                    address = ?seed.pool_address,
-                    error = ?e,
-                    "Failed to refresh BinaryFi propAMM full snapshot"
-                );
-                continue;
-            }
+            // 一次链上批量读取全量快照；分发时各实例自行 apply_snapshot，
+            // 利用实例自身的 price_updated_block 保鲜判断（日志价格 >= snap_block
+            // 不覆盖），防止快照回退更新日志价格。
+            let (snap, snap_block) = match seed.fetch_full_snapshot::<N, P>(provider.clone()).await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    error!(
+                        address = ?seed.pool_address,
+                        error = ?e,
+                        "Failed to refresh BinaryFi propAMM full snapshot"
+                    );
+                    continue;
+                }
+            };
+            let refreshed_pairs: Vec<usize> =
+                snap.quotePairs.iter().map(|p| p.to::<usize>()).collect();
             for pool in group {
                 let addr = pool.address();
-                let virtual_address = pool.virtual_address;
-                let exposed_pair = pool.exposed_pair;
-                let mut refreshed = seed.clone();
-                refreshed.virtual_address = virtual_address;
-                refreshed.exposed_pair = exposed_pair;
+                // 保留实例虚拟身份 + 实例自身 price_updated_block（日志保鲜）
+                let mut refreshed = pool.clone();
+                refreshed.apply_snapshot(&snap, snap_block);
+                refreshed.set_last_synced_block(snap_block);
+                refreshed.clear_stale_pairs(&refreshed_pairs);
                 if let Some(existing_amm) = write_guard.get_mut_cow(&addr) {
                     if let AMM::BinaryFiPropPool(existing) = existing_amm {
                         *existing = refreshed;
