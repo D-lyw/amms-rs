@@ -34,7 +34,7 @@ use alloy::consensus::BlockHeader;
 use alloy::eips::BlockId;
 use alloy::network::Network;
 
-use alloy::primitives::{keccak256, Address, Bloom, BloomInput, FixedBytes, B256};
+use alloy::primitives::{keccak256, Address, Bloom, BloomInput, FixedBytes, B256, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::{eth::Log, Filter, FilterSet};
 use alloy::sol;
@@ -2110,21 +2110,76 @@ impl StateSpace {
             .collect()
     }
 
-    fn resolve_binaryfi_update_pool(
+    /// 解析 BinaryFi 事件（Swap / Update）命中的虚拟子池地址集合。
+    ///
+    /// 虚拟化后 StateSpace 中不再有真实地址 key：Swap 事件（topics[2]/topics[3] 为
+    /// tokenIn/tokenOut）命中"暴露 pair 含任一交易资产"的虚拟子池；Update 事件
+    /// （topics[1] 为全局 asset_idx）命中"暴露 pair 含该资产"的虚拟子池。
+    /// 返回 None 表示非本 StateSpace 中 BinaryFi 部署的事件，交由其他分支解析。
+    fn resolve_binaryfi_targets(
         &self,
         log_address: Address,
         topics: &[FixedBytes<32>],
-    ) -> Option<Address> {
-        if topics.first() != Some(&crate::amms::binaryfi_prop::BINARYFI_UPDATE_EVENT) {
-            return None;
+    ) -> Option<Vec<Address>> {
+        use crate::amms::binaryfi_prop::{BINARYFI_SWAP_EVENT, BINARYFI_UPDATE_EVENT};
+
+        let mut instances: Vec<(Address, Option<(usize, usize)>, Vec<Address>, Address, Address)> =
+            Vec::new();
+        let mut has_pool_match = false;
+        let mut has_engine_match = false;
+        for (key, amm) in self.state.iter() {
+            if let AMM::BinaryFiPropPool(p) = amm.as_ref() {
+                has_pool_match |= p.pool_address == log_address;
+                has_engine_match |= p.engine_address == log_address;
+                let assets = p.assets.iter().map(|t| t.address).collect::<Vec<_>>();
+                instances.push((*key, p.exposed_pair, assets, p.pool_address, p.engine_address));
+            }
         }
-        // engine 地址按池子实例配置匹配（支持跨链/多部署，不依赖模块常量）
-        self.state
-            .iter()
-            .find_map(|(pool_address, amm)| match amm.as_ref() {
-                AMM::BinaryFiPropPool(p) if p.engine_address == log_address => Some(*pool_address),
-                _ => None,
-            })
+
+        match topics.first() {
+            Some(topic) if *topic == BINARYFI_SWAP_EVENT && has_pool_match && topics.len() >= 4 => {
+                let token_in = Address::from_word(topics[2]);
+                let token_out = Address::from_word(topics[3]);
+                let targets = instances
+                    .into_iter()
+                    .filter_map(|(key, exposed, assets, pool_addr, _)| {
+                        // 只命中本部署（同一 pool 地址）的虚拟子池，避免多部署串扰
+                        if pool_addr != log_address {
+                            return None;
+                        }
+                        let Some((a, b)) = exposed else {
+                            return None;
+                        };
+                        let in_pair = [assets.get(a), assets.get(b)]
+                            .into_iter()
+                            .flatten()
+                            .any(|addr| *addr == token_in || *addr == token_out);
+                        in_pair.then_some(key)
+                    })
+                    .collect();
+                Some(targets)
+            }
+            Some(topic)
+                if *topic == BINARYFI_UPDATE_EVENT && has_engine_match && topics.len() >= 2 =>
+            {
+                let asset_idx = U256::from_be_bytes(topics[1].0).to::<usize>();
+                let targets = instances
+                    .into_iter()
+                    .filter_map(|(key, exposed, _, _, engine_addr)| {
+                        // 只命中本部署（同一 engine 地址）的虚拟子池，避免多部署串扰
+                        if engine_addr != log_address {
+                            return None;
+                        }
+                        match exposed {
+                            Some((a, b)) if a == asset_idx || b == asset_idx => Some(key),
+                            _ => None,
+                        }
+                    })
+                    .collect();
+                Some(targets)
+            }
+            _ => None,
+        }
     }
 
     pub fn sync(
@@ -2195,10 +2250,10 @@ impl StateSpace {
                     if self.state.contains_key(&pool_address) {
                         target_addresses.push(pool_address);
                     }
-                } else if let Some(pool_address) =
-                    self.resolve_binaryfi_update_pool(address, log.topics())
+                } else if let Some(binaryfi_targets) =
+                    self.resolve_binaryfi_targets(address, log.topics())
                 {
-                    target_addresses.push(pool_address);
+                    target_addresses.extend(binaryfi_targets);
                 } else if let Some(pool_address) =
                     self.resolve_slipstream_fee_event_pool(log.topics())
                 {

@@ -108,11 +108,38 @@ pub const BINARYFI_DEFAULT_SPREAD: u64 = 8;
 /// 每次 swap 模拟消耗的默认 gas
 pub const DEFAULT_SWAP_GAS: u64 = 250_000;
 
-/// BinaryFi propAMM 池子（单实例：1 池 + 12 资产 + 132 有向费率）
+/// 确定性派生 BinaryFi 虚拟子池地址（token_a < token_b 排序，无方向歧义）。
+///
+/// 与 UniswapV4 的 poolId 不同：BinaryFi 链上不存在 pair 身份，虚拟地址必须由
+/// amms 与下游（poolindex/loader）用同一函数链下派生，保证 StateSpace key 与
+/// 拓扑/ndjson 中的地址一致。输入含真实池子地址 → 天然支持跨链/多部署。
+pub fn binaryfi_virtual_address(pool: Address, token_a: Address, token_b: Address) -> Address {
+    let (a, b) = if token_a < token_b {
+        (token_a, token_b)
+    } else {
+        (token_b, token_a)
+    };
+    let digest = keccak256(("BinaryFiEvm", pool, a, b).abi_encode());
+    Address::from_word(digest)
+}
+
+/// BinaryFi propAMM 池子。
+///
+/// 对外以"具体 token pair 的虚拟子池"呈现（与 UniswapV4/Caliber 一致）：
+/// StateSpace 中一个实例 = 一个可交易对；`virtual_address` 为 StateSpace key，
+/// `exposed_pair` 限定对外暴露的资产对。实例内部仍保留全 12 资产数组
+/// （numéraire 假设、全局 asset_idx、报价公式与引擎一致），未暴露资产数据
+/// 不参与任何对外计算。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BinaryFiPropPool {
-    /// 池子合约地址（StateSpace key）
+    /// 池子真实合约地址（链上批量调用 + Swap 日志匹配；不再是 StateSpace key）
     pub pool_address: Address,
+    /// StateSpace key（虚拟子池地址）；ZERO = canonical 模式（等于 pool_address）
+    #[serde(default)]
+    pub virtual_address: Address,
+    /// 对外暴露的资产对（全局资产索引，与引擎资产列表对齐）；None = 暴露全部
+    #[serde(default)]
+    pub exposed_pair: Option<(usize, usize)>,
     /// 引擎合约地址（update 日志来源）
     pub engine_address: Address,
     /// 金库合约地址
@@ -167,6 +194,17 @@ pub struct BinaryFiPropPool {
 }
 
 impl BinaryFiPropPool {
+    /// 部署分组 key（同 pool/engine/router/vault = 同一部署，共享链上状态）。
+    /// 用于 init_batch 去重与周期同步按部署刷新。
+    pub fn deployment_key(&self) -> (Address, Address, Address, Address) {
+        (
+            self.pool_address,
+            self.engine_address,
+            self.router_address,
+            self.vault_address,
+        )
+    }
+
     /// pair 的线性存储 index
     pub fn pair_index(&self, i: usize, j: usize) -> usize {
         let n = self.assets.len().max(1);
@@ -1017,7 +1055,11 @@ fn u256_to_f64(value: &U256) -> f64 {
 
 impl AutomatedMarketMaker for BinaryFiPropPool {
     fn address(&self) -> Address {
-        self.pool_address
+        if !self.virtual_address.is_zero() {
+            self.virtual_address
+        } else {
+            self.pool_address
+        }
     }
 
     fn supported_chains(&self) -> Option<Vec<u64>> {
@@ -1051,6 +1093,12 @@ impl AutomatedMarketMaker for BinaryFiPropPool {
             if i == j {
                 return Ok(SyncAction::Resync);
             }
+            // 虚拟子池只处理涉及自身暴露 pair 的 Swap（解析层已按此扇出，此处防御性校验）
+            if let Some((a, b)) = self.exposed_pair {
+                if a != i && b != i && a != j && b != j {
+                    return Ok(SyncAction::None);
+                }
+            }
             self.anchor_rate(i, j, amount_in, amount_out);
             return Ok(SyncAction::None);
         }
@@ -1061,6 +1109,12 @@ impl AutomatedMarketMaker for BinaryFiPropPool {
             && topics[0] == BINARYFI_UPDATE_EVENT
         {
             let asset_idx = U256::from_be_bytes(topics[1].0).to::<usize>();
+            // 虚拟子池只处理自身暴露 pair 涉及的资产价格更新
+            if let Some((a, b)) = self.exposed_pair {
+                if a != asset_idx && b != asset_idx {
+                    return Ok(SyncAction::None);
+                }
+            }
             let data = log.data().data.as_ref();
             // 增强后的 data 携带 (price, blockNumber, data0..2, askOffsetRaw, bidOffsetRaw)
             // 7 个 word；price + 点差（由 ladder 前 16 位解析）一次到位
@@ -1109,6 +1163,16 @@ impl AutomatedMarketMaker for BinaryFiPropPool {
     }
 
     fn tokens(&self) -> Vec<Address> {
+        if let Some((a, b)) = self.exposed_pair {
+            let mut out = Vec::with_capacity(2);
+            if let Some(ta) = self.assets.get(a) {
+                out.push(ta.address);
+            }
+            if let Some(tb) = self.assets.get(b) {
+                out.push(tb.address);
+            }
+            return out;
+        }
         self.assets.iter().map(|t| t.address).collect()
     }
 
@@ -1161,6 +1225,13 @@ impl AutomatedMarketMaker for BinaryFiPropPool {
         if i == j || amount_in.is_zero() {
             return Ok(U256::ZERO);
         }
+        // 虚拟子池只对自身暴露 pair 报价（防御性校验；tokens() 已限定）
+        if let Some((a, b)) = self.exposed_pair {
+            let hit = (i == a || i == b) && (j == a || j == b);
+            if !hit {
+                return Ok(U256::ZERO);
+            }
+        }
         let (out, cap_known) = match self.engine_quote(i, j, amount_in) {
             Some(out) => (out, self.ladder_cap_known(i, j)),
             None => {
@@ -1203,6 +1274,13 @@ impl AutomatedMarketMaker for BinaryFiPropPool {
         };
         if i == j || amount_in.is_zero() {
             return Ok(U256::ZERO);
+        }
+        // 虚拟子池只对自身暴露 pair 报价（防御性校验；tokens() 已限定）
+        if let Some((a, b)) = self.exposed_pair {
+            let hit = (i == a || i == b) && (j == a || j == b);
+            if !hit {
+                return Ok(U256::ZERO);
+            }
         }
         let (out, cap_known) = match self.engine_quote(i, j, amount_in) {
             Some(out) => (out, self.ladder_cap_known(i, j)),
@@ -1252,6 +1330,13 @@ impl AutomatedMarketMaker for BinaryFiPropPool {
         };
         if i == j || amount_out.is_zero() {
             return Err(AMMError::Msg("binaryfi: invalid exact out".to_string()));
+        }
+        // 虚拟子池只对自身暴露 pair 报价（防御性校验；tokens() 已限定）
+        if let Some((a, b)) = self.exposed_pair {
+            let hit = (i == a || i == b) && (j == a || j == b);
+            if !hit {
+                return Err(AMMError::Msg("binaryfi: pair not exposed".to_string()));
+            }
         }
         let rate = self
             .rates
@@ -1424,6 +1509,8 @@ impl Default for BinaryFiPropPool {
     fn default() -> Self {
         Self {
             pool_address: BINARYFI_POOL_ADDRESS,
+            virtual_address: Address::ZERO,
+            exposed_pair: None,
             engine_address: BINARYFI_ENGINE_ADDRESS,
             vault_address: BINARYFI_VAULT_ADDRESS,
             router_address: BINARYFI_ROUTER_ADDRESS,

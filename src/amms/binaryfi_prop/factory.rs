@@ -88,6 +88,8 @@ impl BinaryFiPropFactory {
     fn skeleton(&self, created_block: u64) -> BinaryFiPropPool {
         BinaryFiPropPool {
             pool_address: self.contract_address,
+            virtual_address: Address::ZERO,
+            exposed_pair: None,
             engine_address: self.engine_address,
             vault_address: self.vault_address,
             router_address: self.router_address,
@@ -197,11 +199,53 @@ where
     N: Network,
     P: Provider<N> + Clone,
 {
-    let mut initialized = Vec::with_capacity(amms.len());
+    // 虚拟子池：同一部署（pool/engine/router/vault 相同）的多个实例共享一份
+    // 链上状态。按部署分组，每组只对第一个实例做一次全量批量快照初始化，
+    // 其余实例克隆其状态并恢复各自的虚拟身份（virtual_address/exposed_pair），
+    // 避免 65 个实例各自触发一次链上批量读取。
+    let mut groups: std::collections::HashMap<(Address, Address, Address, Address), Vec<AMM>> =
+        std::collections::HashMap::new();
     for amm in amms {
-        let address = amm.address();
-        match amm.init::<N, P>(block_number, provider.clone()).await {
-            Ok(p) => initialized.push(p),
+        let key = match &amm {
+            AMM::BinaryFiPropPool(p) => p.deployment_key(),
+            // 非 BinaryFi 池子（理论不会出现，防御）：以自身地址为组 key，
+            // 保证每组仅一个实例，行为与逐个 init 一致。
+            _ => (amm.address(), Address::ZERO, Address::ZERO, Address::ZERO),
+        };
+        groups.entry(key).or_default().push(amm);
+    }
+
+    let mut initialized = Vec::with_capacity(groups.values().map(|g| g.len()).sum());
+    for (_, group) in groups {
+        let Some(seed) = group.first().cloned() else {
+            continue;
+        };
+        let (seed_virtual, seed_exposed) = match &seed {
+            AMM::BinaryFiPropPool(p) => (p.virtual_address, p.exposed_pair),
+            _ => (Address::ZERO, None),
+        };
+        let address = seed.address();
+        match seed.init::<N, P>(block_number, provider.clone()).await {
+            Ok(mut p) => {
+                // init 不会改动虚拟身份，显式恢复以防未来变更
+                if let AMM::BinaryFiPropPool(pp) = &mut p {
+                    pp.virtual_address = seed_virtual;
+                    pp.exposed_pair = seed_exposed;
+                }
+                for other in group.iter().skip(1) {
+                    let (ov, oe) = match other {
+                        AMM::BinaryFiPropPool(pp) => (pp.virtual_address, pp.exposed_pair),
+                        _ => (Address::ZERO, None),
+                    };
+                    let mut clone = p.clone();
+                    if let AMM::BinaryFiPropPool(cp) = &mut clone {
+                        cp.virtual_address = ov;
+                        cp.exposed_pair = oe;
+                    }
+                    initialized.push(clone);
+                }
+                initialized.push(p);
+            }
             Err(e) => {
                 // 初始化失败会静默丢失池子（上层拓扑仍引用它），必须显式告警
                 warn!(

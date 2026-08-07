@@ -1246,46 +1246,60 @@ pub async fn start_binaryfi_prop_sync_task<N, P>(
         sleep(next_sleep).await;
         next_sleep = interval;
 
-        let mut target_pools: Vec<BinaryFiPropPool> = {
+        // 虚拟子池化后按部署分组：每组取 seed 做一次全量快照刷新，再把刷新结果
+        // 整份克隆到同部署其余实例（恢复各自虚拟身份），避免 65 个实例各自触发
+        // 一次链上批量读取。
+        let mut groups: HashMap<(Address, Address, Address, Address), Vec<BinaryFiPropPool>> =
+            HashMap::new();
+        {
             let read_guard = state.read().await;
-            read_guard
-                .state
-                .values()
-                .filter_map(|amm| match amm.as_ref() {
-                    AMM::BinaryFiPropPool(pool) => Some(pool.clone()),
-                    _ => None,
-                })
-                .collect()
-        };
+            for amm in read_guard.state.values() {
+                if let AMM::BinaryFiPropPool(pool) = amm.as_ref() {
+                    groups
+                        .entry(pool.deployment_key())
+                        .or_default()
+                        .push(pool.clone());
+                }
+            }
+        }
 
-        if target_pools.is_empty() {
+        if groups.is_empty() {
             continue;
         }
 
         debug!(
-            "Re-anchoring {} BinaryFi propAMM pool(s) via full snapshot",
-            target_pools.len()
+            "Re-anchoring {} BinaryFi propAMM deployment(s) via full snapshot",
+            groups.len()
         );
 
-        for pool in &mut target_pools {
+        let mut write_guard = state.write().await;
+        for (_, group) in groups {
+            let Some(mut seed) = group.first().cloned() else {
+                continue;
+            };
             // 全部 pair 标记 stale → update() 走全量批量快照
-            for j in 1..pool.assets.len() {
-                pool.mark_stale_for_asset(j);
+            for j in 1..seed.assets.len() {
+                seed.mark_stale_for_asset(j);
             }
-            if let Err(e) = pool.update::<N, P>(provider.clone()).await {
+            if let Err(e) = seed.update::<N, P>(provider.clone()).await {
                 error!(
-                    address = ?pool.pool_address,
+                    address = ?seed.pool_address,
                     error = ?e,
                     "Failed to refresh BinaryFi propAMM full snapshot"
                 );
+                continue;
             }
-        }
-
-        let mut write_guard = state.write().await;
-        for pool in target_pools {
-            if let Some(existing_amm) = write_guard.get_mut_cow(&pool.address()) {
-                if let AMM::BinaryFiPropPool(existing) = existing_amm {
-                    *existing = pool;
+            for pool in group {
+                let addr = pool.address();
+                let virtual_address = pool.virtual_address;
+                let exposed_pair = pool.exposed_pair;
+                let mut refreshed = seed.clone();
+                refreshed.virtual_address = virtual_address;
+                refreshed.exposed_pair = exposed_pair;
+                if let Some(existing_amm) = write_guard.get_mut_cow(&addr) {
+                    if let AMM::BinaryFiPropPool(existing) = existing_amm {
+                        *existing = refreshed;
+                    }
                 }
             }
         }
