@@ -988,6 +988,24 @@ struct CaliberSnapshot {
 /// `too many RPC calls in batch request`），取安全值 10。
 const STORAGE_BATCH_SIZE: usize = 10;
 
+/// batch 回退告警只输出一次（避免每周期每 chunk 刷屏）
+static BATCH_FALLBACK_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn warn_batch_fallback(e: &AMMError) {
+    if !BATCH_FALLBACK_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            error = ?e,
+            "caliber: JSON-RPC batch rejected by RPC gateway; falling back to per-slot eth_getStorageAt (logged once)"
+        );
+    } else {
+        tracing::debug!(
+            error = ?e,
+            "caliber: JSON-RPC batch failed, using per-slot fallback"
+        );
+    }
+}
+
 /// 通过单次 JSON-RPC batch 读取多个存储槽（一个 HTTP 请求）。
 ///
 /// 与逐槽 `eth_getStorageAt` 完全等价（同一 `block`、同一序列化参数），
@@ -1001,6 +1019,9 @@ where
     N: Network,
     P: Provider<N>,
 {
+    // 先尝试 JSON-RPC batch（一个 HTTP 请求）；若网关拒绝 batch
+    // （如 -32601 method not whitelisted、大小超限截断等），回退逐槽读取。
+    // batch 只是优化路径，逐槽是可靠基线，保证任意网关下可用。
     let mut batch = alloy::rpc::client::BatchRequest::new(provider.client());
     let mut waiters = Vec::with_capacity(reads.len());
     for (address, slot) in reads {
@@ -1010,17 +1031,38 @@ where
             .map_err(|e| AMMError::Msg(format!("caliber: batch add_call failed: {e}")))?;
         waiters.push(waiter);
     }
-    batch
-        .send()
-        .await
-        .map_err(|e| AMMError::Msg(format!("caliber: batch send failed: {e}")))?;
 
-    let mut out = Vec::with_capacity(waiters.len());
-    for waiter in waiters {
-        let value = waiter
-            .await
-            .map_err(|e| AMMError::Msg(format!("caliber: batch get_storage_at failed: {e}")))?;
-        out.push(U256::from_be_bytes(value.0));
+    let mut out = Vec::with_capacity(reads.len());
+    let mut batch_ok = true;
+    if let Err(e) = batch.send().await {
+        batch_ok = false;
+        warn_batch_fallback(&AMMError::Msg(format!("caliber: batch send failed: {e}")));
+    }
+    if batch_ok {
+        for waiter in waiters {
+            match waiter.await {
+                Ok(value) => out.push(U256::from_be_bytes(value.0)),
+                Err(e) => {
+                    batch_ok = false;
+                    warn_batch_fallback(&AMMError::Msg(format!(
+                        "caliber: batch get_storage_at failed: {e}"
+                    )));
+                    break;
+                }
+            }
+        }
+    }
+    if !batch_ok {
+        out.clear();
+        for (address, slot) in reads {
+            let key = U256::from_be_bytes(slot.0);
+            let value = provider
+                .get_storage_at(*address, key)
+                .block_id(block)
+                .await
+                .map_err(|e| AMMError::Msg(format!("caliber: get_storage_at failed: {e}")))?;
+            out.push(value);
+        }
     }
     Ok(out)
 }
