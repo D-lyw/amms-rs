@@ -266,6 +266,56 @@ async fn flush_block<P: Provider + Clone>(
             }
         }
     }
+    // 大额 SELL（100 整枚）对拍：验证日志驱动后 sell_raw 精确性。
+    // sell_raw = price×1999 - sell_off×2000 由 update 事件（L2 增强）直接设置；
+    // 单档资产大额 SELL 必须逐位复刻（含超容量归零）；多档阶梯资产
+    // （快照两点无法反推第一档 raw）在纯快照路径是近似，日志驱动后应精确。
+    for (k, pair) in snap.quotePairs.iter().enumerate() {
+        if k >= snap.quotes.len() || !snap.quotes[k].success {
+            continue;
+        }
+        let p = pair.to::<usize>();
+        let nn = n * n;
+        if p < 2 * nn {
+            continue;
+        }
+        let j = p - 2 * nn;
+        if j == 0 || j >= n {
+            continue;
+        }
+        let dj = snap.decimals.get(j).copied().unwrap_or(0) as u32;
+        if dj == 0 || dj > 30 {
+            continue;
+        }
+        let sell_in = U256::from(100u64) * U256::from(10u64).pow(U256::from(dj));
+        let sim = pool.simulate_swap(snap.assets[j], snap.assets[0], sell_in)?;
+        let chain = snap.quotes[k].amountOut;
+        let raw_state = match pool.sell_raw.get(j).copied().flatten() {
+            Some(r) => format!("raw={r}"),
+            None => "raw=None(snapshot-approx)".to_string(),
+        };
+        if sim == chain {
+            *quote_ok += 1;
+        } else if raw_state.starts_with("raw=None") {
+            // 阶梯资产且尚无 update 日志：快照近似，INFO 不参与断言
+            cap_infos.push(format!(
+                "  [{block}] {j}->0 sell in={sell_in} {raw_state}: sim={sim} chain={chain}"
+            ));
+        } else {
+            mismatches.push(format!(
+                "  [{block}] {j}->0 sell in={sell_in} {raw_state}: sim={sim} chain={chain} diff={}",
+                if sim > chain { sim - chain } else { chain - sim }
+            ));
+        }
+    }
+    // sell_raw 覆盖率（日志驱动后应为全 Some = 精确）
+    let raw_known = (1..n)
+        .filter(|&j| pool.sell_raw.get(j).copied().flatten().is_some())
+        .count();
+    let n_assets = n.saturating_sub(1);
+    println!(
+        "  [{block}] sell_raw known: {raw_known}/{n_assets} assets"
+    );
     let recovered = recover_prices(&snap);
     for j in 1..n {
         let local_p = pool.prices.get(j).copied().unwrap_or_default();

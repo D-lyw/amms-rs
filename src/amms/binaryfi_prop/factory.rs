@@ -101,6 +101,8 @@ impl BinaryFiPropFactory {
             spreads: Vec::new(),
             bid_offsets: Vec::new(),
             ask_offsets: Vec::new(),
+            q0j: Vec::new(),
+            sell_raw: Vec::new(),
             price_scales: Vec::new(),
             buy_disabled: Vec::new(),
             buy_zero_over_vault: Vec::new(),
@@ -110,6 +112,9 @@ impl BinaryFiPropFactory {
             rates: Vec::new(),
             stale_pairs: Vec::new(),
             price_updated_block: Vec::new(),
+            sell_ladders: Vec::new(),
+            buy_ladders: Vec::new(),
+            ladder_reserves: Vec::new(),
             price0_calibrated: false,
         }
     }
