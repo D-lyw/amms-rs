@@ -136,9 +136,7 @@ impl DiscoverySync for BinaryFiPropFactory {
     {
         let created_block = self.creation_block;
         let factory = self.clone();
-        async move {
-            Ok(vec![AMM::BinaryFiPropPool(factory.skeleton(created_block))])
-        }
+        async move { Ok(vec![AMM::BinaryFiPropPool(factory.skeleton(created_block))]) }
     }
 
     fn sync<N, P>(

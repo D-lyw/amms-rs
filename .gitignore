@@ -26,3 +26,7 @@ contracts/src/flattened/
 .algebra-*
 .curve-*
 .pendle-*
+
+# Python artifacts
+__pycache__/
+*.pyc

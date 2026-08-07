@@ -247,11 +247,8 @@ async fn test_binaryfi_prop_fork_quote_replication() -> Result<()> {
             block_id,
         )
         .await?;
-        let sim_b = local.simulate_swap(
-            local.assets[0].address,
-            local.assets[j].address,
-            big_buy_in,
-        )?;
+        let sim_b =
+            local.simulate_swap(local.assets[0].address, local.assets[j].address, big_buy_in)?;
         total2 += 1;
         if sim_b == chain_b {
             ok2 += 1;
@@ -270,7 +267,8 @@ async fn test_binaryfi_prop_fork_quote_replication() -> Result<()> {
             block_id,
         )
         .await?;
-        let sim_s = local.simulate_swap(local.assets[j].address, local.assets[0].address, sell_in)?;
+        let sim_s =
+            local.simulate_swap(local.assets[j].address, local.assets[0].address, sell_in)?;
         total2 += 1;
         if sim_s == chain_s {
             ok2 += 1;
@@ -306,7 +304,8 @@ async fn test_binaryfi_prop_fork_quote_replication() -> Result<()> {
             block_id,
         )
         .await?;
-        let sim = local.simulate_swap(local.assets[0].address, local.assets[j].address, amount_in)?;
+        let sim =
+            local.simulate_swap(local.assets[0].address, local.assets[j].address, amount_in)?;
         println!("Phase 4: 0->SKHYx in={amount_in}: sim={sim} chain={chain}");
         assert_eq!(sim, chain, "BUY small quote must replicate exactly");
 
@@ -319,7 +318,8 @@ async fn test_binaryfi_prop_fork_quote_replication() -> Result<()> {
             block_id,
         )
         .await?;
-        let sim_s = local.simulate_swap(local.assets[j].address, local.assets[0].address, sell_in)?;
+        let sim_s =
+            local.simulate_swap(local.assets[j].address, local.assets[0].address, sell_in)?;
         println!("Phase 4: SKHYx->0 in={sell_in}: sim={sim_s} chain={chain_s}");
         if sim_s != chain_s && local.sell_raw.get(j).copied().flatten().is_none() {
             // 快照两点无法反推第一档精确 raw（阶梯资产）；生产环境由 update 日志

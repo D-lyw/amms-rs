@@ -18,6 +18,7 @@ mod xlayer_flashblocks;
 
 use crate::amms::amm::AutomatedMarketMaker;
 use crate::amms::amm::{SyncAction, AMM};
+use crate::amms::caliber_prop::CaliberPropPool;
 use crate::amms::error::AMMError;
 use crate::amms::factory::Factory;
 use crate::amms::fluid_dex::get_liquidity_layer;
@@ -58,6 +59,7 @@ use tokio::sync::{Mutex, Notify, RwLock};
 
 use tokio::time::{sleep, Duration};
 use tracing::{error, info, warn};
+use xlayer_flashblocks::CaliberTxEvent;
 
 #[derive(Clone, Debug, Default)]
 pub enum RealtimeSyncSource {
@@ -151,6 +153,8 @@ const APPLIED_LOG_DEDUP_CAPACITY: usize = 300_000;
 const CONTENT_HASH_DEDUP_CAPACITY: usize = 1_000;
 const DEFAULT_PENDING_SYNC_WORKER_INTERVAL: Duration = Duration::from_secs(2);
 const DEFAULT_DRIFT_PROBE_INTERVAL: Duration = Duration::from_secs(120);
+/// 实时交易驱动下 caliber 周期对账默认间隔（断流/储备变动/漏更新的兜底延迟上界）
+const DEFAULT_CALIBER_RECONCILE_INTERVAL: Duration = Duration::from_secs(45);
 
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1047,6 +1051,39 @@ impl<N, P> StateSpaceManager<N, P> {
         ))
     }
 
+    /// 应用 Xlayer flashblocks 提取的 caliber 报价更新事件。
+    ///
+    /// caliber 更新交易不 emit 任何事件，只能从原始交易 calldata 提取；
+    /// 本函数与 `apply_logs_for_block_timed` 同锁同序（同一 RwLock、
+    /// 同一 realtime_head 推进语义）：
+    /// - 块内按 `tx_index` 排序（EVM 语义：后者覆盖前者）；
+    /// - `pairId + 合约地址 → virtual_address` 路由，命中本地池子后
+    ///   `apply_batch_update` 增量刷新 field0/field1/deadline；
+    /// - pairId 不在本地 / 块号落后于池子已同步块 → 静默跳过（对账兜底）。
+    async fn apply_caliber_updates_for_block(
+        state: &Arc<RwLock<StateSpace>>,
+        block_num: u64,
+        updates: Vec<CaliberTxEvent>,
+        realtime_head: &Arc<AtomicU64>,
+    ) -> Result<Vec<Address>, StateSpaceError> {
+        // 与 apply_logs_for_block_timed 相同的 head 推进语义
+        let mut prev = realtime_head.load(Ordering::Relaxed);
+        while block_num > prev
+            && realtime_head
+                .compare_exchange(prev, block_num, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            prev = realtime_head.load(Ordering::Relaxed);
+        }
+
+        if updates.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut guard = state.write().await;
+        Ok(guard.apply_caliber_updates(&updates, block_num))
+    }
+
     async fn collect_logs_for_chunks(
         provider: &P,
         chunks: &[LogQueryChunk],
@@ -1479,6 +1516,11 @@ pub struct StateSpaceBuilder<N, P> {
     pub curve_sync_interval: Option<Duration>,
     /// Dedicated interval for Caliber propAMM Ladder refresh.
     pub caliber_ladder_sync_interval: Option<Duration>,
+    /// 实时交易驱动开关：true（默认）时 caliber 报价更新由 Xlayer flashblocks
+    /// 原始交易流驱动，周期任务降频为对账/兜底；false 时退回纯周期拉取。
+    pub caliber_realtime_sync: bool,
+    /// 实时模式下的 caliber 对账/兜底间隔（默认 45s）。
+    pub caliber_reconcile_interval: Option<Duration>,
     /// Dedicated interval for BinaryFi propAMM full-snapshot re-anchor
     /// (cap/disabled states are not observable from events).
     pub binaryfi_sync_interval: Option<Duration>,
@@ -1510,6 +1552,8 @@ where
             slipstream_fee_sync_interval: None,
             curve_sync_interval: None,
             caliber_ladder_sync_interval: None,
+            caliber_realtime_sync: true,
+            caliber_reconcile_interval: None,
             binaryfi_sync_interval: None,
             pending_sync_worker_interval: DEFAULT_PENDING_SYNC_WORKER_INTERVAL,
             drift_probe_interval: DEFAULT_DRIFT_PROBE_INTERVAL,
@@ -1613,10 +1657,33 @@ where
     }
 
     /// Set a dedicated interval for Caliber propAMM Ladder refresh.
-    /// Falls back to `non_event_sync_interval` when not set.
+    ///
+    /// 实时交易驱动关闭（`with_caliber_realtime_sync(false)`）时的周期拉取间隔；
+    /// 未设置时回退到 `non_event_sync_interval`。实时模式开启时此配置被
+    /// `caliber_reconcile_interval`（对账间隔）取代。
     pub fn with_caliber_ladder_sync_interval(self, interval: Duration) -> StateSpaceBuilder<N, P> {
         StateSpaceBuilder {
             caliber_ladder_sync_interval: Some(interval),
+            ..self
+        }
+    }
+
+    /// 启用/关闭 caliber 实时交易驱动同步（默认开启）。
+    ///
+    /// 开启：报价更新由 Xlayer flashblocks 原始交易流（`batchUpdateParameters`
+    /// calldata）驱动，周期任务降频为对账/兜底；关闭：退回纯周期拉取，便于灰度。
+    pub fn with_caliber_realtime_sync(mut self, enabled: bool) -> StateSpaceBuilder<N, P> {
+        self.caliber_realtime_sync = enabled;
+        self
+    }
+
+    /// 设置实时模式下的 caliber 对账/兜底间隔（默认 45s）。
+    ///
+    /// 对账任务负责冷启动、flashblocks 断流回填、储备/pos 低频变动与漏更新纠正；
+    /// 对账间隔即断流期间报价滞后的上界。
+    pub fn with_caliber_reconcile_interval(self, interval: Duration) -> StateSpaceBuilder<N, P> {
+        StateSpaceBuilder {
+            caliber_reconcile_interval: Some(interval),
             ..self
         }
     }
@@ -1959,8 +2026,17 @@ where
             ));
         }
 
-        // Caliber propAMM pools: periodic Ladder pricing refresh (no on-chain events)
-        if let Some(interval) = self.caliber_ladder_sync_interval.or(non_event_interval) {
+        // Caliber propAMM pools: 实时交易驱动 + 低频对账/兜底。
+        // 实时模式（默认）：报价更新由 flashblocks 原始交易流（batchUpdateParameters
+        // calldata）驱动，周期任务只负责冷启动/断流回填/储备 pos 变动/漏更新纠正；
+        // 关闭时退回纯周期拉取（legacy caliber_ladder_sync_interval 语义）。
+        let caliber_interval = if self.caliber_realtime_sync {
+            self.caliber_reconcile_interval
+                .or(Some(DEFAULT_CALIBER_RECONCILE_INTERVAL))
+        } else {
+            self.caliber_ladder_sync_interval.or(non_event_interval)
+        };
+        if let Some(interval) = caliber_interval {
             tokio::spawn(sync_services::start_caliber_prop_ladder_sync_task(
                 state_space.clone(),
                 self.provider.clone(),
@@ -2123,8 +2199,13 @@ impl StateSpace {
     ) -> Option<Vec<Address>> {
         use crate::amms::binaryfi_prop::{BINARYFI_SWAP_EVENT, BINARYFI_UPDATE_EVENT};
 
-        let mut instances: Vec<(Address, Option<(usize, usize)>, Vec<Address>, Address, Address)> =
-            Vec::new();
+        let mut instances: Vec<(
+            Address,
+            Option<(usize, usize)>,
+            Vec<Address>,
+            Address,
+            Address,
+        )> = Vec::new();
         let mut has_pool_match = false;
         let mut has_engine_match = false;
         for (key, amm) in self.state.iter() {
@@ -2132,7 +2213,13 @@ impl StateSpace {
                 has_pool_match |= p.pool_address == log_address;
                 has_engine_match |= p.engine_address == log_address;
                 let assets = p.assets.iter().map(|t| t.address).collect::<Vec<_>>();
-                instances.push((*key, p.exposed_pair, assets, p.pool_address, p.engine_address));
+                instances.push((
+                    *key,
+                    p.exposed_pair,
+                    assets,
+                    p.pool_address,
+                    p.engine_address,
+                ));
             }
         }
 
@@ -2363,6 +2450,44 @@ impl StateSpace {
             needs_resync.into_iter().collect(),
             needs_async_update.into_iter().collect(),
         ))
+    }
+
+    /// 应用 caliber 报价更新事件（XLayer flashblocks 原始交易驱动）。
+    ///
+    /// 与 `sync()` 同锁调用；块内按 `tx_index` 排序（EVM 语义：后者覆盖前者），
+    /// `pairId + 合约地址 → virtual_address` 路由，命中本地池子后
+    /// `apply_batch_update` 增量刷新 field0/field1/deadline。
+    /// pairId 不在本地 / 块号落后于池子已同步块 → 静默跳过（对账兜底）。
+    fn apply_caliber_updates(
+        &mut self,
+        updates: &[CaliberTxEvent],
+        block_num: u64,
+    ) -> Vec<Address> {
+        if updates.is_empty() {
+            return vec![];
+        }
+
+        let mut sorted: Vec<&CaliberTxEvent> = updates.iter().collect();
+        sorted.sort_by_key(|u| u.tx_index);
+
+        let mut affected_set = HashSet::new();
+        for event in sorted {
+            let virtual_address =
+                CaliberPropPool::virtual_address_from_pair_id(event.update.pair_id, event.contract);
+            let Some(amm) = self.get_mut_cow(&virtual_address) else {
+                continue;
+            };
+            let AMM::CaliberPropPool(pool) = amm else {
+                continue;
+            };
+            // 幂等保护：与 sync() 相同语义，禁止回卷池子状态
+            if block_num < pool.last_synced_block() {
+                continue;
+            }
+            pool.apply_batch_update(&event.update, block_num);
+            affected_set.insert(virtual_address);
+        }
+        affected_set.into_iter().collect()
     }
 }
 
@@ -2705,6 +2830,75 @@ mod tests {
         );
         assert_eq!(restored.realtime_head.load(Ordering::Relaxed), 300);
         assert_eq!(restored.canonical_head.load(Ordering::Relaxed), 290);
+    }
+
+    #[test]
+    fn caliber_updates_route_apply_in_tx_order_and_skip_unknown() {
+        use crate::amms::caliber_prop::{CaliberBatchUpdate, CaliberPropPool};
+        use crate::amms::Token;
+
+        let contract: Address = "0x154586b2479b9a11e3d4db90024dc0e26f097312"
+            .parse()
+            .unwrap();
+        let pair_id = B256::from([0x11u8; 32]);
+        let virtual_address = CaliberPropPool::virtual_address_from_pair_id(pair_id, contract);
+
+        let mut state = StateSpace::default();
+        state.insert_amm(AMM::CaliberPropPool(CaliberPropPool {
+            contract_address: contract,
+            pair_id,
+            virtual_address,
+            token_x: Address::from([1u8; 20]),
+            token_y: Address::from([2u8; 20]),
+            token_a: Token::new_with_decimals(Address::from([1u8; 20]), 18),
+            token_b: Token::new_with_decimals(Address::from([2u8; 20]), 18),
+            created_block: 0,
+            last_synced_block: 0,
+            reserve_a: U256::from(1_000),
+            reserve_b: U256::from(1_000),
+            ladder: Default::default(),
+            price_a_in_b: 1.0,
+            price_b_in_a: 1.0,
+        }));
+
+        let mk_event = |pair: B256, tx_index: u64, price: u64, flags: u32| CaliberTxEvent {
+            contract,
+            tx_index,
+            update: CaliberBatchUpdate {
+                pair_id: pair,
+                price: U256::from(price),
+                flags,
+                deadline: 1_786_098_592,
+            },
+        };
+
+        // 乱序传入：排序后 tx_index=0 先应用、tx_index=1 覆盖（EVM 语义）
+        let updates = vec![mk_event(pair_id, 1, 100, 10), mk_event(pair_id, 0, 200, 20)];
+        let affected = state.apply_caliber_updates(&updates, 67_329_558);
+        assert_eq!(affected, vec![virtual_address]);
+        let pool = match state.get(&virtual_address).unwrap() {
+            AMM::CaliberPropPool(p) => p,
+            _ => unreachable!(),
+        };
+        // tx_index=1（price=100）最后应用，覆盖 tx_index=0（price=200）
+        assert_eq!(pool.ladder.field0, U256::from(100u64));
+        assert_eq!(pool.ladder.field1, U256::from(10u64));
+        assert_eq!(pool.last_synced_block, 67_329_558);
+
+        // 未知 pairId → 路由无池子，静默跳过
+        let unknown = mk_event(B256::from([0x22u8; 32]), 2, 999, 1);
+        let affected = state.apply_caliber_updates(&[unknown], 67_329_559);
+        assert!(affected.is_empty());
+        let pool = match state.get(&virtual_address).unwrap() {
+            AMM::CaliberPropPool(p) => p,
+            _ => unreachable!(),
+        };
+        assert_eq!(pool.ladder.field0, U256::from(100u64));
+
+        // 块号落后于池子已同步块 → 跳过（幂等保护）
+        let stale = mk_event(pair_id, 3, 300, 30);
+        let affected = state.apply_caliber_updates(&[stale], 67_329_557);
+        assert!(affected.is_empty());
     }
 }
 

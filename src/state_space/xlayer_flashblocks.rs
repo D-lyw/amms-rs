@@ -26,6 +26,10 @@ use super::{
 };
 use crate::amms::amm::AMM;
 use crate::amms::binaryfi_prop::{enrich_update_log_data, BINARYFI_UPDATE_EVENT};
+use crate::amms::caliber_prop::{
+    decode_batch_update_parameters, extract_input_from_raw_tx, extract_to_from_raw_tx,
+    CaliberBatchUpdate,
+};
 use crate::state_space::{
     STREAM_IDLE_TIMEOUT, STREAM_RECONNECT_DELAY, XLAYER_FLASHBLOCKS_RAW_WS_URL,
 };
@@ -306,6 +310,18 @@ impl XlayerTxCountTracker {
     }
 }
 
+/// 从 flashblocks 原始交易中提取的 caliber 报价更新事件。
+///
+/// `tx_index` 为块内全局索引（跨 slice 由 `XlayerTxCountTracker` 的 `tx_base`
+/// 拼接，与懒排序修正使用同一约定）；`contract` 为被调用的 caliber 合约地址，
+/// 供路由层推导 virtual_address。
+#[derive(Debug)]
+pub(crate) struct CaliberTxEvent {
+    pub contract: Address,
+    pub tx_index: u64,
+    pub update: CaliberBatchUpdate,
+}
+
 // ─────────────────────────────────────────────
 // Log matcher (local copy — same logic as Base flashblocks)
 // ─────────────────────────────────────────────
@@ -382,20 +398,34 @@ fn extract_logs_from_xlayer_flashblock(
     fb: &XlayerFlashblockMessage,
     matcher: &XlayerLogMatcher,
     binaryfi_engines: &HashSet<Address>,
+    caliber_contracts: &HashSet<Address>,
     dedup_cache: &mut XlayerDedupCache,
     parse_cache: &mut XlayerParseCache,
     tx_tracker: &mut XlayerTxCountTracker,
     latest_block_timestamp: &mut Option<(u64, u64)>,
-) -> (Vec<Log>, Option<u64>, usize, HashSet<Address>) {
+) -> (
+    Vec<Log>,
+    Option<u64>,
+    usize,
+    HashSet<Address>,
+    Vec<CaliberTxEvent>,
+) {
     let mut out = Vec::new();
     let mut decode_fail = 0usize;
     let mut decode_failed_addresses = HashSet::new();
+    let mut caliber_events = Vec::new();
 
     // 1. 获取 block_number（metadata 数值优先，base hex 备选）
     let block_number = xlayer_flashblock_block_number(fb);
 
     let Some(block_number) = block_number else {
-        return (out, None, decode_fail, decode_failed_addresses);
+        return (
+            out,
+            None,
+            decode_fail,
+            decode_failed_addresses,
+            caliber_events,
+        );
     };
 
     // 2. 获取/缓存 block_timestamp
@@ -421,6 +451,50 @@ fn extract_logs_from_xlayer_flashblock(
         }
     };
 
+    // 2b. 块内全局 tx_base：caliber 原始交易提取与懒排序共用同一约定
+    let tx_base = tx_tracker.base(&fb.payload_id);
+
+    // 2c. caliber 报价更新提取：更新交易 0 日志，只能从 diff.transactions 原始
+    //     交易发现。先轻量 RLP 定位 to（只跳字段、零分配，~100-200ns/笔），
+    //     过滤出目标合约交易；命中后才完整解码 calldata + 标准 ABI 解码
+    //     （每块 ~14 笔通常只有 1-2 笔命中，避免对无关交易做全量解码）。
+    //     失败静默跳过（对账任务兜底），绝不污染状态。放在 metadata 守卫之前，
+    //     保证无日志/空 receipts 的块也能提取 caliber 事件。
+    if !caliber_contracts.is_empty() {
+        if let Some(diff) = fb.diff.as_ref() {
+            for (real_idx, raw_tx_hex) in diff.transactions.iter().enumerate() {
+                let raw_hex = raw_tx_hex.strip_prefix("0x").unwrap_or(raw_tx_hex);
+                let Ok(raw) = alloy::hex::decode(raw_hex) else {
+                    continue;
+                };
+                // 第一步：轻量定位 to，过滤非目标交易
+                let Some(to) = extract_to_from_raw_tx(&raw) else {
+                    continue;
+                };
+                if !caliber_contracts.contains(&to) {
+                    continue;
+                }
+                // 第二步：命中后才取 calldata（完整 RLP 解码 + 拷贝）
+                let Some(input) = extract_input_from_raw_tx(&raw) else {
+                    continue;
+                };
+                let Some(updates) = decode_batch_update_parameters(&input) else {
+                    continue;
+                };
+                // diff.transactions 数组下标 + tx_base = 块内全局 tx_index
+                // （EVM 语义：块内后者覆盖前者）。
+                let tx_index = tx_base + real_idx as u64;
+                for update in updates {
+                    caliber_events.push(CaliberTxEvent {
+                        contract: to,
+                        tx_index,
+                        update,
+                    });
+                }
+            }
+        }
+    }
+
     // 3. 获取 metadata（receipts 从这里提取）
     let Some(metadata) = fb.metadata.as_ref() else {
         return (
@@ -428,6 +502,7 @@ fn extract_logs_from_xlayer_flashblock(
             Some(block_number),
             decode_fail,
             decode_failed_addresses,
+            caliber_events,
         );
     };
 
@@ -437,6 +512,7 @@ fn extract_logs_from_xlayer_flashblock(
             Some(block_number),
             decode_fail,
             decode_failed_addresses,
+            caliber_events,
         );
     }
 
@@ -467,8 +543,6 @@ fn extract_logs_from_xlayer_flashblock(
     //  边缘情况: 如果同个 payload 中有 ≥2 个不同交易操作同个池子，
     //  后续的"懒排序"步骤会 hash diff.transactions 中的原始交易字节来修正真实顺序。
     //  ═══════════════════════════════════════════════════════════════════
-    let tx_base = tx_tracker.base(&fb.payload_id);
-
     // 按 cumulativeGasUsed 排序 receipts，替代不安全的 HashMap 迭代顺序
     let mut sorted_receipts: Vec<(&String, &serde_json::Value)> =
         metadata.receipts.iter().collect();
@@ -571,8 +645,8 @@ fn extract_logs_from_xlayer_flashblock(
             };
 
             // 5g. 构造 LogData（engine 地址按已注册池子实例配置匹配）
-            let is_binaryfi_update_log =
-                binaryfi_engines.contains(&address) && topics.first() == Some(&BINARYFI_UPDATE_EVENT);
+            let is_binaryfi_update_log = binaryfi_engines.contains(&address)
+                && topics.first() == Some(&BINARYFI_UPDATE_EVENT);
             let Some(log_data) = LogData::new(topics, data) else {
                 decode_fail += 1;
                 decode_failed_addresses.insert(address);
@@ -666,6 +740,7 @@ fn extract_logs_from_xlayer_flashblock(
         Some(block_number),
         decode_fail,
         decode_failed_addresses,
+        caliber_events,
     )
 }
 
@@ -706,6 +781,18 @@ impl<N, P> StateSpaceManager<N, P> {
                     .values()
                     .filter_map(|amm| match amm.as_ref() {
                         AMM::BinaryFiPropPool(p) => Some(p.engine_address),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            // 已注册 Caliber 池子的合约地址（更新交易 0 日志，按 to 地址过滤原始交易）
+            let caliber_contracts: HashSet<Address> = {
+                let read_guard = state.read().await;
+                read_guard
+                    .state
+                    .values()
+                    .filter_map(|amm| match amm.as_ref() {
+                        AMM::CaliberPropPool(p) => Some(p.contract_address),
                         _ => None,
                     })
                     .collect()
@@ -901,12 +988,19 @@ impl<N, P> StateSpaceManager<N, P> {
                         }
                     }
 
-                    // 6. 提取 logs
-                    let (logs, block_number, decode_fail_count, decode_failed_addresses) =
+                    // 6. 提取 logs + caliber 报价更新事件
+                    let (
+                        logs,
+                        block_number,
+                        decode_fail_count,
+                        decode_failed_addresses,
+                        caliber_events,
+                    ) =
                         extract_logs_from_xlayer_flashblock(
                             &fb,
                             &matcher,
                             &binaryfi_engines,
+                            &caliber_contracts,
                             &mut dedup_cache,
                             &mut parse_cache,
                             &mut tx_tracker,
@@ -945,43 +1039,71 @@ impl<N, P> StateSpaceManager<N, P> {
                         }
                     }
 
-                    // 8. 空日志跳过
-                    if logs.is_empty() {
+                    // 8. 无日志且无 caliber 更新 → 跳过
+                    if logs.is_empty() && caliber_events.is_empty() {
                         continue;
                     }
                     let log_count = logs.len();
 
-                    // 9. 应用日志到池子状态
-                    match Self::apply_logs_for_block_timed(
-                        &provider,
-                        &state,
-                        &hooks,
-                        block_num,
-                        logs,
-                        &realtime_head,
-                        &canonical_head,
-                        &pending_sync_queue,
-                        &pending_sync_notify,
-                        &applied_log_dedup,
-                        LogSource::XlayerFlashblock,
-                    )
-                    .await
-                    {
-                        Ok((affected, _apply_timing)) => {
-                            if !affected.is_empty() {
-                                let meta = super::build_realtime_update_meta(
-                                    &update_seq,
-                                    block_num,
-                                    received_at,
-                                    Some(fb.index),
-                                );
-                                super::log_realtime_update_applied(meta, affected.len(), log_count);
-                                yield Ok((meta, affected));
+                    let mut affected: Vec<Address> = Vec::new();
+
+                    // 9. 应用日志到池子状态（原有路径）
+                    if !logs.is_empty() {
+                        match Self::apply_logs_for_block_timed(
+                            &provider,
+                            &state,
+                            &hooks,
+                            block_num,
+                            logs,
+                            &realtime_head,
+                            &canonical_head,
+                            &pending_sync_queue,
+                            &pending_sync_notify,
+                            &applied_log_dedup,
+                            LogSource::XlayerFlashblock,
+                        )
+                        .await
+                        {
+                            Ok((affected_logs, _apply_timing)) => {
+                                affected.extend(affected_logs);
+                            }
+                            Err(e) => {
+                                error!("Xlayer flashblocks batch process failed: {}", e);
                             }
                         }
-                        Err(e) => {
-                            error!("Xlayer flashblocks batch process failed: {}", e);
+                    }
+
+                    // 10. 应用 caliber 实时报价更新（无日志交易，由原始交易驱动）
+                    if !caliber_events.is_empty() {
+                        match Self::apply_caliber_updates_for_block(
+                            &state,
+                            block_num,
+                            caliber_events,
+                            &realtime_head,
+                        )
+                        .await
+                        {
+                            Ok(affected_caliber) => {
+                                affected.extend(affected_caliber);
+                            }
+                            Err(e) => {
+                                error!(
+                                    "Xlayer flashblocks caliber update apply failed: {}",
+                                    e
+                                );
+                            }
                         }
+                    }
+
+                    if !affected.is_empty() {
+                        let meta = super::build_realtime_update_meta(
+                            &update_seq,
+                            block_num,
+                            received_at,
+                            Some(fb.index),
+                        );
+                        super::log_realtime_update_applied(meta, affected.len(), log_count);
+                        yield Ok((meta, affected));
                     }
                 }
 
@@ -994,8 +1116,12 @@ impl<N, P> StateSpaceManager<N, P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy::primitives::{address, keccak256, B256};
+    use alloy::primitives::{address, keccak256, B256, U256};
     use serde_json::{json, Map};
+
+    /// 真实 caliber 更新交易（XLayer 块 67329558，tx 0xd9a1ffba…，
+    /// EIP-1559，to=0x154586b2…，5 个 pair 的 batchUpdateParameters calldata）
+    const REAL_CALIBER_RAW_TX_HEX: &str = "02f9033481c483129664832dc6c08401c9c3808301d4c094154586b2479b9a11e3d4db90024dc0e26f09731280b902c4008dcc8e00000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000005d2ba36ae7a49fbbb15ac04a76531d9e811ca5fe2e57f4c559f200ed2a57aac7a0000000000000000000000000000000000000000000000000000000efaaa31bf0000000000000000000000000000000000000000000000000000000000000483000000000000000000000000000000000000000000000000000000006a75b3a0f4b05af384ac756330659972e8584851916c39bf13414abd632dc7c11ee792380000000000000000000000000000000000000000000000000000001b318644c0000000000000000000000000000000000000000000000000000000000000043d000000000000000000000000000000000000000000000000000000006a75b3a0b2d5c47f635aa119fc5e911aa881db33bc77b61a1872d035d6122869e24a96730000000000000000000000000000000000000000000000000000003338d4970100000000000000000000000000000000000000000000000000000000000003b1000000000000000000000000000000000000000000000000000000006a75b3a0304e5bfc144bd0991c990cbbe6488660faf1f6be58a8afb15f3330c8a01599880000000000000000000000000000000000000000000000000000012de1e46dc000000000000000000000000000000000000000000000000000000000000005e3000000000000000000000000000000000000000000000000000000006a75b3a0de4c3cddfd81d8ee19634d5d62f07681bf28fdc2c622a1bbdb276d3359053ddf0000000000000000000000000000000000000000000000000000002127ffdb40000000000000000000000000000000000000000000000000000000000000042e000000000000000000000000000000000000000000000000000000006a75b3a0c001a07ed1485c2f6ace2104a384b0e596f9a39729450002b77b23bd1e4ab10ea24512a0179baa7e6f42f7e616b59046768d8a81c12d3c0653338501c4855584046f291e";
 
     fn hash_raw_tx(raw: &[u8]) -> String {
         format!("{:#x}", keccak256(raw))
@@ -1060,9 +1186,10 @@ mod tests {
         slice0_receipts.insert(hash_raw_tx(&slice0_txs[1]), receipt(pool, topic0, 20));
         let slice0 = flashblock(payload_id, 0, block_number, slice0_txs, slice0_receipts);
 
-        let (logs0, _, _, _) = extract_logs_from_xlayer_flashblock(
+        let (logs0, _, _, _, _) = extract_logs_from_xlayer_flashblock(
             &slice0,
             &matcher,
+            &HashSet::new(),
             &HashSet::new(),
             &mut dedup,
             &mut parse_cache,
@@ -1083,9 +1210,10 @@ mod tests {
         slice1_receipts.insert(hash_raw_tx(&slice1_txs[1]), receipt(pool, topic0, 40));
         let slice1 = flashblock(payload_id, 1, block_number, slice1_txs, slice1_receipts);
 
-        let (logs1, _, _, _) = extract_logs_from_xlayer_flashblock(
+        let (logs1, _, _, _, _) = extract_logs_from_xlayer_flashblock(
             &slice1,
             &matcher,
+            &HashSet::new(),
             &HashSet::new(),
             &mut dedup,
             &mut parse_cache,
@@ -1100,5 +1228,143 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![2, 3]
         );
+    }
+
+    #[test]
+    fn xlayer_caliber_update_extraction_from_raw_tx() {
+        use alloy::hex;
+
+        let caliber_contract: Address = "0x154586b2479b9a11e3d4db90024dc0e26f097312"
+            .parse()
+            .unwrap();
+        // 真实更新交易（块 67329558，tx 0xd9a1ffba…，EIP-1559，5 pair）
+        let raw_tx = hex::decode(REAL_CALIBER_RAW_TX_HEX).unwrap();
+
+        let matcher = XlayerLogMatcher {
+            topic_addresses: HashSet::new(),
+            topic_signatures: HashSet::new(),
+            address_only_addresses: HashSet::new(),
+        };
+        let mut dedup = XlayerDedupCache::new(XLAYER_DEDUP_PAYLOAD_WINDOW);
+        let mut parse_cache = XlayerParseCache::new();
+        let mut tx_tracker = XlayerTxCountTracker::new(XLAYER_TX_COUNT_WINDOW);
+        let mut latest_block_timestamp = None;
+
+        // 同块两笔更新交易：tx_index 应为 0 和 1（tx_base=0 + 数组下标）
+        let fb = flashblock(
+            "0xcaliber",
+            0,
+            67329558,
+            vec![raw_tx.clone(), raw_tx.clone()],
+            Map::new(),
+        );
+
+        let (logs, _, _, _, events) = extract_logs_from_xlayer_flashblock(
+            &fb,
+            &matcher,
+            &HashSet::new(),
+            &HashSet::from([caliber_contract]),
+            &mut dedup,
+            &mut parse_cache,
+            &mut tx_tracker,
+            &mut latest_block_timestamp,
+        );
+        assert!(logs.is_empty());
+        assert_eq!(events.len(), 10); // 2 笔 × 5 pair
+        assert_eq!(events[0].tx_index, 0);
+        assert_eq!(events[5].tx_index, 1);
+        assert_eq!(events[0].contract, caliber_contract);
+        assert_eq!(events[0].update.pair_id, events[5].update.pair_id);
+        assert_eq!(events[0].update.price, U256::from(64_334_999_999u64));
+        assert_eq!(events[0].update.flags, 1155);
+        assert_eq!(events[0].update.deadline, 1_786_098_592);
+
+        // to 不在兴趣集合 → 不产出事件
+        let (_, _, _, _, events2) = extract_logs_from_xlayer_flashblock(
+            &fb,
+            &matcher,
+            &HashSet::new(),
+            &HashSet::new(),
+            &mut dedup,
+            &mut parse_cache,
+            &mut tx_tracker,
+            &mut latest_block_timestamp,
+        );
+        assert!(events2.is_empty());
+    }
+
+    #[test]
+    fn xlayer_caliber_extract_to_apply_end_to_end() {
+        use crate::amms::caliber_prop::CaliberPropPool;
+        use crate::amms::Token;
+
+        let caliber_contract: Address = "0x154586b2479b9a11e3d4db90024dc0e26f097312"
+            .parse()
+            .unwrap();
+        // 真实更新 calldata 的第一个 pair（price=64334999999, flags=1155, deadline=1786098592）
+        let pair_id: B256 = B256::from_slice(
+            &alloy::hex::decode("d2ba36ae7a49fbbb15ac04a76531d9e811ca5fe2e57f4c559f200ed2a57aac7a")
+                .unwrap(),
+        );
+        let virtual_address =
+            CaliberPropPool::virtual_address_from_pair_id(pair_id, caliber_contract);
+
+        let mut state = StateSpace::default();
+        state.insert_amm(AMM::CaliberPropPool(CaliberPropPool {
+            contract_address: caliber_contract,
+            pair_id,
+            virtual_address,
+            token_x: Address::from([1u8; 20]),
+            token_y: Address::from([2u8; 20]),
+            token_a: Token::new_with_decimals(Address::from([1u8; 20]), 18),
+            token_b: Token::new_with_decimals(Address::from([2u8; 20]), 18),
+            created_block: 0,
+            last_synced_block: 0,
+            reserve_a: U256::from(1_000),
+            reserve_b: U256::from(1_000),
+            ladder: Default::default(),
+            price_a_in_b: 1.0,
+            price_b_in_a: 1.0,
+        }));
+
+        let raw_tx = alloy::hex::decode(REAL_CALIBER_RAW_TX_HEX).unwrap();
+        let fb = flashblock("0xcaliber", 0, 67329558, vec![raw_tx], Map::new());
+        let matcher = XlayerLogMatcher {
+            topic_addresses: HashSet::new(),
+            topic_signatures: HashSet::new(),
+            address_only_addresses: HashSet::new(),
+        };
+        let mut dedup = XlayerDedupCache::new(XLAYER_DEDUP_PAYLOAD_WINDOW);
+        let mut parse_cache = XlayerParseCache::new();
+        let mut tx_tracker = XlayerTxCountTracker::new(XLAYER_TX_COUNT_WINDOW);
+        let mut latest_block_timestamp = None;
+
+        // 提取：真实 flashblock 原始交易 → caliber 事件
+        let (_, _, _, _, events) = extract_logs_from_xlayer_flashblock(
+            &fb,
+            &matcher,
+            &HashSet::new(),
+            &HashSet::from([caliber_contract]),
+            &mut dedup,
+            &mut parse_cache,
+            &mut tx_tracker,
+            &mut latest_block_timestamp,
+        );
+        assert_eq!(events.len(), 5);
+
+        // 路由 + 应用：pool.field0/field1/deadline 与链上 data+0 一致
+        let affected = state.apply_caliber_updates(&events, 67_329_558);
+        assert_eq!(affected, vec![virtual_address]);
+        let pool = match state.get(&virtual_address).unwrap() {
+            AMM::CaliberPropPool(p) => p,
+            _ => unreachable!(),
+        };
+        assert_eq!(pool.ladder.field0, U256::from(64_334_999_999u64));
+        assert_eq!(pool.ladder.field1, U256::from(1155u64));
+        assert_eq!(pool.ladder.deadline, 1_786_098_592);
+        assert_eq!(pool.last_synced_block, 67_329_558);
+
+        // 其余 4 个 pair 不在本地池子 → 静默跳过，不影响已应用状态
+        assert_eq!(affected, vec![virtual_address]);
     }
 }

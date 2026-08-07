@@ -5,7 +5,7 @@
 
 use alloy::hex;
 use alloy::primitives::Log as AlloyLog;
-use alloy::primitives::{address, keccak256, Address, B256, Bytes, LogData, U256};
+use alloy::primitives::{address, keccak256, Address, Bytes, LogData, B256, U256};
 use alloy::rpc::types::Log;
 
 use amms::amms::amm::{AutomatedMarketMaker, SyncAction};
@@ -134,8 +134,13 @@ fn test_enrich_update_log_data() {
     let topics = vec![BINARYFI_UPDATE_EVENT, update_asset_topic()];
     let log_data = LogData::new(topics, Bytes::new()).unwrap();
 
-    let enriched = enrich_update_log_data(&[hex::encode(&raw)], Some(tx_hash), &log_data, BINARYFI_ENGINE_ADDRESS)
-        .expect("enrich should succeed");
+    let enriched = enrich_update_log_data(
+        &[hex::encode(&raw)],
+        Some(tx_hash),
+        &log_data,
+        BINARYFI_ENGINE_ADDRESS,
+    )
+    .expect("enrich should succeed");
     let data = enriched.data.as_ref();
     assert_eq!(data.len(), 224);
     let price = U256::from_be_slice(&data[..32]);
@@ -178,7 +183,8 @@ fn test_apply_l2_update_spread_and_scale() {
     assert_eq!(out, U256::from_str_radix("7145921212554514", 10).unwrap());
     // SELL：SKHYx→0 in=1e15 → 139,740（链上逐位对拍）
     assert_eq!(
-        pool.engine_quote(1, 0, U256::from(1_000_000_000_000_000u64)).unwrap(),
+        pool.engine_quote(1, 0, U256::from(1_000_000_000_000_000u64))
+            .unwrap(),
         U256::from(139_740u64)
     );
 
@@ -212,19 +218,20 @@ fn test_enrich_wrong_tx_hash_returns_none() {
     let topics = vec![BINARYFI_UPDATE_EVENT, update_asset_topic()];
     let log_data = LogData::new(topics, Bytes::new()).unwrap();
     let bogus = B256::repeat_byte(0xff);
-    assert!(
-        enrich_update_log_data(
-            &[hex::encode(&raw)],
-            Some(bogus),
-            &log_data,
-            BINARYFI_ENGINE_ADDRESS
-        )
-        .is_none()
-    );
-    assert!(
-        enrich_update_log_data(&[] as &[&str], Some(keccak256(&raw)), &log_data, BINARYFI_ENGINE_ADDRESS)
-            .is_none()
-    );
+    assert!(enrich_update_log_data(
+        &[hex::encode(&raw)],
+        Some(bogus),
+        &log_data,
+        BINARYFI_ENGINE_ADDRESS
+    )
+    .is_none());
+    assert!(enrich_update_log_data(
+        &[] as &[&str],
+        Some(keccak256(&raw)),
+        &log_data,
+        BINARYFI_ENGINE_ADDRESS
+    )
+    .is_none());
 }
 
 fn test_pool() -> BinaryFiPropPool {
@@ -631,8 +638,7 @@ fn test_sync_enriched_update_applies_price() {
 #[test]
 fn test_sync_canonical_update_marks_stale() {
     let mut pool = test_pool();
-    let log_data =
-        LogData::new(vec![BINARYFI_UPDATE_EVENT, asset_topic(1)], Bytes::new()).unwrap();
+    let log_data = LogData::new(vec![BINARYFI_UPDATE_EVENT, asset_topic(1)], Bytes::new()).unwrap();
     let log = Log {
         inner: AlloyLog {
             address: BINARYFI_ENGINE_ADDRESS,
@@ -653,10 +659,8 @@ fn test_sync_canonical_update_marks_stale() {
 #[test]
 fn test_engine_quote_buy_low_decimals_asset() {
     let mut pool = test_pool();
-    pool.assets[1] = Token::new_with_decimals(
-        address!("0x58100046a4afcd4ee4fadbd4244f3f895a341c56"),
-        4,
-    );
+    pool.assets[1] =
+        Token::new_with_decimals(address!("0x58100046a4afcd4ee4fadbd4244f3f895a341c56"), 4);
     // ask = 15005 + 4 = 15009 → q0j = floor(1e6×1999/(2000×15009)) = 66
     pool.apply_l2_update(1, U256::from(15_005u64), 100, 4, 4);
     let out = pool
@@ -673,14 +677,13 @@ fn test_exact_out_respects_ladder_caps() {
 
     // BUY 饱和型：maxOut=1000（远小于 96% 金库）→ 超过即拒绝
     pool.max_outputs[1] = Some(U256::from(1000u64));
-    assert!(
-        pool.simulate_swap_exact_out(
+    assert!(pool
+        .simulate_swap_exact_out(
             pool.assets[0].address,
             pool.assets[1].address,
             U256::from(5000u64),
         )
-        .is_err()
-    );
+        .is_err());
     let in_needed = pool
         .simulate_swap_exact_out(
             pool.assets[0].address,
@@ -694,14 +697,13 @@ fn test_exact_out_respects_ladder_caps() {
     pool.max_outputs[1] = None;
     pool.max_inputs[1] = Some(U256::from(1_000_000_000_000_000_000u64));
     // 超过 maxIn 线性可达输出 → 拒绝
-    assert!(
-        pool.simulate_swap_exact_out(
+    assert!(pool
+        .simulate_swap_exact_out(
             pool.assets[1].address,
             pool.assets[0].address,
             U256::from(200_000_000u64),
         )
-        .is_err()
-    );
+        .is_err());
     let in_needed = pool
         .simulate_swap_exact_out(
             pool.assets[1].address,
@@ -772,11 +774,11 @@ fn test_ladder_sell_tiers_asset6() {
     // 引擎储备 R = 29.4e15（链上反推），SELL 逐档输出与链上一致
     pool.ladder_reserves[2] = Some(U256::from(29_400_000_000_000_000u64));
     let cases: &[(u64, u64)] = &[
-        (1_000_000_000_000_00, 76_862), // 1e14，首档内
-        (10_000_000_000_000_000, 7_686_254), // 1e16
-        (1_000_000_000_000_000_000, 768_625_495), // 1e18
-        (5_000_000_000_000_000_000, 3_843_087_511), // 5e18，跨 2 档
-        (10_000_000_000_000_000_000, 7_685_995_104), // 1e19，跨 3 档
+        (1_000_000_000_000_00, 76_862),               // 1e14，首档内
+        (10_000_000_000_000_000, 7_686_254),          // 1e16
+        (1_000_000_000_000_000_000, 768_625_495),     // 1e18
+        (5_000_000_000_000_000_000, 3_843_087_511),   // 5e18，跨 2 档
+        (10_000_000_000_000_000_000, 7_685_995_104),  // 1e19，跨 3 档
         (18_000_000_000_000_000_000, 13_827_464_262), // 1.8e19，跨 4 档
     ];
     for &(inp, expected) in cases {

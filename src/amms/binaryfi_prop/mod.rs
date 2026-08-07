@@ -386,7 +386,9 @@ impl BinaryFiPropPool {
             let out = big_in
                 .checked_mul(U256::from(10u64).pow(U256::from(dj + 2)))?
                 .checked_mul(U256::from(1999))?
-                / (cand.checked_mul(U256::from(2000))?.checked_mul(U256::from(10u64).pow(U256::from(d0)))?);
+                / (cand
+                    .checked_mul(U256::from(2000))?
+                    .checked_mul(U256::from(10u64).pow(U256::from(d0)))?);
             if out == big_out {
                 return Some(cand);
             }
@@ -490,9 +492,7 @@ impl BinaryFiPropPool {
         // （bid = floor(raw/2000) = scaled - ceil(scaled/2000) - sell_off）
         let sell_raw = scaled
             .checked_mul(U256::from(1999))
-            .and_then(|v| {
-                v.checked_sub(U256::from(sell_off).checked_mul(U256::from(2000))?)
-            });
+            .and_then(|v| v.checked_sub(U256::from(sell_off).checked_mul(U256::from(2000))?));
         if let Some(r) = self.sell_raw.get_mut(asset_idx) {
             *r = sell_raw;
         }
@@ -514,14 +514,23 @@ impl BinaryFiPropPool {
         data0: U256,
         data1: U256,
     ) {
-        self.apply_l2_update(asset_idx, price, block_number, ask_offset_raw, bid_offset_raw);
+        self.apply_l2_update(
+            asset_idx,
+            price,
+            block_number,
+            ask_offset_raw,
+            bid_offset_raw,
+        );
         let factor = {
             let scale = self.price_scales.get(asset_idx).copied().unwrap_or(10_000);
             (scale / 10_000).max(1) as u32
         };
         let decode = |data: U256| -> Option<Vec<(u32, u32)>> {
-            decode_ladder(data)
-                .map(|l| l.into_iter().map(|(w, q)| (w.saturating_mul(factor), q)).collect())
+            decode_ladder(data).map(|l| {
+                l.into_iter()
+                    .map(|(w, q)| (w.saturating_mul(factor), q))
+                    .collect()
+            })
         };
         if let Some(l) = self.sell_ladders.get_mut(asset_idx) {
             *l = decode(data0);
@@ -561,10 +570,7 @@ impl BinaryFiPropPool {
             Some(m) => amount_in.min(m),
             None => amount_in,
         };
-        let out = eff_in
-            .checked_mul(raw)?
-            .checked_mul(p10(k0))?
-            / (U256::from(2000) * p10(di));
+        let out = eff_in.checked_mul(raw)?.checked_mul(p10(k0))? / (U256::from(2000) * p10(di));
         self.sell_zero_over_vault(out)
     }
 
@@ -592,8 +598,7 @@ impl BinaryFiPropPool {
         let p = self.prices.get(i).copied().filter(|p| !p.is_zero())?;
         let d0 = self.assets[0].decimals as u32;
         let di = self.assets[i].decimals as u32;
-        ladder_sell_out(p, &ladder, r, U256::MAX, d0, di)
-            .and_then(|v| self.sell_zero_over_vault(v))
+        ladder_sell_out(p, &ladder, r, U256::MAX, d0, di).and_then(|v| self.sell_zero_over_vault(v))
     }
 
     /// 用候选储备 R 重算 100 整枚 SELL probe 输出并与链上 q_big 对拍；
@@ -1113,12 +1118,16 @@ impl BinaryFiPropPool {
                                 if qb < q4 {
                                     return None; // 封顶，非线性
                                 }
-                                Self::recover_ask_big(qb, U256::from(10u64).pow(U256::from(d0 + 4)), dj, d0)
+                                Self::recover_ask_big(
+                                    qb,
+                                    U256::from(10u64).pow(U256::from(d0 + 4)),
+                                    dj,
+                                    d0,
+                                )
                             })
                             .or_else(|| Self::recover_ask_eff(z, dj))
                             .unwrap_or(U256::ZERO);
-                        self.ask_offsets[j] =
-                            ask_eff.saturating_sub(b).to::<u64>();
+                        self.ask_offsets[j] = ask_eff.saturating_sub(b).to::<u64>();
                     }
                 }
                 (Some(b), None) => {
@@ -1142,7 +1151,12 @@ impl BinaryFiPropPool {
                                 if qb < q4 {
                                     return None;
                                 }
-                                Self::recover_ask_big(qb, U256::from(10u64).pow(U256::from(d0 + 4)), dj, d0)
+                                Self::recover_ask_big(
+                                    qb,
+                                    U256::from(10u64).pow(U256::from(d0 + 4)),
+                                    dj,
+                                    d0,
+                                )
                             })
                             .or_else(|| Self::recover_ask_eff(z, dj))
                             .unwrap_or(U256::ZERO);
@@ -1184,7 +1198,9 @@ impl BinaryFiPropPool {
             if dj > 30 {
                 continue;
             }
-            let big_in = U256::from(100u64).checked_mul(p10a(dj)).unwrap_or(U256::ZERO);
+            let big_in = U256::from(100u64)
+                .checked_mul(p10a(dj))
+                .unwrap_or(U256::ZERO);
             let lo = bid.checked_mul(U256::from(2000)).unwrap_or(U256::ZERO);
             let hi = lo + U256::from(1999);
             let raw = match big_sell_out[j] {
@@ -1480,9 +1496,7 @@ fn ladder_sell_out(
         let cap = U256::from(q).checked_mul(reserve)?;
         let consume = rem.min(cap);
         let p_eff = price.checked_sub(U256::from(w))?;
-        out = out.checked_add(
-            p_eff.checked_mul(consume)?.checked_mul(scale)? / den,
-        )?;
+        out = out.checked_add(p_eff.checked_mul(consume)?.checked_mul(scale)? / den)?;
         rem = rem.checked_sub(consume)?;
     }
     Some(out)
@@ -1994,7 +2008,6 @@ impl BinaryFiPropPool {
         let snap = self.fetch_stale_snapshot(provider, block).await?;
         Ok((snap, snap_block))
     }
-
 }
 
 impl BinaryFiPropPool {

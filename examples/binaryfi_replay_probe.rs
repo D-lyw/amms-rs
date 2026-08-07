@@ -304,7 +304,11 @@ async fn flush_block<P: Provider + Clone>(
         } else {
             mismatches.push(format!(
                 "  [{block}] {j}->0 sell in={sell_in} {raw_state}: sim={sim} chain={chain} diff={}",
-                if sim > chain { sim - chain } else { chain - sim }
+                if sim > chain {
+                    sim - chain
+                } else {
+                    chain - sim
+                }
             ));
         }
     }
@@ -313,15 +317,12 @@ async fn flush_block<P: Provider + Clone>(
         .filter(|&j| pool.sell_raw.get(j).copied().flatten().is_some())
         .count();
     let n_assets = n.saturating_sub(1);
-    println!(
-        "  [{block}] sell_raw known: {raw_known}/{n_assets} assets"
-    );
+    println!("  [{block}] sell_raw known: {raw_known}/{n_assets} assets");
     let recovered = recover_prices(&snap);
     for j in 1..n {
         let local_p = pool.prices.get(j).copied().unwrap_or_default();
-        let local_b = local_p.saturating_sub(U256::from(
-            pool.bid_offsets.get(j).copied().unwrap_or(0),
-        ));
+        let local_b =
+            local_p.saturating_sub(U256::from(pool.bid_offsets.get(j).copied().unwrap_or(0)));
         let local_a = local_p + U256::from(pool.ask_offsets.get(j).copied().unwrap_or(0));
         let (rec_b, rec_a, disabled) = recovered[j];
         // 买入禁用资产（快照 ask=0 标记）只比较 bid；正常资产 bid/ask 全比
@@ -341,9 +342,8 @@ async fn flush_block<P: Provider + Clone>(
             if local_p.is_zero() {
                 continue;
             }
-            let lb = local_p.saturating_sub(U256::from(
-                pool.bid_offsets.get(j).copied().unwrap_or(0),
-            ));
+            let lb =
+                local_p.saturating_sub(U256::from(pool.bid_offsets.get(j).copied().unwrap_or(0)));
             let la = local_p + U256::from(pool.ask_offsets.get(j).copied().unwrap_or(0));
             let (rb, ra, _disabled) = recovered[j];
             let tag = if lb == rb && la == ra { "ok " } else { "DIFF" };
@@ -485,7 +485,12 @@ async fn main() -> eyre::Result<()> {
                 Some(h) => match provider.get_raw_transaction_by_hash(h).await? {
                     Some(bytes) => {
                         let raw_hex = alloy::hex::encode(bytes.as_ref());
-                        enrich_update_log_data(&[raw_hex], Some(h), &log.data(), BINARYFI_ENGINE_ADDRESS)
+                        enrich_update_log_data(
+                            &[raw_hex],
+                            Some(h),
+                            &log.data(),
+                            BINARYFI_ENGINE_ADDRESS,
+                        )
                     }
                     None => None,
                 },
@@ -538,7 +543,10 @@ async fn main() -> eyre::Result<()> {
     for m in quote_mismatches.iter().take(20) {
         println!("{m}");
     }
-    println!("info (engine buy-cap consumed, unobservable): {}", cap_infos.len());
+    println!(
+        "info (engine buy-cap consumed, unobservable): {}",
+        cap_infos.len()
+    );
     for m in cap_infos.iter().take(20) {
         println!("{m}");
     }

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::amms::aerodrome_slipstream::pool::FEE_MODULE_GLOBALS;
 use crate::amms::aerodrome_slipstream::pool::{
@@ -18,8 +18,8 @@ use crate::amms::aerodrome_slipstream::pool::{
 use crate::amms::amm::{AutomatedMarketMaker, AMM};
 use crate::amms::balancer_v2::BalancerV2Pool;
 use crate::amms::balancer_v3::BalancerV3Pool;
-use crate::amms::caliber_prop::CaliberPropPool;
 use crate::amms::binaryfi_prop::BinaryFiPropPool;
+use crate::amms::caliber_prop::CaliberPropPool;
 use crate::amms::curve_ng::{CurveNGFactory, ICurveNGStableSwap};
 use crate::amms::fluid_dex::{
     DexReservesResolver, FluidDexT1, FluidLiquidity, TokenLimitData, FLUID_DEX_RESOLVER,
@@ -1148,24 +1148,21 @@ pub async fn start_pendle_sync_task<N, P>(
     }
 }
 
-/// Periodically refreshes Caliber propAMM pool ladder snapshots.
+/// Periodically reconciles Caliber propAMM pool ladder snapshots.
 ///
-/// Caliber pools do not emit Swap events, so their pricing ladder cannot be
-/// tracked via event-driven sync. Instead, each refresh cycle calls the
-/// Caliber ladder batch reader contract to rebuild the complete ladder state.
+/// 实时模式下（默认）报价更新由 Xlayer flashblocks 原始交易流
+/// （`batchUpdateParameters` calldata）驱动，本任务降频为**对账/兜底**：
+/// - 冷启动 / flashblocks 断流回填；
+/// - 储备、pos（`cfg+4/5`、`cfg+7`）等不随更新交易变化的低频变动；
+/// - 漏更新 / calldata 解码失败的纠正。
 ///
-/// ## Frequency Trade-off
+/// 对账间隔即断流期间报价滞后的上界（默认 45s，`with_caliber_reconcile_interval`
+/// 可配置）；关闭实时开关（`with_caliber_realtime_sync(false)`）时退回纯周期拉取
+/// （`caliber_ladder_sync_interval`）。
 ///
-/// - **High frequency (<= 1s)**: Best for MEV/arbitrage use cases. The ladder
-///   reflects the market maker's latest off-chain pricing with minimal staleness.
-/// - **Medium frequency (10-60s)**: Sufficient for DEX aggregation use cases
-///   (matching KyberNetwork's approach).
-/// - **Low frequency (> 300s)**: Only suitable for display purposes; pricing
-///   accuracy degrades significantly.
-///
-/// Each pool refresh now costs one `eth_call` per pool; the reader contract
-/// internally performs `getPoolBalances`, base sampling, and one midpoint
-/// refinement pass before returning the final ladder snapshot.
+/// 批量刷新：`caliber_prop::batch_refresh_snapshots` 把所有 pool 的
+/// `eth_getStorageAt`（固定槽位 + ladder 槽位）折叠进 JSON-RPC batch，
+/// 每 512 槽一次 HTTP 请求，RPC 往返从每 pool ~10+n 次降到几乎常数。
 pub async fn start_caliber_prop_ladder_sync_task<N, P>(
     state: Arc<RwLock<StateSpace>>,
     provider: P,
@@ -1196,17 +1193,29 @@ pub async fn start_caliber_prop_ladder_sync_task<N, P>(
         }
 
         debug!(
-            "Updating ladder snapshots for {} Caliber propAMM pools",
+            "Reconciling ladder snapshots for {} Caliber propAMM pools",
             target_pools.len()
         );
 
-        for pool in &mut target_pools {
-            if let Err(e) = pool.update::<N, P>(provider.clone()).await {
-                error!(
-                    address = ?pool.virtual_address,
-                    error = ?e,
-                    "Failed to update Caliber propAMM ladder"
-                );
+        match crate::amms::caliber_prop::batch_refresh_snapshots::<N, P>(
+            &provider,
+            &mut target_pools,
+            alloy::eips::BlockId::latest(),
+        )
+        .await
+        {
+            Ok(flags) => {
+                let failed = flags.iter().filter(|f| !**f).count();
+                if failed > 0 {
+                    warn!(
+                        "Caliber reconcile: {}/{} pools failed",
+                        failed,
+                        flags.len()
+                    );
+                }
+            }
+            Err(e) => {
+                error!(error = ?e, "Caliber reconcile batch snapshot failed");
             }
         }
 
@@ -1219,7 +1228,6 @@ pub async fn start_caliber_prop_ladder_sync_task<N, P>(
             }
         }
     }
-
 }
 
 /// BinaryFi propAMM 周期全量校正任务。

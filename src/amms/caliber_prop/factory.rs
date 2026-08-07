@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument};
 
 use crate::amms::{
-    amm::{AutomatedMarketMaker, AMM},
+    amm::AMM,
     error::AMMError,
     factory::{AutomatedMarketMakerFactory, DiscoverySync},
     Token,
@@ -296,6 +296,8 @@ pub(super) async fn init_batch<N, P>(
 ) -> Result<Vec<AMM>, AMMError>
 where
     N: Network,
+    N::BlockResponse: alloy::network::BlockResponse,
+    <N::BlockResponse as alloy::network::BlockResponse>::Header: alloy::consensus::BlockHeader,
     P: Provider<N> + Clone,
 {
     if amms.is_empty() {
@@ -338,17 +340,22 @@ where
             .unwrap_or(18);
     }
 
-    // 2. 逐池初始化（reader 合约一次性拉取储备 + Ladder）
-    let mut initialized = Vec::with_capacity(pools.len());
-    for pool in pools {
-        let virt = pool.virtual_address;
-        match pool.init::<N, P>(block_number, provider.clone()).await {
-            Ok(p) => initialized.push(AMM::CaliberPropPool(p)),
-            Err(e) => {
-                debug!("caliber: failed to init pool {}: {}", virt, e);
+    // 2. 批量初始化：一次 JSON-RPC batch 读取全部储备 + Ladder + 精确报价参数
+    //    （每个 pair 的固定槽位 + ladder 槽位折叠进 batch，失败 pool 保持骨架被过滤）
+    let flags = super::batch_refresh_snapshots::<N, P>(&provider, &mut pools, block_number).await?;
+
+    let initialized = pools
+        .into_iter()
+        .zip(flags)
+        .filter_map(|(pool, ok)| {
+            if ok {
+                Some(AMM::CaliberPropPool(pool))
+            } else {
+                debug!("caliber: failed to init pool {}", pool.virtual_address);
+                None
             }
-        }
-    }
+        })
+        .collect();
 
     Ok(initialized)
 }
@@ -427,6 +434,13 @@ impl Default for super::types::CaliberLadderState {
             consumed_out_ab: U256::ZERO,
             consumed_in_ba: U256::ZERO,
             consumed_out_ba: U256::ZERO,
+            field0: U256::ZERO,
+            field1: U256::ZERO,
+            fee_rate: U256::ZERO,
+            window: U256::ZERO,
+            scale: U256::ZERO,
+            pos: U256::ZERO,
+            deadline: 0,
         }
     }
 }

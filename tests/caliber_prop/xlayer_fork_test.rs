@@ -1,34 +1,29 @@
-//! Caliber propAMM — 全链路真实性验证（XLayer 链上 Fork 测试）
+//! Caliber propAMM — 全链路精确复刻验证（XLayer 链上 Fork 测试）
 //!
 //! ## 验证范围
 //!
-//! 1. **池子发现 & 初始化** — getAllPairIds + Caliber ladder batch reader
-//! 2. **分段线性插值精度** — 使用非采样点交易量对比 `simulate_swap` vs `batchQuote()`
-//! 3. **边界条件** — before-first 安全护栏和后向越界（超过 Ladder 范围报错）
-//! 4. **Consumed 追踪 + simulate_swap_mut** — 连续多笔 swap 验证 consumed 状态正确性
-//! 5. **StateSpace 集成** — with_amms 构建
+//! 1. **池子发现 & 初始化** — getAllPairIds + `fetch_exact_snapshot` 直读存储
+//!    （cfg/data/ladder，含 `cfg+7` pos）
+//! 2. **正向/反向报价逐位对照** — `simulate_swap` vs 链上 `batchQuote()`，
+//!    固定金额列表（含小额 before-first 与跨段大额），**逐位一致**（0 偏差）
+//! 3. **Consumed 追踪 + simulate_swap_mut** — 连续多笔 swap 的累计输出
+//!    与链上累计输入报价逐位一致
+//! 4. **StateSpace 集成** — with_amms 构建
+//! 5. **全量 pair 扫描** — 所有 pair 逐位对照
 //!
-//! ## 关键设计
+//! ## 运行
 //!
-//! 测试使用的交易量百分比如下（全都不在基础采样网格上）：
-//!
-//! | 测试类型 | BPS | 相对 Ladder 位置 |
-//! |---|---|---|
-//! | before-first | 动态 | `<` 第一个真实采样点 |
-//! | 插值 | 4 | 在 3 和 5 之间 |
-//! | 插值 | 18 | 在 15 和 20 之间 |
-//! | 插值 | 130 | 在 100 和 150 之间 |
-//! | 插值 | 220 | 在 200 和 250 之间 |
-//! | 插值 | 350 | 在 300 和 400 之间 |
-//! | 插值 | 1200 | 在 1000 和 1500 之间 |
-//! | 插值 | 5500 | 在 5000 和 6000 之间 |
-//! | 插值 | 9500 | 在 9000 和 9900 之间 |
-//! | 后向越界 | 9950 | > 最后一个采样点 9900 |
+//! ```bash
+//! XLAYER_PROVIDER=http://127.0.0.1:8557 CALIBER_TEST_BLOCK=66309105 \
+//!   cargo test -p amms --test caliber_prop
+//! ```
 //!
 //! ## 参考合约
 //!
 //! - XLayer: `0x154586B2479b9a11e3d4db90024Dc0e26F097312`
-//! - 环境变量: `XLAYER_PROVIDER` 或 `XLAYER_RPC_URL`
+//! - 报价公式与存储布局：`docs/caliber_prop_internal.md`
+//! - 向量来源：`docs/caliber_prop_re/model.py`（4 pair × 双向 × 14 金额，
+//!   块 66309105 链上 eth_call 验证零 DIFF）
 
 use alloy::{
     eips::BlockId,
@@ -61,8 +56,6 @@ struct PoolDeviationSummary {
     virtual_address: Address,
     ladder_ab_points: usize,
     ladder_ba_points: usize,
-    empty_directions: usize,
-    max_deviation_bps: f64,
     checked_quotes: usize,
 }
 
@@ -74,52 +67,24 @@ const XLAYER_CHAIN_ID: u64 = 196;
 const CALIBER_CONTRACT: Address = address!("154586b2479b9a11e3d4db90024dc0e26f097312");
 const CALIBER_TEST_BLOCK: u64 = 66_309_105;
 
-/// 允许的最大**插值**偏差（BPS）。仅适用于两个已知采样点之间的
-/// 线性插值。before-first 安全护栏不在此限制之列。
-const MAX_INTERP_DEVIATION_BPS: f64 = 5.0;
-
-/// 用于验证插值精度的非采样点 BPS（全都在基础采样网格之外）。
-/// 9950 是越界点，预期报错。
-const OFF_GRID_BPS: &[(u32, &str)] = &[
-    (4, "0.04% (3↔5)"),
-    (6, "0.06% (5↔7)"),
-    (8, "0.08% (7↔10)"),
-    (12, "0.12% (10↔15)"),
-    (18, "0.18% (15↔20)"),
-    (23, "0.23% (20↔25)"),
-    (35, "0.35% (30↔40)"),
-    (60, "0.60% (50↔75)"),
-    (90, "0.90% (75↔100)"),
-    (130, "1.30% (100↔150)"),
-    (175, "1.75% (150↔200)"),
-    (220, "2.20% (200↔250)"),
-    (275, "2.75% (250↔300)"),
-    (350, "3.50% (300↔400)"),
-    (625, "6.25% (500↔750)"),
-    (1200, "12.0% (1000↔1500)"),
-    (1750, "17.5% (1500↔2000)"),
-    (2250, "22.5% (2000↔3000)"),
-    (3500, "35.0% (3000↔4000)"),
-    (5500, "55.0% (5000↔6000)"),
-    (8500, "85.0% (8000↔9000)"),
-    (9500, "95.0% (9000↔9900)"),
-    (9950, "99.5% (>9900 overflow)"),
+/// 逐位对照的固定金额列表（= docs/caliber_prop_re/ 的 Python 验证集，
+/// 覆盖 before-first 小额、段内、跨段大额）。
+const QUOTE_AMOUNTS: &[u64] = &[
+    1,
+    2,
+    3,
+    5,
+    10,
+    50,
+    100,
+    1_000,
+    10_000,
+    100_000,
+    1_000_000,
+    10_000_000,
+    100_000_000,
+    1_000_000_000,
 ];
-
-/// 多池横向偏差扫描使用更少的代表性点位，避免把 RPC 压力放大到不必要的程度。
-const OFF_GRID_SCAN_BPS: &[(u32, &str)] = &[
-    (4, "0.04% (3↔5)"),
-    (18, "0.18% (15↔20)"),
-    (130, "1.30% (100↔150)"),
-    (350, "3.50% (300↔400)"),
-    (1200, "12.0% (1000↔1500)"),
-    (5500, "55.0% (5000↔6000)"),
-    (9500, "95.0% (9000↔9900)"),
-    (9950, "99.5% (>9900 overflow)"),
-];
-
-/// 连续 simulate_swap_mut 序列的 BPS 值（均 > 首采样点）。
-const MUT_SWAP_BPS_CURVED: &[u32] = &[15, 25, 35]; // total 75 bps
 
 // ============================================================
 // ERC20 ABI
@@ -151,54 +116,11 @@ fn caliber_test_block() -> u64 {
         .unwrap_or(CALIBER_TEST_BLOCK)
 }
 
-fn u256_to_f64(value: &U256) -> f64 {
-    let limbs = value.as_limbs();
-    let mut result = limbs[0] as f64;
-    result += (limbs[1] as f64) * (2.0f64.powi(64));
-    result += (limbs[2] as f64) * (2.0f64.powi(128));
-    result += (limbs[3] as f64) * (2.0f64.powi(192));
-    result
-}
-
-fn reserve_share(reserve: &U256, bps: u32) -> U256 {
-    *reserve * U256::from(bps) / U256::from(10_000)
-}
-
 fn xlayer_test_guard() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-fn before_first_amount(pool: &CaliberPropPool, token_in: Address) -> U256 {
-    let ladder = if token_in == pool.token_a.address {
-        &pool.ladder.ladder_a_to_b
-    } else {
-        &pool.ladder.ladder_b_to_a
-    };
-
-    let first = ladder
-        .first()
-        .expect("caliber ladder should have at least one point")
-        .amount_in;
-    assert!(first > U256::from(1), "first ladder point should be > 1");
-    first - U256::from(1)
-}
-
-fn before_first_amount_opt(pool: &CaliberPropPool, token_in: Address) -> Option<U256> {
-    let ladder = if token_in == pool.token_a.address {
-        &pool.ladder.ladder_a_to_b
-    } else {
-        &pool.ladder.ladder_b_to_a
-    };
-
-    let first = ladder.first()?.amount_in;
-    if first > U256::from(1) {
-        Some(first - U256::from(1))
-    } else {
-        None
-    }
 }
 
 async fn connect_xlayer_provider() -> Result<Option<(Arc<impl Provider>, u64, BlockId)>> {
@@ -310,7 +232,8 @@ where
     })
 }
 
-async fn scan_pool_deviation<P>(
+/// 单 pair 双向固定金额逐位对照
+async fn scan_pool_exact<P>(
     provider: P,
     loaded: &LoadedCaliberPool,
     block_id: BlockId,
@@ -319,111 +242,28 @@ where
     P: Provider + Clone,
 {
     let pool = &loaded.pool;
-    let phase1_requests: Vec<(Address, Address, U256)> = OFF_GRID_SCAN_BPS
-        .iter()
-        .flat_map(|(test_bps, _)| {
-            [
-                (
-                    pool.token_a.address,
-                    pool.token_b.address,
-                    reserve_share(&pool.reserve_a, *test_bps),
-                ),
-                (
-                    pool.token_b.address,
-                    pool.token_a.address,
-                    reserve_share(&pool.reserve_b, *test_bps),
-                ),
-            ]
-        })
-        .filter(|(_, _, amount_in)| !amount_in.is_zero())
-        .collect();
-    let phase1_chain_quotes =
-        chain_quotes_batch(provider.clone(), pool.pair_id, &phase1_requests, block_id).await?;
-
-    let mut max_dev_bps = 0.0f64;
-    let mut checked_quotes = 0usize;
-    let mut empty_directions = 0usize;
-    let mut phase1_idx = 0usize;
-
-    for &(test_bps, _) in OFF_GRID_SCAN_BPS {
-        for &(token_in, token_out, reserve) in &[
-            (pool.token_a.address, pool.token_b.address, &pool.reserve_a),
-            (pool.token_b.address, pool.token_a.address, &pool.reserve_b),
-        ] {
-            let amount_in = reserve_share(reserve, test_bps);
-            if amount_in.is_zero() {
-                continue;
-            }
-
-            let local_res = pool.simulate_swap(token_in, token_out, amount_in);
-            let chain_res = phase1_chain_quotes[phase1_idx];
-            phase1_idx += 1;
-
-            match local_res {
-                Ok(local_out) => {
-                    if chain_res.is_zero() {
-                        continue;
-                    }
-                    let diff = if chain_res > local_out {
-                        chain_res - local_out
-                    } else {
-                        local_out - chain_res
-                    };
-                    let diff_bps = u256_to_f64(&diff) / u256_to_f64(&chain_res) * 10000.0;
-                    max_dev_bps = max_dev_bps.max(diff_bps);
-                    checked_quotes += 1;
-                }
-                Err(_) => {
-                    assert!(
-                        chain_res.is_zero() || test_bps == 9950,
-                        "unexpected simulate_swap error for {} / {} at {}bps with non-zero chain quote {}",
-                        loaded.symbol_a,
-                        loaded.symbol_b,
-                        test_bps,
-                        chain_res
-                    );
-                }
-            }
-        }
-    }
-
+    let mut requests: Vec<(Address, Address, U256)> = Vec::new();
     for &(token_in, token_out) in &[
         (pool.token_a.address, pool.token_b.address),
         (pool.token_b.address, pool.token_a.address),
     ] {
-        if let Some(amount_in) = before_first_amount_opt(pool, token_in) {
-            let local_out = pool.simulate_swap(token_in, token_out, amount_in)?;
-            assert_eq!(
-                local_out,
-                U256::ZERO,
-                "before-first guard failed for {} / {}",
-                loaded.symbol_a,
-                loaded.symbol_b
-            );
-        } else {
-            empty_directions += 1;
+        for &amt in QUOTE_AMOUNTS {
+            requests.push((token_in, token_out, U256::from(amt)));
         }
     }
+    let chain_quotes = chain_quotes_batch(provider, pool.pair_id, &requests, block_id).await?;
+    assert_eq!(requests.len(), chain_quotes.len());
 
-    for &(token_in, token_out, reserve) in &[
-        (pool.token_a.address, pool.token_b.address, &pool.reserve_a),
-        (pool.token_b.address, pool.token_a.address, &pool.reserve_b),
-    ] {
-        let has_ladder = if token_in == pool.token_a.address {
-            !pool.ladder.ladder_a_to_b.is_empty()
-        } else {
-            !pool.ladder.ladder_b_to_a.is_empty()
-        };
-        if !has_ladder {
-            continue;
-        }
-        let amount_in = reserve_share(reserve, 9950);
-        assert!(
-            pool.simulate_swap(token_in, token_out, amount_in).is_err(),
-            "expected beyond-last error for {} / {}",
-            loaded.symbol_a,
-            loaded.symbol_b
+    let mut checked_quotes = 0usize;
+    for (i, &(token_in, token_out, amount_in)) in requests.iter().enumerate() {
+        let chain_out = chain_quotes[i];
+        let local_out = pool.simulate_swap(token_in, token_out, amount_in)?;
+        assert_eq!(
+            local_out, chain_out,
+            "quote mismatch for {} / {} ({token_in}->{token_out}) amount={amount_in}",
+            loaded.symbol_a, loaded.symbol_b
         );
+        checked_quotes += 1;
     }
 
     Ok(PoolDeviationSummary {
@@ -431,8 +271,6 @@ where
         virtual_address: pool.virtual_address,
         ladder_ab_points: pool.ladder.ladder_a_to_b.len(),
         ladder_ba_points: pool.ladder.ladder_b_to_a.len(),
-        empty_directions,
-        max_deviation_bps: max_dev_bps,
         checked_quotes,
     })
 }
@@ -450,7 +288,7 @@ where
     Ok(B256::from(result.to_be_bytes::<32>()))
 }
 
-/// 从合约 storage 读取 pair 的 token 地址。
+/// 从合约 storage 读取 pair 的 token 地址（cfg 基址 keccak256(pairId||6)）。
 async fn read_token_addresses<P>(
     provider: &P,
     contract: Address,
@@ -548,7 +386,7 @@ where
 }
 
 // ============================================================
-// 主测试：全链路验证
+// 主测试：全链路精确验证
 // ============================================================
 
 #[tokio::test]
@@ -559,7 +397,7 @@ async fn test_caliber_prop_full_verification() -> Result<()> {
     };
 
     // ========================================================================
-    // Phase 0: 池子发现 & 初始化
+    // Phase 0: 池子发现 & 初始化（fetch_exact_snapshot 直读存储）
     // ========================================================================
 
     println!("=== Phase 0: Discover & Initialize ===");
@@ -569,7 +407,7 @@ async fn test_caliber_prop_full_verification() -> Result<()> {
     assert!(!pair_ids.is_empty(), "no Caliber pairs found on XLayer");
 
     let loaded = load_caliber_pool(provider.clone(), chain_id, pair_ids[0], block_id).await?;
-    let pool = loaded.pool;
+    let pool = loaded.pool.clone();
     let pair_id = pool.pair_id;
     let token_a = pool.token_a.address;
     let token_b = pool.token_b.address;
@@ -585,223 +423,146 @@ async fn test_caliber_prop_full_verification() -> Result<()> {
         pool.ladder.ladder_b_to_a.len()
     );
     println!(
+        "  quote params: field0={} field1={} fee={} window={} scale={} pos={}",
+        pool.ladder.field0,
+        pool.ladder.field1,
+        pool.ladder.fee_rate,
+        pool.ladder.window,
+        pool.ladder.scale,
+        pool.ladder.pos,
+    );
+    println!(
         "  price_a_in_b={:.6} price_b_in_a={:.6}",
         pool.price_a_in_b, pool.price_b_in_a
     );
 
     // ========================================================================
-    // Phase 1: 非采样点插值精度验证
+    // Phase 1: 双向固定金额逐位对照
     // ========================================================================
 
-    println!("\n=== Phase 1: Off-grid interpolation accuracy ===");
+    println!("\n=== Phase 1: Exact quote comparison (simulate_swap vs batchQuote) ===");
 
-    let mut max_dev_bps = 0.0f64;
-    let phase1_requests: Vec<(Address, Address, U256)> = OFF_GRID_BPS
-        .iter()
-        .flat_map(|(test_bps, _)| {
-            [
-                (token_a, token_b, reserve_share(&pool.reserve_a, *test_bps)),
-                (token_b, token_a, reserve_share(&pool.reserve_b, *test_bps)),
-            ]
-        })
-        .filter(|(_, _, amount_in)| !amount_in.is_zero())
-        .collect();
-    let phase1_chain_quotes =
-        chain_quotes_batch(provider.clone(), pair_id, &phase1_requests, block_id).await?;
-    let mut phase1_idx = 0usize;
-
-    for &(test_bps, label) in OFF_GRID_BPS {
-        for &(token_in, token_out, reserve) in &[
-            (token_a, token_b, &pool.reserve_a),
-            (token_b, token_a, &pool.reserve_b),
-        ] {
-            let amount_in = reserve_share(reserve, test_bps);
-            if amount_in.is_zero() {
-                continue;
-            }
-
-            let local_res = pool.simulate_swap(token_in, token_out, amount_in);
-            let chain_res = phase1_chain_quotes[phase1_idx];
-            phase1_idx += 1;
-
-            match local_res {
-                Ok(local_out) => {
-                    if chain_res.is_zero() {
-                        println!("  [{label:30}] {token_in:12}→{token_out:12} chain=0 (skip)");
-                        continue;
-                    }
-
-                    let diff = if chain_res > local_out {
-                        chain_res - local_out
-                    } else {
-                        local_out - chain_res
-                    };
-                    let diff_bps = u256_to_f64(&diff) / u256_to_f64(&chain_res) * 10000.0;
-                    if diff_bps > max_dev_bps {
-                        max_dev_bps = diff_bps;
-                    }
-
-                    let status = if diff_bps <= MAX_INTERP_DEVIATION_BPS {
-                        "OK"
-                    } else {
-                        "FAIL"
-                    };
-                    println!(
-                        "  [{status:4}] {label:30} local={local_out:30} chain={chain_res:30} diff={diff_bps:.2}bps"
-                    );
-
-                    assert!(
-                        diff_bps <= MAX_INTERP_DEVIATION_BPS,
-                        "interpolation deviation {diff_bps:.2} BPS exceeds {MAX_INTERP_DEVIATION_BPS}"
-                    );
-                }
-                Err(e) => {
-                    if test_bps == 9950 {
-                        println!("  [OK  ] {label:30} expected error: {e}");
-                    } else {
-                        panic!("unexpected simulate_swap error at {label}: {e}");
-                    }
-                }
-            }
-        }
-    }
-
+    let summary = scan_pool_exact(provider.clone(), &loaded, block_id).await?;
     println!(
-        "  Worst deviation: {:.2} BPS (threshold: {MAX_INTERP_DEVIATION_BPS} BPS)",
-        max_dev_bps
+        "  {} checked={} quotes, ALL bit-exact",
+        summary.pair_label, summary.checked_quotes
     );
 
     // ========================================================================
-    // Phase 2a: before-first 安全护栏
+    // Phase 2: Consumed 追踪 + simulate_swap_mut（累计输出逐位对照）
     // ========================================================================
 
-    println!("\n=== Phase 2a: Before-first guard ===");
-
-    for &(token_in, token_out) in &[(token_a, token_b), (token_b, token_a)] {
-        let amount_in = before_first_amount(&pool, token_in);
-
-        // simulate_swap 对 before-first 返回 0
-        let local_out = pool.simulate_swap(token_in, token_out, amount_in)?;
-        assert_eq!(local_out, U256::ZERO);
-        let chain_out = chain_quote(
-            provider.clone(),
-            pair_id,
-            token_in,
-            token_out,
-            amount_in,
-            block_id,
-        )
-        .await?;
-        println!("  {token_in:12}→{token_out:12} local=0 chain={chain_out:30} (safe fallback)");
-    }
-
-    // ========================================================================
-    // Phase 2b: 后向越界（beyond last）
-    // ========================================================================
-
-    println!("\n=== Phase 2b: Beyond-last-point error ===");
-
-    for &(token_in, token_out) in &[(token_a, token_b), (token_b, token_a)] {
-        let reserve = if token_in == token_a {
-            &pool.reserve_a
-        } else {
-            &pool.reserve_b
-        };
-        let amount_in = reserve_share(reserve, 9950);
-        match pool.simulate_swap(token_in, token_out, amount_in) {
-            Err(e) => println!("  {token_in:12}→{token_out:12} correctly errored: {e}"),
-            Ok(v) => panic!("expected error for beyond-last amount, got {v}"),
-        }
-    }
-
-    // ========================================================================
-    // Phase 3: Before-first guard (simulate_swap returns 0)
-    // ========================================================================
-
-    println!("\n=== Phase 3: Before-first guard (simulate_swap returns 0) ===");
-
-    for &(token_in, token_out) in &[(token_a, token_b), (token_b, token_a)] {
-        let amount_in = before_first_amount(&pool, token_in);
-        let local_out = pool.simulate_swap(token_in, token_out, amount_in)?;
-        assert_eq!(
-            local_out,
-            U256::ZERO,
-            "simulate_swap should return 0 for before-first amount"
-        );
-        println!("  {token_in:12}→{token_out:12} amount_in < first sample → 0");
-    }
-
-    // ========================================================================
-    // Phase 4: Consumed 追踪 + simulate_swap_mut（仅 b→a 方向，Ladder 有曲线变化）
-    // ========================================================================
-
-    println!("\n=== Phase 4: Sequential consume tracking (b→a only) ===");
+    println!("\n=== Phase 2: Sequential consume tracking ===");
 
     {
         let mut test_pool = pool.clone();
+        // 用三个递增金额走 consumed 路径。链上反向报价在 pos 消耗殆尽后，
+        // 小额输出为 0 属正常（本地与链上一致），所以先探测哪个方向非零。
+        let swap_amounts = [
+            U256::from(10_000u64),
+            U256::from(100_000u64),
+            U256::from(1_000_000u64),
+        ];
+
+        // 探测：两个方向 × 三档金额，取全部非零的第一个方向
+        let probes: Vec<(Address, Address)> = vec![(token_a, token_b), (token_b, token_a)];
+        let mut chosen: Option<(Address, Address)> = None;
+        for (t_in, t_out) in probes {
+            let chain_outs = chain_quotes_batch(
+                provider.clone(),
+                pair_id,
+                &swap_amounts
+                    .iter()
+                    .map(|&amt| (t_in, t_out, amt))
+                    .collect::<Vec<_>>(),
+                block_id,
+            )
+            .await?;
+            if chain_outs.iter().all(|&out| !out.is_zero()) {
+                chosen = Some((t_in, t_out));
+                break;
+            }
+        }
+        let (token_in, token_out) =
+            chosen.expect("no direction with non-zero chain quote for sequential tracking");
+
         let mut cumulative_amount_in = U256::ZERO;
         let mut cumulative_amount_out_local = U256::ZERO;
+        let mut prev_chain_total = U256::ZERO;
 
-        for &mut_bps in MUT_SWAP_BPS_CURVED {
-            let amount_in = reserve_share(&pool.reserve_b, mut_bps);
-            let amount_out = test_pool.simulate_swap_mut(token_b, token_a, amount_in)?;
-
-            assert!(
-                !amount_out.is_zero(),
-                "swap_mut returned zero at {mut_bps}bps"
-            );
+        for amount_in in swap_amounts {
+            let amount_out = test_pool.simulate_swap_mut(token_in, token_out, amount_in)?;
+            assert!(!amount_out.is_zero(), "swap_mut returned zero");
             cumulative_amount_in += amount_in;
             cumulative_amount_out_local += amount_out;
 
+            // 链上对照：quote(累计输入) - quote(上一累计输入) 应等于本笔本地输出（逐位一致）
+            let chain_total = chain_quote(
+                provider.clone(),
+                pair_id,
+                token_in,
+                token_out,
+                cumulative_amount_in,
+                block_id,
+            )
+            .await?;
+            let chain_leg = chain_total - prev_chain_total;
             assert_eq!(
-                test_pool.ladder.consumed_in_ba, cumulative_amount_in,
-                "consumed_in_ba mismatch after {mut_bps}bps swap"
+                amount_out, chain_leg,
+                "per-leg output mismatch: cumulative_in={cumulative_amount_in}"
+            );
+            prev_chain_total = chain_total;
+            println!(
+                "  {token_in:?}→{token_out:?} amount_in={amount_in:12} amount_out={amount_out:30} leg_exact"
             );
         }
 
-        // 链上全量校验
-        let chain_total_out = chain_quote(
-            provider.clone(),
-            pair_id,
-            token_b,
-            token_a,
-            cumulative_amount_in,
-            block_id,
-        )
-        .await?;
-
+        // consumed 计数器与累计值一致
+        let (consumed_in, consumed_out) = if token_in == token_b {
+            (
+                test_pool.ladder.consumed_in_ba,
+                test_pool.ladder.consumed_out_ba,
+            )
+        } else {
+            (
+                test_pool.ladder.consumed_in_ab,
+                test_pool.ladder.consumed_out_ab,
+            )
+        };
+        assert_eq!(consumed_in, cumulative_amount_in, "consumed_in mismatch");
         assert_eq!(
-            test_pool.ladder.consumed_out_ba, cumulative_amount_out_local,
-            "consumed_out_ba mismatch"
+            consumed_out, cumulative_amount_out_local,
+            "consumed_out mismatch"
         );
-
-        let diff = if chain_total_out > cumulative_amount_out_local {
-            chain_total_out - cumulative_amount_out_local
-        } else {
-            cumulative_amount_out_local - chain_total_out
-        };
-        let diff_bps = if chain_total_out.is_zero() {
-            0.0
-        } else {
-            u256_to_f64(&diff) / u256_to_f64(&chain_total_out) * 10000.0
-        };
-
+        assert_eq!(
+            cumulative_amount_out_local, prev_chain_total,
+            "consumed cumulative output mismatch vs chain"
+        );
         println!(
-            "  {token_b:12}→{token_a:12} cumulative local={cumulative_amount_out_local:30} chain={chain_total_out:30} diff={diff_bps:.2}bps",
+            "  cumulative local={cumulative_amount_out_local:30} chain={prev_chain_total:30} bit-exact"
         );
-        assert!(diff_bps <= MAX_INTERP_DEVIATION_BPS);
-        assert_eq!(test_pool.reserve_b, pool.reserve_b + cumulative_amount_in);
-        assert_eq!(
-            test_pool.reserve_a,
-            pool.reserve_a - cumulative_amount_out_local
-        );
+
+        // 储备按方向更新
+        if token_in == token_b {
+            assert_eq!(test_pool.reserve_b, pool.reserve_b + cumulative_amount_in);
+            assert_eq!(
+                test_pool.reserve_a,
+                pool.reserve_a - cumulative_amount_out_local
+            );
+        } else {
+            assert_eq!(test_pool.reserve_a, pool.reserve_a + cumulative_amount_in);
+            assert_eq!(
+                test_pool.reserve_b,
+                pool.reserve_b - cumulative_amount_out_local
+            );
+        }
     }
 
     // ========================================================================
-    // Phase 5: 价格缓存合理性
+    // Phase 3: 价格缓存合理性
     // ========================================================================
 
-    println!("\n=== Phase 5: Spot price sanity ===");
+    println!("\n=== Phase 3: Spot price sanity ===");
 
     assert!(pool.price_a_in_b > 0.0, "price_a_in_b should be positive");
     assert!(pool.price_b_in_a > 0.0, "price_b_in_a should be positive");
@@ -821,25 +582,6 @@ async fn test_caliber_prop_full_verification() -> Result<()> {
         pool.price_b_in_a,
         ratio_diff * 100.0
     );
-
-    // ========================================================================
-    // Phase 6: 现货价格 vs 首 Ladder 点
-    // ========================================================================
-
-    println!("\n=== Phase 6: Spot price vs first ladder point ===");
-
-    if let Some(first) = pool.ladder.ladder_a_to_b.first() {
-        if !first.amount_in.is_zero() && !first.amount_out.is_zero() {
-            let expected = u256_to_f64(&first.amount_out) / u256_to_f64(&first.amount_in)
-                * 10f64.powi(pool.token_a.decimals as i32 - pool.token_b.decimals as i32);
-            let diff = (pool.price_a_in_b - expected).abs() / expected;
-            println!(
-                "  from first ladder point: {expected:.6} cached: {} error={:.4}%",
-                pool.price_a_in_b,
-                diff * 100.0,
-            );
-        }
-    }
 
     println!("\n=== All verification phases passed ===");
 
@@ -892,8 +634,8 @@ async fn test_caliber_prop_with_amms() -> Result<()> {
                         "pool should have sufficient liquidity"
                     );
                     assert!(
-                        p.ladder.ladder_a_to_b.len() >= 32,
-                        "expected refined ladder points"
+                        p.ladder.ladder_a_to_b.len() >= 3,
+                        "expected original ladder points"
                     );
                     println!(
                         "  StateSpace built successfully! ladder_a_to_b points={}",
@@ -911,8 +653,12 @@ async fn test_caliber_prop_with_amms() -> Result<()> {
     Ok(())
 }
 
+// ============================================================
+// 全量 pair 精确扫描
+// ============================================================
+
 #[tokio::test]
-async fn test_caliber_prop_all_xlayer_pairs_deviation_scan() -> Result<()> {
+async fn test_caliber_prop_all_xlayer_pairs_exact_scan() -> Result<()> {
     let _guard = xlayer_test_guard();
     let Some((provider, chain_id, block_id)) = connect_xlayer_provider().await? else {
         return Ok(());
@@ -925,42 +671,32 @@ async fn test_caliber_prop_all_xlayer_pairs_deviation_scan() -> Result<()> {
         pair_ids.len()
     );
 
-    println!("=== Caliber All-Pairs Deviation Scan ===");
+    println!("=== Caliber All-Pairs Exact Scan ===");
     println!("Discovered {} pair(s)", pair_ids.len());
 
     let mut summaries = Vec::with_capacity(pair_ids.len());
-    let mut global_max_deviation_bps = 0.0f64;
+    let mut total_checked = 0usize;
 
     for pair_id in pair_ids {
         let loaded = load_caliber_pool(provider.clone(), chain_id, pair_id, block_id).await?;
-        let summary = scan_pool_deviation(provider.clone(), &loaded, block_id).await?;
-        global_max_deviation_bps = global_max_deviation_bps.max(summary.max_deviation_bps);
+        let summary = scan_pool_exact(provider.clone(), &loaded, block_id).await?;
+        total_checked += summary.checked_quotes;
 
         println!(
-            "  {:14} virt={} ladder=({},{}) empty_dirs={} checked={} max_dev={:.2}bps",
+            "  {:14} virt={} ladder=({},{}) checked={} bit-exact",
             summary.pair_label,
             summary.virtual_address,
             summary.ladder_ab_points,
             summary.ladder_ba_points,
-            summary.empty_directions,
             summary.checked_quotes,
-            summary.max_deviation_bps
-        );
-
-        assert!(
-            summary.max_deviation_bps <= MAX_INTERP_DEVIATION_BPS,
-            "{} deviation {:.2}bps exceeds threshold {:.2}bps",
-            summary.pair_label,
-            summary.max_deviation_bps,
-            MAX_INTERP_DEVIATION_BPS
         );
 
         summaries.push(summary);
     }
 
     println!(
-        "All-pairs worst deviation: {:.2}bps across {} pool(s)",
-        global_max_deviation_bps,
+        "All-pairs exact: {} quotes across {} pool(s), zero deviation",
+        total_checked,
         summaries.len()
     );
 
