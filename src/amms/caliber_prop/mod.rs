@@ -495,10 +495,16 @@ impl CaliberPropPool {
 
     /// 应用链上 `batchUpdateParameters` 的单个 pair 更新（实时交易驱动）。
     ///
-    /// 只更新报价参数（`field0=price`、`field1=flags`、`deadline=tsX`）与
-    /// 同步区块号；ladder 曲线、储备、pos 不随更新变化（由低频对账任务覆盖
-    /// 做市商充值等低频变动）。`pair_id` 不匹配时静默忽略（fail-safe，
+    /// 只更新报价参数（`field0=price`、`field1=flags`、`deadline`）与
+    /// 同步区块号；ladder 曲线、储备、pos、validity_window、暂停态不随更新
+    /// 变化（由低频对账任务覆盖做市商充值等低频变动）。更新写入后 deadline
+    /// 刷新，若 pair 此前因过期被判定不可报价（ladder 保留自最近一次有效
+    /// 快照），将立即恢复可报价状态。`pair_id` 不匹配时静默忽略（fail-safe，
     /// 防跨 pair 污染）。
+    ///
+    /// TODO(后续): 暂停类交易（`setPricingMode`/`setLocked`/`setWhitelistOnly`）
+    /// 未纳入实时解析，暂停态只能由周期对账刷新（≤45s 滞后）；后续应在
+    /// flashblocks 实时流中解析这些交易并实时更新 `ladder.paused`。
     pub fn apply_batch_update(&mut self, u: &CaliberBatchUpdate, block_number: u64) {
         if u.pair_id != self.pair_id {
             return;
@@ -526,6 +532,16 @@ fn u256_to_f64(value: &U256) -> f64 {
     result += (limbs[2] as f64) * (2.0f64.powi(128));
     result += (limbs[3] as f64) * (2.0f64.powi(192));
     result
+}
+
+/// 当前 Unix 时间戳（秒）。链上过期判定使用 `block.timestamp`，本地报价路径
+/// 没有块上下文，用墙钟近似（XLayer 秒级出块，误差可忽略；如需更保守可在
+/// 上游对判定结果预留安全缓冲）。
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// 计算给定输入量产生的输出量（包含 consumed 追踪）
@@ -794,7 +810,10 @@ impl AutomatedMarketMaker for CaliberPropPool {
         // If the current snapshot has no ladder, treat the pool as temporarily unquotable.
         // Returning zero is safer for upstream route search than bubbling an error, because
         // many call sites interpret zero-output as "not profitable / skip this path".
-        if ladder.is_empty() {
+        // 同时校验报价时效性：链上 quote() 在 block.timestamp > deadline + validity_window
+        // 或暂停时直接 revert（StalePrices/暂停错误），本地必须把过期/暂停 pair 视为
+        // 不可报价，否则会算出"幻影利润"导致上链回滚（事故 tx 0x7dbc...b047a）。
+        if ladder.is_empty() || self.ladder.is_unquotable(unix_now()) {
             return Ok(U256::ZERO);
         }
 
@@ -829,6 +848,11 @@ impl AutomatedMarketMaker for CaliberPropPool {
         let (ladder, reserve_out) = self.get_ladder_and_reserve_out(idx)?;
 
         let (consumed_in, consumed_out) = self.get_consumed_refs(idx);
+        // 与 simulate_swap 一致的时效性/空 ladder 守卫：过期/暂停/无曲线时
+        // 直接返回 0（不可报价），不修改任何 consumed/储备状态。
+        if ladder.is_empty() || self.ladder.is_unquotable(unix_now()) {
+            return Ok(U256::ZERO);
+        }
         // ladder 两份都存 token_x → token_y 方向的原始曲线；
         // 正向/反向取决于输入 token 是否 == token_x，而非 token_a 下标。
         let forward = token_in == self.token_x;
@@ -925,22 +949,27 @@ impl CaliberPropPool {
         self.reserve_a = snap.reserve_a;
         self.reserve_b = snap.reserve_b;
 
-        // 重置 consumed（ladder 快照变更后旧值无意义）
-        self.ladder = CaliberLadderState {
-            ladder_a_to_b: snap.ladder.clone(),
-            ladder_b_to_a: snap.ladder,
-            consumed_in_ab: U256::ZERO,
-            consumed_out_ab: U256::ZERO,
-            consumed_in_ba: U256::ZERO,
-            consumed_out_ba: U256::ZERO,
-            field0: snap.field0,
-            field1: snap.field1,
-            fee_rate: snap.fee_rate,
-            window: snap.window,
-            scale: snap.scale,
-            pos: snap.pos,
-            deadline: snap.deadline,
-        };
+        // 快照有效时刷新完整 ladder 并重置 consumed（旧值无意义）；
+        // 快照因过期/暂停返回空 ladder 时保留最近一次有效 ladder + consumed，
+        // 使后续实时更新（刷新 deadline）能立即恢复报价，而不是等下一轮对账。
+        if !snap.ladder.is_empty() {
+            self.ladder.ladder_a_to_b = snap.ladder.clone();
+            self.ladder.ladder_b_to_a = snap.ladder;
+            self.ladder.consumed_in_ab = U256::ZERO;
+            self.ladder.consumed_out_ab = U256::ZERO;
+            self.ladder.consumed_in_ba = U256::ZERO;
+            self.ladder.consumed_out_ba = U256::ZERO;
+        }
+        // 报价参数与时效性参数始终刷新（过期/暂停由报价路径在报价时判定）
+        self.ladder.field0 = snap.field0;
+        self.ladder.field1 = snap.field1;
+        self.ladder.fee_rate = snap.fee_rate;
+        self.ladder.window = snap.window;
+        self.ladder.scale = snap.scale;
+        self.ladder.pos = snap.pos;
+        self.ladder.deadline = snap.deadline;
+        self.ladder.validity_window = snap.validity_window;
+        self.ladder.paused = snap.paused;
 
         // 重新计算现货价格
         self.refresh_prices();
@@ -979,8 +1008,12 @@ struct CaliberSnapshot {
     scale: U256,
     /// 反向报价位置（cfg+7 的 pos，仅当 cfg+7.block == 当前块时有效，否则 0）
     pos: U256,
-    /// data+0 的 tsX（bits 96..128），报价过期时间戳
+    /// data+0 完整 64 位 deadline（tsY<<32|tsX），报价过期时间戳
     deadline: u64,
+    /// 全局 slot2 有效期（本合约 20s）
+    validity_window: u64,
+    /// 全局/单 pair 暂停态快照
+    paused: bool,
 }
 
 /// 单次 JSON-RPC batch 请求中的 `eth_getStorageAt` 数量上限。
@@ -1133,21 +1166,30 @@ struct RawPairSlots {
     data0: U256,
 }
 
-/// 复刻链上 quote() 的过期/暂停判断（EVM trace 确认）：
+/// 全局/单 pair 暂停判定（EVM trace 确认）：
 /// - `SLOAD(3) & 0xff != 0` → 全局暂停 revert 0x8507a90d
 /// - `SLOAD(cfg+6) byte@0x40 != 0` → per-pair 暂停 revert 0xb69ec3f0
-/// - `deadline = ((data0 >> 128) & u32) << 32 | ((data0 >> 96) & u32)`，
-///   `block.timestamp > deadline + validity_window` → revert 0x2af96ae8
+fn pair_paused(raw: &RawPairSlots, global_paused: U256) -> bool {
+    !(global_paused & U256::from(0xff)).is_zero()
+        || !((raw.cfg6 >> U256::from(0x40)) & U256::from(0xff)).is_zero()
+}
+
+/// 完整 64 位报价过期时间戳：`((data0 >> 128) & u32) << 32 | ((data0 >> 96) & u32)`
+/// （即 `tsY << 32 | tsX`）。tsY 非零时 deadline 为巨大值，链上永不过期。
+fn pair_deadline64(raw: &RawPairSlots) -> U256 {
+    (((raw.data0 >> U256::from(128)) & U256::from(u32::MAX)) << U256::from(32))
+        | ((raw.data0 >> U256::from(96)) & U256::from(u32::MAX))
+}
+
+/// 复刻链上 quote() 的过期/暂停判断（EVM trace 确认）：
+/// - `deadline64 + validity_window < block.timestamp` → revert 0x2af96ae8（StalePrices）
+/// - 暂停 → revert 0x8507a90d / 0xb69ec3f0
 ///
 /// 注意：当 data0 高 32 位（tsY）非零时，deadline 变为 64 位巨大值，链上永不
 /// 过期——这是合约的实际行为，本地必须同样处理。
 fn pair_stale(raw: &RawPairSlots, validity_window: U256, global_paused: U256, block_ts: U256) -> bool {
-    let paused = !(global_paused & U256::from(0xff)).is_zero()
-        || !((raw.cfg6 >> U256::from(0x40)) & U256::from(0xff)).is_zero();
-    let ts_xy = (((raw.data0 >> U256::from(128)) & U256::from(u32::MAX)) << U256::from(32))
-        | ((raw.data0 >> U256::from(96)) & U256::from(u32::MAX));
-    let expired = block_ts > ts_xy + validity_window;
-    paused || expired
+    let expired = block_ts > pair_deadline64(raw) + validity_window;
+    pair_paused(raw, global_paused) || expired
 }
 
 /// 由原始槽位值构建 `CaliberSnapshot`（单池与批量路径共用）。
@@ -1197,8 +1239,10 @@ fn build_snapshot_from_slots(
     } else {
         U256::ZERO
     };
-    // tsX = data+0 bits 96..128（更新交易的 deadline 写入此字段）
-    let ts_x = ((raw.data0 >> U256::from(96)) & U256::from(u32::MAX)).to::<u64>();
+    // 完整 64 位 deadline（tsY<<32|tsX）+ 暂停态：时效性参数必须随快照持久化，
+    // 由报价路径（simulate_swap）在每次报价时判定，不能只在快照构建时消费。
+    let paused = pair_paused(&raw, global_paused);
+    let deadline64 = pair_deadline64(&raw).to::<u64>();
 
     // 过期/暂停 pair 返回空 ladder，模拟链上不可报价（simulate_swap → 0）
     let stale = pair_stale(&raw, validity_window, global_paused, block_ts);
@@ -1232,7 +1276,9 @@ fn build_snapshot_from_slots(
         window: raw.window,
         scale,
         pos,
-        deadline: ts_x,
+        deadline: deadline64,
+        validity_window: validity_window.to::<u64>(),
+        paused,
     })
 }
 
@@ -1946,6 +1992,218 @@ mod tests {
             .simulate_swap(pool.token_a.address, pool.token_b.address, U256::from(100))
             .unwrap();
         assert_eq!(out, U256::ZERO);
+    }
+
+    /// 构造一个带有效 ladder 的测试池（pair2 真实参数，正向报价非零）。
+    fn test_pool_with_ladder() -> CaliberPropPool {
+        let contract = Address::repeat_byte(0xAA);
+        let pair_id = B256::from([0x11u8; 32]);
+        let mut pool = CaliberPropPool {
+            contract_address: contract,
+            pair_id,
+            virtual_address: CaliberPropPool::virtual_address_from_pair_id(pair_id, contract),
+            token_x: Address::from([1u8; 20]),
+            token_y: Address::from([2u8; 20]),
+            token_a: Token::new_with_decimals(Address::from([1u8; 20]), 18),
+            token_b: Token::new_with_decimals(Address::from([2u8; 20]), 18),
+            created_block: 0,
+            last_synced_block: 0,
+            reserve_a: U256::from(6210305049u64),
+            reserve_b: U256::from(1760056227u64),
+            ladder: Default::default(),
+            price_a_in_b: 1.0,
+            price_b_in_a: 1.0,
+        };
+        let ladder = vec![
+            LadderPoint {
+                amount_in: U256::from(10u64),
+                amount_out: U256::from(200000000u64),
+            },
+            LadderPoint {
+                amount_in: U256::from(50u64),
+                amount_out: U256::from(900000000u64),
+            },
+            LadderPoint {
+                amount_in: U256::from(300u64),
+                amount_out: U256::from(1000000000u64),
+            },
+        ];
+        pool.ladder.ladder_a_to_b = ladder.clone();
+        pool.ladder.ladder_b_to_a = ladder;
+        pool.ladder.field0 = U256::from(75111231784u64);
+        pool.ladder.field1 = U256::from(283u64);
+        pool.ladder.fee_rate = U256::from(200u64);
+        pool.ladder.window = U256::from(500u64);
+        pool.ladder.scale = U256::from(1000u64);
+        pool.ladder.pos = U256::ZERO;
+        pool.ladder.deadline = unix_now() + 3600; // 默认新鲜
+        pool.ladder.validity_window = 20;
+        pool
+    }
+
+    #[test]
+    fn test_simulate_swap_stale_returns_zero_fresh_quotes() {
+        let now = unix_now();
+        let mut pool = test_pool_with_ladder();
+
+        // 新鲜：deadline 在未来 → 正常报价（非 0）
+        let fresh = pool
+            .simulate_swap(pool.token_a.address, pool.token_b.address, U256::from(1_000_000_000u64))
+            .unwrap();
+        assert!(fresh > U256::ZERO, "fresh quote should be non-zero");
+
+        // 过期：deadline 在过去 → 不可报价（返回 0，避免幻影利润上链回滚）
+        pool.ladder.deadline = now - 3600;
+        let stale = pool
+            .simulate_swap(pool.token_a.address, pool.token_b.address, U256::from(1_000_000_000u64))
+            .unwrap();
+        assert_eq!(stale, U256::ZERO, "stale pair must be unquotable");
+    }
+
+    #[test]
+    fn test_simulate_swap_mut_stale_returns_zero_without_mutation() {
+        let now = unix_now();
+        let mut pool = test_pool_with_ladder();
+        pool.ladder.deadline = now - 3600;
+        pool.ladder.consumed_in_ab = U256::from(12345u64);
+        pool.ladder.consumed_out_ab = U256::from(67890u64);
+
+        let out = pool
+            .simulate_swap_mut(pool.token_a.address, pool.token_b.address, U256::from(1_000_000_000u64))
+            .unwrap();
+        assert_eq!(out, U256::ZERO, "stale pair must be unquotable");
+        assert_eq!(pool.ladder.consumed_in_ab, U256::from(12345u64), "consumed must not mutate");
+        assert_eq!(pool.ladder.consumed_out_ab, U256::from(67890u64), "consumed must not mutate");
+    }
+
+    #[test]
+    fn test_apply_batch_update_revives_stale_pool() {
+        let now = unix_now();
+        let mut pool = test_pool_with_ladder();
+        pool.ladder.deadline = now - 3600; // 过期
+        assert_eq!(
+            pool.simulate_swap(pool.token_a.address, pool.token_b.address, U256::from(1_000_000_000u64))
+                .unwrap(),
+            U256::ZERO
+        );
+
+        // 实时更新刷新 deadline → ladder 保留自最近有效快照，立即恢复报价
+        pool.apply_batch_update(
+            &CaliberBatchUpdate {
+                pair_id: pool.pair_id,
+                price: U256::from(75_111_231_784u64),
+                flags: 283,
+                deadline: now + 3600,
+            },
+            1,
+        );
+        let revived = pool
+            .simulate_swap(pool.token_a.address, pool.token_b.address, U256::from(1_000_000_000u64))
+            .unwrap();
+        assert!(revived > U256::ZERO, "updated pair should be quotable again");
+    }
+
+    #[test]
+    fn test_pair_deadline64_ts_y_nonzero_never_expires() {
+        let mk = |data0: U256| RawPairSlots {
+            cfg1: U256::ZERO,
+            n: U256::ZERO,
+            window: U256::ZERO,
+            reserve_x: U256::ZERO,
+            reserve_y: U256::ZERO,
+            cfg6: U256::ZERO,
+            cfg7: U256::ZERO,
+            data0,
+        };
+        let validity = U256::from(20u64);
+        let block_ts = U256::from(unix_now());
+        let ts_x = U256::from(1u64) << 96; // 仅 tsX（更新路径，tsY=0）
+
+        // tsY 非零 → deadline64 巨大 → 永不过期
+        let ts_y = U256::from(0xffff_ffffu64) << 128;
+        assert!(!pair_stale(&mk(ts_y | ts_x), validity, U256::ZERO, block_ts));
+
+        // 仅 tsX → 过期
+        assert!(pair_stale(&mk(ts_x), validity, U256::ZERO, block_ts));
+
+        // 暂停 → stale
+        assert!(pair_stale(&mk(ts_y | ts_x), validity, U256::from(1u64), block_ts));
+    }
+
+    #[test]
+    fn test_legacy_snapshot_zero_validity_is_conservatively_stale() {
+        let now = unix_now();
+        let mut pool = test_pool_with_ladder();
+        // 旧快照反序列化：validity_window=0（serde default），deadline 已过 → 保守视为过期
+        pool.ladder.deadline = now - 1;
+        pool.ladder.validity_window = 0;
+        assert!(pool.ladder.is_unquotable(now));
+        assert_eq!(
+            pool.simulate_swap(pool.token_a.address, pool.token_b.address, U256::from(1_000_000_000u64))
+                .unwrap(),
+            U256::ZERO
+        );
+    }
+
+    #[test]
+    fn test_apply_snapshot_keeps_ladder_when_stale() {
+        let now = unix_now();
+        let mut pool = test_pool_with_ladder();
+        let kept_len = pool.ladder.ladder_a_to_b.len();
+        assert!(kept_len > 0);
+
+        // 过期快照（空 ladder + 过去 deadline）：保留最近有效 ladder，刷新时效性参数
+        let stale_snap = CaliberSnapshot {
+            reserve_a: U256::from(1u64),
+            reserve_b: U256::from(2u64),
+            ladder: Vec::new(),
+            field0: U256::from(999u64),
+            field1: U256::from(3u64),
+            fee_rate: U256::from(200u64),
+            window: U256::from(500u64),
+            scale: U256::from(1000u64),
+            pos: U256::ZERO,
+            deadline: now - 3600,
+            validity_window: 20,
+            paused: false,
+        };
+        pool.apply_snapshot(stale_snap);
+        assert_eq!(
+            pool.ladder.ladder_a_to_b.len(),
+            kept_len,
+            "stale snapshot must keep last valid ladder"
+        );
+        assert_eq!(pool.ladder.deadline, now - 3600);
+        assert_eq!(pool.ladder.validity_window, 20);
+        // 保留的 ladder + 过期 deadline → 不可报价
+        assert_eq!(
+            pool.simulate_swap(pool.token_a.address, pool.token_b.address, U256::from(1_000_000_000u64))
+                .unwrap(),
+            U256::ZERO
+        );
+
+        // 新鲜快照（非空 ladder）：替换 ladder 并重置 consumed
+        let fresh_snap = CaliberSnapshot {
+            reserve_a: U256::from(1u64),
+            reserve_b: U256::from(2u64),
+            ladder: vec![LadderPoint {
+                amount_in: U256::from(1u64),
+                amount_out: U256::from(2u64),
+            }],
+            field0: U256::from(999u64),
+            field1: U256::from(3u64),
+            fee_rate: U256::from(200u64),
+            window: U256::from(500u64),
+            scale: U256::from(1000u64),
+            pos: U256::ZERO,
+            deadline: now + 3600,
+            validity_window: 20,
+            paused: false,
+        };
+        pool.ladder.consumed_in_ab = U256::from(777u64);
+        pool.apply_snapshot(fresh_snap);
+        assert_eq!(pool.ladder.ladder_a_to_b.len(), 1, "fresh snapshot must replace ladder");
+        assert_eq!(pool.ladder.consumed_in_ab, U256::ZERO, "consumed must reset on fresh snapshot");
     }
 
     #[test]

@@ -52,12 +52,36 @@ pub struct CaliberLadderState {
     /// 否则按 pos=0（整段）计算；本字段在 `fetch_exact_snapshot` 中已完成
     /// 该判断（无效时为 0），`quote_reverse_exact` 直接使用。
     pub pos: U256,
-    /// 报价过期时间戳 tsX（data+0 槽 bits 96..128）。
-    ///
-    /// 与链上 `data+0` 对齐：`batchUpdateParameters` 的 deadline 参数写入此字段
-    /// （同时 tsY 置 0），过期判断为 `block.timestamp > (tsY << 32 | tsX) + window`，
-    /// tsY=0 时即退化为 `deadline + window`。实时交易更新与周期快照都会刷新该值。
+    /// 报价过期时间戳（完整 64 位 deadline = `(tsY << 32) | tsX`，data+0 槽
+    /// bits 96..160）。`batchUpdateParameters` 更新写入时 tsY 置 0，故该路径下
+    /// deadline 即更新交易的 deadline 参数；快照路径保留完整 64 位，tsY 非零时
+    /// 链上永不过期，本地必须同样处理（不能只存 tsX）。
+    /// 过期判定（链上语义）：`block.timestamp > deadline + validity_window` → revert。
     pub deadline: u64,
+    /// 全局报价有效期 validity_window（合约 slot2，XLayer 本合约 = 20s）。
+    ///
+    /// 注意：这不是 `window`（per-pool cfg+3 合成尾段长度，本 pair 为 500s），
+    /// 两者不能混用。实时更新 calldata 不含此值，只由快照路径刷新
+    /// （协议低频修改，周期对账兜底）。
+    #[serde(default)]
+    pub validity_window: u64,
+    /// 暂停态快照（全局 slot3 byte0 / per-pair cfg+6 byte@0x40 非零时暂停）。
+    ///
+    /// TODO(后续): 暂停类交易（`setPricingMode`/`setLocked`/`setWhitelistOnly`）
+    /// 未纳入实时解析，暂停态只能由周期对账刷新（≤45s 滞后）；后续应在
+    /// flashblocks 实时流中解析这些交易（与 `batchUpdateParameters` 同构）并
+    /// 实时更新本字段，消除暂停滞后窗口。
+    #[serde(default)]
+    pub paused: bool,
+}
+
+impl CaliberLadderState {
+    /// 链上 quote() 的不可报价判定（与 `pair_stale` 语义一致）：
+    /// `block.timestamp > deadline + validity_window` 或暂停 → 上链 revert。
+    /// 本地报价路径必须在每次报价时校验，避免已过期 pair 产生"幻影利润"上链回滚。
+    pub fn is_unquotable(&self, now: u64) -> bool {
+        self.paused || now > self.deadline.saturating_add(self.validity_window)
+    }
 }
 
 /// Pool Extra 字段（序列化到 entity.Pool.Extra）

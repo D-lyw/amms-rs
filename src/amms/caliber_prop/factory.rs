@@ -441,6 +441,8 @@ impl Default for super::types::CaliberLadderState {
             scale: U256::ZERO,
             pos: U256::ZERO,
             deadline: 0,
+            validity_window: 0,
+            paused: false,
         }
     }
 }
