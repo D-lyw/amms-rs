@@ -1072,6 +1072,50 @@ fn warn_batch_fallback(e: &AMMError) {
     }
 }
 
+/// 存储读取块高钳制告警只输出一次（避免每次 resync/coverage 刷屏）。
+static STORAGE_CLAMP_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn warn_storage_clamp(requested_block: u64, storage_head: u64) {
+    if !STORAGE_CLAMP_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            requested_block,
+            storage_head,
+            "caliber: requested block ahead of storage RPC head; clamping snapshot read to storage head (logged once)"
+        );
+    } else {
+        tracing::debug!(
+            requested_block,
+            storage_head,
+            "caliber: clamping snapshot read to storage head"
+        );
+    }
+}
+
+/// 存储读取块高钳制：caliber 存储读取走硬编码 HTTP RPC
+/// （`caliber_storage_provider`），该节点头部可能落后于调用方传入的块高
+/// （如 maintenance Resync/coverage 传入的 flashblocks 乐观头），直接查询会
+/// 触发 `-32019 block is out of range`。这里把数字块钳制到 HTTP 节点头部：
+/// 历史块（≤ 头部）原样保留（`initial_block` 回填/回放的块语义不变），
+/// 超前块降级为 HTTP 已收录的块，从根上消除 -32019。实时报价仍由
+/// flashblocks 交易驱动，存储快照的语义始终是"当前链上状态"。
+/// 头部查询失败时按原块继续，不引入新的失败路径。
+async fn clamp_block_to_storage_head(block: BlockId) -> BlockId {
+    let BlockId::Number(alloy::eips::BlockNumberOrTag::Number(num)) = block else {
+        return block;
+    };
+    let Ok(http_provider) = caliber_storage_provider() else {
+        return block;
+    };
+    match http_provider.get_block_number().await {
+        Ok(head) if head < num => {
+            warn_storage_clamp(num, head);
+            BlockId::Number(alloy::eips::BlockNumberOrTag::Number(head))
+        }
+        _ => block,
+    }
+}
+
 /// 通过单次 JSON-RPC batch 读取多个存储槽（一个 HTTP 请求）。
 ///
 /// 与逐槽 `eth_getStorageAt` 完全等价（同一 `block`、同一序列化参数），
@@ -1300,6 +1344,10 @@ where
     <N::BlockResponse as BlockResponse>::Header: BlockHeader,
     P: Provider<N> + Clone,
 {
+    // 存储读取统一钳制到 HTTP 节点头部，避免请求超前块触发 -32019
+    // （Resync/coverage 传入的是 flashblocks 乐观头，HTTP 节点可能落后）。
+    let block = clamp_block_to_storage_head(block).await;
+
     let cfg_base = pair_slot(pair_id, 6);
     let data_base = pair_slot(pair_id, 7);
 
@@ -1407,6 +1455,9 @@ where
     if pairs.is_empty() {
         return Ok(Vec::new());
     }
+
+    // 存储读取统一钳制到 HTTP 节点头部（见 clamp_block_to_storage_head）。
+    let block = clamp_block_to_storage_head(block).await;
 
     // 全局槽位（每合约一次）+ 块头（整个 batch 一次）
     let globals = storage_at_batch(
