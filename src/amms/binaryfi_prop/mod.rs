@@ -74,6 +74,70 @@
 //!    pending_sync_queue 触发 `update()`：一次 `GetBinaryFiPropStateBatchRequest`
 //!    静态调用批量拉取余额 + stale pair 的 `pool.quote`，从同块 `(0→j)/(j→0)`
 //!    精确恢复每资产 bid/ask（含点差），再本地推导全部费率。
+//!
+//! ## 协议形态与部署对照（BinaryFiEvm，2026-08 源码级核验）
+//!
+//! BinaryFiEvm 是**单一 operator 的链上订单簿 DEX**：链下做市引擎（operator）
+//! 通过 `update` 提交带签名的价格/点差/阶梯，定价核心只通过 router 可达。
+//! 同一份 router 实现部署在 XLayer 与 Base 两链（bytecode 除 WETH 常量外
+//! 逐字节一致，见 `BINARYFI_ROUTER_ADDRESS`），因此本模块在 XLayer 上实证
+//! 反推的费率/阶梯/时效规则对 Base 部署同样成立。
+//!
+//! - **router swap 入口**：`swap(address tokenIn, address tokenOut, uint256 amountIn,
+//!   uint256 minAmountOut, uint256 expiry)`，选择器 `0x7a950f99`（exact-in）。
+//!   `expiry` 是 **tx 级 deadline**：router 校验 `block.timestamp <= expiry`，
+//!   **不是** `BINARYFI_QUOTE_TTL_BLOCKS` 那 5 块报价时效（时效在引擎 quote
+//!   内部 `0x6ee50667` 路径，见上）。router 无 taker callback（无 ERC-1271/
+//!   flash 回调），本地模拟无需回调路径。结算：router 从调用方 `transferFrom`
+//!   拉 `tokenIn` 进 vault、从 vault 发 `tokenOut`；原生 ETH 统一按 WETH
+//!   归一化（XLayer WETH9 = `0xe538905cf8410324e03a5a23c1c177a474d59b2b`，
+//!   Base WETH = `0x4200000000000000000000000000000000000006`）。
+//! - **BinaryFiEvmAdapter**（`0x4d0e78ba4c116f576fbe2908c75696d9041e5f04`）：
+//!   聚合器用的**无状态清仓适配器**，`sellBase/sellQuote(to, pool, moreInfo)`，
+//!   `moreInfo = abi.encode(tokenIn, tokenOut)`；流程为
+//!   `balanceOf>0` 检查 → `forceApprove(pool, balance)` →
+//!   `pool.swap(tokenIn, tokenOut, balance, 0, block.timestamp)`（minOut=0，
+//!   滑点由上游聚合器保证）→ `forceApprove(pool, 0)` → 剩余 `tokenOut` 转给
+//!   `to`、剩余 `tokenIn` 退回调用方。XLayer 部署为该源码的旧版（无原生 ETH
+//!   处理）；Base 同地址为新版（多 `weth()`/`receive()`）。该合约仅供理解
+//!   入口语义与事件结构，报价公式细节均在引擎内，本地 `engine_quote` 的
+//!   两段式公式以 `debug_traceCall`/回放实证为准。
+//! - **引擎函数入口参考**（bytecode 反汇编，0x 前缀为选择器 → 内部偏移）：
+//!   `update 0x024b94f6 → 0x0362`、
+//!   `swap(account,tokenIn,tokenOut,amountIn,extraFeePpm) e343fe12 → 0x1207`、
+//!   `quote(account,tokenIn,tokenOut,amountIn) 08bb9367 → 0x0438`、
+//!   `getAssets() 67e4ac2c → 0x0c37`、`getAssetReserves() 17ec4199 → 0x080c`、
+//!   `getFee(account) b88c9148 → 0x10af`、`vault() fbfa77cf → 0x14e1`、
+//!   `时效 6ee50667 → 0x0c9f`（内部 revert `0x86fa3e43`，外层 quote 捕获转 0）。
+//!   （函数名与选择器由 PAmm1010Router 开源源码 + keccak 双向核验，2026-08。）
+//!
+//! ### PAmm1010Router（XLayer 池子 = 官方 Router，已验证源码）
+//!
+//! Router 是**薄代理**（ReentrancyGuard）：owner 可 `setTarget` 切换核心，
+//! 链上实测 `target()` = 引擎 `0xeacf260a...`；核心接口 `IPAmm1010` 的
+//! `quote/swap` 首参均为 `account`（router 转发时 = `msg.sender`），
+//! 核心 `swap` 末参为 `extraFeePpm`（router 普通 swap 传 0）。
+//!
+//! - 公开入口一：`swap(tokenIn, tokenOut, amountIn, minAmountOut, expiry)`
+//!   （`0x7a950f99`，extraFeePpm=0，adapter/常规聚合器走此路径）；
+//!   入口二：`swapWithExtraFees(tokenIn, tokenOut, amountIn, minAmountOut,
+//!   expiry, extraFeePpm)`（`0x9e51844f`，**带额外费率的路径**——竞争对手若
+//!   走此入口，成交价低于纯 swap 路径；本地模拟按 0 费率路径可能高估输出，
+//!   识别竞争者套利时需留意）。
+//! - `_swap` 结算顺序：`block.timestamp > expiry → revert Expired` →
+//!   核心 `swap(msg.sender, tokenIn, tokenOut, amountIn, extraFeePpm)` →
+//!   `amountOut < minAmountOut → revert InsufficientOutput` →
+//!   `tokenIn` 进 vault（原生 ETH 走 WETH deposit；ERC20 走 transferFrom）→
+//!   `tokenOut` 从 vault 出（原生 ETH 走 WETH withdraw；ERC20 走 transferFrom）
+//!   → emit `Swap(msg.sender, tokenIn, tokenOut, amountIn, amountOut)`。
+//! - 原生 ETH 支持：`NATIVE_ETH = 0xEeee...EeE`（ethIn 要求 `msg.value ==
+//!   amountIn`、ethOut 要求 `msg.value == 0`）；核心/引擎内部统一按 WETH 处理。
+//! - `getFee(account)`：核心按账户收取费率 → 引擎 bytecode 无硬编码 999/1000
+//!   的原因（费率在核心 storage，可能 per-account）；本地 999/1000 由 quote
+//!   实证锚定，见 `BINARYFI_DEFAULT_*` 与费率推导注释。
+//! - Swap 事件 topics = `[sig, user, tokenIn, tokenOut]`、data = `(amountIn,
+//!   amountOut)`，与模块 L1 解析（`token_in=topics[2]`、`token_out=topics[3]`）
+//!   逐位一致。
 
 pub mod factory;
 
@@ -108,6 +172,13 @@ pub const BINARYFI_ASSET_COUNT: usize = 12;
 /// XLayer 默认部署：池子合约（Swap 事件、quote 报价）。
 /// 配置化部署时地址应由 poolindex/loader 经 `BinaryFiPropFactory::new` 传入，
 /// 此常量仅作为默认值与文档参考。
+/// 池子 = 官方 **PAmm1010Router**，swap 入口
+/// `swap(tokenIn, tokenOut, amountIn, minAmountOut, expiry)`（选择器
+/// `0x7a950f99`，exact-in）：router 校验 `block.timestamp <= expiry`（tx 级
+/// deadline，非 5 块报价 TTL）、无 taker callback、`transferFrom` 拉入
+/// `tokenIn` 进 vault、从 vault 发 `tokenOut`；另有带额外费率的
+/// `swapWithExtraFees`（`0x9e51844f`）与原生 ETH 入口（`0xEeee...EeE`）；
+/// 详见模块顶部“协议形态与部署对照”。
 pub const BINARYFI_POOL_ADDRESS: Address = address!("0x2d651e3fe9470db52d211569a0ab7266c5180de7");
 /// XLayer 默认部署：引擎合约（update 事件、价格提交）
 pub const BINARYFI_ENGINE_ADDRESS: Address = address!("0xeacf260a16a4e16a758fc1bd126d49d8e02f9996");
@@ -116,7 +187,19 @@ pub const BINARYFI_VAULT_ADDRESS: Address = address!("0x9b169052Ee1569Ec5bDF51Db
 /// XLayer 默认部署：quote 的 recipient（Router）。
 /// 官方 Router 为 PAmm1010Router（= 池子地址 0x2d651e，与 poolindex 配置一致）；
 /// 该常量仅作 `Default` 兜底初值，生产路径由 loader 从 ndjson config 覆盖。
+/// 跨链对照：Base 同实现 router = `0x98537a558449bC1437C2e897d640847AF6102549`
+/// （bytecode 与 XLayer 除 WETH 常量外逐字节一致；XLayer WETH9 =
+/// `0xe538905cf8410324e03a5a23c1c177a474d59b2b`，Base WETH =
+/// `0x4200000000000000000000000000000000000006`）。
 pub const BINARYFI_ROUTER_ADDRESS: Address = address!("0x2d651e3fe9470db52d211569a0ab7266c5180de7");
+/// BinaryFiEvmAdapter（XLayer 部署，2026-08 反汇编 + 开源源码双向核验一致）：
+/// 聚合器用无状态清仓适配器 `sellBase/sellQuote(to, pool, moreInfo)`，
+/// `moreInfo = abi.encode(tokenIn, tokenOut)`，内部
+/// `forceApprove(pool, balance) → pool.swap(tokenIn, tokenOut, balance, 0,
+/// block.timestamp) → forceApprove(pool, 0)` 后把剩余 tokenOut/tokenIn 退回。
+/// Base 同地址为新版（多 `weth()`/`receive()` 原生 ETH 处理）。仅供理解
+/// 入口语义与事件结构；报价公式在引擎内，见模块顶部说明。
+pub const BINARYFI_ADAPTER_ADDRESS: Address = address!("0x4d0e78ba4c116f576fbe2908c75696d9041e5f04");
 /// 池子 Swap 事件签名
 pub const BINARYFI_SWAP_EVENT: B256 =
     b256!("cd3829a3813dc3cdd188fd3d01dcf3268c16be2fdd2dd21d0665418816e46062");
