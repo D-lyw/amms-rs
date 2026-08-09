@@ -70,9 +70,13 @@ pub struct Token {
     /// 不会自动检测，需在初始化阶段通过 `fot::register_fot_token` 注入，
     /// 或直接在序列化数据中标注（显式标注优先级更高）。
     ///
-    /// 注意：当前 `FotTaxType::FlatRate` 表示 **池子转出该 token 时扣税**
-    /// （单侧，输出侧），即模拟输出返回 net、exact-out 输入需 gross-up；
-    /// 池子 reserve / Sync 保持 gross 口径。to = pool（卖出）方向不扣税。
+    /// 两种变体语义（链上取证，见 `fot` 模块文档）：
+    /// - `FotTaxType::FlatRate`：**池子转出该 token 时扣税**（单侧，输出侧），
+    ///   模拟输出返回 net、exact-out 输入需 gross-up；to = pool（卖出）方向不扣税。
+    /// - `FotTaxType::BothSides`：**每次 transfer 都扣税**（输入侧 + 输出侧），
+    ///   模拟层 hop 链中一次 transfer 的税由 hop N 输出侧 `fot_net` 捕获，
+    ///   输入侧不重复扣税；仅引擎层起点转账（flash→池）用 `fot_input_net`
+    ///   折算池子实收净额，输出侧同 FlatRate。
     #[serde(default)]
     pub fot_tax: Option<fot::FotTaxType>,
 }
@@ -128,6 +132,35 @@ impl Token {
         match self.fot_tax {
             Some(tax) => tax.gross_up(net),
             None => net,
+        }
+    }
+
+    /// 输入侧（user→pool）实收净额。仅双向 FoT（BothSides）按税率扣，
+    /// 单侧 FoT 与普通 token 全额入池。
+    ///
+    /// 链上语义（XLS 实测）：池子实收 net，K 检查按 balanceOf 差值（net）记账，
+    /// swap math 的 amountIn 也是 net。
+    ///
+    /// amms 模拟层 hop 链中**不调用**本方法：一次 transfer 的税已由 hop N
+    /// 输出侧 `fot_net` 捕获，输入侧重复扣税会造成 0.97 × 0.97 双重扣税。
+    /// 本方法仅供引擎层起点转账场景（flash→池）使用：用户需转名义 gross，
+    /// 池子实收本方法返回值后按此净额入池并参与 math。
+    pub fn fot_input_net(&self, gross: U256) -> U256 {
+        match self.fot_tax {
+            Some(tax) if tax.input_taxed() => tax.net_of_gross(gross),
+            _ => gross,
+        }
+    }
+
+    /// 输入侧反算：池子需实收 `net` 时，用户需转的名义金额（向上取整）。
+    ///
+    /// 仅双向 FoT（BothSides）时 gross-up，单侧 FoT 与普通 token 返回原值。
+    /// 用于 exact-out 起点转账场景：`get_amount_in` 返回池子实收需求，
+    /// 双向 FoT 下用户转账需多转以覆盖输入侧扣税。
+    pub fn fot_input_gross_up(&self, net: U256) -> U256 {
+        match self.fot_tax {
+            Some(tax) if tax.input_taxed() => tax.gross_up(net),
+            _ => net,
         }
     }
 

@@ -1207,11 +1207,7 @@ pub async fn start_caliber_prop_ladder_sync_task<N, P>(
             Ok(flags) => {
                 let failed = flags.iter().filter(|f| !**f).count();
                 if failed > 0 {
-                    warn!(
-                        "Caliber reconcile: {}/{} pools failed",
-                        failed,
-                        flags.len()
-                    );
+                    warn!("Caliber reconcile: {}/{} pools failed", failed, flags.len());
                 }
             }
             Err(e) => {

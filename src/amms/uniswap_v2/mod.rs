@@ -153,8 +153,10 @@ impl AutomatedMarketMaker for UniswapV2Pool {
         quote_token: Address,
         amount_in: U256,
     ) -> Result<U256, AMMError> {
-        // 输入侧（in_token 为 FoT）：全额入池、不扣税（to = pool 方向无税）
-        // 池子 math 输出 gross（reserve 保持 gross 口径，与链上 Sync 一致）
+        // 输入侧不做 FoT 扣税：`amount_in` 语义 = 池子实收值（balance 增量）。
+        // hop 链中 hop N+1 的输入 = hop N 输出（fot_net 后实收），一次 transfer 的
+        // 税已由 hop N 输出侧捕获；起点转账（flash→池）由引擎层用 fot_input_net
+        // 处理，amms 模拟层不重复扣税。
         let gross = if self.token_a.address == base_token {
             self.get_amount_out(
                 amount_in,
@@ -178,8 +180,9 @@ impl AutomatedMarketMaker for UniswapV2Pool {
         quote_token: Address,
         amount_in: U256,
     ) -> Result<U256, AMMError> {
-        // 输入侧（in_token 为 FoT）：全额入池、不扣税（to = pool 方向无税）
-        // reserve 更新保持 gross（与链上 Sync 事件一致），返回值为扣税后 net
+        // 输入侧不做 FoT 扣税（同 simulate_swap）：reserve 增量 = amount_in
+        // （= 实收值，链上 balance 增量与 hop N 输出一致）。输出侧池子付出
+        // gross（reserve 减少量含税部分），返回值扣税后 net。
         if self.token_a.address == base_token {
             let amount_out = self.get_amount_out(
                 amount_in,
@@ -243,23 +246,30 @@ impl AutomatedMarketMaker for UniswapV2Pool {
     ) -> Result<U256, AMMError> {
         // amount_out 是接收方到手 net；池子 math 必须先输出 gross，
         // transfer 扣税后接收方才能拿到 net，因此先 gross-up。
-        // 输入侧（in_token 为 FoT）全额入池、不扣税（to = pool 方向无税）
+        // 输入侧双向 FoT：get_amount_in 返回池子实收需求，用户需转 gross-up 名义
+        // 以覆盖输入侧扣税（单侧 FoT 时 fot_input_gross_up 返回原值）
         let gross_out = self
             .output_token(base_token, quote_token)
             .fot_gross_up(amount_out);
-        if self.token_a.address == base_token {
+        let amount_in = if self.token_a.address == base_token {
             self.get_amount_in(
                 gross_out,
                 U256::from(self.reserve_0),
                 U256::from(self.reserve_1),
-            )
+            )?
         } else {
             self.get_amount_in(
                 gross_out,
                 U256::from(self.reserve_1),
                 U256::from(self.reserve_0),
-            )
-        }
+            )?
+        };
+        let input_token = if self.token_a.address == base_token {
+            &self.token_a
+        } else {
+            &self.token_b
+        };
+        Ok(input_token.fot_input_gross_up(amount_in))
     }
 
     fn tokens(&self) -> Vec<Address> {
@@ -1296,6 +1306,108 @@ mod tests {
                 )
                 .unwrap()
         );
+    }
+
+    // ==================== BothSides（双向扣税）测试 ====================
+    // 链上实测（交易 0xf90b9c...，block 66864081）：
+    //   a70e6413 转出名义 656445408742641273262 XLS → 输入侧池子 3d49cdd2 实收
+    //   636752046480362035065（97.0000%），K 检查按 balanceOf 差值（实收净额）记账。
+    //
+    // hop 链语义：一次 transfer 的税由 hop N 输出侧（fot_net）捕获，hop N+1 的
+    // amount_in = 实收值（balance 增量），输入侧不重复扣税；exact-out 返回值 =
+    // 上游需转出的名义（输入侧 gross-up）。
+
+    fn fot_both_sides_pool() -> UniswapV2Pool {
+        let mut pool = fot_pool();
+        pool.token_b.fot_tax = Some(crate::amms::fot::FotTaxType::BothSides { fee_bps: 300 });
+        pool
+    }
+
+    #[test]
+    fn test_simulate_swap_both_sides_input_not_double_taxed() {
+        let pool = fot_both_sides_pool();
+        // hop 链场景：amount_in 已是实收值（hop N 输出 = fot_net 后），math 输入即全额
+        let amount_in = U256::from(636_752_046_480_362_035_065u128); // 3d49cdd2 实收
+        let expected_out = pool.get_amount_out(
+            amount_in,
+            U256::from(pool.reserve_1),
+            U256::from(pool.reserve_0),
+        );
+        let out = pool
+            .simulate_swap(pool.token_b.address, pool.token_a.address, amount_in)
+            .unwrap();
+        assert_eq!(out, expected_out);
+
+        // 输出侧同为 XLS 时（token_a → token_b）：返回按 97% 折扣（同 FlatRate）
+        let in_a = U256::from(100_000u64) * U256::from(10u64).pow(U256::from(6));
+        let gross_b = pool.get_amount_out(
+            in_a,
+            U256::from(pool.reserve_0),
+            U256::from(pool.reserve_1),
+        );
+        let out_b = pool
+            .simulate_swap(pool.token_a.address, pool.token_b.address, in_a)
+            .unwrap();
+        assert_eq!(out_b, gross_b - gross_b * U256::from(300u16) / U256::from(10000u16));
+    }
+
+    #[test]
+    fn test_simulate_swap_mut_both_sides_no_input_tax() {
+        let mut pool = fot_both_sides_pool();
+        // 输入 = 实收值（hop N 输出）：reserve 增量 = 输入全额（链上 balance 增量一致）
+        let amount_in = U256::from(636_752_046_480_362_035_065u128);
+        let pre_reserve_0 = pool.reserve_0;
+        let pre_reserve_1 = pool.reserve_1;
+
+        let expected_out = pool.get_amount_out(
+            amount_in,
+            U256::from(pool.reserve_1),
+            U256::from(pool.reserve_0),
+        );
+        let amount_out = pool
+            .simulate_swap_mut(pool.token_b.address, pool.token_a.address, amount_in)
+            .unwrap();
+        assert_eq!(amount_out, expected_out);
+
+        // reserve_1（XLS）增量 = 输入全额（实收值，非名义的 97%）
+        assert_eq!(U256::from(pool.reserve_1), U256::from(pre_reserve_1) + amount_in);
+        // reserve_0（USDT）减少 = 输出 gross
+        assert_eq!(U256::from(pool.reserve_0), U256::from(pre_reserve_0) - expected_out);
+    }
+
+    #[test]
+    fn test_simulate_swap_exact_out_both_sides_input_gross_up() {
+        let pool = fot_both_sides_pool();
+        // 输入侧 XLS：exact-out 输出 USDT，输入需 gross-up 覆盖输入侧扣税
+        let target_out = U256::from(10_000u64) * U256::from(10u64).pow(U256::from(6)); // 10k USDT
+
+        let amount_in = pool
+            .simulate_swap_exact_out(pool.token_b.address, pool.token_a.address, target_out)
+            .unwrap();
+
+        let raw_in = pool
+            .get_amount_in(
+                target_out,
+                U256::from(pool.reserve_1),
+                U256::from(pool.reserve_0),
+            )
+            .unwrap();
+        // 3% 双向：名义 = ceil((raw_in-1)×10000/9700)+1 > raw_in
+        let expected_ceil = (raw_in - U256::from(1u8)) * U256::from(10000u16)
+            / U256::from(9700u16)
+            + U256::from(1u8);
+        assert_eq!(amount_in, expected_ceil);
+        assert!(amount_in > raw_in);
+
+        // 无 FoT 回归：返回 raw_in 原值
+        let no_fot = UniswapV2Pool {
+            token_b: Token::new_with_decimals(pool.token_b.address, 18),
+            ..pool.clone()
+        };
+        let nf = no_fot
+            .simulate_swap_exact_out(pool.token_b.address, pool.token_a.address, target_out)
+            .unwrap();
+        assert_eq!(nf, raw_in);
     }
 
     #[test]

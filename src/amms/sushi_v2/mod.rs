@@ -366,8 +366,10 @@ impl AutomatedMarketMaker for SushiV2Pool {
         quote_token: Address,
         amount_in: U256,
     ) -> Result<U256, AMMError> {
-        // 输入侧（in_token 为 FoT）：全额入池、不扣税（to = pool 方向无税）
-        // 池子 math 输出 gross（reserve 保持 gross 口径，与链上 Sync 一致）
+        // 输入侧不做 FoT 扣税：`amount_in` 语义 = 池子实收值（balance 增量）。
+        // hop 链中 hop N+1 的输入 = hop N 输出（fot_net 后实收），一次 transfer 的
+        // 税已由 hop N 输出侧捕获；起点转账（flash→池）由引擎层用 fot_input_net
+        // 处理，amms 模拟层不重复扣税。
         let gross = if self.token_a.address == base_token {
             self.get_amount_out(
                 amount_in,
@@ -393,23 +395,30 @@ impl AutomatedMarketMaker for SushiV2Pool {
     ) -> Result<U256, AMMError> {
         // amount_out 是接收方到手 net；池子 math 必须先输出 gross，
         // transfer 扣税后接收方才能拿到 net，因此先 gross-up。
-        // 输入侧（in_token 为 FoT）全额入池、不扣税（to = pool 方向无税）
+        // 输入侧双向 FoT：get_amount_in 返回池子实收需求，用户需转 gross-up 名义
+        // 以覆盖输入侧扣税（单侧 FoT 时 fot_input_gross_up 返回原值）
         let gross_out = self
             .output_token(base_token, quote_token)
             .fot_gross_up(amount_out);
-        if self.token_a.address == base_token {
+        let amount_in = if self.token_a.address == base_token {
             self.get_amount_in(
                 gross_out,
                 U256::from(self.reserve_0),
                 U256::from(self.reserve_1),
-            )
+            )?
         } else {
             self.get_amount_in(
                 gross_out,
                 U256::from(self.reserve_1),
                 U256::from(self.reserve_0),
-            )
-        }
+            )?
+        };
+        let input_token = if self.token_a.address == base_token {
+            &self.token_a
+        } else {
+            &self.token_b
+        };
+        Ok(input_token.fot_input_gross_up(amount_in))
     }
 
     fn simulate_swap_mut(
@@ -418,8 +427,9 @@ impl AutomatedMarketMaker for SushiV2Pool {
         quote_token: Address,
         amount_in: U256,
     ) -> Result<U256, AMMError> {
-        // 输入侧（in_token 为 FoT）：全额入池、不扣税（to = pool 方向无税）
-        // reserve 更新保持 gross（与链上 Sync 事件一致），返回值为扣税后 net
+        // 输入侧不做 FoT 扣税（同 simulate_swap）：reserve 增量 = amount_in
+        // （= 实收值，链上 balance 增量与 hop N 输出一致）。输出侧池子付出
+        // gross（reserve 减少量含税部分），返回值扣税后 net。
         if self.token_a.address == base_token {
             let amount_out = self.get_amount_out(
                 amount_in,

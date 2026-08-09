@@ -23,7 +23,7 @@
 
 use alloy::{
     eips::BlockId,
-    primitives::{keccak256, address, Address, B256, U256},
+    primitives::{address, keccak256, Address, B256, U256},
     providers::{Provider, ProviderBuilder},
 };
 use amms::amms::{
@@ -36,8 +36,7 @@ use std::env;
 use std::time::Duration;
 
 const XLAYER_CHAIN_ID: u64 = 196;
-const CALIBER_CONTRACT: Address =
-    address!("154586b2479b9a11e3d4db90024dc0e26f097312");
+const CALIBER_CONTRACT: Address = address!("154586b2479b9a11e3d4db90024dc0e26f097312");
 /// 公共 RPC 对连续调用限流较严，probe 只抽查前若干个 pair
 const PROBE_MAX_PAIRS: usize = 6;
 /// 逐槽参考读取之间的间隔（避免公共 RPC 429）
@@ -187,7 +186,11 @@ async fn reference_snapshot<P: Provider>(
     // 有效 pos
     let pos_block = cfg7 >> U256::from(192);
     let pos_raw = (cfg7 >> U256::from(96)) & ((U256::from(1) << U256::from(96)) - U256::from(1));
-    let pos = if pos_block == cur_block { pos_raw } else { U256::ZERO };
+    let pos = if pos_block == cur_block {
+        pos_raw
+    } else {
+        U256::ZERO
+    };
 
     // 过期/暂停
     let paused = !(paused_raw & U256::from(0xff)).is_zero()
@@ -200,9 +203,8 @@ async fn reference_snapshot<P: Provider>(
     // ladder
     let mut ladder = Vec::new();
     if !stale {
-        let ladder_base = keccak256(
-            (U256::from_be_bytes(cfg_base.0) + U256::from(2)).to_be_bytes::<32>(),
-        );
+        let ladder_base =
+            keccak256((U256::from_be_bytes(cfg_base.0) + U256::from(2)).to_be_bytes::<32>());
         for i in 0..n_usize {
             let raw = slot_at(provider, contract, b256_add(ladder_base, i as u64), block).await?;
             ladder.push((raw >> U256::from(128), raw & U256::from(u128::MAX)));
@@ -233,10 +235,16 @@ async fn reference_snapshot<P: Provider>(
 fn compare_pool(pool: &CaliberPropPool, r: &RefSnapshot) -> (bool, Vec<String>) {
     let mut diffs = Vec::new();
     if pool.reserve_a != r.reserve_a {
-        diffs.push(format!("reserve_a: batch={} ref={}", pool.reserve_a, r.reserve_a));
+        diffs.push(format!(
+            "reserve_a: batch={} ref={}",
+            pool.reserve_a, r.reserve_a
+        ));
     }
     if pool.reserve_b != r.reserve_b {
-        diffs.push(format!("reserve_b: batch={} ref={}", pool.reserve_b, r.reserve_b));
+        diffs.push(format!(
+            "reserve_b: batch={} ref={}",
+            pool.reserve_b, r.reserve_b
+        ));
     }
     if pool.ladder.ladder_a_to_b.len() != r.ladder.len() {
         diffs.push(format!(
@@ -245,8 +253,12 @@ fn compare_pool(pool: &CaliberPropPool, r: &RefSnapshot) -> (bool, Vec<String>) 
             r.ladder.len()
         ));
     } else {
-        for (i, (p, (amount_in, amount_out))) in
-            pool.ladder.ladder_a_to_b.iter().zip(r.ladder.iter()).enumerate()
+        for (i, (p, (amount_in, amount_out))) in pool
+            .ladder
+            .ladder_a_to_b
+            .iter()
+            .zip(r.ladder.iter())
+            .enumerate()
         {
             if p.amount_in != *amount_in || p.amount_out != *amount_out {
                 diffs.push(format!(
@@ -263,10 +275,16 @@ fn compare_pool(pool: &CaliberPropPool, r: &RefSnapshot) -> (bool, Vec<String>) 
         diffs.push(format!("fee: batch={} ref={}", pool.ladder.fee_rate, r.fee));
     }
     if pool.ladder.window != r.window {
-        diffs.push(format!("window: batch={} ref={}", pool.ladder.window, r.window));
+        diffs.push(format!(
+            "window: batch={} ref={}",
+            pool.ladder.window, r.window
+        ));
     }
     if pool.ladder.scale != r.scale {
-        diffs.push(format!("scale: batch={} ref={}", pool.ladder.scale, r.scale));
+        diffs.push(format!(
+            "scale: batch={} ref={}",
+            pool.ladder.scale, r.scale
+        ));
     }
     if pool.ladder.pos != r.pos {
         diffs.push(format!("pos: batch={} ref={}", pool.ladder.pos, r.pos));
@@ -278,10 +296,16 @@ fn compare_pool(pool: &CaliberPropPool, r: &RefSnapshot) -> (bool, Vec<String>) 
         ));
     }
     if pool.ladder.field0 != r.field0 {
-        diffs.push(format!("field0: batch={} ref={}", pool.ladder.field0, r.field0));
+        diffs.push(format!(
+            "field0: batch={} ref={}",
+            pool.ladder.field0, r.field0
+        ));
     }
     if pool.ladder.field1 != r.field1 {
-        diffs.push(format!("field1: batch={} ref={}", pool.ladder.field1, r.field1));
+        diffs.push(format!(
+            "field1: batch={} ref={}",
+            pool.ladder.field1, r.field1
+        ));
     }
     (diffs.is_empty(), diffs)
 }
@@ -290,13 +314,11 @@ fn compare_pool(pool: &CaliberPropPool, r: &RefSnapshot) -> (bool, Vec<String>) 
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
-    let rpc_url =
-        env::var("XLAYER_RPC").unwrap_or_else(|_| "https://rpc.xlayer.tech".to_string());
+    let rpc_url = env::var("XLAYER_RPC").unwrap_or_else(|_| "https://rpc.xlayer.tech".to_string());
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
 
     let latest = provider.get_block_number().await?;
@@ -312,11 +334,15 @@ async fn main() -> Result<()> {
         .await?;
     let total_pairs = all_ids.len();
     let pair_ids: Vec<B256> = all_ids.into_iter().take(PROBE_MAX_PAIRS).collect();
-    println!("[probe] got {total_pairs} pairs (checking first {})", pair_ids.len());
+    println!(
+        "[probe] got {total_pairs} pairs (checking first {})",
+        pair_ids.len()
+    );
 
     let mut skeletons: Vec<AMM> = Vec::with_capacity(pair_ids.len());
     for pair_id in pair_ids {
-        let (token_x, token_y) = read_token_addresses(&provider, CALIBER_CONTRACT, pair_id, block).await?;
+        let (token_x, token_y) =
+            read_token_addresses(&provider, CALIBER_CONTRACT, pair_id, block).await?;
         let (token_a_addr, token_b_addr) = if token_x < token_y {
             (token_x, token_y)
         } else {
@@ -363,12 +389,9 @@ async fn main() -> Result<()> {
             _ => None,
         })
         .collect();
-    let flags = batch_refresh_snapshots::<alloy::network::Ethereum, _>(
-        &provider,
-        &mut pools,
-        block,
-    )
-    .await?;
+    let flags =
+        batch_refresh_snapshots::<alloy::network::Ethereum, _>(&provider, &mut pools, block)
+            .await?;
     let failed = flags.iter().filter(|f| !**f).count();
     if pools.is_empty() {
         eyre::bail!("batch_refresh_snapshots returned 0 pools (batch path failed)");
@@ -407,9 +430,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    println!(
-        "[probe] checked={checked} pools, mismatches={mismatched} (block {latest})"
-    );
+    println!("[probe] checked={checked} pools, mismatches={mismatched} (block {latest})");
     if mismatched > 0 {
         eyre::bail!("{mismatched}/{checked} pools mismatched");
     }

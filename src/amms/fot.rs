@@ -1,32 +1,45 @@
 //! Fee-on-transfer (FoT) token 支持
 //!
-//! # 扣税语义（链上取证确认：XLS token，XLayer 交易 0xf90b9c...）
+//! # 扣税语义（链上取证确认：XLS token，XLayer 交易 0xf90b9c...、0x487fd3f3...）
+//!
+//! 存在两类扣税语义，用不同变体表达：
+//!
+//! ## [`FotTaxType::FlatRate`]（单侧，输出侧）
 //!
 //! 扣税发生在 **swap 之后、token transfer hook 内部**，且 **只在 from = pair（池子）
 //! 转出时扣税**（即用户从池子买入该 token 时）：
 //!   - from = pool（买）：池子 swap math 输出 gross，transfer hook 扣税，
 //!     接收方到手 net = gross × (10000 - fee_bps) / 10000（向下取整）
-//!   - to = pool（卖）：**不扣税**，池子收到全额（Swap.amountIn / reserve 增量均为全额，
-//!     已由 0x3d49 池收到 636752046480362035065 全额验证）
-//!   - EOA → EOA：**不扣税**（fork 实测 0.1 XLS 全额到账）
-//!   - 合约 → pool（如执行合约偿还 flash loan）：**不扣税**（t1 中竞争者合约
-//!     0x0223... 转 XLS 给池子全额到账）
+//!   - to = pool（卖）：不扣税，池子收到全额
+//!   - EOA → EOA、合约 → pool：不扣税
 //!
-//! 因此池子 reserve / Sync 事件保持 **gross 口径**，模拟时：
-//!   - 输入侧（in_token 是 FoT）：金额全额入池，不做扣税处理
-//!   - 输出侧（out_token 是 FoT）：swap math 输出 gross，返回给调用方的是扣税后 net
+//! ## [`FotTaxType::BothSides`]（双向，输入侧 + 输出侧）
+//!
+//! XLS 实测（Transfer 事件逐笔金额 + balanceOf 差值双重验证，2026-08-09）：
+//!   - **每次 transfer（无论方向）都扣税**：发送者付出名义 gross，
+//!     接收者实收 net = gross × (10000 - fee_bps) / 10000
+//!   - 输入侧（user→pool）：池子实收 net，K 检查按 **net** 记账
+//!     （balanceOf 差值 = net；3d49 池收到 636752046480362035065 =
+//!     名义 656445408742641273262 的 97%，此前"全额"解读是错的）
+//!   - 输出侧（pool→user）：池子余额减少 gross（含税部分），接收者实收 net
+//!   - 拆账：net 给接收者 + fee 部分进税池合约（XLS 为 proxy 0x15e98f9e，
+//!     其中 0.1% 由 proxy 转 0xdead 销毁，proxy 净留 2.9%）
+//!   - 每次 transfer 额外触发 2× process() 分红（实测 ~1.03M gas，
+//!     引擎 gas 估算需为含该 token 的 hop 加 ~1.15M 预算）
+//!
+//! 因此模拟时：
+//!   - 输入侧（user→pool）：amms 模拟层的 `amount_in` 语义 = 池子实收值
+//!     （balance 增量）。hop 链中 hop N+1 的输入 = hop N 输出（`fot_net`
+//!     后实收），一次 transfer 的税已由 hop N 输出侧捕获，**输入侧不重复扣税**
+//!     （否则 0.97 × 0.97 双重扣税）。仅引擎层起点转账（flash→池）场景
+//!     需用 `Token::fot_input_net` 将名义金额折算为池子实收净额入池
+//!   - 输出侧（pool→user）：math 输出 gross，返回给调用方的是扣税后 net
 //!
 //! # 注册方式
 //!
 //! FoT 参数 **不会自动检测**，必须在初始化阶段通过 [`register_fot_token`]
 //! 显式注册（或直接在 Token 序列化数据中标注 `fot_tax` 字段）。
 //! 优先级：Token 上显式标注的 `fot_tax` > registry 运行时注入。
-//!
-//! # 注意
-//!
-//! 当前 [`FotTaxType::FlatRate`] 表示"池子转出时扣税"（单侧），**不**表示每次
-//! transfer 都扣税。若未来遇到无条件扣税（买卖同税率）的 token，需新增独立变体
-//! 并同步实现输入侧扣税逻辑，不能复用本变体。
 
 use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
@@ -51,11 +64,22 @@ pub enum FotTaxType {
     ///
     /// **不**表示每次 transfer 都扣税：to = pool（卖出）、EOA→EOA、
     /// 合约→pool 均不扣税（链上取证确认，见模块文档）。
-    /// 若未来遇到无条件扣税（买卖同税率每次 transfer 都扣）的 token，
-    /// 需新增独立变体并实现输入侧扣税逻辑，不能复用本变体。
     ///
     /// `fee_bps` 以 basis points 计（1 bps = 0.01%），例如 3% 税 = 300。
     FlatRate { fee_bps: u64 },
+
+    /// 双向扣税（输入侧 + 输出侧）
+    ///
+    /// **每次 transfer（无论方向）都扣税**（XLS 实测，见模块文档）：
+    ///   - 输入侧（user→pool）：池子实收 net，K 检查按 net 记账
+    ///   - 输出侧（pool→user）：接收者实收 net，同 [`FotTaxType::FlatRate`]
+    ///
+    /// 模拟层语义：hop 链中一次 transfer 的税由 hop N 输出侧 `fot_net` 捕获，
+    /// 输入侧不重复扣税；仅引擎层起点转账（flash→池）需用
+    /// `Token::fot_input_net` 将名义金额折算为池子实收净额入池。
+    ///
+    /// `fee_bps` 以 basis points 计（1 bps = 0.01%），例如 3% 税 = 300。
+    BothSides { fee_bps: u64 },
     // 未来扩展（示例，变体命名用 snake_case 与 serde rename_all 保持一致）：
     // /// 买入/卖出分离税率
     // BuySell { buy_fee_bps: u64, sell_fee_bps: u64 },
@@ -69,21 +93,30 @@ impl FotTaxType {
     /// 税率分母（万分之一）
     pub const BASIS: u64 = 10_000;
 
+    /// 输入侧（user→pool 方向）是否扣税。
+    ///
+    /// 仅 [`FotTaxType::BothSides`] 返回 `true`（每次 transfer 都扣税）；
+    /// [`FotTaxType::FlatRate`] 只在池子转出（输出侧）时扣税，输入侧不扣。
+    pub fn input_taxed(&self) -> bool {
+        matches!(self, FotTaxType::BothSides { .. })
+    }
+
     /// 该税种下，gross 金额实际到手 net
     ///
     /// 链上语义（取证确认）：合约先算 `tax = floor(gross × fee_bps / 10000)`，
     /// 再转出 `net = gross - tax`。等价于 `ceil(gross × (10000-fee) / 10000)`，
     /// 与直接 `floor(gross × (10000-fee) / 10000)` 可能差 1 wei。
+    ///
+    /// 输出侧与输入侧共用同一折扣数学（BothSides 输入侧同样调用本方法）。
     pub fn net_of_gross(&self, gross: U256) -> U256 {
-        match self {
-            FotTaxType::FlatRate { fee_bps } => {
-                if *fee_bps >= Self::BASIS {
-                    return U256::ZERO;
-                }
-                let tax = gross * U256::from(*fee_bps) / U256::from(Self::BASIS);
-                gross - tax
-            }
+        let fee_bps = match self {
+            FotTaxType::FlatRate { fee_bps } | FotTaxType::BothSides { fee_bps } => *fee_bps,
+        };
+        if fee_bps >= Self::BASIS {
+            return U256::ZERO;
         }
+        let tax = gross * U256::from(fee_bps) / U256::from(Self::BASIS);
+        gross - tax
     }
 
     /// 反算：接收方到手 net 所需的最小 gross 金额
@@ -94,17 +127,17 @@ impl FotTaxType {
     ///
     /// 用于 exact-out 场景：池子 math 必须先输出 gross，transfer 扣税后
     /// 接收方才能拿到 net，因此 amount_out 需先 gross-up 再进 `get_amount_in`。
+    /// BothSides 输入侧同样调用本方法（池子需实收 net，用户需转 gross-up 名义）。
     pub fn gross_up(&self, net: U256) -> U256 {
-        match self {
-            FotTaxType::FlatRate { fee_bps } => {
-                if *fee_bps >= Self::BASIS || net.is_zero() {
-                    return U256::ZERO;
-                }
-                let numerator = (net - U256::from(1u8)) * U256::from(Self::BASIS);
-                let denominator = U256::from(Self::BASIS - *fee_bps);
-                numerator / denominator + U256::from(1u8)
-            }
+        let fee_bps = match self {
+            FotTaxType::FlatRate { fee_bps } | FotTaxType::BothSides { fee_bps } => *fee_bps,
+        };
+        if fee_bps >= Self::BASIS || net.is_zero() {
+            return U256::ZERO;
         }
+        let numerator = (net - U256::from(1u8)) * U256::from(Self::BASIS);
+        let denominator = U256::from(Self::BASIS - fee_bps);
+        numerator / denominator + U256::from(1u8)
     }
 }
 
@@ -182,6 +215,45 @@ mod tests {
         let tax = FotTaxType::FlatRate { fee_bps: 10_000 };
         assert_eq!(tax.net_of_gross(GROSS), U256::ZERO);
         assert_eq!(tax.gross_up(GROSS), U256::ZERO);
+    }
+
+    #[test]
+    fn test_both_sides_net_matches_onchain_forensics() {
+        let tax = FotTaxType::BothSides { fee_bps: 300 };
+        // 输入/输出侧同一折扣数学：名义 656445408742641273262 → 实收 636752046480362035065
+        assert_eq!(tax.net_of_gross(GROSS), NET);
+    }
+
+    #[test]
+    fn test_both_sides_gross_up_inverse() {
+        let tax = FotTaxType::BothSides { fee_bps: 300 };
+        // net -> gross_up -> net 应回到原值，且是最小解
+        let gross = tax.gross_up(NET);
+        assert_eq!(tax.net_of_gross(gross), NET);
+        assert!(tax.net_of_gross(gross - U256::from(1u8)) < NET);
+    }
+
+    #[test]
+    fn test_input_taxed_semantics() {
+        // 双向：输入侧扣税；单侧：输入侧不扣
+        assert!(FotTaxType::BothSides { fee_bps: 300 }.input_taxed());
+        assert!(!FotTaxType::FlatRate { fee_bps: 300 }.input_taxed());
+    }
+
+    #[test]
+    fn test_both_sides_full_fee_returns_zero() {
+        let tax = FotTaxType::BothSides { fee_bps: 10_000 };
+        assert_eq!(tax.net_of_gross(GROSS), U256::ZERO);
+        assert_eq!(tax.gross_up(GROSS), U256::ZERO);
+    }
+
+    #[test]
+    fn test_both_sides_serde_roundtrip() {
+        let tax = FotTaxType::BothSides { fee_bps: 300 };
+        let json = serde_json::to_string(&tax).unwrap();
+        assert_eq!(json, r#"{"type":"both_sides","fee_bps":300}"#);
+        let back: FotTaxType = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, tax);
     }
 
     #[test]
