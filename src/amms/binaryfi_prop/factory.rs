@@ -114,6 +114,7 @@ impl BinaryFiPropFactory {
             price_updated_block: Vec::new(),
             sell_ladders: Vec::new(),
             buy_ladders: Vec::new(),
+            buy_ladder_remaining: Vec::new(),
             ladder_reserves: Vec::new(),
             price0_calibrated: false,
         }

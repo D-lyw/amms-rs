@@ -17,6 +17,7 @@ use alloy::{
     eips::{BlockId, BlockNumberOrTag},
     primitives::{address, Address, U256},
     providers::{Provider, ProviderBuilder},
+    rpc::types::Filter,
     sol_types::SolValue,
 };
 use amms::{
@@ -25,7 +26,7 @@ use amms::{
         binaryfi_prop::{
             BinaryFiPropPool, GetBinaryFiPropStateBatchRequest, IBinaryFiPropPool, Snapshot,
             BINARYFI_ASSET_COUNT, BINARYFI_ENGINE_ADDRESS, BINARYFI_POOL_ADDRESS,
-            BINARYFI_ROUTER_ADDRESS,
+            BINARYFI_ROUTER_ADDRESS, BINARYFI_UPDATE_EVENT,
         },
     },
     state_space::StateSpaceBuilder,
@@ -39,6 +40,10 @@ use eyre::Result;
 const XLAYER_CHAIN_ID: u64 = 196;
 /// 已验证的 fork 锚点（新引擎 1999/2000 因子已生效的块，报价曲线固定可复现）
 const BINARYFI_TEST_BLOCK: u64 = 67_302_485;
+/// NVDAx 非单调阶梯退化观测块（我方失败交易 0x3238186c… 前一块）：
+/// 1e9→4.456e18 线性、≥5e9 骤降平顶 1.301e18；in=867,053,194 → 3.863e18
+const NVDAX_DEGENERATE_BLOCK: u64 = 67_430_640;
+const NVDAX_ADDRESS: Address = address!("0xc845b2894dbddd03858fd2d643b4ef725fe0849d");
 
 // ============================================================
 // Provider helpers（照 caliber fork 测试）
@@ -111,9 +116,12 @@ async fn fetch_snapshot_at<P: Provider + Clone>(provider: P, block: u64) -> Resu
             }
         }
     }
-    let mut big_quote_pairs = Vec::with_capacity(BINARYFI_ASSET_COUNT - 1);
+    let mut big_quote_pairs = Vec::with_capacity(2 * (BINARYFI_ASSET_COUNT - 1));
     for j in 1..BINARYFI_ASSET_COUNT {
         big_quote_pairs.push(U256::from(BINARYFI_ASSET_COUNT * BINARYFI_ASSET_COUNT + j));
+        big_quote_pairs.push(U256::from(
+            3 * BINARYFI_ASSET_COUNT * BINARYFI_ASSET_COUNT + j,
+        ));
     }
     let mut big_sell_pairs = Vec::with_capacity(BINARYFI_ASSET_COUNT - 1);
     for j in 1..BINARYFI_ASSET_COUNT {
@@ -358,5 +366,256 @@ async fn test_binaryfi_prop_fork_quote_replication() -> Result<()> {
         Err(e) => panic!("StateSpace build failed: {e}"),
     }
 
+    Ok(())
+}
+
+/// Phase 6: NVDAx 非单调阶梯退化对拍（块 67430640）—— 本地必须不把退化
+/// 平顶（1.301e18）当 maxOut 截断线性区；in=867,053,194（失败交易实际输入）
+/// 应复刻链上 3.863e18 量级。
+#[tokio::test]
+async fn test_binaryfi_prop_fork_nvdx_degenerate_curve() -> Result<()> {
+    let _guard = xlayer_test_guard();
+    let Some((provider, chain_id, _)) = connect_xlayer_provider().await? else {
+        return Ok(());
+    };
+    assert_eq!(chain_id, XLAYER_CHAIN_ID);
+    let block = BlockId::Number(BlockNumberOrTag::Number(NVDAX_DEGENERATE_BLOCK));
+
+    let local = BinaryFiPropPool::default()
+        .init(block, provider.clone())
+        .await?;
+    let Some(j) = local.assets.iter().position(|t| t.address == NVDAX_ADDRESS) else {
+        println!("SKIP: NVDAx not in assets");
+        return Ok(());
+    };
+    let nvdx = local.assets[j].address;
+    println!("=== BinaryFi NVDAx degenerate verification @ block {NVDAX_DEGENERATE_BLOCK} ===");
+
+    // 线性区（失败交易实际输入）：本地 ≈ 链上 3.863e18，而非平顶 1.301e18
+    let in_amt = U256::from(867_053_194u64);
+    let chain = chain_quote(
+        provider.clone(),
+        local.assets[0].address,
+        nvdx,
+        in_amt,
+        block,
+    )
+    .await?;
+    let sim = local.simulate_swap(local.assets[0].address, nvdx, in_amt)?;
+    println!("Phase 6: 0->NVDAx in={in_amt}: sim={sim} chain={chain}");
+    let plateau = U256::from_str_radix("1301449609759457280", 10).unwrap();
+    assert!(
+        sim > plateau,
+        "linear region must not be capped by degenerate plateau: sim={sim}"
+    );
+    let diff = if sim > chain {
+        sim - chain
+    } else {
+        chain - sim
+    };
+    assert!(
+        diff < U256::from(100_000_000_000_000u64),
+        "linear quote drift too large: sim={sim} chain={chain}"
+    );
+
+    // 观测平顶区（仅报告，不参与断言）：链上 ≥5e9 应 ≈1.301e18
+    for big_in in [U256::from(5_000_000_000u64), U256::from(10_000_000_000u64)] {
+        let chain_big = chain_quote(
+            provider.clone(),
+            local.assets[0].address,
+            nvdx,
+            big_in,
+            block,
+        )
+        .await?;
+        println!("Phase 6: big quote 0->NVDAx in={big_in} chain={chain_big}");
+    }
+    Ok(())
+}
+
+/// Phase 7: binaryFI 链上时效窗口对拍（块 67430640，NVDAx 最后 update=67430638）。
+/// 本地按 `price_updated_block + last_synced_block` 判定（生产由 flashblocks raw
+/// 增强写入 update 块号）：diff≤5 报价复刻链上，diff≥6 本地与链上同时返回 0
+/// （链上实测：67430643 正常、67430644 起归零，非 revert）。
+#[tokio::test]
+async fn test_binaryfi_prop_fork_quote_ttl_window() -> Result<()> {
+    let _guard = xlayer_test_guard();
+    let Some((provider, chain_id, _)) = connect_xlayer_provider().await? else {
+        return Ok(());
+    };
+    assert_eq!(chain_id, XLAYER_CHAIN_ID);
+    let block = BlockId::Number(BlockNumberOrTag::Number(NVDAX_DEGENERATE_BLOCK));
+
+    let mut local = BinaryFiPropPool::default()
+        .init(block, provider.clone())
+        .await?;
+    let Some(j) = local.assets.iter().position(|t| t.address == NVDAX_ADDRESS) else {
+        println!("SKIP: NVDAx not in assets");
+        return Ok(());
+    };
+    let nvdx = local.assets[j].address;
+
+    // NVDAx 最后一次 update 块（引擎 update 事件 topic1 = asset id）
+    let filter = Filter::new()
+        .from_block(NVDAX_DEGENERATE_BLOCK - 64)
+        .to_block(NVDAX_DEGENERATE_BLOCK)
+        .address(BINARYFI_ENGINE_ADDRESS)
+        .event_signature(BINARYFI_UPDATE_EVENT);
+    let logs = provider.get_logs(&filter).await?;
+    let last_update = logs
+        .iter()
+        .filter(|l| {
+            l.topics()
+                .get(1)
+                .map(|t| U256::from_be_bytes(t.0) == U256::from(j))
+                .unwrap_or(false)
+        })
+        .filter_map(|l| l.block_number)
+        .max()
+        .ok_or_else(|| eyre::eyre!("no NVDAx update log before {NVDAX_DEGENERATE_BLOCK}"))?;
+    println!(
+        "=== BinaryFi quote TTL window @ block {NVDAX_DEGENERATE_BLOCK}: asset={j} last_update={last_update} ==="
+    );
+    local.price_updated_block[j] = last_update;
+    let in_amt = U256::from(1_000_000u64);
+
+    // diff = 5：本地报价 == 链上同块 quote（非 0）
+    let fresh_block = last_update + 5;
+    local.last_synced_block = fresh_block;
+    let chain_fresh = chain_quote(
+        provider.clone(),
+        local.assets[0].address,
+        nvdx,
+        in_amt,
+        BlockId::Number(BlockNumberOrTag::Number(fresh_block)),
+    )
+    .await?;
+    let sim_fresh = local.simulate_swap(local.assets[0].address, nvdx, in_amt)?;
+    println!("Phase 7: diff=5 block={fresh_block}: sim={sim_fresh} chain={chain_fresh}");
+    assert!(
+        !chain_fresh.is_zero(),
+        "chain quote at diff=5 must be non-zero"
+    );
+    assert!(!sim_fresh.is_zero(), "local fresh quote must be non-zero");
+    // 快照 ask 恢复含 ~1e-5 舍入（与 xETH 小额同类）：容差对拍，归零端精确
+    let drift = if sim_fresh > chain_fresh {
+        sim_fresh - chain_fresh
+    } else {
+        chain_fresh - sim_fresh
+    };
+    assert!(
+        drift < U256::from(100_000_000_000_000u64),
+        "fresh quote drift too large: sim={sim_fresh} chain={chain_fresh}"
+    );
+
+    // diff = 6：本地与链上同时归零
+    let stale_block = last_update + 6;
+    local.last_synced_block = stale_block;
+    let chain_stale = chain_quote(
+        provider.clone(),
+        local.assets[0].address,
+        nvdx,
+        in_amt,
+        BlockId::Number(BlockNumberOrTag::Number(stale_block)),
+    )
+    .await?;
+    let sim_stale = local.simulate_swap(local.assets[0].address, nvdx, in_amt)?;
+    println!("Phase 7: diff=6 block={stale_block}: sim={sim_stale} chain={chain_stale}");
+    assert_eq!(chain_stale, U256::ZERO, "chain quote at diff=6 must be 0");
+    assert_eq!(sim_stale, U256::ZERO, "local stale quote must be 0");
+    Ok(())
+}
+
+/// “asset2/3 差 8 块仍新鲜”归因回归（链上实测，2026-08-09）：
+/// 67430648 时 asset2 的真实 last_update 已是 67430643（差 5，窗口内）、
+/// NVDAx 已是 67430647（差 1）——asset2/3 每 1~3 块就被 MM 重新 update，
+/// 5 块窗口从不过期，并非时效更长。用事件流最新 update 块驱动本地时效，
+/// 模拟与链上同块 quote 一致（非 0）；若误把 67430640 当最后 update（“差 8 块”），
+/// diff=8 会误判过期返回 0（这正是之前误读的来源）。
+#[tokio::test]
+async fn test_binaryfi_prop_fork_asset23_frequent_update_fresh() -> Result<()> {
+    let _guard = xlayer_test_guard();
+    let Some((provider, chain_id, _)) = connect_xlayer_provider().await? else {
+        return Ok(());
+    };
+    assert_eq!(chain_id, XLAYER_CHAIN_ID);
+    let anchor = BlockId::Number(BlockNumberOrTag::Number(NVDAX_DEGENERATE_BLOCK));
+    let mut local = BinaryFiPropPool::default()
+        .init(anchor, provider.clone())
+        .await?;
+
+    let target = NVDAX_DEGENERATE_BLOCK + 8; // 67430648 = “差 8 块”观测点
+                                             // 取 target 之前的最后 update（不含当块）：67430648 当块 asset2 也被 MM
+                                             // 更新（67430648: [2,3]），把它排掉才能验证“差 8 块”观测点前的真实时效
+    let filter = Filter::new()
+        .from_block(NVDAX_DEGENERATE_BLOCK - 64)
+        .to_block(target - 1)
+        .address(BINARYFI_ENGINE_ADDRESS)
+        .event_signature(BINARYFI_UPDATE_EVENT);
+    let logs = provider.get_logs(&filter).await?;
+    let last_of = |idx: usize| -> Option<u64> {
+        logs.iter()
+            .filter(|l| {
+                l.topics()
+                    .get(1)
+                    .map(|t| U256::from_be_bytes(t.0) == U256::from(idx))
+                    .unwrap_or(false)
+            })
+            .filter_map(|l| l.block_number)
+            .max()
+    };
+    let last_a2 = last_of(2).ok_or_else(|| eyre::eyre!("no asset2 update log"))?;
+    let last_a8 = last_of(8).ok_or_else(|| eyre::eyre!("no NVDAx update log"))?;
+    // 链上引擎 per-asset lastUpdateBlock（keccak(assetId,9) 槽 +0）逐块实测
+    assert_eq!(
+        last_a2, 67_430_643,
+        "asset2 last update before {target} must be 67430643"
+    );
+    assert_eq!(
+        last_a8, 67_430_647,
+        "NVDAx last update before {target} must be 67430647"
+    );
+
+    local.price_updated_block[2] = last_a2;
+    local.price_updated_block[8] = last_a8;
+    local.last_synced_block = target;
+
+    let in_amt = U256::from(1_000_000u64);
+    for j in [2usize, 8] {
+        let addr = local.assets[j].address;
+        let sim = local.simulate_swap(local.assets[0].address, addr, in_amt)?;
+        let chain = chain_quote(
+            provider.clone(),
+            local.assets[0].address,
+            addr,
+            in_amt,
+            BlockId::Number(BlockNumberOrTag::Number(target)),
+        )
+        .await?;
+        let last = if j == 2 { last_a2 } else { last_a8 };
+        println!(
+            "Phase 8: block={target} asset={j} last_update={last} diff={} sim={sim} chain={chain}",
+            target - last
+        );
+        assert!(!sim.is_zero(), "asset{j} fresh sim must be non-zero");
+        assert!(!chain.is_zero(), "chain quote at diff<=5 must be non-zero");
+        let drift = if sim > chain {
+            sim - chain
+        } else {
+            chain - sim
+        };
+        assert!(
+            drift < U256::from(100_000_000_000_000u64),
+            "fresh quote drift too large: sim={sim} chain={chain}"
+        );
+    }
+
+    // 反例：误把 67430640 当 asset2 最后 update → diff=8 误判过期，模拟返回 0
+    local.price_updated_block[2] = NVDAX_DEGENERATE_BLOCK;
+    assert_eq!(
+        local.simulate_swap(local.assets[0].address, local.assets[2].address, in_amt)?,
+        U256::ZERO,
+        "stale-misread must gate to zero"
+    );
     Ok(())
 }

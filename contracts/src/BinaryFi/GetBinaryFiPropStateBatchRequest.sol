@@ -18,11 +18,18 @@ pragma solidity ^0.8.0;
  *           - (0 -> j): 10 ** d0 (whole USDT0) -> out = floor(10^(dj+2)/ask)
  *           - (j -> 0): 10 ** (dj-4)           -> out = bid exactly
  *           - (i -> j) cross: 10 ** (di-4)     -> linear anchor only
- *         bigQuotePairs are additional (0 -> j) quotes with 10 ** (d0+4);
- *         combined with the small (0 -> j) quote they pin the exact ask
- *         (unique integer) even for low-decimal assets where the small quote
- *         alone is ambiguous. Their results are appended to quotePairs/quotes
- *         so the Rust side can pair them back up.
+ *         bigQuotePairs are additional (0 -> j) quotes, encoded as
+ *           - n*n + j: 10 ** (d0+4) big amount; combined with the small
+ *             (0 -> j) quote they pin the exact ask (unique integer) even for
+ *             low-decimal assets where the small quote alone is ambiguous.
+ *           - 3*n*n + j: 10 ** (d0+3) mid amount (1000x the small amount);
+ *             together with the big quote they detect non-monotonic "ladder
+ *             collapse" curves (e.g. NVDAx): when the mid quote is still
+ *             linear but the big quote is smaller than the mid output, the
+ *             big quote is NOT a valid maxOut for the whole input range and
+ *             the Rust side must not cap the linear region with it.
+ *         Their results are appended to quotePairs/quotes so the Rust side
+ *         can pair them back up.
  *
  *         bigSellPairs are (j -> 0) quotes with 10 ** (dj + 2) (100 whole
  *         units), encoded as 2 * n * n + j. The engine caps the input of a
@@ -134,18 +141,28 @@ contract GetBinaryFiPropStateBatchRequest {
             }
             snap.quotePairs[k] = pair;
         }
-        // 追加 (0 -> j) 大额报价：10^(d0+4)，与小额联合锁定 ask；
-        // 被引擎 maxOut 截断时同时给出 BUY 侧精确输出上限。
-        // bigQuotePairs 编码为 n*n + j（区别于普通 pair 的 i*n+j）
+        // 追加 (0 -> j) 大额/中额报价：10^(d0+4) 锁定 ask + 恢复 BUY maxOut；
+        // 10^(d0+3) 中额用于检测非单调阶梯退化（mid 线性但 big 输出 < mid
+        // 输出 → big 不是有效 maxOut，Rust 侧不得用它截断线性区）。
+        // bigQuotePairs 编码为 n*n + j / 3*n*n + j（区别于普通 pair 的 i*n+j）
         for (uint256 k = 0; k < bigQuotePairs.length; ++k) {
             uint256 idx = quotePairs.length + k;
             if (n == 0) break;
             uint256 pair = bigQuotePairs[k];
-            if (pair < n * n || pair >= 2 * n * n) continue;
-            uint256 j = pair - n * n;
+            uint256 amountIn;
+            uint256 j;
+            if (pair < n * n) continue;
+            if (pair < 2 * n * n) {
+                j = pair - n * n;
+                amountIn = 10 ** (uint256(snap.decimals[0]) + 4);
+            } else if (pair >= 3 * n * n && pair < 4 * n * n) {
+                j = pair - 3 * n * n;
+                amountIn = 10 ** (uint256(snap.decimals[0]) + 3);
+            } else {
+                continue;
+            }
             if (j >= n || j == 0) continue;
             if (snap.decimals[0] == 0) continue;
-            uint256 amountIn = 10 ** (uint256(snap.decimals[0]) + 4);
             try IBinaryFiPropPool(pool).quote(recipient, assets[0], assets[j], amountIn)
                 returns (uint256 amountOut)
             {

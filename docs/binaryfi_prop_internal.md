@@ -112,9 +112,84 @@ out = floor(v × 10^(dj−d0+2) / ask_j)                  // 第二段 BUY，**�
   probe + ladder 反推
 - `maxIn_i`（SELL 输入上限）= `ladderWeight_sell × engineReserve`（= Σ qty×R）；
   快照用 100 整枚 probe 精确恢复（候选 R 对拍 + 精确 maxInput）
-- `maxOut_j`（BUY 输出上限）= 阶梯总容量或金库余额，由大额 probe 观测
+- `maxOut_j`（BUY 输出上限）= 阶梯总容量 `Σ qty×R`（链上实测 asset2 @ 67430640：
+  buy_ladders `[(1960,767),(1960,1150),(1960,1183)]`、R=20000 → in≥5e10 平顶
+  **62,000,000 = Σqty×R**，逐位一致）或金库余额；快照由大额 probe 观测，
+  update 路径由 `buy_ladder_remaining = Σ qty×R` 精确推导，并随 Swap 事件消费递减
 - 多档阶梯资产（如 DOG）100 整枚 probe 与单档线性不兼容 → 本地仅小额区
   可精确复刻；生产 update 路径直接携带精确 ladder，无此问题
+- **R 反推增强（1.5b）**：100 整枚 probe 未饱和（总容量 > 输入）时闭式公式
+  失效，改单调二分求解 —— `out(R)` 关于 R 单调不减（每档
+  `consume = min(rem_k, q_k×R)`），下界取闭式饱和解，上界倍增到
+  `out(R) ≥ q_big` 后二分最小命中 R（与 probe 逐位一致即采用）。
+  多档资产不再回退单档线性（避免高估）。
+
+## 7.5 BUY 实时金库零门槛（P0 修复）
+
+- `buy_capped` 对**封顶后**输出做金库零门槛：`min(linear, maxOut) > 金库余额 → 0`。
+  链上实测锚点：饱和型且 `maxOut ≤ 金库` 时 `linear > 金库` 仍返回 `maxOut`
+  （5 资产大额 probe 对拍）；金库被 Swap 抽干后（NVDAx 金库≈1.07e12 近空）
+  `maxOut=1.301e18 > 金库` → 链上 quote 恒 0，本地必须同样归零（防幻影利润）。
+- 归零型（`buy_zero_over_vault`）保持 `linear > 金库 → 0` 不变；金库未知时
+  不门控（与 `capped_out`"余额未知不截断"一致）。
+
+## 7.6 非单调阶梯退化检测（P1 修复）
+
+- 快照新增 (0→j) **中额 probe**（`10^(d0+3)`，1000x 小额，编码 `3n²+j`，
+  与大额共用 `bigQuotePairs` 列表）：mid 仍线性但 big 输出 < mid 输出
+  → 曲线非单调回落（NVDAx 实测：1e9→4.456e18 线性、≥5e9 骤降平顶 1.301e18），
+  big 落在退化平顶区，**不是全输入范围的有效 maxOut**；此时清掉 maxOut，
+  线性区恢复正确报价（in=867,053,194：本地 1.301e18 → 链上 3.863e18，低估 66%），
+  超大额由 7.5 金库零门槛兜底。
+
+## 7.7 报价时效窗口（链上实测，P2 修复）
+
+- binaryFI 池子链上 `quote()` **自带块号时效**（非 Caliber 的 deadline64+window
+  墙钟机制，也不依赖本地时钟）：每资产以**最后一次引擎 update 的块号**为基准，
+  时效窗口 **5 块**；`当前块 − 最后update块 ≤ 5` 正常报价，差 **≥ 6 块时
+  `quote()` 直接返回 0**（不是 revert；引擎内部 `0x6ee50667` 路径 revert
+  `0x86fa3e43`，外层 quote 捕获转 0）。
+- 引擎 per-asset `lastUpdateBlock` 存储位置：`keccak256(abi.encode(assetId, 9))`
+  槽 +0（另：+1 打包 scale/decimals/address，+3 打包 price，+4 sellLadder，
+  +5 buyLadder）。**每次 update 交易都会写 lastUpdateBlock**——即使价格/ladder
+  与上次相同（实测 67430645 与 67430647 两笔内容完全相同的 NVDAx update 都
+  刷新了时效）。
+- 逐块实测（直接对链上历史块 eth_call，块 67430638–67430652）：
+  - NVDAx（asset8）：lastUpdate=67430638 → 67430640–43 正常（差 2–5），
+    **67430644（差 6）起返回 0**；67430645 被 update → 恢复，67430647 再 update
+  - SPYx（asset6）：lastUpdate=67430639 → 67430640–44 正常（差 1–5），
+    **67430645（差 6）起返回 0**；67430647 被 update → 恢复
+  - asset2：lastUpdate=67430640 → **67430642 → 67430643** → 67430648（每 1–3 块
+    就被 MM 重新 update，5 块窗口从不过期，67430640–52 全程正常报价）
+  - asset3：lastUpdate=67430640 → 67430644 → 67430647 → 67430648（同样从不过期）
+- **“asset2/3 差 8 块仍新鲜”不是异常**：67430648 时 asset2 的真实 lastUpdate 已是
+  67430643（差 5）、asset3 已是 67430647（差 1），窗口内自然新鲜；之前把它当
+  时效异常是把 67430640 误当最后一次 update，忽略了中间的 update 事件。
+- 本地判定用模块自身数据：`price_updated_block[asset]`（L2 flashblocks 增强注入
+  的 calldata blockNumber、L3 canonical 用**事件块号** = 引擎最后一次 update 该
+  资产的块）与 `last_synced_block`；`last_synced_block − price_updated_block > 5`
+  → 过期。
+- 门控位置：`engine_quote`（覆盖 `simulate_swap`/`simulate_swap_mut`）、
+  `max_achievable_out`（覆盖 `simulate_swap_exact_out`，过期直接拒绝）、
+  `calculate_price`（过期 spot = 0.0，prefilter 放弃路径）。过期返回 0，
+  **不触发 AsyncUpdate**（AsyncUpdate 仍是 L3 数据源补缺机制，与时效无关）。
+- 边界：`price_updated_block == 0`（快照/锚定路径，无 update 日志佐证）不判过期，
+  避免快照初始化池被误杀；快照**不**写 `price_updated_block`（周期快照不能把
+  过期资产"保鲜"——链上只由引擎 update 推进时效）。L3 canonical 路径无 raw
+  bytes 时**仍用事件块号推进时效时钟**（与链上每次 update 写 lastUpdateBlock
+  一致），价格本体由 AsyncUpdate 快照补缺。
+
+## 7.8 BUY 阶梯容量进报价路径（P2 修复）
+
+- 新增 `buy_ladder_remaining[asset]`（BUY 剩余容量 = `Σ qty×R`）：
+  update 路径由 `apply_l2_update_full` 从 buy_ladders × R 精确重置；快照路径在
+  饱和型大额 probe 处覆盖为观测 maxOut（容量以快照为权威）；归零型清空
+  （金库零门槛接管）；退化型/未截断保留 update 推导值（精确容量，asset2 实测
+  大额 probe 未饱和但 Σqty×R 即链上平顶）。
+- Swap 事件（`anchor_rate`）：0→j 与跨资产第二段按 `amount_out` 消费 j 的剩余
+  容量，直到下一次 update/快照重置——容量变化**通过交易实时更新**，不再等快照。
+- `buy_capped`/`max_achievable_out`/`ladder_cap_known` 封顶优先取
+  `buy_ladder_remaining`，其次快照 `max_outputs`，再叠加 7.5 金库零门槛。
 
 ## 8. 三层数据同步（事件驱动，无轮询）
 
@@ -155,6 +230,12 @@ SELL 归零样例（xETH，金库 17,347,345,227）：`in=9.13e18 → 17,343,984
 - `rem = in − in/2000`，in<2000 时与 `in×1999/2000` 不同（易错点）
 - 买入被禁用资产（0→j quote 恒 0）仍可能收到 update 日志 → 只更新价格，费率保持 0
 - 周期快照不能覆盖日志驱动的更新价格（保鲜判断：日志优先、快照补缺）
+- **时效只在 L2 日志路径生效**：canonical/L3 路径无 raw bytes → 无 update 块号，
+  按"未知不过期"兜底；快照路径的 `price_updated_block` 恒为 0，不会把过期资产
+  "保鲜"（链上只由引擎 update 推进时效）
+- **NVDAx BUY 小额 ~1e-5 舍入**（块 67430640：sim=4,455,688,302,425,106 vs
+  chain=4,455,644,262,075,732，相对 ~1e-5，与 xETH 同类）；快照 ask 恢复的
+  已知精度限制，Phase 7 对拍按容差断言，归零端精确
 
 ## 11. 逆向工具链记录
 

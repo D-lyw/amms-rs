@@ -336,7 +336,7 @@ fn test_simulate_swap_matches_onchain_sample() {
         .unwrap();
     assert_eq!(sell, U256::from(139_740_080u64));
 
-    // 大额受输出余额 96% 截断
+    // 大额 linear > 金库余额 → 实时金库零门槛归零（链上实测：linear 超金库即 0）
     let huge = pool
         .simulate_swap(
             pool.assets[0].address,
@@ -344,8 +344,7 @@ fn test_simulate_swap_matches_onchain_sample() {
             U256::from(1_000_000_000_000u64),
         )
         .unwrap();
-    let cap = U256::from(8_000_000_000_000_000_000u64) * U256::from(9600) / U256::from(10_000);
-    assert_eq!(huge, cap);
+    assert_eq!(huge, U256::ZERO);
 }
 
 /// SELL 阶梯上限：maxIn 截断。新引擎因子：
@@ -416,6 +415,7 @@ fn test_engine_quote_buy_cap_matches_onchain() {
         let out = pool
             .simulate_swap(pool.assets[0].address, pool.assets[1].address, amt)
             .unwrap();
+        // 饱和型 maxOut ≤ 金库：min(linear, maxOut) 正常返回（锚点块实测）
         assert_eq!(
             out,
             U256::from_str_radix("7643300000000000000", 10).unwrap()
@@ -654,6 +654,53 @@ fn test_sync_canonical_update_marks_stale() {
     assert!(pool.stale_pairs.contains(&pool.pair_index(1, 0)));
 }
 
+/// canonical（无 raw bytes）update 事件：价格由 AsyncUpdate 快照补缺，但时效时钟
+/// 必须用事件块号推进——链上引擎每次 update 交易都写 per-asset lastUpdateBlock
+/// （即使内容相同也刷新，实测 67430645/47 两笔相同 NVDAx update）。若不推进，
+/// 时效门控在 canonical 路径整体失效，会用快照价格算出链上已过期=0 的幻影利润。
+#[test]
+fn test_sync_canonical_update_advances_freshness_clock() {
+    let mut pool = test_pool();
+    let log_data = LogData::new(vec![BINARYFI_UPDATE_EVENT, asset_topic(1)], Bytes::new()).unwrap();
+    let log = Log {
+        inner: AlloyLog {
+            address: BINARYFI_ENGINE_ADDRESS,
+            data: log_data,
+        },
+        block_number: Some(100),
+        ..Default::default()
+    };
+
+    let action = pool.sync(&log).expect("sync ok");
+    assert!(matches!(action, SyncAction::AsyncUpdate));
+    assert_eq!(pool.price_updated_block[1], 100);
+
+    // diff=5 仍新鲜（引擎 quote 需先有价格：快照路径经 apply_price_update 锚定）
+    pool.apply_l2_update(1, U256::from(13_984u64), 100, 3, 3);
+    pool.last_synced_block = 105;
+    let fresh = pool.engine_quote(0, 1, U256::from(1_000_000u64)).unwrap();
+    assert!(!fresh.is_zero());
+
+    // diff=6 过期返回 0（与链上一致：NVDAx lastUpdate=67430638 时 67430644 归零）
+    pool.last_synced_block = 106;
+    assert_eq!(
+        pool.engine_quote(0, 1, U256::from(1_000_000u64)).unwrap(),
+        U256::ZERO
+    );
+
+    // 无块号的 canonical 日志（历史回放/缺块号）不推进时钟：price_updated_block
+    // 保持 100，避免把旧日志误判成新时效。
+    let log_no_blk = Log {
+        inner: AlloyLog {
+            address: BINARYFI_ENGINE_ADDRESS,
+            data: LogData::new(vec![BINARYFI_UPDATE_EVENT, asset_topic(1)], Bytes::new()).unwrap(),
+        },
+        ..Default::default()
+    };
+    pool.sync(&log_no_blk).expect("sync ok");
+    assert_eq!(pool.price_updated_block[1], 100);
+}
+
 /// BUY 低小数位资产：dj=4 < d0-2 时 q0j = floor(10^(dj+2)×1999/(2000×ask)) 很小，
 /// BUY 报价 = floor(in × q0j / 10^d0) 仍精确。
 #[test]
@@ -820,4 +867,422 @@ fn test_ladder_sell_tiers_asset6() {
         .engine_quote(2, 0, U256::from(1_000_000_000_000_000u64))
         .expect("sell quote fallback");
     assert_eq!(out, U256::from(768_835u64));
+}
+
+/// P0 回归：饱和型 BUY 受实时金库零门槛约束 —— maxOut 来自快照时刻 probe，
+/// 金库被 Swap 抽干后（NVDAx 实测 vault≈1.07e12 近空）链上 quote 恒 0，
+/// 本地不得继续按快照 maxOut 报价制造幻影利润。
+#[test]
+fn test_buy_capped_saturating_vault_depleted_zeroes() {
+    let mut pool = test_pool();
+    pool.apply_l2_update(1, U256::from(13_984u64), 100, 3, 3);
+    // 饱和型 maxOut 已知（快照时刻值）
+    pool.max_outputs[1] = Some(U256::from_str_radix("1301449609759457280", 10).unwrap());
+    // 健康金库：in=1e9 → linear≈7.146e18 > maxOut → 饱和截断到 maxOut
+    pool.reserves[1] = U256::from_str_radix("21087064247644425879", 10).unwrap();
+    let out = pool
+        .engine_quote(0, 1, U256::from(1_000_000_000u64))
+        .unwrap();
+    assert_eq!(
+        out,
+        U256::from_str_radix("1301449609759457280", 10).unwrap()
+    );
+    // 金库近空（Swap 抽干、maxOut 未刷新）：链上归零，本地必须归零
+    pool.reserves[1] = U256::from(1_070_000_000_000u64);
+    let out = pool
+        .engine_quote(0, 1, U256::from(1_000_000_000u64))
+        .unwrap();
+    assert_eq!(out, U256::ZERO);
+    // 归零型行为不变：linear ≤ 金库才返回（不叠加 min(maxOut)）
+    pool.buy_zero_over_vault[1] = true;
+    pool.reserves[1] = U256::from_str_radix("21087064247644425879", 10).unwrap();
+    let out = pool
+        .engine_quote(0, 1, U256::from(1_000_000_000u64))
+        .unwrap();
+    let linear = U256::from(1_000_000_000u64)
+        .checked_mul(U256::from(10u64).pow(U256::from(20)))
+        .unwrap()
+        .checked_mul(U256::from(1999))
+        .unwrap()
+        / (U256::from(2000u64) * U256::from(13_987u64) * U256::from(10u64).pow(U256::from(6)));
+    assert_eq!(out, linear);
+}
+
+/// P1 回归：非单调阶梯退化（NVDAx 块 67430640 实测）—— big probe（1e10）
+/// 落在退化平顶区 1.301e18，而 mid probe（1e9）仍线性 4.456e18 > big；
+/// 快照不得把 big 当 maxOut 截断线性区（否则 in=867,053,194 本地 1.301e18
+/// vs 链上 3.863e18，低估 66%）。
+#[test]
+fn test_apply_snapshot_degenerate_maxout_cleared() {
+    let mut pool = BinaryFiPropPool::default();
+    let usdt0 = address!("0x779ded0c9e1022225f8e0630b35a9b54be713736");
+    let nvdx = address!("0xc845b2894dbddd03858fd2d643b4ef725fe0849d");
+    let ok = |v: &str| QuoteResult {
+        amountOut: U256::from_str_radix(v, 10).unwrap(),
+        success: true,
+    };
+    let snap = Snapshot {
+        assets: vec![usdt0, nvdx],
+        decimals: vec![6u8, 18u8],
+        scales: vec![U256::ZERO, U256::from(10_000u64)],
+        poolBalances: vec![U256::ZERO, U256::ZERO],
+        vaultReserves: vec![
+            U256::from(11_281_542_985u64),
+            U256::from_str_radix("21087064247644425879", 10).unwrap(),
+        ],
+        // n=2：small 0→1=1、1→0=2；big(1e10)=n²+1=5；bigsell(1e20)=2n²+1=9；
+        // mid(1e9)=3n²+1=13
+        quotePairs: vec![
+            U256::from(1),
+            U256::from(2),
+            U256::from(5),
+            U256::from(9),
+            U256::from(13),
+        ],
+        quotes: vec![
+            ok("4455644262075732"),    // 0→1 small：q0j
+            ok("22384"),               // 1→0 small：bid
+            ok("1301449609759457280"), // 0→1 big：退化平顶
+            ok("10916672400"),         // 1→0 100 整枚
+            ok("4456402343463560796"), // 0→1 mid：线性 4.456e18
+        ],
+    };
+    pool.apply_snapshot(&snap, 67_430_640);
+    // 退化检测：mid(4.456e18) > big(1.301e18) → maxOut 清除（不得截断线性区）
+    assert_eq!(pool.max_outputs[1], None);
+    assert!(!pool.buy_zero_over_vault[1]);
+    // 线性区恢复：in=867,053,194（失败交易实际输入）→ ≈3.863e18，非 1.301e18
+    let out = pool.engine_quote(0, 1, U256::from(867_053_194u64)).unwrap();
+    let plateau = U256::from_str_radix("1301449609759457280", 10).unwrap();
+    assert!(out > plateau, "linear region must not be capped: {out}");
+    let chain = U256::from_str_radix("3863280589625797243", 10).unwrap();
+    let diff = if out > chain {
+        out - chain
+    } else {
+        chain - out
+    };
+    assert!(
+        diff < U256::from(100_000_000_000_000u64),
+        "linear drift too large: sim={out} chain={chain}"
+    );
+    // 金库抽干 → 实时零门槛归零
+    pool.reserves[1] = U256::from(1_070_000_000_000u64);
+    let out = pool.engine_quote(0, 1, U256::from(867_053_194u64)).unwrap();
+    assert_eq!(out, U256::ZERO);
+}
+
+/// P1 回归：多档 SELL 引擎储备 R 单调二分推导 —— 100 整枚 probe 未饱和时
+/// （总容量 > 输入）闭式公式失效，二分求解仍能恢复 R，ladder 路径逐位复刻
+/// probe；不再回退单档线性高估。
+#[test]
+fn test_sell_ladder_r_derived_when_probe_unsaturated() {
+    let mut pool = test_pool();
+    // test_pool 未初始化 ladder 容器；L2 阶梯写入前补齐
+    pool.sell_ladders = vec![None; pool.assets.len()];
+    pool.buy_ladders = vec![None; pool.assets.len()];
+    pool.ladder_reserves = vec![None; pool.assets.len()];
+    // L2 更新携带真实引擎价格 + sell ladder（asset1，scale=10000）
+    let data0 = {
+        // 两档：w=500 q=2000、w=1000 q=3000（24bit 左对齐，qty 12bit ≤ 4095）
+        let a = (500u64 << 12) | 2_000;
+        let b = (1_000u64 << 12) | 3_000;
+        let mut d = U256::ZERO;
+        d |= U256::from(a) << U256::from(256 - 24);
+        d |= U256::from(b) << U256::from(256 - 48);
+        d
+    };
+    pool.apply_l2_update_full(1, U256::from(15_000u64), 100, 0, 0, data0, U256::ZERO);
+    let snap_block = 100u64; // 与 L2 块一致 → 快照不覆盖引擎价格
+    let ok = |v: &str| QuoteResult {
+        amountOut: U256::from_str_radix(v, 10).unwrap(),
+        success: true,
+    };
+    let snap = Snapshot {
+        assets: pool.assets.iter().map(|t| t.address).collect(),
+        decimals: vec![6u8, 18u8],
+        scales: vec![U256::ZERO, U256::from(10_000u64)],
+        poolBalances: vec![U256::ZERO, U256::ZERO],
+        vaultReserves: vec![
+            U256::from(10u64).pow(U256::from(30)),
+            U256::from(10u64).pow(U256::from(30)),
+        ],
+        quotePairs: vec![
+            U256::from(1),
+            U256::from(2),
+            U256::from(5),
+            U256::from(9),
+            U256::from(13),
+        ],
+        quotes: vec![
+            ok("1000000000000000"),     // 0→1 small（BUY 侧非本测试重点）
+            ok("14492"),                // 1→0 small：tier-1 线性 bid
+            ok("10000000000000000000"), // 0→1 big
+            ok("14193000000"),          // 1→0 100 整枚：两档部分消费、未饱和
+            ok("1000000000000000000"),  // 0→1 mid
+        ],
+    };
+    pool.apply_snapshot(&snap, snap_block);
+    // 多档 probe 与单档不兼容 → sell_raw 清空（快照近似），但 R 必须恢复
+    assert_eq!(pool.sell_raw[1], None);
+    let r = pool.ladder_reserves[1].expect("R must be derived");
+    assert!(
+        r > U256::from(19u64) * U256::from(10u64).pow(U256::from(15)),
+        "r={r}"
+    );
+    assert!(
+        r < U256::from(21u64) * U256::from(10u64).pow(U256::from(15)),
+        "r={r}"
+    );
+    // ladder 路径逐位复刻 100 整枚 probe
+    let out = pool
+        .engine_quote(1, 0, U256::from(10u64).pow(U256::from(20)))
+        .unwrap();
+    assert_eq!(out, U256::from(14_193_000_000u64));
+    // 小额（tier-1 内）与链上 bid 一致
+    let small = pool
+        .engine_quote(1, 0, U256::from(10u64).pow(U256::from(14)))
+        .unwrap();
+    assert_eq!(small, U256::from(14_492u64));
+    // 5e19 输入（跨两档）：与 ladder 逐档一致（recovered R 等价区 ±2 wei）
+    let mid = pool
+        .engine_quote(
+            1,
+            0,
+            U256::from(5u64) * U256::from(10u64).pow(U256::from(19)),
+        )
+        .unwrap();
+    assert!(
+        mid >= U256::from(7_196_499_998u64) && mid <= U256::from(7_196_500_002u64),
+        "mid-tier out={mid}"
+    );
+}
+
+/// binaryFI 链上时效：引擎 update 后 5 块窗口内报价正常，差 ≥ 6 块 quote 返回 0。
+/// 用模块自身数据 price_updated_block + last_synced_block 判定（链上实测，
+/// NVDAx/SPYx/asset2/3 均在最后 update 后第 6 块起归零）。
+#[test]
+fn test_quote_stale_returns_zero() {
+    let mut pool = test_pool();
+    pool.apply_l2_update(1, U256::from(13_984u64), 100, 3, 3);
+    let fresh = pool.engine_quote(0, 1, U256::from(1_000_000u64)).unwrap();
+    assert!(!fresh.is_zero());
+
+    // diff = 5 仍新鲜（窗口边界）
+    pool.last_synced_block = 105;
+    assert_eq!(
+        pool.engine_quote(0, 1, U256::from(1_000_000u64)).unwrap(),
+        fresh
+    );
+
+    // diff = 6 过期：BUY / SELL / 跨资产全部返回 0
+    pool.last_synced_block = 106;
+    assert_eq!(
+        pool.engine_quote(0, 1, U256::from(1_000_000u64)).unwrap(),
+        U256::ZERO
+    );
+    assert_eq!(
+        pool.engine_quote(1, 0, U256::from(1_000_000_000_000u64))
+            .unwrap(),
+        U256::ZERO
+    );
+    // simulate_swap 同步 0，且不改余额
+    let out = pool
+        .simulate_swap(
+            pool.assets[0].address,
+            pool.assets[1].address,
+            U256::from(1_000_000u64),
+        )
+        .unwrap();
+    assert_eq!(out, U256::ZERO);
+    // spot 归零
+    let p = pool
+        .calculate_price(pool.assets[0].address, pool.assets[1].address)
+        .unwrap();
+    assert_eq!(p, 0.0);
+    // exact_out 拒绝
+    assert!(pool
+        .simulate_swap_exact_out(
+            pool.assets[0].address,
+            pool.assets[1].address,
+            U256::from(1)
+        )
+        .is_err());
+
+    // price_updated_block == 0（快照/锚定路径，无 update 日志）不判过期
+    pool.price_updated_block[1] = 0;
+    pool.last_synced_block = 10_000;
+    assert_eq!(
+        pool.engine_quote(0, 1, U256::from(1_000_000u64)).unwrap(),
+        fresh
+    );
+}
+
+/// BUY 阶梯容量进报价路径：update 重置 Σqty×R，Swap 事件消费递减，封顶随之下降。
+/// 链上实测（asset2 @ 67430640）：buy_ladders [(1960,767),(1960,1150),(1960,1183)]、
+/// R=20000 → 平顶 62,000,000 = Σqty×R，in≥5e10 起逐位吻合。
+#[test]
+fn test_buy_ladder_remaining_caps_and_consumes() {
+    let mut pool = test_pool();
+    let n = pool.assets.len();
+    pool.sell_ladders = vec![None; n];
+    pool.buy_ladders = vec![None; n];
+    pool.ladder_reserves = vec![None; n];
+    pool.buy_ladder_remaining = vec![None; n];
+    pool.ladder_reserves[1] = Some(U256::from(20_000u64)); // 引擎 cap = R（链上实测）
+                                                           // data1 = 3 档 (w=3): qty 767/1150/1183（左对齐 24bit/档）
+    let tier1 = U256::from(3u64 << 12 | 767);
+    let tier2 = U256::from(3u64 << 12 | 1150);
+    let tier3 = U256::from(3u64 << 12 | 1183);
+    let data1 = (tier1 << 232) | (tier2 << 208) | (tier3 << 184);
+    pool.apply_l2_update_full(
+        1,
+        U256::from(13_984u64),
+        100,
+        3,
+        3,
+        U256::ZERO, // data0 空：sell ladder 清空
+        data1,
+    );
+    assert_eq!(
+        pool.buy_ladders[1],
+        Some(vec![(3, 767), (3, 1150), (3, 1183)])
+    );
+    let cap = U256::from(62_000_000u64);
+    assert_eq!(pool.buy_ladder_remaining[1], Some(cap));
+
+    // 大额 BUY：linear > 容量 → 封顶 = Σqty×R
+    let big = pool
+        .engine_quote(0, 1, U256::from(10u64).pow(U256::from(24)))
+        .unwrap();
+    assert_eq!(big, cap);
+    // simulate_swap 同语义
+    let sim = pool
+        .simulate_swap(
+            pool.assets[0].address,
+            pool.assets[1].address,
+            U256::from(10u64).pow(U256::from(24)),
+        )
+        .unwrap();
+    assert_eq!(sim, cap);
+
+    // Swap 事件消费：0→1 消耗 amount_out
+    pool.anchor_rate(0, 1, U256::from(1_000_000u64), U256::from(30_000_000u64));
+    assert_eq!(
+        pool.buy_ladder_remaining[1],
+        Some(U256::from(32_000_000u64))
+    );
+    let big2 = pool
+        .engine_quote(0, 1, U256::from(10u64).pow(U256::from(24)))
+        .unwrap();
+    assert_eq!(big2, U256::from(32_000_000u64));
+
+    // 消费到 0：BUY 封顶 0（链上容量耗尽语义）
+    pool.anchor_rate(0, 1, U256::from(1_000_000u64), U256::from(32_000_000u64));
+    assert_eq!(pool.buy_ladder_remaining[1], Some(U256::ZERO));
+    assert_eq!(
+        pool.engine_quote(0, 1, U256::from(10u64).pow(U256::from(24)))
+            .unwrap(),
+        U256::ZERO
+    );
+
+    // 下一次 update 重置容量
+    pool.apply_l2_update_full(1, U256::from(13_984u64), 101, 3, 3, U256::ZERO, data1);
+    assert_eq!(pool.buy_ladder_remaining[1], Some(cap));
+}
+
+/// spot 与链上可交易性对齐（P2 加固）：方向容量恒为 0 时 spot 必须为 0.0，
+/// 与 simulate_swap/链上 quote 一致，避免 multihop/2hop 预过滤把已死方向排高。
+/// SELL 死 = maxIn==0（ladderWeight×reserve=0，只买不卖）；BUY 死 =
+/// buy_ladder_remaining==0（Σqty×R=0）或快照 maxOut==0；跨资产任一侧死则 0。
+#[test]
+fn test_spot_zero_when_direction_dead() {
+    let mut pool = test_pool();
+    // 第三资产覆盖跨资产方向
+    pool.assets.push(Token::new_with_decimals(
+        address!("0xb7c00000bcdeef966b20b3d884b98e64d2b06b4f"),
+        8,
+    ));
+    let n = pool.assets.len();
+    pool.prices.push(U256::ZERO);
+    pool.spreads.push(0);
+    pool.bid_offsets.push(0);
+    pool.ask_offsets.push(0);
+    pool.q0j.push(None);
+    pool.sell_raw.push(None);
+    pool.buy_zero_over_vault.push(false);
+    pool.max_outputs.push(None);
+    pool.max_inputs.push(None);
+    pool.reserves.push(U256::from(62_000_000u64));
+    pool.rates.resize(n * n, Rate::zero());
+    pool.price_updated_block.push(0);
+    pool.sell_ladders = vec![None; n];
+    pool.buy_ladders = vec![None; n];
+    pool.ladder_reserves = vec![None; n];
+    pool.buy_ladder_remaining = vec![None; n];
+
+    // 正常状态：两侧 + 跨资产 spot 均非 0
+    pool.apply_l2_update(1, U256::from(15_005u64), 100, 3, 3);
+    pool.apply_l2_update(2, U256::from(20_000u64), 100, 4, 4);
+    let p_sell = pool
+        .calculate_price(pool.assets[1].address, pool.assets[0].address)
+        .unwrap();
+    let p_buy = pool
+        .calculate_price(pool.assets[0].address, pool.assets[1].address)
+        .unwrap();
+    let p_cross = pool
+        .calculate_price(pool.assets[1].address, pool.assets[2].address)
+        .unwrap();
+    assert!(p_sell > 0.0 && p_buy > 0.0 && p_cross > 0.0);
+
+    // SELL 死：maxIn=0 → spot(i→0)=0，跨资产输入侧死；BUY 不受影响
+    pool.max_inputs[1] = Some(U256::ZERO);
+    assert_eq!(
+        pool.calculate_price(pool.assets[1].address, pool.assets[0].address)
+            .unwrap(),
+        0.0
+    );
+    assert_eq!(
+        pool.calculate_price(pool.assets[1].address, pool.assets[2].address)
+            .unwrap(),
+        0.0
+    );
+    assert!(
+        pool.calculate_price(pool.assets[0].address, pool.assets[1].address)
+            .unwrap()
+            > 0.0
+    );
+    pool.max_inputs[1] = None;
+
+    // BUY 死：buy_ladder_remaining=0 → spot(0→j)=0，跨资产输出侧死；SELL 不受影响
+    pool.buy_ladder_remaining[2] = Some(U256::ZERO);
+    assert_eq!(
+        pool.calculate_price(pool.assets[0].address, pool.assets[2].address)
+            .unwrap(),
+        0.0
+    );
+    assert_eq!(
+        pool.calculate_price(pool.assets[1].address, pool.assets[2].address)
+            .unwrap(),
+        0.0
+    );
+    assert!(
+        pool.calculate_price(pool.assets[2].address, pool.assets[0].address)
+            .unwrap()
+            > 0.0
+    );
+    pool.buy_ladder_remaining[2] = None;
+
+    // maxOut=0 同语义；未知（None）不门控，与 96% 兜底口径一致
+    pool.max_outputs[2] = Some(U256::ZERO);
+    assert_eq!(
+        pool.calculate_price(pool.assets[0].address, pool.assets[2].address)
+            .unwrap(),
+        0.0
+    );
+    pool.max_outputs[2] = None;
+    assert!(
+        pool.calculate_price(pool.assets[0].address, pool.assets[2].address)
+            .unwrap()
+            > 0.0
+    );
 }

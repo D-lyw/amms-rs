@@ -126,6 +126,18 @@ pub const BINARYFI_UPDATE_SELECTOR: [u8; 4] = [0x02, 0x4b, 0x94, 0xf6];
 /// update calldata 总长度（实测 452B）= selector(4) + head 6 words(192) +
 /// data0..2(96) + data_len(32) + sig_len(32) + sig(96)
 pub const BINARYFI_UPDATE_CALLDATA_LEN: usize = 4 + 32 * 6 + 96 + 32 + 32 + 96;
+/// binaryFI 报价时效窗口（块数）：引擎 per-asset `lastUpdateBlock`（mapping
+/// keccak256(assetId,9) 槽 +0）后链上 `pool.quote()` 仅在本窗口内有效，超过
+/// `price_updated_block + BINARYFI_QUOTE_TTL_BLOCKS` 的块返回 0（内部 0x6ee50667
+/// revert 0x86fa3e43，外层 quote 捕获转 0，非 revert）。
+/// 链上逐块实测（67430640 起）：NVDAx(lastUpdate=67430638) 在 diff 2~5 正常、
+/// diff=6 起归 0；SPYx(lastUpdate=67430639) 在 diff 1~5 正常、diff=6 归 0；
+/// asset2/3 每 1~3 块就被 MM 重新 update（asset2: 67430640/42/43/48…，
+/// asset3: 67430640/44/47/48…），5 块窗口从不过期——这就是“差 8 块仍新鲜”
+/// 的真相（67430648 时真实 lastUpdate 已是 67430643/67430647），并非时效更长。
+/// 本地用模块自身数据 `price_updated_block`（L2 用 calldata 注入块号、L3 用
+/// 事件块号）与 `last_synced_block` 判定，不引入墙钟 TTL。
+pub const BINARYFI_QUOTE_TTL_BLOCKS: u64 = 5;
 /// 单笔输出截断比例（96% 池子余额，本地近似）
 pub const BINARYFI_MAX_OUTPUT_BPS: u64 = 9600;
 /// USDT0 的引擎报价默认值（2 位小数定点）
@@ -233,10 +245,17 @@ pub struct BinaryFiPropPool {
     #[serde(default)]
     pub sell_ladders: Vec<Option<Vec<(u32, u32)>>>,
     /// 每资产 BUY 多档阶梯（L2 update calldata data1 解析；weight 已折算内部单位）。
-    /// BUY 线性区用首档 ask（= price + w1），封顶 = Σqty×R（快照大额 probe 观测）；
-    /// 此字段用于封顶交叉校验与诊断，BUY 报价不直接消费逐档。
+    /// BUY 线性区用首档 ask（= price + w1），封顶 = Σqty×R（链上实测：asset2
+    /// in≥5e10 平顶 62,000,000 = (767+1150+1183)×20000，逐位一致）。
+    /// 报价路径通过 `buy_ladder_remaining` 消费逐档容量。
     #[serde(default)]
     pub buy_ladders: Vec<Option<Vec<(u32, u32)>>>,
+    /// 每资产 BUY 剩余阶梯容量（= Σqty×R，随 Swap 消费递减；update 重置）。
+    /// update 路径由 `buy_ladders × ladder_reserves` 精确推导；快照路径取大额
+    /// probe 观测的 maxOut；`None` = 未知（不截断）。BUY 报价封顶优先取它，
+    /// 其次才用快照 `max_outputs`。
+    #[serde(default)]
+    pub buy_ladder_remaining: Vec<Option<U256>>,
     /// 每资产引擎阶梯储备 R（quote 内部使用；与金库余额不同，链上长期稳定、
     /// 不随 Swap 变化）。由快照大额 probe（100 整枚 SELL 封顶）+ ladder 反推；
     /// `None` = 未知（ladder 路径不可用，回退单档线性）
@@ -538,6 +557,23 @@ impl BinaryFiPropPool {
         if let Some(l) = self.buy_ladders.get_mut(asset_idx) {
             *l = decode(data1);
         }
+        // BUY 阶梯容量重置：Σqty×R（R 已知时；链上实测 asset2 平顶 = Σqty×R）。
+        // 之后由 Swap 事件逐笔消费（见 anchor_rate），直到下一次 update 重置。
+        if asset_idx != 0 {
+            if let (Some(ladder), Some(r)) = (
+                self.buy_ladders.get(asset_idx).cloned().flatten(),
+                self.ladder_reserves.get(asset_idx).copied().flatten(),
+            ) {
+                if !ladder.is_empty() && !r.is_zero() {
+                    let total: Option<U256> = ladder.iter().try_fold(U256::ZERO, |acc, &(_, q)| {
+                        acc.checked_add(U256::from(q).checked_mul(r)?)
+                    });
+                    if let Some(v) = self.buy_ladder_remaining.get_mut(asset_idx) {
+                        *v = total.filter(|t| !t.is_zero());
+                    }
+                }
+            }
+        }
     }
 
     /// SELL（i→USDT0）输出：ladder + 引擎储备 R 已知时多档阶梯逐位复刻；
@@ -733,6 +769,15 @@ impl BinaryFiPropPool {
         if let Some(r) = self.reserves.get_mut(j) {
             *r = r.saturating_sub(amount_out);
         }
+        // BUY 阶梯容量消费：0→j（及跨资产第二段）消耗 j 的 BUY 容量，
+        // 与链上 swap 消耗 ladder 一致；直到下一次 update/快照重置。
+        if j != 0 {
+            if let Some(rem) = self.buy_ladder_remaining.get_mut(j) {
+                if let Some(r) = rem.as_mut() {
+                    *r = r.saturating_sub(amount_out);
+                }
+            }
+        }
         if !self.price0_calibrated {
             if let Some(p0) = self.implied_price0(i, j, amount_in, amount_out) {
                 if !p0.is_zero() {
@@ -835,6 +880,13 @@ impl BinaryFiPropPool {
         if i >= self.assets.len() || j >= self.assets.len() {
             return None;
         }
+        // binaryFI 链上时效：引擎 update 后 quote 仅在 5 块窗口内有效，过期后
+        // pool.quote() 返回 0（链上实测，非 revert）。用模块自身数据
+        // price_updated_block（update calldata 注入块号）与 last_synced_block
+        // 判定；price_updated_block == 0（快照/锚定路径）不判过期。
+        if !self.asset_price_fresh(j) || (i != 0 && !self.asset_price_fresh(i)) {
+            return Some(U256::ZERO);
+        }
         // 引擎侧该资产买入被禁用（0→j quote 恒为 0）
         if self.buy_disabled.get(j).copied().unwrap_or(false) {
             return Some(U256::ZERO);
@@ -878,19 +930,59 @@ impl BinaryFiPropPool {
         }
     }
 
+    /// 资产价格是否在链上时效窗口内（最后 update 后 ≤ BINARYFI_QUOTE_TTL_BLOCKS 块）。
+    /// `price_updated_block == 0`（无 update 日志佐证）不判过期；过期后链上
+    /// quote 返回 0，本地同步返回 0，避免用过期价格算出幻影利润。
+    fn asset_price_fresh(&self, asset_idx: usize) -> bool {
+        match self
+            .price_updated_block
+            .get(asset_idx)
+            .copied()
+            .unwrap_or(0)
+        {
+            0 => true,
+            updated => self.last_synced_block.saturating_sub(updated) <= BINARYFI_QUOTE_TTL_BLOCKS,
+        }
+    }
+
     /// BUY（0→j）输出应用引擎阶梯上限：
     ///   - 超阈值归零型（大额 probe = 0，阶梯容量 > 金库余额）：
     ///     linear ≤ 金库余额才返回，否则 0
     ///   - 饱和型（maxOut 已知）：`min(linear, maxOut)`
     ///   - 未知：不截断（保持线性）
     fn buy_capped(&self, j: usize, linear: U256) -> U256 {
+        // 归零型：阶梯容量 > 金库余额，maxOut 不可观测；linear ≤ 金库才返回
+        // （与 max_outputs 互斥：apply_snapshot 置归零型时 maxOut 恒为 None）
         if self.buy_zero_over_vault.get(j).copied().unwrap_or(false) {
             let vault = self.reserves.get(j).copied().unwrap_or(U256::ZERO);
             return if linear <= vault { linear } else { U256::ZERO };
         }
-        match self.max_outputs.get(j).copied().flatten() {
+        // maxOut 未知时 capped = linear；归零型（buy_zero_over_vault）等价于
+        // maxOut = ∞（capped = linear），已在上方分支处理。
+        // 封顶优先取 buy_ladder_remaining（update 路径 Σqty×R 精确、随 Swap 消费
+        // 递减），其次快照观测的 max_outputs。
+        let capped = match self
+            .buy_ladder_remaining
+            .get(j)
+            .copied()
+            .flatten()
+            .or_else(|| self.max_outputs.get(j).copied().flatten())
+        {
             Some(m) => linear.min(m),
             None => linear,
+        };
+        // 实时金库零门槛：**封顶后**输出超出当前金库余额 → 链上归零。
+        //  - 饱和型：min(linear, maxOut) > vault → 0（NVDAx 金库被抽干后
+        //    maxOut=1.301e18 > vault≈1.07e12，链上 quote 恒 0，本地不得继续
+        //    按快照 maxOut 报价制造幻影利润）
+        //  - 饱和型且 maxOut ≤ vault：min(linear, maxOut) 正常返回（锚点块
+        //    5 资产实测：linear > vault 但链上仍返回 maxOut）
+        // 金库未知（0）时不门控，与 capped_out 的"余额未知不截断"一致。
+        let vault = self.reserves.get(j).copied().unwrap_or(U256::ZERO);
+        if !vault.is_zero() && capped > vault {
+            U256::ZERO
+        } else {
+            capped
         }
     }
 
@@ -903,7 +995,12 @@ impl BinaryFiPropPool {
         }
         let max_in = |k: usize| self.max_inputs.get(k).copied().flatten().is_some();
         let max_out = |k: usize| {
-            self.max_outputs.get(k).copied().flatten().is_some()
+            self.buy_ladder_remaining
+                .get(k)
+                .copied()
+                .flatten()
+                .is_some()
+                || self.max_outputs.get(k).copied().flatten().is_some()
                 || self.buy_zero_over_vault.get(k).copied().unwrap_or(false)
         };
         if j == 0 {
@@ -929,10 +1026,28 @@ impl BinaryFiPropPool {
         if i >= n || j >= n || i == j {
             return None;
         }
+        // 时效门控与 engine_quote 一致：过期资产不可达，输出上限 = 0
+        if !self.asset_price_fresh(j) || (i != 0 && !self.asset_price_fresh(i)) {
+            return Some(U256::ZERO);
+        }
         let out_ceiling = if self.buy_zero_over_vault.get(j).copied().unwrap_or(false) {
             Some(self.reserves.get(j).copied().unwrap_or(U256::ZERO))
         } else {
-            self.max_outputs.get(j).copied().flatten()
+            // 饱和型同样受实时金库约束（buy_capped 零门槛）：可达上限 =
+            // min(maxOut, 当前金库)；maxOut 优先取 buy_ladder_remaining
+            match self
+                .buy_ladder_remaining
+                .get(j)
+                .copied()
+                .flatten()
+                .or_else(|| self.max_outputs.get(j).copied().flatten())
+            {
+                Some(m) => match self.reserves.get(j).copied().filter(|r| !r.is_zero()) {
+                    Some(v) => Some(m.min(v)),
+                    None => Some(m),
+                },
+                None => None,
+            }
         };
         if j == 0 {
             if let Some(cap) = self.sell_cap(i) {
@@ -963,7 +1078,7 @@ impl BinaryFiPropPool {
     /// （不做 quote 锚定，避免 1-ulp 放大误差）；同时从大额 probe 恢复 BUY maxOut
     /// （饱和型直接取 q_big，归零型标记 `buy_zero_over_vault`）与 SELL maxIn
     /// （100 整枚 probe 反推）。
-    pub(crate) fn apply_snapshot(&mut self, snap: &Snapshot, snap_block: u64) -> usize {
+    pub fn apply_snapshot(&mut self, snap: &Snapshot, snap_block: u64) -> usize {
         let mut derived = 0usize;
         if !snap.assets.is_empty() {
             self.assets = snap
@@ -998,6 +1113,7 @@ impl BinaryFiPropPool {
         self.max_inputs.resize(n, None);
         self.sell_ladders.resize(n, None);
         self.buy_ladders.resize(n, None);
+        self.buy_ladder_remaining.resize(n, None);
         self.ladder_reserves.resize(n, None);
         self.reserves.resize(n, U256::ZERO);
         self.rates.resize(n * n, Rate::zero());
@@ -1034,6 +1150,7 @@ impl BinaryFiPropPool {
         let mut j0_out: Vec<Option<U256>> = vec![None; n];
         let mut zj_out: Vec<Option<U256>> = vec![None; n];
         let mut big_out: Vec<Option<U256>> = vec![None; n];
+        let mut mid_out: Vec<Option<U256>> = vec![None; n];
         let mut big_sell_out: Vec<Option<U256>> = vec![None; n];
         for (k, pair) in snap.quotePairs.iter().enumerate() {
             if k >= snap.quotes.len() || !snap.quotes[k].success {
@@ -1041,6 +1158,14 @@ impl BinaryFiPropPool {
             }
             let p = pair.to::<usize>();
             let nn = n * n;
+            if p >= 3 * nn {
+                // (0→j) 中额报价（10^(d0+3)，1000x 小额）：检测非单调阶梯退化
+                let j = p - 3 * nn;
+                if j > 0 && j < n {
+                    mid_out[j] = Some(snap.quotes[k].amountOut);
+                }
+                continue;
+            }
             if p >= 2 * nn {
                 // (j→0) 100 整枚报价：恢复 SELL 侧 maxIn
                 let j = p - 2 * nn;
@@ -1258,12 +1383,33 @@ impl BinaryFiPropPool {
                     if qb.is_zero() {
                         self.buy_zero_over_vault[j] = true;
                         self.max_outputs[j] = None;
+                        self.buy_ladder_remaining[j] = None;
                     } else if qb < qs.checked_mul(U256::from(10_000)).unwrap_or(U256::MAX) {
-                        self.max_outputs[j] = Some(qb);
-                        self.buy_zero_over_vault[j] = false;
+                        // 阶梯退化检测：mid probe（1000x 小额，仍在线性区）输出
+                        // > big probe 输出 → 曲线非单调回落（NVDAx 实测：1e9→
+                        // 4.456e18 线性、≥5e9 骤降平顶 1.301e18），big 落在退化
+                        // 平顶区，不是全输入范围的有效 maxOut。若用其截断线性区
+                        // 会低估 66%（in=867,053,194 本地 1.301e18 vs 链上 3.863e18）。
+                        // 清掉 maxOut，线性区报价恢复；超大额由 buy_capped 的
+                        // 实时金库零门槛兜底（防幻影利润）。
+                        let degenerate = mid_out[j].is_some_and(|qm| !qm.is_zero() && qm > qb);
+                        if degenerate {
+                            self.max_outputs[j] = None;
+                            self.buy_zero_over_vault[j] = false;
+                            // 退化平顶不是有效 maxOut；但 update 推导的 Σqty×R
+                            // 是精确容量（asset2 实测），保留作为封顶
+                        } else {
+                            self.max_outputs[j] = Some(qb);
+                            self.buy_zero_over_vault[j] = false;
+                            // 快照容量权威：饱和型 probe 直接观测当前 maxOut，
+                            // 覆盖（可能已过时的）update 推导剩余容量
+                            self.buy_ladder_remaining[j] = Some(qb);
+                        }
                     } else {
                         self.max_outputs[j] = None;
                         self.buy_zero_over_vault[j] = false;
+                        // 大额 probe 未饱和：无容量信息，保留 update 推导的
+                        // Σqty×R（精确容量，asset2 实测大额 probe 不饱和）
                     }
                 }
             }
@@ -1353,6 +1499,50 @@ impl BinaryFiPropPool {
                     .iter()
                     .fold(U256::ZERO, |acc, &(_, q)| acc + U256::from(q));
                 self.max_inputs[j] = Some(total * r);
+            } else {
+                // 闭式候选未命中（100 整枚 probe 未饱和时总容量 > 输入，
+                // 饱和公式失效）→ 单调二分求解：out(R) 关于 R 单调不减
+                // （每档 consume = min(rem_k, q_k×R)），下界 = 闭式饱和解
+                // base（未饱和时实际输出 ≤ 饱和输出 → 真 R ≥ base），
+                // 上界倍增到 out(R) ≥ q_big，再二分最小命中 R（逐位一致）。
+                let probe_in = U256::from(100u64)
+                    .checked_mul(p10a(dj))
+                    .unwrap_or(U256::ZERO);
+                if !probe_in.is_zero() {
+                    let mut lo = base;
+                    let mut hi = base.max(U256::from(1));
+                    for _ in 0..256 {
+                        let out_hi =
+                            ladder_sell_out(p, &ladder, hi, probe_in, d0, dj).unwrap_or(U256::ZERO);
+                        if out_hi >= qb {
+                            break;
+                        }
+                        match hi.checked_mul(U256::from(2)) {
+                            Some(h) => hi = h,
+                            None => {
+                                hi = U256::MAX;
+                                break;
+                            }
+                        }
+                    }
+                    while lo < hi {
+                        let mid = lo + (hi - lo) / U256::from(2);
+                        let out_mid = ladder_sell_out(p, &ladder, mid, probe_in, d0, dj)
+                            .unwrap_or(U256::ZERO);
+                        if out_mid < qb {
+                            lo = mid + U256::from(1);
+                        } else {
+                            hi = mid;
+                        }
+                    }
+                    if ladder_sell_out(p, &ladder, lo, probe_in, d0, dj) == Some(qb) {
+                        self.ladder_reserves[j] = Some(lo);
+                        let total: U256 = ladder
+                            .iter()
+                            .fold(U256::ZERO, |acc, &(_, q)| acc + U256::from(q));
+                        self.max_inputs[j] = Some(total * lo);
+                    }
+                }
             }
         }
 
@@ -1613,7 +1803,19 @@ impl AutomatedMarketMaker for BinaryFiPropPool {
                 );
                 return Ok(SyncAction::None);
             }
-            // canonical 路径无 raw bytes：标记 stale，交由 update() 批量刷新
+            // canonical 路径无 raw bytes：标记 stale，交由 update() 批量刷新；
+            // 时效时钟仍以本事件块号推进——链上引擎每次 update 交易都会写
+            // per-asset lastUpdateBlock（即使价格/ladder 不变，实测 67430645/47
+            // 两笔相同 NVDAx update 都刷新了），仅靠快照不会刷新时效，若此处不
+            // 推进，时效门控在 canonical 路径会整体失效（用快照价格算出链上已
+            // 过期=0 的幻影利润）。asset2/3 每 1~3 块被 MM 重新 update，5 块窗口
+            // 从不过期（“差 8 块仍新鲜”= 67430648 时真实 lastUpdate 已是
+            // 67430643/67430647）；NVDAx/SPYx 更新间隔长，diff=6 起链上 quote=0。
+            if let Some(ev_block) = log.block_number {
+                if let Some(updated) = self.price_updated_block.get_mut(asset_idx) {
+                    *updated = (*updated).max(ev_block);
+                }
+            }
             self.mark_stale_for_asset(asset_idx);
             return Ok(SyncAction::AsyncUpdate);
         }
@@ -1661,6 +1863,30 @@ impl AutomatedMarketMaker for BinaryFiPropPool {
             .copied()
             .unwrap_or_default();
         if rate.is_zero() {
+            return Ok(0.0);
+        }
+        // 时效：任一端价格过期 → 池子不可交易（链上 quote 返回 0）
+        if !self.asset_price_fresh(i) || !self.asset_price_fresh(j) {
+            return Ok(0.0);
+        }
+        // 方向可交易性（spot 与 simulate_swap/链上 quote 对齐）：链上该方向容量
+        // 恒为 0 时 quote 恒 0，spot 也必须为 0，避免 multihop/2hop 预过滤把
+        // 已死方向排高（最终 sim 虽会剪掉，但白占候选位）。
+        //   - SELL（j==0）：maxIn = ladderWeight_sell×engineReserve == 0（MM
+        //     只买不卖/引擎储备归零）；快照路径 prices 已清零天然为 0，L2 路径
+        //     prices 来自 calldata 非零，此处补齐门控
+        //   - BUY（i==0）：buy_ladder_remaining（Σqty×R）或快照 maxOut == 0
+        //   - 跨资产：输入侧 SELL 或输出侧 BUY 任一为死方向 → 0
+        // 未知（None）不门控：与 ladder_cap_known/96% 兜底口径一致。
+        let sell_dead = |k: usize| self.max_inputs.get(k).copied().flatten() == Some(U256::ZERO);
+        let buy_dead = |k: usize| {
+            self.buy_ladder_remaining.get(k).copied().flatten() == Some(U256::ZERO)
+                || self.max_outputs.get(k).copied().flatten() == Some(U256::ZERO)
+        };
+        if (j == 0 && sell_dead(i))
+            || (i == 0 && buy_dead(j))
+            || (i != 0 && j != 0 && (sell_dead(i) || buy_dead(j)))
+        {
             return Ok(0.0);
         }
         let di = self.assets[i].decimals as i32;
@@ -1855,9 +2081,14 @@ impl AutomatedMarketMaker for BinaryFiPropPool {
                 }
             }
         }
-        let mut big_quote_pairs = Vec::with_capacity(BINARYFI_ASSET_COUNT - 1);
+        // 11 对 (0→j) 大额（1e10，锁定 ask + BUY maxOut）+ 11 对中额
+        // （1e9，检测非单调阶梯退化）
+        let mut big_quote_pairs = Vec::with_capacity(2 * (BINARYFI_ASSET_COUNT - 1));
         for j in 1..BINARYFI_ASSET_COUNT {
             big_quote_pairs.push(U256::from(BINARYFI_ASSET_COUNT * BINARYFI_ASSET_COUNT + j));
+            big_quote_pairs.push(U256::from(
+                3 * BINARYFI_ASSET_COUNT * BINARYFI_ASSET_COUNT + j,
+            ));
         }
         // 11 对 (j→0) 100 整枚大额报价：恢复 SELL 侧 maxIn 上限
         let mut big_sell_pairs = Vec::with_capacity(BINARYFI_ASSET_COUNT - 1);
@@ -1954,6 +2185,7 @@ impl BinaryFiPropPool {
             let (i, j) = self.pair_indices(p);
             if i == 0 && j != 0 {
                 big_quote_pairs.push(U256::from(n * n + j));
+                big_quote_pairs.push(U256::from(3 * n * n + j));
             }
             if i != 0 && j == 0 {
                 big_sell_pairs.push(U256::from(2 * n * n + i));
@@ -2056,6 +2288,7 @@ impl Default for BinaryFiPropPool {
             price_updated_block: Vec::new(),
             sell_ladders: Vec::new(),
             buy_ladders: Vec::new(),
+            buy_ladder_remaining: Vec::new(),
             ladder_reserves: Vec::new(),
             price0_calibrated: false,
         }
