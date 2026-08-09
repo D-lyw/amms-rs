@@ -161,31 +161,31 @@ fn test_enrich_update_log_data() {
     );
 }
 
-/// L2 完整应用：price + ladder 点差（新引擎 1999/2000 因子，链上逐位对拍）：
+/// L2 完整应用：price + ladder 点差（新引擎 999/1000 因子，链上逐位对拍）：
 ///   - SKHYx（index 1）：price=13984，ask 字段=3、sell 字段=3 →
-///     bid_offset = ceil(13984/2000)+3 = 10 → bid=13974；ask=13987
+///     bid_offset = ceil(13984/1000)+3 = 17 → bid=13967；ask=13987
 ///   - asset2（index 2，scale=100000）：price=640774，raw 252/252 →
-///     ask_off=2520、sell_off=2520 → bid_offset = ceil(6407740/2000)+2520 = 5724
+///     ask_off=2520、sell_off=2520 → bid_offset = ceil(6407740/1000)+2520 = 8928
 #[test]
 fn test_apply_l2_update_spread_and_scale() {
     let mut pool = test_pool();
     // SKHYx（index 1，dj=18，scale=10000 默认）
     pool.apply_l2_update(1, U256::from(13_984u64), 100, 3, 3);
     assert_eq!(pool.prices[1], U256::from(13_984u64));
-    assert_eq!(pool.bid_price(1).unwrap(), U256::from(13_974u64));
+    assert_eq!(pool.bid_price(1).unwrap(), U256::from(13_967u64));
     assert_eq!(pool.ask_price(1).unwrap(), U256::from(13_987u64));
-    // q0j = floor(1e20×1999/(2000×13987))，链上 0→SKHYx in=1e6 逐位对拍
+    // q0j = floor(1e20×999/(1000×13987))，链上 0→SKHYx in=1e6 逐位对拍
     assert_eq!(
         pool.q0j[1],
-        Some(U256::from_str_radix("7145921212554514", 10).unwrap())
+        Some(U256::from_str_radix("7142346464574247", 10).unwrap())
     );
     let out = pool.engine_quote(0, 1, U256::from(1_000_000u64)).unwrap();
-    assert_eq!(out, U256::from_str_radix("7145921212554514", 10).unwrap());
-    // SELL：SKHYx→0 in=1e15 → 139,740（链上逐位对拍）
+    assert_eq!(out, U256::from_str_radix("7142346464574247", 10).unwrap());
+    // SELL：SKHYx→0 in=1e15 → 139,670（链上逐位对拍）
     assert_eq!(
         pool.engine_quote(1, 0, U256::from(1_000_000_000_000_000u64))
             .unwrap(),
-        U256::from(139_740u64)
+        U256::from(139_670u64)
     );
 
     // asset2：scale=100000，raw 252 → 实际 2520
@@ -206,11 +206,11 @@ fn test_apply_l2_update_spread_and_scale() {
     pool.apply_l2_update(2, U256::from(640_774u64), 100, 252, 252);
     // 内部价格 = 640,774 × 100000/10000 = 6,407,740
     assert_eq!(pool.prices[2], U256::from(6_407_740u64));
-    assert_eq!(pool.spreads[2], 8244);
+    assert_eq!(pool.spreads[2], 11448);
     assert_eq!(pool.ask_price(2).unwrap(), U256::from(6_410_260u64));
-    assert_eq!(pool.bid_price(2).unwrap(), U256::from(6_402_016u64));
-    // q0j = floor(10^10×1999/(2000×6,410,260)) = 1559（dj=8）
-    assert_eq!(pool.q0j[2], Some(U256::from(1559u64)));
+    assert_eq!(pool.bid_price(2).unwrap(), U256::from(6_398_812u64));
+    // q0j = floor(10^10×999/(1000×6,410,260)) = 1558（dj=8）
+    assert_eq!(pool.q0j[2], Some(U256::from(1558u64)));
 }
 
 fn test_enrich_wrong_tx_hash_returns_none() {
@@ -292,18 +292,18 @@ fn test_swap_event_anchors_rate_and_reserves() {
 fn test_price_update_is_idempotent_set() {
     let mut pool = test_pool();
     pool.apply_l2_update(1, U256::from(13_984u64), 100, 3, 3);
-    // 0→SKHYx：rate = q0j/10^6 = 7,145,921,212,554,514 / 1e6
+    // 0→SKHYx：rate = q0j/10^6 = 7,142,346,464,574,247 / 1e6
     let rate = pool.rates[pool.pair_index(0, 1)];
     assert_eq!(
         rate.num,
-        U256::from_str_radix("7145921212554514", 10).unwrap()
+        U256::from_str_radix("7142346464574247", 10).unwrap()
     );
     assert_eq!(rate.den, U256::from(1_000_000u64));
-    // SKHYx→0：raw = 13984×1999 − 3×2000 = 27,948,016，
-    // rate = raw×10^4/(2000×10^18) = 27,948,016/(2×10^17)
+    // SKHYx→0：raw = 13984×999 − 3×1000 = 13,967,016，
+    // rate = raw×10^4/(1000×10^18) = 13,967,016/(1×10^17)
     let rate_ba = pool.rates[pool.pair_index(1, 0)];
-    assert_eq!(rate_ba.num, U256::from(27_948_016u64));
-    assert_eq!(rate_ba.den, U256::from(200_000_000_000_000_000u64));
+    assert_eq!(rate_ba.num, U256::from(13_967_016u64));
+    assert_eq!(rate_ba.den, U256::from(100_000_000_000_000_000u64));
 
     // 重复同 price 更新：费率不变（幂等）
     pool.apply_l2_update(1, U256::from(13_984u64), 101, 3, 3);
@@ -316,7 +316,7 @@ fn test_simulate_swap_matches_onchain_sample() {
     let mut pool = test_pool();
     // 新引擎锚点：SKHYx price=13984/askOff=3/sellOff=3（链上逐位对拍）
     pool.apply_l2_update(1, U256::from(13_984u64), 100, 3, 3);
-    // BUY 小额：0→SKHYx in=1e6 → q0j = 7,145,921,212,554,514
+    // BUY 小额：0→SKHYx in=1e6 → q0j = 7,142,346,464,574,247
     let out = pool
         .simulate_swap(
             pool.assets[0].address,
@@ -324,9 +324,9 @@ fn test_simulate_swap_matches_onchain_sample() {
             U256::from(1_000_000u64),
         )
         .unwrap();
-    assert_eq!(out, U256::from_str_radix("7145921212554514", 10).unwrap());
-    // SELL：SKHYx→0 in=1e18 → 139,740,080
-    // （精确有理数 raw=27,948,016，含 raw/2000 小数部分；整数 bid=13,974 会低估 80）
+    assert_eq!(out, U256::from_str_radix("7142346464574247", 10).unwrap());
+    // SELL：SKHYx→0 in=1e18 → 139,670,160
+    // （精确有理数 raw=13,967,016，含 raw/1000 小数部分；整数 bid=13,967 会低估 160）
     let sell = pool
         .simulate_swap(
             pool.assets[1].address,
@@ -334,7 +334,7 @@ fn test_simulate_swap_matches_onchain_sample() {
             U256::from(1_000_000_000_000_000_000u64),
         )
         .unwrap();
-    assert_eq!(sell, U256::from(139_740_080u64));
+    assert_eq!(sell, U256::from(139_670_160u64));
 
     // 大额 linear > 金库余额 → 实时金库零门槛归零（链上实测：linear 超金库即 0）
     let huge = pool
@@ -348,9 +348,9 @@ fn test_simulate_swap_matches_onchain_sample() {
 }
 
 /// SELL 阶梯上限：maxIn 截断。新引擎因子：
-///   - price=15005/askOff=4/sellOff=4 → bid_offset=ceil(15005/2000)+4=12 → bid=14993
-///   - in=1e18（< maxIn）：149,930,000（线性）
-///   - in=1e20 / 1e24（> maxIn）：3,682,100,884（饱和 = maxIn × bid × 1e-14）
+///   - price=15005/askOff=4/sellOff=4 → bid_offset=ceil(15005/1000)+4=20 → bid=14985
+///   - in=1e18（< maxIn）：149,859,950（线性）
+///   - in=1e20 / 1e24（> maxIn）：3,680,380,540（饱和 = maxIn × bid × 1e-14）
 #[test]
 fn test_engine_quote_sell_cap_matches_onchain() {
     let mut pool = test_pool();
@@ -365,8 +365,8 @@ fn test_engine_quote_sell_cap_matches_onchain() {
     // USDT0 金库余额调大，避免超容量归零（本测试只验证 maxIn 饱和截断）
     pool.reserves[0] = U256::from(10u64.pow(15));
 
-    // 线性区（in=1e18 < maxIn）：out = in×raw×1e4/(2000×1e18)
-    // raw = 15005×1999 − 4×2000 = 29,986,995 → out(1e18) = 149,934,975
+    // 线性区（in=1e18 < maxIn）：out = in×raw×1e4/(1000×1e18)
+    // raw = 15005×999 − 4×1000 = 14,985,995 → out(1e18) = 149,859,950
     let out = pool
         .simulate_swap(
             pool.assets[1].address,
@@ -374,9 +374,9 @@ fn test_engine_quote_sell_cap_matches_onchain() {
             U256::from(10u64.pow(18)),
         )
         .unwrap();
-    assert_eq!(out, U256::from(149_934_975u64));
+    assert_eq!(out, U256::from(149_859_950u64));
 
-    // 饱和区：in=1e20 与 1e24 均为 min(in, maxIn)×raw×1e4/(2000×1e18)
+    // 饱和区：in=1e20 与 1e24 均为 min(in, maxIn)×raw×1e4/(1000×1e18)
     let out = pool
         .simulate_swap(
             pool.assets[1].address,
@@ -384,7 +384,7 @@ fn test_engine_quote_sell_cap_matches_onchain() {
             U256::from(10u128.pow(20)),
         )
         .unwrap();
-    assert_eq!(out, U256::from(3_682_223_064u64));
+    assert_eq!(out, U256::from(3_680_380_540u64));
     let out = pool
         .simulate_swap(
             pool.assets[1].address,
@@ -392,7 +392,33 @@ fn test_engine_quote_sell_cap_matches_onchain() {
             U256::from(10u128.pow(24)),
         )
         .unwrap();
-    assert_eq!(out, U256::from(3_682_223_064u64));
+    assert_eq!(out, U256::from(3_680_380_540u64));
+}
+
+/// P0 回归：BUY 费率先按 rem = in − in/1000 整数扣减再线性报价（非最后乘 999/1000）。
+/// 两笔生产失败套利交易的 binaryFI 池子 quote 逐位对拍：
+///   - 67475114 asset9 price=13649/askOff=4，in=44,291,018 → 324,080,619,644,034,278
+///   - 67476139 asset9 price=13684/askOff=5，in=122,156,425 → 891,476,871,940,974,505
+#[test]
+fn test_engine_quote_buy_rem_fee_matches_failed_tx_samples() {
+    let mut pool = test_pool();
+    pool.apply_l2_update(1, U256::from(13_649u64), 67_475_114, 4, 4);
+    let out = pool
+        .engine_quote(0, 1, U256::from(44_291_018u64))
+        .unwrap();
+    assert_eq!(
+        out,
+        U256::from_str_radix("324080619644034278", 10).unwrap()
+    );
+
+    pool.apply_l2_update(1, U256::from(13_684u64), 67_476_139, 5, 4);
+    let out = pool
+        .engine_quote(0, 1, U256::from(122_156_425u64))
+        .unwrap();
+    assert_eq!(
+        out,
+        U256::from_str_radix("891476871940974505", 10).unwrap()
+    );
 }
 
 /// BUY 阶梯上限：线性区 = q0j（in=1e6），饱和区 min(linear, maxOut)
@@ -409,7 +435,7 @@ fn test_engine_quote_buy_cap_matches_onchain() {
             U256::from(1_000_000u64),
         )
         .unwrap();
-    assert_eq!(out, U256::from_str_radix("7145921212554514", 10).unwrap());
+    assert_eq!(out, U256::from_str_radix("7142346464574247", 10).unwrap());
 
     for amt in [U256::from(1_000_000_000_000u64), U256::from(10u128.pow(24))] {
         let out = pool
@@ -424,7 +450,7 @@ fn test_engine_quote_buy_cap_matches_onchain() {
 }
 
 /// BUY 超阈值归零型（阶梯容量 > 金库余额）：linear ≤ 金库余额才返回，否则 0。
-/// 构造样例：xSOL dj=9，price=7376/askOff=3/sellOff=3 → ask=7379、q0j=13,545,195
+/// 构造样例：xSOL dj=9，price=7376/askOff=3/sellOff=3 → ask=7379、q0j=13,538,419
 #[test]
 fn test_engine_quote_buy_zero_over_vault() {
     let mut pool = test_pool();
@@ -446,36 +472,36 @@ fn test_engine_quote_buy_zero_over_vault() {
     pool.max_inputs.push(None);
     pool.reserves.push(U256::from(160_992_934u64));
     pool.apply_l2_update(2, U256::from(7_376u64), 100, 3, 3);
-    // BUY(1e6) = q0j = 13,545,195
+    // BUY(1e6) = q0j = 13,538,419
     assert_eq!(
         pool.engine_quote(0, 2, U256::from(1_000_000u64)).unwrap(),
-        U256::from(13_545_195u64)
+        U256::from(13_538_419u64)
     );
-    // 线性区：in=11,870,000 → 160,781,474 ≤ 金库 → 返回
+    // 线性区：in=11,870,000 → 160,701,043 ≤ 金库 → 返回
     assert_eq!(
         pool.engine_quote(0, 2, U256::from(11_870_000u64)).unwrap(),
-        U256::from(160_781_474u64)
+        U256::from(160_701_043u64)
     );
-    // 线性区边界：in=11,880,000 → 160,916,926 ≤ 金库 → 返回
+    // 线性区边界：in=11,880,000 → 160,836,427 ≤ 金库 → 返回
     assert_eq!(
         pool.engine_quote(0, 2, U256::from(11_880_000u64)).unwrap(),
-        U256::from(160_916_926u64)
+        U256::from(160_836_427u64)
     );
-    // 超阈值归零：in=11,900,000 → 161,187,830 > 金库 → 0
+    // 超阈值归零：in=11,900,000 → 161,107,196 > 金库 → 0
     assert_eq!(
         pool.engine_quote(0, 2, U256::from(11_900_000u64)).unwrap(),
         U256::ZERO
     );
-    // 跨资产两段式：SKHYx(1) → xSOL(2), in=5e16（第二段不含 1999/2000 因子）
+    // 跨资产两段式：SKHYx(1) → xSOL(2), in=5e16（第二段不含 999/1000 因子）
     pool.apply_l2_update(1, U256::from(13_984u64), 100, 3, 3);
-    // v = floor(5e16 × 27,948,016 × 1e4 / (2000×1e18)) = 6,987,004
-    // linear = floor(6,987,004 × 1e5 / 7379) = 94,687,681 ≤ 金库 → 返回
+    // v = floor(5e16 × 13,967,016 × 1e4 / (1000×1e18)) = 6,983,508
+    // linear = floor(6,983,508 × 1e5 / 7379) = 94,640,303 ≤ 金库 → 返回
     assert_eq!(
         pool.engine_quote(1, 2, U256::from(50_000_000_000_000_000u64))
             .unwrap(),
-        U256::from(94_687_681u64)
+        U256::from(94_640_303u64)
     );
-    // in=1e17：v = 13,974,008 → linear = 189,375,362 > 金库 → 0
+    // in=1e17：v = 13,967,016 → linear = 189,280,607 > 金库 → 0
     assert_eq!(
         pool.engine_quote(1, 2, U256::from(100_000_000_000_000_000u64))
             .unwrap(),
@@ -499,25 +525,25 @@ fn test_engine_quote_cross_two_stage() {
     pool.sell_raw.push(None);
     pool.rates = vec![Rate::zero(); n * n];
     pool.price_updated_block.push(0);
-    // asset4(2)：price=32481/askOff=18/sellOff=9 → ask=32499、raw4=64,911,519
+    // asset4(2)：price=32481/askOff=18/sellOff=9 → ask=32499、raw4=32,439,519
     pool.apply_l2_update(2, U256::from(32_481u64), 100, 18, 9);
     pool.apply_l2_update(1, U256::from(13_984u64), 100, 3, 3);
-    // SKHYx(1) -> asset4(2), in=1e18：两段式（第二段不含 1999/2000 因子）
-    // v = floor(1e18 × 27,948,016 × 1e4 / (2000×1e18)) = 139,740,080
-    // out = floor(139,740,080 × 1e14 / 32499) = 429,982,707,160,220,314
+    // SKHYx(1) -> asset4(2), in=1e18：两段式（第二段不含 999/1000 因子）
+    // v = floor(1e18 × 13,967,016 × 1e4 / (1000×1e18)) = 139,670,160
+    // out = floor(139,670,160 × 1e14 / 32499) = 429,767,562,078,833,194
     let out = pool
         .engine_quote(1, 2, U256::from(10u64.pow(18)))
         .expect("engine quote");
-    assert_eq!(out, U256::from_str_radix("429982707160220314", 10).unwrap());
-    // asset4(2) -> SKHYx(1)：raw4 = 32481×1999 − 9×2000 = 64,911,519
-    // v = floor(1e18 × 64,911,519 × 1e4 / (2000×1e18)) = 324,557,595
-    // out = floor(324,557,595 × 1e14 / 13987) = 2,320,423,214,413,383,856
+    assert_eq!(out, U256::from_str_radix("429767562078833194", 10).unwrap());
+    // asset4(2) -> SKHYx(1)：raw4 = 32481×999 − 9×1000 = 32,439,519
+    // v = floor(1e18 × 32,439,519 × 1e4 / (1000×1e18)) = 324,395,190
+    // out = floor(324,395,190 × 1e14 / 13987) = 2,319,262,100,521,913,205
     let out = pool
         .engine_quote(2, 1, U256::from(10u64.pow(18)))
         .expect("engine quote");
     assert_eq!(
         out,
-        U256::from_str_radix("2320423214413383856", 10).unwrap()
+        U256::from_str_radix("2319262100521913205", 10).unwrap()
     );
 }
 
@@ -621,16 +647,16 @@ fn test_sync_enriched_update_applies_price() {
     assert!(matches!(action, SyncAction::None));
     assert_eq!(pool.prices[1], U256::from(15005));
     assert_eq!(pool.price_updated_block[1], 0x400c944);
-    // 点差偏移 0/0 → raw = 15005×1999 = 29,994,995，
-    // rate(1→0) = raw×10^4/(2000×10^18) = 29,994,995/(2×10^17)
+    // 点差偏移 0/0 → raw = 15005×999 = 14,989,995，
+    // rate(1→0) = raw×10^4/(1000×10^18) = 14,989,995/(1×10^17)
     let rate_ba = pool.rates[pool.pair_index(1, 0)];
-    assert_eq!(rate_ba.num, U256::from(29_994_995u64));
-    assert_eq!(rate_ba.den, U256::from(200_000_000_000_000_000u64));
-    // BUY：q0j = floor(1e20×1999/(2000×15005))，rate(0→1) = q0j/1e6
+    assert_eq!(rate_ba.num, U256::from(14_989_995u64));
+    assert_eq!(rate_ba.den, U256::from(100_000_000_000_000_000u64));
+    // BUY：q0j = floor(1e20×999/(1000×15005))，rate(0→1) = q0j/1e6
     let rate = pool.rates[pool.pair_index(0, 1)];
     assert_eq!(
         rate.num,
-        U256::from_str_radix("6661112962345884", 10).unwrap()
+        U256::from_str_radix("6657780739753415", 10).unwrap()
     );
     assert_eq!(rate.den, U256::from(1_000_000u64));
 }
@@ -701,14 +727,14 @@ fn test_sync_canonical_update_advances_freshness_clock() {
     assert_eq!(pool.price_updated_block[1], 100);
 }
 
-/// BUY 低小数位资产：dj=4 < d0-2 时 q0j = floor(10^(dj+2)×1999/(2000×ask)) 很小，
+/// BUY 低小数位资产：dj=4 < d0-2 时 q0j = floor(10^(dj+2)×999/(1000×ask)) 很小，
 /// BUY 报价 = floor(in × q0j / 10^d0) 仍精确。
 #[test]
 fn test_engine_quote_buy_low_decimals_asset() {
     let mut pool = test_pool();
     pool.assets[1] =
         Token::new_with_decimals(address!("0x58100046a4afcd4ee4fadbd4244f3f895a341c56"), 4);
-    // ask = 15005 + 4 = 15009 → q0j = floor(1e6×1999/(2000×15009)) = 66
+    // ask = 15005 + 4 = 15009 → q0j = floor(1e6×999/(1000×15009)) = 66
     pool.apply_l2_update(1, U256::from(15_005u64), 100, 4, 4);
     let out = pool
         .engine_quote(0, 1, U256::from(1_000_000u64))
@@ -821,12 +847,12 @@ fn test_ladder_sell_tiers_asset6() {
     // 引擎储备 R = 29.4e15（链上反推），SELL 逐档输出与链上一致
     pool.ladder_reserves[2] = Some(U256::from(29_400_000_000_000_000u64));
     let cases: &[(u64, u64)] = &[
-        (1_000_000_000_000_00, 76_862),               // 1e14，首档内
-        (10_000_000_000_000_000, 7_686_254),          // 1e16
-        (1_000_000_000_000_000_000, 768_625_495),     // 1e18
-        (5_000_000_000_000_000_000, 3_843_087_511),   // 5e18，跨 2 档
-        (10_000_000_000_000_000_000, 7_685_995_104),  // 1e19，跨 3 档
-        (18_000_000_000_000_000_000, 13_827_464_262), // 1.8e19，跨 4 档
+        (1_000_000_000_000_00, 76_824),               // 1e14，首档内
+        (10_000_000_000_000_000, 7_682_409),          // 1e16
+        (1_000_000_000_000_000_000, 768_240_990),     // 1e18
+        (5_000_000_000_000_000_000, 3_841_165_086),   // 5e18，跨 2 档
+        (10_000_000_000_000_000_000, 7_682_150_304),  // 1e19，跨 3 档
+        (18_000_000_000_000_000_000, 13_820_554_332), // 1.8e19，跨 4 档
     ];
     for &(inp, expected) in cases {
         let out = pool
@@ -862,11 +888,11 @@ fn test_ladder_sell_tiers_asset6() {
     fallback.ladder_reserves.push(None);
     fallback.reserves[0] = U256::from(10_000_000_000_000_000u64);
     fallback.apply_l2_update(2, U256::from(76_925u64), 0x402fdb5, 4, 3);
-    // raw = 76925×1999 - 3×2000 = 153,767,075；out = in×raw×1e4/(2000×1e18)
+    // raw = 76925×999 - 3×1000 = 76,845,075；out = in×raw×1e4/(1000×1e18)
     let out = fallback
         .engine_quote(2, 0, U256::from(1_000_000_000_000_000u64))
         .expect("sell quote fallback");
-    assert_eq!(out, U256::from(768_835u64));
+    assert_eq!(out, U256::from(768_450u64));
 }
 
 /// P0 回归：饱和型 BUY 受实时金库零门槛约束 —— maxOut 来自快照时刻 probe，
@@ -902,9 +928,9 @@ fn test_buy_capped_saturating_vault_depleted_zeroes() {
     let linear = U256::from(1_000_000_000u64)
         .checked_mul(U256::from(10u64).pow(U256::from(20)))
         .unwrap()
-        .checked_mul(U256::from(1999))
+        .checked_mul(U256::from(999))
         .unwrap()
-        / (U256::from(2000u64) * U256::from(13_987u64) * U256::from(10u64).pow(U256::from(6)));
+        / (U256::from(1000u64) * U256::from(13_987u64) * U256::from(10u64).pow(U256::from(6)));
     assert_eq!(out, linear);
 }
 
@@ -1015,7 +1041,7 @@ fn test_sell_ladder_r_derived_when_probe_unsaturated() {
         ],
         quotes: vec![
             ok("1000000000000000"),     // 0→1 small（BUY 侧非本测试重点）
-            ok("14492"),                // 1→0 small：tier-1 线性 bid
+            ok("14485"),                // 1→0 small：tier-1 线性 bid
             ok("10000000000000000000"), // 0→1 big
             ok("14193000000"),          // 1→0 100 整枚：两档部分消费、未饱和
             ok("1000000000000000000"),  // 0→1 mid
@@ -1042,7 +1068,7 @@ fn test_sell_ladder_r_derived_when_probe_unsaturated() {
     let small = pool
         .engine_quote(1, 0, U256::from(10u64).pow(U256::from(14)))
         .unwrap();
-    assert_eq!(small, U256::from(14_492u64));
+    assert_eq!(small, U256::from(14_485u64));
     // 5e19 输入（跨两档）：与 ladder 逐档一致（recovered R 等价区 ±2 wei）
     let mid = pool
         .engine_quote(
@@ -1052,7 +1078,7 @@ fn test_sell_ladder_r_derived_when_probe_unsaturated() {
         )
         .unwrap();
     assert!(
-        mid >= U256::from(7_196_499_998u64) && mid <= U256::from(7_196_500_002u64),
+        mid >= U256::from(7_199_999_998u64) && mid <= U256::from(7_200_000_002u64),
         "mid-tier out={mid}"
     );
 }
