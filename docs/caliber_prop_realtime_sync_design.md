@@ -34,6 +34,8 @@
    不在核心路由堆协议分支（对账任务保留，解决回填不对称）。
 3. **fail-safe**：calldata 解码失败 / pairId 不在本地 / 断流 → 静默跳过，由低频对账快照纠正，
    绝不污染状态。
+4. **成功确认**：caliber 更新无事件，只能靠 receipt status 确认交易是否真正落地；
+   回滚（`status=0x0`）或 receipt 缺失（未确认）的更新一律不应用（2026-08-09 P0 修复）。
 4. **性能零头**：每块逐笔 RLP 定位 `to`（约 1µs/笔，实测每块 ~14 笔），命中 1-2 笔 ABI 解码，
    每块增量 <100µs。
 
@@ -42,7 +44,7 @@
 ```
 XLayer Flashblocks WS payload
   ├─ diff.transactions[]   (raw RLP 交易 hex，唯一能发现 caliber 更新的地方)
-  ├─ metadata.receipts     (只有带日志的交易，caliber 更新不在其中)
+  ├─ metadata.receipts     (键 = tx hash；含 status，用于 caliber 成功确认)
   └─ base/diff 块信息
         │
         ▼
@@ -50,8 +52,9 @@ extract_logs_from_xlayer_flashblock()          ← 现有：日志提取（不�
         │  新增（同函数内，与日志提取并行）：
         │    1) 遍历 diff.transactions，轻量 RLP 定位 to
         │    2) to ∈ caliber_contracts && input[0..4]==0x008dcc8e
-        │    3) ABI 解码 batchUpdateParameters → CaliberBatchUpdate[]
-        │    4) 结合 XlayerTxCountTracker 的 tx_base 得块内全局 tx_index
+        │    3) keccak256(raw) → 查 metadata.receipts，status != 0x1 → 丢弃
+        │    4) ABI 解码 batchUpdateParameters → CaliberBatchUpdate[]
+        │    5) 结合 XlayerTxCountTracker 的 tx_base 得块内全局 tx_index
         ▼
 apply_logs_for_block_timed() / StateSpace.sync()  ← 复用现有簿记
         │  新增 apply_caliber_updates()（与 apply_logs 同锁同序）：
@@ -165,6 +168,8 @@ start_caliber_prop_ladder_sync_task(降频保留)     ← 对账/兜底
 |---|---|
 | 块内多笔更新 | 按 tx_index 排序应用，后者覆盖（EVM 语义） |
 | calldata 解码失败 | 跳过该笔，不影响其他 pair；下次对账纠正 |
+| 更新交易回滚（status=0x0） | receipt 校验拦截，不应用（P0：防幻影 deadline 污染本地时效） |
+| receipt 缺失（未确认） | 不应用；实测同一 slice 内 diff.txs 数量 == receipts 数量 |
 | pairId 不在本地池子 | 跳过（新 pair 未发现，走 discover/对账） |
 | flashblocks 断流/重连 | 复用现有重连+初始回填；回填期间的 caliber 更新由对账任务补齐 |
 | reorg | 依赖现有 realtime_head/对账兜底，caliber 事件不做额外 reorg 检测 |

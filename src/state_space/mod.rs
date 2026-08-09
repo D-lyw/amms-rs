@@ -1056,6 +1056,7 @@ impl<N, P> StateSpaceManager<N, P> {
     /// caliber 更新交易不 emit 任何事件，只能从原始交易 calldata 提取；
     /// 本函数与 `apply_logs_for_block_timed` 同锁同序（同一 RwLock、
     /// 同一 realtime_head 推进语义）：
+    /// - 提取侧已按 receipt status 过滤回滚/未确认交易（仅成功更新到达本函数）；
     /// - 块内按 `tx_index` 排序（EVM 语义：后者覆盖前者）；
     /// - `pairId + 合约地址 → virtual_address` 路由，命中本地池子后
     ///   `apply_batch_update` 增量刷新 field0/field1/deadline；

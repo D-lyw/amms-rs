@@ -142,6 +142,18 @@ fn parse_cumulative_gas(v: &serde_json::Value) -> Option<u64> {
     Some(u64::from_str_radix(s.trim_start_matches("0x"), 16).ok()?)
 }
 
+/// 从 receipt 中提取交易执行结果：`status == "0x1"` 成功、`"0x0"` 回滚；
+/// 字段缺失或无法解析返回 `None`（调用方按"未确认"处理）。
+fn parse_receipt_status(v: &serde_json::Value) -> Option<bool> {
+    match v.get("status") {
+        Some(serde_json::Value::String(s)) => {
+            Some(u64::from_str_radix(s.trim_start_matches("0x"), 16).ok()? == 1)
+        }
+        Some(serde_json::Value::Number(n)) => n.as_u64().map(|n| n == 1),
+        _ => None,
+    }
+}
+
 /// 从 serde_json::Value 中提取日志列表
 fn parse_logs_from_value(v: &serde_json::Value) -> Vec<XlayerFlashblockLog> {
     let Some(logs_array) = v.get("logs").and_then(|l| l.as_array()) else {
@@ -458,8 +470,11 @@ fn extract_logs_from_xlayer_flashblock(
     //     交易发现。先轻量 RLP 定位 to（只跳字段、零分配，~100-200ns/笔），
     //     过滤出目标合约交易；命中后才完整解码 calldata + 标准 ABI 解码
     //     （每块 ~14 笔通常只有 1-2 笔命中，避免对无关交易做全量解码）。
-    //     失败静默跳过（对账任务兜底），绝不污染状态。放在 metadata 守卫之前，
-    //     保证无日志/空 receipts 的块也能提取 caliber 事件。
+    //     失败/未确认交易过滤（P0，2026-08-09 事故 0x914e39…）：caliber 更新
+    //     无事件，只能靠 receipt status 判定是否真正落地——链上回滚
+    //     （status=0x0）或 receipt 缺失（未确认）的更新一律不应用，否则失败
+    //     交易的 deadline 会作为"幻影报价"喂饱本地时效门控，产生幻影套利机会。
+    //     对账任务仍作为低频兜底（只读链上真实存储，天然免疫）。
     if !caliber_contracts.is_empty() {
         if let Some(diff) = fb.diff.as_ref() {
             for (real_idx, raw_tx_hex) in diff.transactions.iter().enumerate() {
@@ -474,7 +489,22 @@ fn extract_logs_from_xlayer_flashblock(
                 if !caliber_contracts.contains(&to) {
                     continue;
                 }
-                // 第二步：命中后才取 calldata（完整 RLP 解码 + 拷贝）
+                // 第二步：receipt status 校验——仅应用链上确认成功的更新。
+                // metadata.receipts 以 tx hash 为键，raw 交易字节的 keccak256
+                // 即为 tx hash（与懒排序修正同一约定）。
+                let confirmed = fb
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| {
+                        m.receipts
+                            .get(&format!("{:#x}", alloy::primitives::keccak256(&raw)))
+                    })
+                    .and_then(parse_receipt_status)
+                    .unwrap_or(false);
+                if !confirmed {
+                    continue;
+                }
+                // 第三步：命中后才取 calldata（完整 RLP 解码 + 拷贝）
                 let Some(input) = extract_input_from_raw_tx(&raw) else {
                     continue;
                 };
@@ -1251,12 +1281,17 @@ mod tests {
         let mut latest_block_timestamp = None;
 
         // 同块两笔更新交易：tx_index 应为 0 和 1（tx_base=0 + 数组下标）
+        let mut receipts = Map::new();
+        receipts.insert(
+            hash_raw_tx(&raw_tx),
+            json!({"status": "0x1", "cumulativeGasUsed": "0x1", "logs": []}),
+        );
         let fb = flashblock(
             "0xcaliber",
             0,
             67329558,
             vec![raw_tx.clone(), raw_tx.clone()],
-            Map::new(),
+            receipts,
         );
 
         let (logs, _, _, _, events) = extract_logs_from_xlayer_flashblock(
@@ -1294,6 +1329,66 @@ mod tests {
     }
 
     #[test]
+    fn xlayer_caliber_reverted_or_unconfirmed_tx_not_extracted() {
+        use alloy::hex;
+
+        let caliber_contract: Address = "0x154586b2479b9a11e3d4db90024dc0e26f097312"
+            .parse()
+            .unwrap();
+        let raw_tx = hex::decode(REAL_CALIBER_RAW_TX_HEX).unwrap();
+
+        let matcher = XlayerLogMatcher {
+            topic_addresses: HashSet::new(),
+            topic_signatures: HashSet::new(),
+            address_only_addresses: HashSet::new(),
+        };
+        let mut dedup = XlayerDedupCache::new(XLAYER_DEDUP_PAYLOAD_WINDOW);
+        let mut parse_cache = XlayerParseCache::new();
+        let mut tx_tracker = XlayerTxCountTracker::new(XLAYER_TX_COUNT_WINDOW);
+        let mut latest_block_timestamp = None;
+
+        // status=0x0（链上回滚，如 2026-08-09 事故的 MM 更新）→ 不产出事件
+        let mut reverted = Map::new();
+        reverted.insert(
+            hash_raw_tx(&raw_tx),
+            json!({"status": "0x0", "cumulativeGasUsed": "0x1", "logs": []}),
+        );
+        let fb_reverted = flashblock("0xcaliber", 0, 67329558, vec![raw_tx.clone()], reverted);
+
+        let (_, _, _, _, events) = extract_logs_from_xlayer_flashblock(
+            &fb_reverted,
+            &matcher,
+            &HashSet::new(),
+            &HashSet::from([caliber_contract]),
+            &mut dedup,
+            &mut parse_cache,
+            &mut tx_tracker,
+            &mut latest_block_timestamp,
+        );
+        assert!(
+            events.is_empty(),
+            "reverted caliber update must not produce events"
+        );
+
+        // receipt 缺失（未确认）→ 不产出事件
+        let fb_missing = flashblock("0xcaliber", 0, 67329558, vec![raw_tx.clone()], Map::new());
+        let (_, _, _, _, events) = extract_logs_from_xlayer_flashblock(
+            &fb_missing,
+            &matcher,
+            &HashSet::new(),
+            &HashSet::from([caliber_contract]),
+            &mut dedup,
+            &mut parse_cache,
+            &mut tx_tracker,
+            &mut latest_block_timestamp,
+        );
+        assert!(
+            events.is_empty(),
+            "unconfirmed caliber update must not produce events"
+        );
+    }
+
+    #[test]
     fn xlayer_caliber_extract_to_apply_end_to_end() {
         use crate::amms::caliber_prop::CaliberPropPool;
         use crate::amms::Token;
@@ -1328,7 +1423,12 @@ mod tests {
         }));
 
         let raw_tx = alloy::hex::decode(REAL_CALIBER_RAW_TX_HEX).unwrap();
-        let fb = flashblock("0xcaliber", 0, 67329558, vec![raw_tx], Map::new());
+        let mut receipts = Map::new();
+        receipts.insert(
+            hash_raw_tx(&raw_tx),
+            json!({"status": "0x1", "cumulativeGasUsed": "0x1", "logs": []}),
+        );
+        let fb = flashblock("0xcaliber", 0, 67329558, vec![raw_tx], receipts);
         let matcher = XlayerLogMatcher {
             topic_addresses: HashSet::new(),
             topic_signatures: HashSet::new(),
