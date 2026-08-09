@@ -461,7 +461,7 @@ impl CaliberPropPool {
         }
     }
 
-    /// 根据 ladder 的第一个点刷新缓存价格
+    /// 根据 ladder 的边际价格刷新缓存现货价（与链上 quote 语义一致）
     fn refresh_prices(&mut self) {
         // Empty ladder means the maker currently provides no usable quote.
         // Clear cached spot prices so upstream price filters won't reuse stale data.
@@ -469,13 +469,16 @@ impl CaliberPropPool {
         self.price_b_in_a = 0.0;
 
         if let Some(first) = self.ladder.ladder_a_to_b.first() {
-            if !first.amount_in.is_zero() && !first.amount_out.is_zero() {
-                let price = u256_to_f64(&first.amount_out) / u256_to_f64(&first.amount_in);
-                self.price_a_in_b =
-                    price * 10f64.powi(self.token_a.decimals as i32 - self.token_b.decimals as i32);
-                if self.price_a_in_b > 0.0 {
-                    self.price_b_in_a = 1.0 / self.price_a_in_b;
-                }
+            // 现货价 = 链上边际价格（docs/caliber_prop_internal.md §5）：
+            //   d(out)/d(in) = field0 * (1e6 - (x0 + field1)) / (1e9 * scale * 1e6)
+            // 归一化到人读价格（1 token_a = X token_b）后 scale 与 10^(dec_a-dec_b) 相消，
+            // 得 price_a_in_b = field0 * (1e6 - (x0 + field1)) / 1e15。
+            // 注意：不能用首段斜率 y0/x0（旧实现），与真实边际价可差多个数量级。
+            let a0 = MILLION - (first.amount_in + self.ladder.field1);
+            let price = u256_to_f64(&(self.ladder.field0 * a0)) / 1e15;
+            if price > 0.0 {
+                self.price_a_in_b = price;
+                self.price_b_in_a = 1.0 / price;
             }
         }
     }
@@ -1231,7 +1234,12 @@ fn pair_deadline64(raw: &RawPairSlots) -> U256 {
 ///
 /// 注意：当 data0 高 32 位（tsY）非零时，deadline 变为 64 位巨大值，链上永不
 /// 过期——这是合约的实际行为，本地必须同样处理。
-fn pair_stale(raw: &RawPairSlots, validity_window: U256, global_paused: U256, block_ts: U256) -> bool {
+fn pair_stale(
+    raw: &RawPairSlots,
+    validity_window: U256,
+    global_paused: U256,
+    block_ts: U256,
+) -> bool {
     let expired = block_ts > pair_deadline64(raw) + validity_window;
     pair_paused(raw, global_paused) || expired
 }
@@ -2099,14 +2107,22 @@ mod tests {
 
         // 新鲜：deadline 在未来 → 正常报价（非 0）
         let fresh = pool
-            .simulate_swap(pool.token_a.address, pool.token_b.address, U256::from(1_000_000_000u64))
+            .simulate_swap(
+                pool.token_a.address,
+                pool.token_b.address,
+                U256::from(1_000_000_000u64),
+            )
             .unwrap();
         assert!(fresh > U256::ZERO, "fresh quote should be non-zero");
 
         // 过期：deadline 在过去 → 不可报价（返回 0，避免幻影利润上链回滚）
         pool.ladder.deadline = now - 3600;
         let stale = pool
-            .simulate_swap(pool.token_a.address, pool.token_b.address, U256::from(1_000_000_000u64))
+            .simulate_swap(
+                pool.token_a.address,
+                pool.token_b.address,
+                U256::from(1_000_000_000u64),
+            )
             .unwrap();
         assert_eq!(stale, U256::ZERO, "stale pair must be unquotable");
     }
@@ -2120,11 +2136,23 @@ mod tests {
         pool.ladder.consumed_out_ab = U256::from(67890u64);
 
         let out = pool
-            .simulate_swap_mut(pool.token_a.address, pool.token_b.address, U256::from(1_000_000_000u64))
+            .simulate_swap_mut(
+                pool.token_a.address,
+                pool.token_b.address,
+                U256::from(1_000_000_000u64),
+            )
             .unwrap();
         assert_eq!(out, U256::ZERO, "stale pair must be unquotable");
-        assert_eq!(pool.ladder.consumed_in_ab, U256::from(12345u64), "consumed must not mutate");
-        assert_eq!(pool.ladder.consumed_out_ab, U256::from(67890u64), "consumed must not mutate");
+        assert_eq!(
+            pool.ladder.consumed_in_ab,
+            U256::from(12345u64),
+            "consumed must not mutate"
+        );
+        assert_eq!(
+            pool.ladder.consumed_out_ab,
+            U256::from(67890u64),
+            "consumed must not mutate"
+        );
     }
 
     #[test]
@@ -2133,8 +2161,12 @@ mod tests {
         let mut pool = test_pool_with_ladder();
         pool.ladder.deadline = now - 3600; // 过期
         assert_eq!(
-            pool.simulate_swap(pool.token_a.address, pool.token_b.address, U256::from(1_000_000_000u64))
-                .unwrap(),
+            pool.simulate_swap(
+                pool.token_a.address,
+                pool.token_b.address,
+                U256::from(1_000_000_000u64)
+            )
+            .unwrap(),
             U256::ZERO
         );
 
@@ -2149,9 +2181,16 @@ mod tests {
             1,
         );
         let revived = pool
-            .simulate_swap(pool.token_a.address, pool.token_b.address, U256::from(1_000_000_000u64))
+            .simulate_swap(
+                pool.token_a.address,
+                pool.token_b.address,
+                U256::from(1_000_000_000u64),
+            )
             .unwrap();
-        assert!(revived > U256::ZERO, "updated pair should be quotable again");
+        assert!(
+            revived > U256::ZERO,
+            "updated pair should be quotable again"
+        );
     }
 
     #[test]
@@ -2172,13 +2211,23 @@ mod tests {
 
         // tsY 非零 → deadline64 巨大 → 永不过期
         let ts_y = U256::from(0xffff_ffffu64) << 128;
-        assert!(!pair_stale(&mk(ts_y | ts_x), validity, U256::ZERO, block_ts));
+        assert!(!pair_stale(
+            &mk(ts_y | ts_x),
+            validity,
+            U256::ZERO,
+            block_ts
+        ));
 
         // 仅 tsX → 过期
         assert!(pair_stale(&mk(ts_x), validity, U256::ZERO, block_ts));
 
         // 暂停 → stale
-        assert!(pair_stale(&mk(ts_y | ts_x), validity, U256::from(1u64), block_ts));
+        assert!(pair_stale(
+            &mk(ts_y | ts_x),
+            validity,
+            U256::from(1u64),
+            block_ts
+        ));
     }
 
     #[test]
@@ -2190,8 +2239,12 @@ mod tests {
         pool.ladder.validity_window = 0;
         assert!(pool.ladder.is_unquotable(now));
         assert_eq!(
-            pool.simulate_swap(pool.token_a.address, pool.token_b.address, U256::from(1_000_000_000u64))
-                .unwrap(),
+            pool.simulate_swap(
+                pool.token_a.address,
+                pool.token_b.address,
+                U256::from(1_000_000_000u64)
+            )
+            .unwrap(),
             U256::ZERO
         );
     }
@@ -2228,8 +2281,12 @@ mod tests {
         assert_eq!(pool.ladder.validity_window, 20);
         // 保留的 ladder + 过期 deadline → 不可报价
         assert_eq!(
-            pool.simulate_swap(pool.token_a.address, pool.token_b.address, U256::from(1_000_000_000u64))
-                .unwrap(),
+            pool.simulate_swap(
+                pool.token_a.address,
+                pool.token_b.address,
+                U256::from(1_000_000_000u64)
+            )
+            .unwrap(),
             U256::ZERO
         );
 
@@ -2253,8 +2310,16 @@ mod tests {
         };
         pool.ladder.consumed_in_ab = U256::from(777u64);
         pool.apply_snapshot(fresh_snap);
-        assert_eq!(pool.ladder.ladder_a_to_b.len(), 1, "fresh snapshot must replace ladder");
-        assert_eq!(pool.ladder.consumed_in_ab, U256::ZERO, "consumed must reset on fresh snapshot");
+        assert_eq!(
+            pool.ladder.ladder_a_to_b.len(),
+            1,
+            "fresh snapshot must replace ladder"
+        );
+        assert_eq!(
+            pool.ladder.consumed_in_ab,
+            U256::ZERO,
+            "consumed must reset on fresh snapshot"
+        );
     }
 
     #[test]
@@ -2279,6 +2344,60 @@ mod tests {
         pool.refresh_prices();
         assert_eq!(pool.price_a_in_b, 0.0);
         assert_eq!(pool.price_b_in_a, 0.0);
+    }
+
+    #[test]
+    fn test_refresh_prices_uses_marginal_price() {
+        // 现货价 = 链上边际价格 field0 * (1e6 - (x0 + field1)) / 1e15（docs §5），
+        // 而不是首段斜率 y0/x0（旧实现，与真实价格可差多个数量级）。
+        // 用真实 xSOL 对账基线（块 66309105）：ladder=[(10,2e8),(50,9e8),(300,1e9)]，
+        // field0=75111231784, field1=283 → 边际价 ≈ 75.09；
+        // 首段斜率 y0/x0=2e7，×10^(18-6) 归一化后 = 2e19，错 17 个数量级。
+        let contract = Address::repeat_byte(0xBB);
+        let pair_id = B256::from([0x22u8; 32]);
+        let mut pool = CaliberPropPool {
+            contract_address: contract,
+            pair_id,
+            virtual_address: CaliberPropPool::virtual_address_from_pair_id(pair_id, contract),
+            token_x: Address::from([1u8; 20]),
+            token_y: Address::from([2u8; 20]),
+            token_a: Token::new_with_decimals(Address::from([1u8; 20]), 18),
+            token_b: Token::new_with_decimals(Address::from([2u8; 20]), 6),
+            created_block: 0,
+            last_synced_block: 0,
+            reserve_a: U256::from(6210305049u64),
+            reserve_b: U256::from(1760056227u64),
+            ladder: Default::default(),
+            price_a_in_b: 1.0,
+            price_b_in_a: 1.0,
+        };
+        pool.ladder.ladder_a_to_b = vec![
+            LadderPoint {
+                amount_in: U256::from(10u64),
+                amount_out: U256::from(200000000u64),
+            },
+            LadderPoint {
+                amount_in: U256::from(50u64),
+                amount_out: U256::from(900000000u64),
+            },
+            LadderPoint {
+                amount_in: U256::from(300u64),
+                amount_out: U256::from(1000000000u64),
+            },
+        ];
+        pool.ladder.field0 = U256::from(75111231784u64);
+        pool.ladder.field1 = U256::from(283u64);
+
+        pool.refresh_prices();
+
+        let expected = 75111231784f64 * (1_000_000f64 - (10f64 + 283f64)) / 1e15;
+        assert!(
+            (pool.price_a_in_b - expected).abs() < 1e-9,
+            "price_a_in_b={} expected={}",
+            pool.price_a_in_b,
+            expected
+        );
+        assert!((pool.price_b_in_a - 1.0 / expected).abs() < 1e-12);
     }
 
     // ── batchUpdateParameters 解码 / raw tx 提取 / 池子应用 ──
