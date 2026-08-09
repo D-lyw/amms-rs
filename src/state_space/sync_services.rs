@@ -29,6 +29,14 @@ use crate::amms::rocketpool::RocketPoolConverter;
 use crate::amms::uniswap_v3::GetUniswapV3PoolStaticMetaBatchRequest;
 use crate::state_space::StateSpace;
 
+sol! {
+    #[derive(Debug, PartialEq, Eq)]
+    #[sol(rpc)]
+    contract IERC20BalanceOf {
+        function balanceOf(address owner) external view returns (uint256);
+    }
+}
+
 const STARTUP_JITTER_PCT: u128 = 15;
 
 fn startup_delay_with_jitter(interval: Duration, task_key: &str) -> Duration {
@@ -1309,6 +1317,61 @@ pub async fn start_binaryfi_prop_sync_task<N, P>(
                     if let AMM::BinaryFiPropPool(existing) = existing_amm {
                         *existing = refreshed;
                     }
+                }
+            }
+        }
+    }
+}
+
+/// 周期性刷新 BuySell FoT token 的合约自身持有余额（swapBack 触发判定用）
+///
+/// 链上语义：`balanceOf(address(this))` = token 合约自持 token 余额。
+/// 该余额**与池子无关**，无法从池子 Sync/Swap 事件流同步，必须周期轮询。
+/// 卖出该 token 到主池时若余额 >= `swap_back_threshold` 将触发 swapBack
+/// 预交易（砸盘），模拟层通过 [`crate::amms::fot::swap_back_balance`] 读取。
+///
+/// 周期硬编码由调用方传入（当前 1s，无配置化需求）。
+pub async fn start_fot_swap_back_balance_sync_task<N, P>(
+    _state: Arc<RwLock<StateSpace>>,
+    provider: P,
+    interval: Duration,
+) where
+    N: Network,
+    P: Provider<N> + Clone + 'static,
+{
+    let mut next_sleep = startup_delay_with_jitter(interval, "fot_swap_back_balance");
+    loop {
+        sleep(next_sleep).await;
+        next_sleep = interval;
+
+        let tokens = crate::amms::fot::buy_sell_tokens();
+        if tokens.is_empty() {
+            continue;
+        }
+
+        for token in tokens {
+            // balanceOf(address(this))：owner = token 合约自身
+            match IERC20BalanceOf::new(token, provider.clone())
+                .balanceOf(token)
+                .call()
+                .await
+            {
+                Ok(balance) => {
+                    crate::amms::fot::set_swap_back_balance(token, balance);
+                    debug!(
+                        target = "sync_services::fot_swap_back_balance",
+                        token = ?token,
+                        balance = ?balance,
+                        "Swap-back balance refreshed"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        target = "sync_services::fot_swap_back_balance",
+                        token = ?token,
+                        error = ?e,
+                        "Failed to fetch swap-back balance; keeping stale value"
+                    );
                 }
             }
         }

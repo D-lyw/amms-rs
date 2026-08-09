@@ -1956,6 +1956,14 @@ where
             ));
         }
 
+        // FoT BuySell token:swapBack 预交易余额 1s 硬编码刷新
+        // （触发判定需实时，且与池子事件流无关，只能轮询；周期暂不配置化）
+        tokio::spawn(sync_services::start_fot_swap_back_balance_sync_task(
+            state_space.clone(),
+            self.provider.clone(),
+            Duration::from_secs(1),
+        ));
+
         // Slipstream fee config sync: low-frequency task to refresh DynamicFeeConfig and
         // FeeModuleGlobals (governance changes we don't fully subscribe to via events).
         // Dynamically resolve FeeModule addresses from loaded pools.

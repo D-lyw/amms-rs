@@ -117,9 +117,11 @@ impl Token {
     /// 扣除 FoT 税后实际到手金额（net）。无 FoT 时返回原值。
     ///
     /// 链上语义：池子 swap math 输出 gross，transfer hook 扣税后接收方到手 net。
+    /// 输出侧方向：[`fot::FotTaxType::BuySell`] 扣 `buy_fee_bps`。
+    /// 仅池子对该 token 的税种生效时扣税，见 [`Token::fot_net_for`]。
     pub fn fot_net(&self, gross: U256) -> U256 {
         match self.fot_tax {
-            Some(tax) => tax.net_of_gross(gross),
+            Some(tax) => tax.output_net(gross),
             None => gross,
         }
     }
@@ -130,36 +132,76 @@ impl Token {
     /// 接收方才能拿到 net。
     pub fn fot_gross_up(&self, net: U256) -> U256 {
         match self.fot_tax {
-            Some(tax) => tax.gross_up(net),
+            Some(tax) => tax.output_gross_up(net),
             None => net,
         }
     }
 
-    /// 输入侧（user→pool）实收净额。仅双向 FoT（BothSides）按税率扣，
+    /// 输入侧（user→pool）实收净额。仅双向/买卖分离 FoT 按税率扣，
     /// 单侧 FoT 与普通 token 全额入池。
     ///
     /// 链上语义（XLS 实测）：池子实收 net，K 检查按 balanceOf 差值（net）记账，
     /// swap math 的 amountIn 也是 net。
     ///
-    /// amms 模拟层 hop 链中**不调用**本方法：一次 transfer 的税已由 hop N
-    /// 输出侧 `fot_net` 捕获，输入侧重复扣税会造成 0.97 × 0.97 双重扣税。
-    /// 本方法仅供引擎层起点转账场景（flash→池）使用：用户需转名义 gross，
-    /// 池子实收本方法返回值后按此净额入池并参与 math。
+    /// amms 模拟层 pool 内部使用带池过滤的 [`Token::fot_input_net_for`] 执行
+    /// 输入侧扣税（hop 链中 hop N+1 的输入 = hop N 输出 `fot_net` 实收值，
+    /// 作为名义再被扣一次——链上引擎中转每 hop 一次 transfer 各扣一次税，
+    /// 0.97 × 0.97 是链上真实语义，不是双重扣税）。
+    /// 本方法（无池过滤，BuySell 不检查 `pair`）仅供引擎层起点转账场景
+    /// （flash→池）使用：用户需转名义 gross，池子实收本方法返回值后按此
+    /// 净额入池并参与 math。
     pub fn fot_input_net(&self, gross: U256) -> U256 {
         match self.fot_tax {
-            Some(tax) if tax.input_taxed() => tax.net_of_gross(gross),
-            _ => gross,
+            Some(tax) => tax.input_net(gross),
+            None => gross,
         }
     }
 
     /// 输入侧反算：池子需实收 `net` 时，用户需转的名义金额（向上取整）。
     ///
-    /// 仅双向 FoT（BothSides）时 gross-up，单侧 FoT 与普通 token 返回原值。
+    /// 仅双向/买卖分离 FoT 时 gross-up，单侧 FoT 与普通 token 返回原值。
     /// 用于 exact-out 起点转账场景：`get_amount_in` 返回池子实收需求，
     /// 双向 FoT 下用户转账需多转以覆盖输入侧扣税。
+    /// 模拟层 pool 内部使用带池过滤的 [`Token::fot_input_gross_up_for`]。
     pub fn fot_input_gross_up(&self, net: U256) -> U256 {
         match self.fot_tax {
-            Some(tax) if tax.input_taxed() => tax.gross_up(net),
+            Some(tax) => tax.input_gross_up(net),
+            None => net,
+        }
+    }
+
+    /// 输出侧净额，**仅当税种对该池生效时扣税**。
+    ///
+    /// [`fot::FotTaxType::BuySell`] 只在白名单主池（`pair`）扣税：
+    /// 其他池子（如 V4 PoolManager）与该 token 的 transfer 不扣税，
+    /// 返回原值。其余税种对所有池生效，等价 [`Token::fot_net`]。
+    pub fn fot_net_for(&self, pool: Address, gross: U256) -> U256 {
+        match self.fot_tax {
+            Some(tax) if tax.applies_to_pool(pool) => tax.output_net(gross),
+            _ => gross,
+        }
+    }
+
+    /// 输出侧反算（池子过滤版），语义同 [`Token::fot_net_for`]。
+    pub fn fot_gross_up_for(&self, pool: Address, net: U256) -> U256 {
+        match self.fot_tax {
+            Some(tax) if tax.applies_to_pool(pool) => tax.output_gross_up(net),
+            _ => net,
+        }
+    }
+
+    /// 输入侧实收净额（池子过滤版），语义同 [`Token::fot_net_for`]。
+    pub fn fot_input_net_for(&self, pool: Address, gross: U256) -> U256 {
+        match self.fot_tax {
+            Some(tax) if tax.applies_to_pool(pool) => tax.input_net(gross),
+            _ => gross,
+        }
+    }
+
+    /// 输入侧反算（池子过滤版），语义同 [`Token::fot_net_for`]。
+    pub fn fot_input_gross_up_for(&self, pool: Address, net: U256) -> U256 {
+        match self.fot_tax {
+            Some(tax) if tax.applies_to_pool(pool) => tax.input_gross_up(net),
             _ => net,
         }
     }
