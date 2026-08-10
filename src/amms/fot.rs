@@ -58,6 +58,7 @@ use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
 
 use alloy::primitives::{Address, U256};
+use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use super::Token;
@@ -299,15 +300,23 @@ pub fn apply_to_token(token: &mut Token) {
 ///
 /// 链上语义：`balanceOf(address(this))`，即 token 合约自持 token 余额。
 /// 无法从池子事件流同步（与池子无关），由周期任务约 1s 刷新一次。
-static FOT_SWAP_BACK_BALANCES: OnceLock<RwLock<HashMap<Address, U256>>> = OnceLock::new();
+///
+/// 缓存携带刷新时刻（`Instant`），供模拟层判断数据新鲜度：
+/// 刷新任务若挂起/连续失败（如 RPC 断连），stale 值会显著放大模拟误差
+/// （见 DYOR:K 事故：cache 84s 未刷新，模拟 dump 量 9 倍小于实际）。
+static FOT_SWAP_BACK_BALANCES: OnceLock<RwLock<HashMap<Address, (U256, Instant)>>> =
+    OnceLock::new();
 
-fn swap_back_balances() -> &'static RwLock<HashMap<Address, U256>> {
+fn swap_back_balances() -> &'static RwLock<HashMap<Address, (U256, Instant)>> {
     FOT_SWAP_BACK_BALANCES.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
 /// 更新 token 合约自身持有余额（周期任务调用）
 pub fn set_swap_back_balance(token: Address, balance: U256) {
-    swap_back_balances().write().unwrap().insert(token, balance);
+    swap_back_balances()
+        .write()
+        .unwrap()
+        .insert(token, (balance, Instant::now()));
 }
 
 /// 读取 token 合约自身持有余额（模拟层调用）
@@ -319,8 +328,33 @@ pub fn swap_back_balance(token: Address) -> U256 {
         .read()
         .unwrap()
         .get(&token)
-        .copied()
+        .map(|(b, _)| *b)
         .unwrap_or(U256::ZERO)
+}
+
+/// 读取 token 合约自身持有余额 + 最后刷新时刻
+///
+/// 未读到返回 `None`（周期任务尚未首跑）。
+pub fn swap_back_balance_with_refresh(token: Address) -> Option<(U256, Instant)> {
+    swap_back_balances()
+        .read()
+        .unwrap()
+        .get(&token)
+        .copied()
+}
+
+/// 缓存数据已 stale 的判定阈值：超过该时长未刷新视为不可信。
+///
+/// 刷新任务 1s 周期 + 5s 调用超时，正常场景 staleness 应在秒级；
+/// 放宽到 30s 以容忍偶发重试窗口，超过即视为刷新链路中断。
+pub const SWAP_BACK_BALANCE_STALE_AFTER: Duration = Duration::from_secs(30);
+
+/// 缓存是否 stale（最后刷新距今超过 [`SWAP_BACK_BALANCE_STALE_AFTER`] 或从未刷新）
+pub fn swap_back_balance_is_stale(token: Address) -> bool {
+    match swap_back_balance_with_refresh(token) {
+        Some((_, refreshed_at)) => refreshed_at.elapsed() > SWAP_BACK_BALANCE_STALE_AFTER,
+        None => true,
+    }
 }
 
 /// 所有已注册 BuySell 的 token 地址列表（周期任务遍历用）

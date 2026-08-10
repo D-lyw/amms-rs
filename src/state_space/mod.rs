@@ -1958,9 +1958,10 @@ where
 
         // FoT BuySell token:swapBack 预交易余额 1s 硬编码刷新
         // （触发判定需实时，且与池子事件流无关，只能轮询；周期暂不配置化）
+        // 任务内部独立使用硬编码 HTTP provider + batch + timeout（见
+        // sync_services::start_fot_swap_back_balance_sync_task 注释），
+        // 不依赖主 WS provider，故不传 state/provider。
         tokio::spawn(sync_services::start_fot_swap_back_balance_sync_task(
-            state_space.clone(),
-            self.provider.clone(),
             Duration::from_secs(1),
         ));
 

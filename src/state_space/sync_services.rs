@@ -1,14 +1,16 @@
 use alloy::eips::BlockId;
 use alloy::network::Network;
-use alloy::primitives::{Address, B256, U256};
-use alloy::providers::Provider;
+use alloy::primitives::{Address, B256, Bytes, U256};
+use alloy::providers::{DynProvider, Provider, ProviderBuilder};
+use alloy::rpc::types::TransactionRequest;
 use alloy::sol;
-use alloy::sol_types::SolValue;
+use alloy::sol_types::{SolCall, SolValue};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::RwLock;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 use tracing::{debug, error, info, warn};
 
 use crate::amms::aerodrome_slipstream::pool::FEE_MODULE_GLOBALS;
@@ -1331,14 +1333,183 @@ pub async fn start_binaryfi_prop_sync_task<N, P>(
 /// 预交易（砸盘），模拟层通过 [`crate::amms::fot::swap_back_balance`] 读取。
 ///
 /// 周期硬编码由调用方传入（当前 1s，无配置化需求）。
-pub async fn start_fot_swap_back_balance_sync_task<N, P>(
-    _state: Arc<RwLock<StateSpace>>,
-    provider: P,
-    interval: Duration,
-) where
-    N: Network,
-    P: Provider<N> + Clone + 'static,
-{
+///
+/// ⚠️ 与主 provider（WS flashblocks）解耦的独立 HTTP provider + JSON-RPC
+/// batch + 硬超时（2026-08-10，DYOR:K 事故修复）：
+/// - 旧实现逐 token 单次 `call()` 挂在主 WS provider 上，`call().await` 无
+///   timeout，WS 半开连接（无心跳、无请求超时）导致任务静默卡死 84s、
+///   缓存 stale（67526462 事故：缓存 8.8k RTX vs 链上 79k RTX，模拟 dump
+///   不足 → 误判盈利 → revert "DYOR: K"，且无任何 warn 日志）。
+/// - 现改为：硬编码 HTTP RPC（`rpc.xlayer.tech`，实测支持 batch，上限 11
+///   取 10）+ 每轮 batch（一个 HTTP 请求读全部 token）+ 5s 硬超时；
+///   batch 被网关拒绝时回退逐 token 单 call（同样带超时）。
+///   缓存带刷新时间戳，模拟层可据 [`crate::amms::fot::swap_back_balance_is_stale`]
+///   保守降级。
+const FOT_BALANCE_HTTP_RPC: &str = "https://rpc.xlayer.tech";
+/// batch 上限实测为 11（rpc.xlayer.tech），取安全值 10（同 caliber storage）。
+const FOT_BALANCE_BATCH_CHUNK: usize = 10;
+/// 单轮 batch / 单次 call 的硬性超时：防止 WS 半开连接那样的静默挂起。
+const FOT_BALANCE_CALL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 懒初始化的 HTTP provider（进程内复用，避免每轮重连）。
+static FOT_BALANCE_PROVIDER: OnceLock<DynProvider> = OnceLock::new();
+
+fn fot_balance_provider() -> Option<&'static DynProvider> {
+    if let Some(provider) = FOT_BALANCE_PROVIDER.get() {
+        return Some(provider);
+    }
+    let url: alloy::transports::http::reqwest::Url = FOT_BALANCE_HTTP_RPC.parse().ok()?;
+    let provider: DynProvider = ProviderBuilder::new().connect_http(url).erased();
+    let _ = FOT_BALANCE_PROVIDER.set(provider);
+    FOT_BALANCE_PROVIDER.get()
+}
+
+/// batch 回退告警只输出一次（避免每 1s 周期刷屏）。
+static FOT_BATCH_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
+
+fn warn_batch_fallback(e: &impl std::fmt::Debug) {
+    if !FOT_BATCH_FALLBACK_WARNED.swap(true, Ordering::Relaxed) {
+        warn!(
+            target = "sync_services::fot_swap_back_balance",
+            error = ?e,
+            "JSON-RPC batch rejected by RPC gateway; falling back to per-token balanceOf calls (logged once)"
+        );
+    } else {
+        debug!(
+            target = "sync_services::fot_swap_back_balance",
+            error = ?e,
+            "JSON-RPC batch failed, using per-token fallback"
+        );
+    }
+}
+
+fn warn_batch_fallback_timeout() {
+    if !FOT_BATCH_FALLBACK_WARNED.swap(true, Ordering::Relaxed) {
+        warn!(
+            target = "sync_services::fot_swap_back_balance",
+            "swap-back balance batch timed out; falling back to per-token balanceOf calls (logged once)"
+        );
+    } else {
+        debug!(
+            target = "sync_services::fot_swap_back_balance",
+            "swap-back balance batch timed out, using per-token fallback"
+        );
+    }
+}
+
+/// 用单次 JSON-RPC batch 刷新一批 token 的 swapBack 余额（一个 HTTP 请求）。
+/// batch 发送/等待均带 [`FOT_BALANCE_CALL_TIMEOUT`] 硬超时；
+/// batch 被网关拒绝或部分失败时回退逐 token 单 call（同样带超时）。
+/// 任何失败路径都保留旧缓存值（+ warn），不引入新的失败路径。
+async fn refresh_swap_back_balances_batch(provider: &DynProvider, tokens: &[Address]) {
+    let mut batch = alloy::rpc::client::BatchRequest::new(provider.client());
+    let mut waiters = Vec::with_capacity(tokens.len());
+    let mut batch_ok = true;
+    for &token in tokens {
+        // balanceOf(address(this))：owner = token 合约自身
+        let calldata = IERC20BalanceOf::balanceOfCall { owner: token }.abi_encode();
+        let tx = TransactionRequest::default().to(token).input(calldata.into());
+        match batch.add_call::<_, Bytes>("eth_call", &(tx, BlockId::latest())) {
+            Ok(waiter) => waiters.push((token, waiter)),
+            Err(e) => {
+                batch_ok = false;
+                warn_batch_fallback(&e);
+                break;
+            }
+        }
+    }
+    if batch_ok {
+        match timeout(FOT_BALANCE_CALL_TIMEOUT, batch.send()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                batch_ok = false;
+                warn_batch_fallback(&e);
+            }
+            Err(_) => {
+                batch_ok = false;
+                warn_batch_fallback_timeout();
+            }
+        }
+    }
+    if batch_ok {
+        for (token, waiter) in waiters {
+            match timeout(FOT_BALANCE_CALL_TIMEOUT, waiter).await {
+                Ok(Ok(bytes)) => {
+                    match IERC20BalanceOf::balanceOfCall::abi_decode_returns(bytes.as_ref()) {
+                        Ok(balance) => {
+                            crate::amms::fot::set_swap_back_balance(token, balance);
+                            debug!(
+                                target = "sync_services::fot_swap_back_balance",
+                                token = ?token,
+                                balance = ?balance,
+                                "Swap-back balance refreshed"
+                            );
+                        }
+                        Err(e) => {
+                            batch_ok = false;
+                            warn!(
+                                target = "sync_services::fot_swap_back_balance",
+                                token = ?token,
+                                error = ?e,
+                                "Failed to decode swap-back balance; keeping stale value"
+                            );
+                            break;
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    batch_ok = false;
+                    warn_batch_fallback(&e);
+                    break;
+                }
+                Err(_) => {
+                    batch_ok = false;
+                    warn_batch_fallback_timeout();
+                    break;
+                }
+            }
+        }
+    }
+    if !batch_ok {
+        // 回退基线：逐 token 单 call（与 batch 等价，同样带硬超时）
+        for &token in tokens {
+            let call = async {
+                IERC20BalanceOf::new(token, provider.clone())
+                    .balanceOf(token)
+                    .call()
+                    .await
+            };
+            match timeout(FOT_BALANCE_CALL_TIMEOUT, call).await {
+                Ok(Ok(balance)) => {
+                    crate::amms::fot::set_swap_back_balance(token, balance);
+                    debug!(
+                        target = "sync_services::fot_swap_back_balance",
+                        token = ?token,
+                        balance = ?balance,
+                        "Swap-back balance refreshed (per-token fallback)"
+                    );
+                }
+                Ok(Err(e)) => {
+                    warn!(
+                        target = "sync_services::fot_swap_back_balance",
+                        token = ?token,
+                        error = ?e,
+                        "Failed to fetch swap-back balance; keeping stale value"
+                    );
+                }
+                Err(_) => {
+                    warn!(
+                        target = "sync_services::fot_swap_back_balance",
+                        token = ?token,
+                        "Timed out fetching swap-back balance; keeping stale value"
+                    );
+                }
+            }
+        }
+    }
+}
+
+pub async fn start_fot_swap_back_balance_sync_task(interval: Duration) {
     let mut next_sleep = startup_delay_with_jitter(interval, "fot_swap_back_balance");
     loop {
         sleep(next_sleep).await;
@@ -1348,32 +1519,15 @@ pub async fn start_fot_swap_back_balance_sync_task<N, P>(
         if tokens.is_empty() {
             continue;
         }
-
-        for token in tokens {
-            // balanceOf(address(this))：owner = token 合约自身
-            match IERC20BalanceOf::new(token, provider.clone())
-                .balanceOf(token)
-                .call()
-                .await
-            {
-                Ok(balance) => {
-                    crate::amms::fot::set_swap_back_balance(token, balance);
-                    debug!(
-                        target = "sync_services::fot_swap_back_balance",
-                        token = ?token,
-                        balance = ?balance,
-                        "Swap-back balance refreshed"
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        target = "sync_services::fot_swap_back_balance",
-                        token = ?token,
-                        error = ?e,
-                        "Failed to fetch swap-back balance; keeping stale value"
-                    );
-                }
-            }
+        let Some(provider) = fot_balance_provider() else {
+            warn!(
+                target = "sync_services::fot_swap_back_balance",
+                "HTTP provider init failed; keeping stale swap-back balances"
+            );
+            continue;
+        };
+        for chunk in tokens.chunks(FOT_BALANCE_BATCH_CHUNK) {
+            refresh_swap_back_balances_batch(provider, chunk).await;
         }
     }
 }
