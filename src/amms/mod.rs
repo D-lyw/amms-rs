@@ -70,13 +70,15 @@ pub struct Token {
     /// 不会自动检测，需在初始化阶段通过 `fot::register_fot_token` 注入，
     /// 或直接在序列化数据中标注（显式标注优先级更高）。
     ///
-    /// 两种变体语义（链上取证，见 `fot` 模块文档）：
+    /// 变体语义（链上取证，见 `fot` 模块文档扣税档案）：
     /// - `FotTaxType::FlatRate`：**池子转出该 token 时扣税**（单侧，输出侧），
     ///   模拟输出返回 net、exact-out 输入需 gross-up；to = pool（卖出）方向不扣税。
     /// - `FotTaxType::BothSides`：**每次 transfer 都扣税**（输入侧 + 输出侧），
     ///   模拟层 hop 链中一次 transfer 的税由 hop N 输出侧 `fot_net` 捕获，
     ///   输入侧不重复扣税；仅引擎层起点转账（flash→池）用 `fot_input_net`
     ///   折算池子实收净额，输出侧同 FlatRate。
+    /// - `FotTaxType::BuySell`：**仅白名单池（`pairs` 集合）生效**的买卖分离税，
+    ///   卖进池扣 `sell_fee_bps`、买出池扣 `buy_fee_bps`（RTX/XLS 实例见档案）。
     #[serde(default)]
     pub fot_tax: Option<fot::FotTaxType>,
 }
@@ -120,7 +122,7 @@ impl Token {
     /// 输出侧方向：[`fot::FotTaxType::BuySell`] 扣 `buy_fee_bps`。
     /// 仅池子对该 token 的税种生效时扣税，见 [`Token::fot_net_for`]。
     pub fn fot_net(&self, gross: U256) -> U256 {
-        match self.fot_tax {
+        match &self.fot_tax {
             Some(tax) => tax.output_net(gross),
             None => gross,
         }
@@ -131,7 +133,7 @@ impl Token {
     /// 用于 exact-out 场景：池子 math 必须先输出 gross，transfer 扣税后
     /// 接收方才能拿到 net。
     pub fn fot_gross_up(&self, net: U256) -> U256 {
-        match self.fot_tax {
+        match &self.fot_tax {
             Some(tax) => tax.output_gross_up(net),
             None => net,
         }
@@ -140,18 +142,18 @@ impl Token {
     /// 输入侧（user→pool）实收净额。仅双向/买卖分离 FoT 按税率扣，
     /// 单侧 FoT 与普通 token 全额入池。
     ///
-    /// 链上语义（XLS 实测）：池子实收 net，K 检查按 balanceOf 差值（net）记账，
+    /// 链上语义：池子实收 net，K 检查按 balanceOf 差值（net）记账，
     /// swap math 的 amountIn 也是 net。
     ///
     /// amms 模拟层 pool 内部使用带池过滤的 [`Token::fot_input_net_for`] 执行
     /// 输入侧扣税（hop 链中 hop N+1 的输入 = hop N 输出 `fot_net` 实收值，
     /// 作为名义再被扣一次——链上引擎中转每 hop 一次 transfer 各扣一次税，
     /// 0.97 × 0.97 是链上真实语义，不是双重扣税）。
-    /// 本方法（无池过滤，BuySell 不检查 `pair`）仅供引擎层起点转账场景
+    /// 本方法（无池过滤，BuySell 不检查池白名单）仅供引擎层起点转账场景
     /// （flash→池）使用：用户需转名义 gross，池子实收本方法返回值后按此
     /// 净额入池并参与 math。
     pub fn fot_input_net(&self, gross: U256) -> U256 {
-        match self.fot_tax {
+        match &self.fot_tax {
             Some(tax) => tax.input_net(gross),
             None => gross,
         }
@@ -164,7 +166,7 @@ impl Token {
     /// 双向 FoT 下用户转账需多转以覆盖输入侧扣税。
     /// 模拟层 pool 内部使用带池过滤的 [`Token::fot_input_gross_up_for`]。
     pub fn fot_input_gross_up(&self, net: U256) -> U256 {
-        match self.fot_tax {
+        match &self.fot_tax {
             Some(tax) => tax.input_gross_up(net),
             None => net,
         }
@@ -172,11 +174,11 @@ impl Token {
 
     /// 输出侧净额，**仅当税种对该池生效时扣税**。
     ///
-    /// [`fot::FotTaxType::BuySell`] 只在白名单主池（`pair`）扣税：
+    /// [`fot::FotTaxType::BuySell`] 只在白名单池（`pairs` 集合）扣税：
     /// 其他池子（如 V4 PoolManager）与该 token 的 transfer 不扣税，
     /// 返回原值。其余税种对所有池生效，等价 [`Token::fot_net`]。
     pub fn fot_net_for(&self, pool: Address, gross: U256) -> U256 {
-        match self.fot_tax {
+        match &self.fot_tax {
             Some(tax) if tax.applies_to_pool(pool) => tax.output_net(gross),
             _ => gross,
         }
@@ -184,7 +186,7 @@ impl Token {
 
     /// 输出侧反算（池子过滤版），语义同 [`Token::fot_net_for`]。
     pub fn fot_gross_up_for(&self, pool: Address, net: U256) -> U256 {
-        match self.fot_tax {
+        match &self.fot_tax {
             Some(tax) if tax.applies_to_pool(pool) => tax.output_gross_up(net),
             _ => net,
         }
@@ -192,7 +194,7 @@ impl Token {
 
     /// 输入侧实收净额（池子过滤版），语义同 [`Token::fot_net_for`]。
     pub fn fot_input_net_for(&self, pool: Address, gross: U256) -> U256 {
-        match self.fot_tax {
+        match &self.fot_tax {
             Some(tax) if tax.applies_to_pool(pool) => tax.input_net(gross),
             _ => gross,
         }
@@ -200,7 +202,7 @@ impl Token {
 
     /// 输入侧反算（池子过滤版），语义同 [`Token::fot_net_for`]。
     pub fn fot_input_gross_up_for(&self, pool: Address, net: U256) -> U256 {
-        match self.fot_tax {
+        match &self.fot_tax {
             Some(tax) if tax.applies_to_pool(pool) => tax.input_gross_up(net),
             _ => net,
         }

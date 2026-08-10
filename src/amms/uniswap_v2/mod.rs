@@ -558,18 +558,18 @@ impl UniswapV2Pool {
             (U256::from(self.reserve_1), U256::from(self.reserve_0))
         };
         let Some(fot::FotTaxType::BuySell {
-            pair,
+            pairs,
             swap_back_threshold,
             ..
-        }) = input_token.fot_tax
+        }) = input_token.fot_tax.as_ref()
         else {
             return (r0, r1);
         };
-        if self.address != pair || r0.is_zero() || r1.is_zero() {
+        if !pairs.contains(&self.address) || r0.is_zero() || r1.is_zero() {
             return (r0, r1);
         }
         let sb_balance = fot::swap_back_balance(base_token);
-        if sb_balance < swap_back_threshold {
+        if sb_balance < *swap_back_threshold {
             return (r0, r1);
         }
         let sb_out = self.get_amount_out(sb_balance, r0, r1);

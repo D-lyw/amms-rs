@@ -1,12 +1,78 @@
 //! Fee-on-transfer (FoT) token 支持
 //!
-//! # 扣税语义（链上取证确认：XLS token，XLayer 交易 0xf90b9c...、0x487fd3f3...）
+//! # 扣税语义（链上取证确认）
 //!
-//! 存在三类扣税语义，用不同变体表达：
+//! 存在三类扣税语义（[`FotTaxType`] 变体）。已注册 token 的扣税模型见下方
+//! **扣税档案**——每节对应一个 token，取证方式与判定规则完整记录，
+//! 是长期迭代维护的唯一事实来源；**修改扣税语义必须同步更新对应档案**。
+//!
+//! # 扣税档案 · XLS（0x64af27d3...）= BuySell{buy:0, sell:300}，XlayerSwapV2 池白名单，无 swapBack
+//!
+//! **取证**：2026-08-09 曾按 Transfer 事件逐笔金额 + balanceOf 差值误判为
+//! `both_sides`（**已推翻**，2026-08-10）；以 **XLS 开源合约源码 + proxy 反汇编
+//! 为硬标准**定案，行为测试（eth_call 差分）与链上交易（debug_trace）仅作佐证。
+//!
+//! ## 合约架构
+//!   - `XLS` = 标准 ERC20（2,633 B 代码，开源）；`c` = proxy 0x15e98f9e...
+//!     存于 slot 5（`_transfer` 内 `IXLSC(c).getSlippage(...)`）
+//!   - proxy → impl 0xbf7bbe66...（23,397 B）：`getSlippage`（税判定）+
+//!     `slippage`（分红分发）
+//!
+//! ## 扣税判定（硬标准，selector 已用 keccak 与源码逐一验证）
+//!
+//! `_transfer(from, to, amount)` 先调 `IXLSC(c).getSlippage(from, to, amount)`
+//! （selector `0x6473e7d6`），按 **参数 from/to** 判定（与 msg.sender 无关，
+//! 差分测试三次一致）：
+//!
+//! | from ∈ XlayerSwapV2 池（factory 0x717ab5de...）| to ∈ XlayerSwapV2 池 | 税率 |
+//! |:--|:--|:--|
+//! | 是 | 任意 | **0%**（池子转出豁免）|
+//! | 否 | 是 | **3%**（卖进池子，池子实收 97%，K 按净额记账）|
+//! | 否 | 否 | 0%（EOA↔EOA、合约↔EOA、其他 DEX 池均不扣）|
+//!
+//! 即：买出池（from=池）免税、卖进池（to=池）扣 3% → 与 RTX 方向同构，
+//! 映射为 `BuySell{buy_fee_bps:0, sell_fee_bps:300}`。
+//! 触发池 = **XlayerSwapV2 factory 下所有含 XLS 的池**（非单个 pair），
+//! 经 `pairs` 白名单集合表达；graph 生成阶段从 poolindex 池数据动态展开，
+//! 新池被索引后自动生效，无需改代码。
+//!
+//! ## 拆账与附加机制
+//!   - 税 = `floor(amount × 300 / 10000)`，从 from 转给 proxy，
+//!     proxy 再转 1/30（≈0.1%）给 0xdead 销毁，净留 2.9%；net 转给 to
+//!   - 随后 `IXLSC(c).slippage(from, to, amount, slippageValue)`
+//!     （selector `0x7783387d`）触发 DividenTracker 分红分发，单次 >588k gas
+//!     （实测 ~1.03M）：**含 XLS 的路径结构性不可执行**
+//!     （引擎 gas 估算需为含该 token 的 hop 加 ~1.15M 预算）
+//!   - **无 swapBack**：分红在 proxy 侧独立分发，注册时
+//!     `swap_back_threshold` 传 [`U256::MAX`] 永不触发
+//!
+//! ## 注册 JSON（fot_tokens 表 / ndjson token 条目）
+//!
+//! ```json
+//! {"type":"buy_sell","buy_fee_bps":0,"sell_fee_bps":300,
+//!  "pairs":["0xa70e64138f1c70f0aa5ce7a5ddde78ecdb49a144",
+//!           "0x3d49cdd23bf689510ece56dd90f4b739c309ef05"],
+//!  "swap_back_threshold":"115792089237316195423570985008687907853269984665640564039457584007913129639935"}
+//! ```
+//!
+//! # 扣税档案 · RTX（0x18a4f9d4...）= BuySell{buy:300, sell:300}，单主池，swapBack 1250e18
+//!
+//! **取证**：2026-08-09，TaxDividendToken 类合约源码 + 交易 trace。
+//!   - `automatedMarketMakerPairs` 白名单**只有主池 0xb8960e3b... 一个地址**
+//!     （`graduate()` 一次性写入，无管理函数）：只有与主池交互的 transfer 扣税，
+//!     其他池（如 V4 PoolManager）**不扣税**
+//!   - 卖进主池（to=主池）：扣 `sell_fee_bps=300`，池子实收 net（K 按 balanceOf 差值记账）
+//!   - 买出主池（from=主池）：扣 `buy_fee_bps=300`，接收方实收 net
+//!   - **swapBack**：卖出到主池时若合约自身余额（`balanceOf(address(this))`，
+//!     [`swap_back_balance`] 周期任务 1s 刷新）>= `swap_back_threshold`（1250e18），
+//!     先以合约全部累积余额砸入主池（`swapping` 豁免不扣税，池子实收全额），
+//!     换出的另一侧全额给分红分发器（不参与用户路径），再算用户主 swap
+//!
+//! # 通用语义（变体定义，与具体 token 无关）
 //!
 //! ## [`FotTaxType::FlatRate`]（单侧，输出侧）
 //!
-//! 扣税发生在 **swap 之后、token transfer hook 内部**，且 **只在 from = pair（池子）
+//! 扣税发生在 **swap 之后、token transfer hook 内部**，且 **只在 from = pool（池子）
 //! 转出时扣税**（即用户从池子买入该 token 时）：
 //!   - from = pool（买）：池子 swap math 输出 gross，transfer hook 扣税，
 //!     接收方到手 net = gross × (10000 - fee_bps) / 10000（向下取整）
@@ -15,44 +81,34 @@
 //!
 //! ## [`FotTaxType::BothSides`]（双向，输入侧 + 输出侧）
 //!
-//! XLS 实测（Transfer 事件逐笔金额 + balanceOf 差值双重验证，2026-08-09）：
-//!   - **每次 transfer（无论方向）都扣税**：发送者付出名义 gross，
-//!     接收者实收 net = gross × (10000 - fee_bps) / 10000
-//!   - 输入侧（user→pool）：池子实收 net，K 检查按 **net** 记账
-//!     （balanceOf 差值 = net；3d49 池收到 636752046480362035065 =
-//!     名义 656445408742641273262 的 97%，此前"全额"解读是错的）
-//!   - 输出侧（pool→user）：池子余额减少 gross（含税部分），接收者实收 net
-//!   - 拆账：net 给接收者 + fee 部分进税池合约（XLS 为 proxy 0x15e98f9e，
-//!     其中 0.1% 由 proxy 转 0xdead 销毁，proxy 净留 2.9%）
-//!   - 每次 transfer 额外触发 2× process() 分红（实测 ~1.03M gas，
-//!     引擎 gas 估算需为含该 token 的 hop 加 ~1.15M 预算）
+//! **每次 transfer（无论方向）都扣税**：发送者付出名义 gross，
+//! 接收者实收 net = gross × (10000 - fee_bps) / 10000。
+//! 输入侧（user→pool）池子实收 net，K 检查按 net 记账；
+//! 输出侧（pool→user）接收者实收 net。
 //!
-//! 因此模拟时（`amount_in` 语义 = **名义金额**，池子实收为扣税后净额）：
+//! 模拟时（`amount_in` 语义 = **名义金额**，池子实收为扣税后净额）：
 //!   - 输入侧（user→pool）：pool 模拟内部按税率扣税后以净额参与 math。
 //!     hop 链中 hop N+1 的输入 = hop N 输出（`fot_net` 后实收）作为**名义**
 //!     再被输入侧扣一次——链上引擎中转每 hop 一次 transfer 各扣一次税，
 //!     `0.97 × 0.97` 正是链上真实语义，不是双重扣税
 //!   - 输出侧（pool→user）：math 输出 gross，返回给调用方的是扣税后 net
 //!
-//! ## [`FotTaxType::BuySell`]（买卖分离 + swapBack，仅主池生效）
+//! ## [`FotTaxType::BuySell`]（买卖分离 + swapBack，仅白名单池生效）
 //!
-//! TaxDividendToken 类合约（RTX 取证，XLayer 主池 0xb8960e3b...，2026-08-09）：
-//!   - `automatedMarketMakerPairs` 白名单只有主池一个地址，只有与主池交互的
-//!     transfer 才扣税；其他池（如 V4 PoolManager）**不扣税**
-//!     （[`FotTaxType::applies_to_pool`]）
-//!   - 卖该 token 进主池：扣 `sell_fee_bps`，池子实收 net；
-//!     买该 token 出主池：扣 `buy_fee_bps`，接收方实收 net
-//!   - **swapBack 预交易**：卖出到主池时若合约自身余额
-//!     （[`swap_back_balance`]，周期任务 1s 刷新）>= `swap_back_threshold`，
-//!     先以合约全部累积余额砸入池子（`swapping` 豁免不扣税，池子实收全额），
-//!     换出的另一侧全额给分红分发器（不参与用户路径），再算用户主 swap
-//!   - 输入/输出侧扣税与 swapBack 均仅在 `pool == pair` 时生效
+//! 模拟层语义（触发判定见 [`FotTaxType::applies_to_pool`]）：
+//!   - 输入侧（token 进白名单池）：扣 `sell_fee_bps`，且模拟前先做
+//!     swapBack 预交易（余额来自 [`swap_back_balance`] 缓存，
+//!     由周期任务 1s 刷新；未读到按 0 = 不触发处理）
+//!   - 输出侧（token 出白名单池）：扣 `buy_fee_bps`
+//!   - pool ∉ pairs 时任何方向都不扣税
 //!
 //! # 注册方式
 //!
 //! FoT 参数 **不会自动检测**，必须在初始化阶段通过 [`register_fot_token`]
 //! 显式注册（或直接在 Token 序列化数据中标注 `fot_tax` 字段）。
 //! 优先级：Token 上显式标注的 `fot_tax` > registry 运行时注入。
+//! **维护提醒**：新增 FoT token 时在 `crates/pools_index/src/fot_tokens.rs`
+//! 注册（写入 fot_tokens 表），graph 生成阶段自动展开 `pairs` 并写入 ndjson。
 
 use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
@@ -67,7 +123,7 @@ use super::Token;
 ///
 /// 不同的扣税 token 逻辑差异很大（买卖分离税率、仅卖出扣税、反射分红等），
 /// 注册时必须指定具体类型，方便后续扩展支持多种扣税逻辑。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum FotTaxType {
     /// 池子转出时扣税（输出侧 FoT，单侧税）
@@ -95,37 +151,42 @@ pub enum FotTaxType {
     /// `fee_bps` 以 basis points 计（1 bps = 0.01%），例如 3% 税 = 300。
     BothSides { fee_bps: u64 },
 
-    /// 买卖分离税率 + swapBack 分红（TaxDividendToken 类合约，RTX 取证）
+    /// 买卖分离税率 + swapBack 分红（TaxDividendToken 类合约）
     ///
-    /// 链上取证（XLayer 主池 0xb8960e3b...，2026-08-09）：
-    ///   - `automatedMarketMakerPairs` 白名单**只有主池一个地址**
-    ///     （`graduate()` 一次性写入，无管理函数）：只有与该主池交互的
-    ///     transfer 才扣税；其他池（如 V4 PoolManager）**不扣税**
-    ///   - to = pair（用户卖该 token 进主池）：扣 `sell_fee_bps`，
+    /// 已注册实例：RTX（单主池白名单 + swapBack，2026-08-09 取证）、
+    /// XLS（XlayerSwapV2 池集合白名单 + 无 swapBack，2026-08-10 取证），
+    /// 完整模型见模块文档扣税档案。
+    ///
+    /// 通用方向语义（触发池 = `pairs` 白名单集合）：
+    ///   - to ∈ pairs（用户卖该 token 进池）：扣 `sell_fee_bps`，
     ///     池子实收 net（K 检查按 balanceOf 差值 = net 记账）
-    ///   - from = pair（用户买该 token 出主池）：扣 `buy_fee_bps`，
+    ///   - from ∈ pairs（用户买该 token 出池）：扣 `buy_fee_bps`，
     ///     接收方实收 net
-    ///   - **swapBack**：卖出该 token 到主池时，若合约自身持有余额
+    ///   - **swapBack**：卖出到白名单池时，若合约自身持有余额
     ///     （`balanceOf(address(this))`）>= `swap_back_threshold`，
     ///     在本次 transfer 扣税**之前**先执行一次预交易：把合约全部
-    ///     累积 token 卖入主池（`swapping = true` 豁免扣税，池子实收全额），
-    ///     换出的另一侧 token 全额转给分红分发器（不参与用户路径），
-    ///     主池 reserve 被砸后再执行用户的主 swap
+    ///     累积 token 卖入池子（`swapping` 豁免扣税，池子实收全额），
+    ///     换出的另一侧全额给分红分发器（不参与用户路径），
+    ///     池子 reserve 被砸后再执行用户的主 swap
     ///
     /// 模拟层语义：
-    ///   - 输入侧（该 token 进主池）：扣 `sell_fee_bps`，且模拟前先做
+    ///   - 输入侧（token 进白名单池）：扣 `sell_fee_bps`，且模拟前先做
     ///     swapBack 预交易（余额来自 [`swap_back_balance`] 缓存，
     ///     由周期任务 1s 刷新；未读到按 0 = 不触发处理）
-    ///   - 输出侧（该 token 出主池）：扣 `buy_fee_bps`
-    ///   - pool != `pair` 时任何方向都不扣税（[`FotTaxType::applies_to_pool`]）
+    ///   - 输出侧（token 出白名单池）：扣 `buy_fee_bps`
+    ///   - pool ∉ pairs 时任何方向都不扣税（[`FotTaxType::applies_to_pool`]）
     BuySell {
         /// 池子转出该 token（用户买）时扣税，basis points（1 bps = 0.01%）
         buy_fee_bps: u64,
         /// 该 token 进入池子（用户卖）时扣税，basis points（1 bps = 0.01%）
         sell_fee_bps: u64,
-        /// 唯一主池地址（白名单），仅与该池交互时扣税
-        pair: Address,
-        /// 合约自身持有余额 >= 该值触发 swapBack 预交易（含精度，如 1250e18）
+        /// 白名单池集合（RTX：唯一主池；XLS：XlayerSwapV2 factory 下所有含该
+        /// token 的池，graph 生成阶段从 poolindex 池数据动态展开；
+        /// 反序列化缺省为空 = 任何池都不扣税）
+        #[serde(default)]
+        pairs: Vec<Address>,
+        /// 合约自身持有余额 >= 该值触发 swapBack 预交易（含精度，如 1250e18；
+        /// XLS 类无 swapBack，注册时传 [`U256::MAX`] 永不触发）
         swap_back_threshold: U256,
     },
     // 未来扩展（示例，变体命名用 snake_case 与 serde rename_all 保持一致）：
@@ -153,12 +214,12 @@ impl FotTaxType {
 
     /// 该税种是否对指定池生效。
     ///
-    /// [`FotTaxType::BuySell`] 仅白名单主池（`pair`）扣税，其他池子
+    /// [`FotTaxType::BuySell`] 仅白名单池（`pairs` 集合）扣税，其他池子
     /// （如 V4 PoolManager）与该 token 的 transfer 不扣税；其余税种
     /// 对所有池子生效。
     pub fn applies_to_pool(&self, pool: Address) -> bool {
         match self {
-            FotTaxType::BuySell { pair, .. } => *pair == pool,
+            FotTaxType::BuySell { pairs, .. } => pairs.contains(&pool),
             _ => true,
         }
     }
@@ -209,18 +270,6 @@ impl FotTaxType {
             FotTaxType::FlatRate { .. } => net,
             FotTaxType::BothSides { fee_bps } => Self::gross_up_for(net, *fee_bps),
             FotTaxType::BuySell { sell_fee_bps, .. } => Self::gross_up_for(net, *sell_fee_bps),
-        }
-    }
-
-    /// BuySell 变体参数（pair, swap_back_threshold）；非 BuySell 返回 None。
-    pub fn buy_sell(&self) -> Option<(Address, U256)> {
-        match self {
-            FotTaxType::BuySell {
-                pair,
-                swap_back_threshold,
-                ..
-            } => Some((*pair, *swap_back_threshold)),
-            _ => None,
         }
     }
 
@@ -282,7 +331,7 @@ pub fn register_fot_token(token: Address, tax: FotTaxType) {
 
 /// 查询 token 的 FoT 税率（未注册返回 `None`）
 pub fn fot_tax(token: Address) -> Option<FotTaxType> {
-    registry().read().unwrap().get(&token).copied()
+    registry().read().unwrap().get(&token).cloned()
 }
 
 /// 初始化阶段应用到 Token：若已注册，注入 `fot_tax` 字段
@@ -489,7 +538,7 @@ mod tests {
         let tax = FotTaxType::BuySell {
             buy_fee_bps: 200,
             sell_fee_bps: 500,
-            pair: Address::repeat_byte(0x01),
+            pairs: vec![Address::repeat_byte(0x01), Address::repeat_byte(0x03)],
             swap_back_threshold: U256::from(1250u64) * U256::from(18),
         };
         // 输出侧（用户买）：扣 buy 2%
@@ -502,13 +551,10 @@ mod tests {
         assert!(tax.output_net(buy_gross - U256::from(1u8)) < NET);
         let sell_gross = tax.input_gross_up(NET);
         assert_eq!(tax.input_net(sell_gross), NET);
-        // 只有主池生效
+        // 白名单：pairs 集合内生效，其余不生效
         assert!(tax.applies_to_pool(Address::repeat_byte(0x01)));
+        assert!(tax.applies_to_pool(Address::repeat_byte(0x03)));
         assert!(!tax.applies_to_pool(Address::repeat_byte(0x02)));
-        // buy_sell() 参数提取
-        let (pair, threshold) = tax.buy_sell().unwrap();
-        assert_eq!(pair, Address::repeat_byte(0x01));
-        assert_eq!(threshold, U256::from(1250u64) * U256::from(18));
         // net_of_gross 兼容语义 = buy 侧
         assert_eq!(tax.net_of_gross(GROSS), tax.output_net(GROSS));
     }
@@ -518,13 +564,26 @@ mod tests {
         let tax = FotTaxType::BuySell {
             buy_fee_bps: 300,
             sell_fee_bps: 300,
-            pair: Address::repeat_byte(0xb8),
+            pairs: vec![Address::repeat_byte(0xb8)],
             swap_back_threshold: U256::from(1250u64) * U256::from(18),
         };
         let json = serde_json::to_string(&tax).unwrap();
         let back: FotTaxType = serde_json::from_str(&json).unwrap();
         assert_eq!(back, tax);
         assert!(back.input_taxed());
+
+        // 旧 pair 格式不再被识别为白名单：未知字段被 serde 忽略，
+        // pairs 缺省为空 = 任何池都不扣税（静默失效，勿回退到该格式）
+        let old_json = format!(
+            r#"{{"type":"buy_sell","buy_fee_bps":300,"sell_fee_bps":300,"pair":"0x{}","swap_back_threshold":"22500"}}"#,
+            "b8".repeat(40)
+        );
+        let old: FotTaxType = serde_json::from_str(&old_json).unwrap();
+        match &old {
+            FotTaxType::BuySell { pairs, .. } => assert!(pairs.is_empty()),
+            _ => panic!("expected BuySell"),
+        }
+        assert!(!old.applies_to_pool(Address::repeat_byte(0xb8)));
     }
 
     #[test]

@@ -64,7 +64,7 @@ async fn main() -> Result<()> {
         FotTaxType::BuySell {
             buy_fee_bps: 300,
             sell_fee_bps: 300,
-            pair: RTX_MAIN_PAIR,
+            pairs: vec![RTX_MAIN_PAIR],
             swap_back_threshold: U256::from(1250u64) * U256::from(10u64).pow(U256::from(18)),
         },
     );
