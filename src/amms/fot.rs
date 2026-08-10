@@ -64,9 +64,25 @@
 //!   - 卖进主池（to=主池）：扣 `sell_fee_bps=300`，池子实收 net（K 按 balanceOf 差值记账）
 //!   - 买出主池（from=主池）：扣 `buy_fee_bps=300`，接收方实收 net
 //!   - **swapBack**：卖出到主池时若合约自身余额（`balanceOf(address(this))`，
-//!     [`swap_back_balance`] 周期任务 1s 刷新）>= `swap_back_threshold`（1250e18），
+//!     [`swap_back_balance`]）>= `swap_back_threshold`（1250e18），
 //!     先以合约全部累积余额砸入主池（`swapping` 豁免不扣税，池子实收全额），
 //!     换出的另一侧全额给分红分发器（不参与用户路径），再算用户主 swap
+//!
+//! ## swapBack 余额同步方式（2026-08-10 起：事件驱动，替代 1s 轮询）
+//!
+//! 自持余额 = `balanceOf(RTX 合约自身)`，变化谱系只有 3 种，全部通过标准
+//! ERC20 Transfer 事件表达（RTX impl 无 mint/burn，Transfer emit 全合约唯一）：
+//!   - 卖出税：`Transfer(用户 → RTX合约, 名义×3%)` → `+= v`
+//!   - 买入税：`Transfer(主池 → RTX合约, gross×3%)` → `+= v`
+//!   - swapBack dump：`Transfer(RTX合约 → 主池, 全部自持)` → **置 0**
+//!     （dump 转出全部，置零而非减法可清除此前任何事件缺失导致的漂移，
+//!     是天然强制对齐点；24h 窗口 440 次 dump，已对账 460/460 采样点）
+//! 同步链路：启动时 [`init_swap_back_balance_snapshot`] 一次快照（sync chain_tip），
+//! 事件流（实时 flashblocks + 断流 backfill 同源覆盖）按
+//! `(block, txIndex, logIndex)` 序调 [`apply_swap_back_transfer`] 增量累加，
+//! 水位 `last_applied_block` 防重复。旧的 1s 周期 RPC 轮询已移除——
+//! 它无法识别机会区块内的增量（事故 67598082：竞争者 idx14 买入推高自持
+//! 32,071→117,250，模拟仍用 block-1 快照 → swapBack dump 低估 3.66 倍 → revert）。
 //!
 //! # 通用语义（变体定义，与具体 token 无关）
 //!
@@ -97,8 +113,8 @@
 //!
 //! 模拟层语义（触发判定见 [`FotTaxType::applies_to_pool`]）：
 //!   - 输入侧（token 进白名单池）：扣 `sell_fee_bps`，且模拟前先做
-//!     swapBack 预交易（余额来自 [`swap_back_balance`] 缓存，
-//!     由周期任务 1s 刷新；未读到按 0 = 不触发处理）
+//!     swapBack 预交易（余额来自 [`swap_back_balance`] 缓存，事件驱动增量
+//!     维护；未读到按 0 = 不触发处理）
 //!   - 输出侧（token 出白名单池）：扣 `buy_fee_bps`
 //!   - pool ∉ pairs 时任何方向都不扣税
 //!
@@ -113,7 +129,7 @@
 use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
 
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, B256, U256};
 use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
@@ -348,54 +364,169 @@ pub fn apply_to_token(token: &mut Token) {
 /// BuySell token 合约自身持有余额缓存（swapBack 触发判定用）
 ///
 /// 链上语义：`balanceOf(address(this))`，即 token 合约自持 token 余额。
-/// 无法从池子事件流同步（与池子无关），由周期任务约 1s 刷新一次。
 ///
-/// 缓存携带刷新时刻（`Instant`），供模拟层判断数据新鲜度：
-/// 刷新任务若挂起/连续失败（如 RPC 断连），stale 值会显著放大模拟误差
-/// （见 DYOR:K 事故：cache 84s 未刷新，模拟 dump 量 9 倍小于实际）。
-static FOT_SWAP_BACK_BALANCES: OnceLock<RwLock<HashMap<Address, (U256, Instant)>>> =
+/// 同步方式（2026-08-10 重构，替代旧 1s 周期 RPC 轮询）——事件驱动：
+///   1. 启动时 [`init_swap_back_balance_snapshot`] 读取一次快照
+///      （block = sync chain_tip，与事件流 backfill 起点对齐）
+///   2. 事件流（实时 flashblocks + 断流 backfill 同源覆盖）按
+///      `(block, txIndex, logIndex)` 序调 [`apply_swap_back_transfer`]：
+///        to   == token → balance += v（sell/buy 3% 税进自持）
+///        from == token → balance = 0（swapBack dump 转出全部，置零清漂移）
+///   3. 水位 `last_applied_block` 防重复（backfill/实时重叠的事件丢弃）
+///
+/// 旧轮询无法识别机会区块内的增量（事故 67598082：竞争者块内买入推高自持，
+/// 模拟仍用旧快照 → swapBack dump 量低估 3.66 倍 → "V4: unprofitable" revert）。
+///
+/// 缓存携带刷新时刻（`Instant`），供模拟层判断数据新鲜度。
+#[derive(Debug, Clone, Copy)]
+struct SwapBackBalanceState {
+    balance: U256,
+    refreshed_at: Instant,
+    /// 已应用事件的最高区块（<= 该区块的事件视为已含在状态中，丢弃）
+    last_applied_block: u64,
+}
+
+static FOT_SWAP_BACK_BALANCES: OnceLock<RwLock<HashMap<Address, SwapBackBalanceState>>> =
     OnceLock::new();
 
-fn swap_back_balances() -> &'static RwLock<HashMap<Address, (U256, Instant)>> {
+fn swap_back_balances() -> &'static RwLock<HashMap<Address, SwapBackBalanceState>> {
     FOT_SWAP_BACK_BALANCES.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-/// 更新 token 合约自身持有余额（周期任务调用）
-pub fn set_swap_back_balance(token: Address, balance: U256) {
-    swap_back_balances()
-        .write()
+/// ERC20 Transfer 事件签名 keccak256("Transfer(address,address,uint256)")
+///
+/// = 0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef
+/// （硬编码避免非 const 的 keccak256 调用；alloy 宏不便在此使用）
+pub const ERC20_TRANSFER_SIG: B256 = B256::new([
+    0xdd, 0xf2, 0x52, 0xad, 0x1b, 0xe2, 0xc8, 0x9b, 0x69, 0xc2, 0xb0, 0x68, 0xfc, 0x37, 0x8d,
+    0xaa, 0x95, 0x2b, 0xa7, 0xf1, 0x63, 0xc4, 0xa1, 0x16, 0x28, 0xf5, 0x5a, 0x4d, 0xf5, 0x23,
+    0xb3, 0xef,
+]);
+
+/// 判断税率是否需要在事件驱动下监控 swapBack 余额。
+///
+/// `swap_back_threshold = U256::MAX` 的 BuySell token（如 XLS）永不触发
+/// swapBack dump，自持余额不影响任何模拟结果，无需监控。
+fn is_swap_back_monitored_tax(tax: &FotTaxType) -> bool {
+    matches!(
+        tax,
+        FotTaxType::BuySell {
+            swap_back_threshold,
+            ..
+        } if *swap_back_threshold != U256::MAX
+    )
+}
+
+/// 需要事件驱动监控 swapBack 余额的 token 地址列表（BuySell 且 threshold != MAX）
+pub fn swap_back_monitored_tokens() -> Vec<Address> {
+    registry()
+        .read()
         .unwrap()
-        .insert(token, (balance, Instant::now()));
+        .iter()
+        .filter(|(_, t)| is_swap_back_monitored_tax(t))
+        .map(|(a, _)| *a)
+        .collect()
+}
+
+/// 判断地址是否为受监控的 swapBack token（事件流防御性过滤用）
+pub fn is_swap_back_monitored(token: Address) -> bool {
+    registry()
+        .read()
+        .unwrap()
+        .get(&token)
+        .map(is_swap_back_monitored_tax)
+        .unwrap_or(false)
+}
+
+/// 初始化 swapBack 余额快照（启动时一次，block = 事件流增量起点）。
+///
+/// block 必须与 state_space `realtime_head` 初始值（sync 的 chain_tip）一致：
+/// 事件流 backfill 从 chain_tip+1 开始，事件全部 > 本水位 → 无重叠无缺口。
+pub fn init_swap_back_balance_snapshot(token: Address, balance: U256, block: u64) {
+    swap_back_balances().write().unwrap().insert(
+        token,
+        SwapBackBalanceState {
+            balance,
+            refreshed_at: Instant::now(),
+            last_applied_block: block,
+        },
+    );
+}
+
+/// 应用一条监控 token 合约的 Transfer 事件（事件流按块内序调用）。
+///
+/// - `block <= last_applied_block` → 丢弃（水位防重复：backfill/实时重叠、
+///   断线重连重放）
+/// - `to == token` → `balance += value`（sell/buy 方向 3% 税进自持）
+/// - `from == token` → `balance = 0`（swapBack dump 转出全部自持；**置零而非
+///   减法**——清除此前任何事件缺失导致的漂移，dump 是天然强制对齐点）
+pub fn apply_swap_back_transfer(
+    token: Address,
+    from: Address,
+    to: Address,
+    value: U256,
+    block: u64,
+) {
+    let mut guard = swap_back_balances().write().unwrap();
+    let state = guard.entry(token).or_insert(SwapBackBalanceState {
+        balance: U256::ZERO,
+        refreshed_at: Instant::now(),
+        last_applied_block: 0,
+    });
+    if block <= state.last_applied_block {
+        return;
+    }
+    // 语义与 verify_rtx_swapback_balance 取证脚本一致：from==self 优先归零
+    // （自转账 from==to==token 在链上不可能发生，防御性取归零分支）
+    match (from == token, to == token) {
+        (false, true) => state.balance = state.balance.saturating_add(value),
+        (true, _) => state.balance = U256::ZERO,
+        _ => {}
+    }
+    state.last_applied_block = block;
+    state.refreshed_at = Instant::now();
+}
+
+/// 更新 token 合约自身持有余额（兼容/测试用途；生产路径已改为事件驱动快照+增量）
+pub fn set_swap_back_balance(token: Address, balance: U256) {
+    swap_back_balances().write().unwrap().insert(
+        token,
+        SwapBackBalanceState {
+            balance,
+            refreshed_at: Instant::now(),
+            last_applied_block: 0,
+        },
+    );
 }
 
 /// 读取 token 合约自身持有余额（模拟层调用）
 ///
-/// 未读到（周期任务尚未首跑）返回 0 = 视为不触发 swapBack（保守：
+/// 未读到（快照尚未初始化）返回 0 = 视为不触发 swapBack（保守：
 /// 宁可高估输出，也避免在余额未知时凭空砸盘）。
 pub fn swap_back_balance(token: Address) -> U256 {
     swap_back_balances()
         .read()
         .unwrap()
         .get(&token)
-        .map(|(b, _)| *b)
+        .map(|s| s.balance)
         .unwrap_or(U256::ZERO)
 }
 
 /// 读取 token 合约自身持有余额 + 最后刷新时刻
 ///
-/// 未读到返回 `None`（周期任务尚未首跑）。
+/// 未读到返回 `None`（快照尚未初始化）。
 pub fn swap_back_balance_with_refresh(token: Address) -> Option<(U256, Instant)> {
     swap_back_balances()
         .read()
         .unwrap()
         .get(&token)
-        .copied()
+        .map(|s| (s.balance, s.refreshed_at))
 }
 
 /// 缓存数据已 stale 的判定阈值：超过该时长未刷新视为不可信。
 ///
-/// 刷新任务 1s 周期 + 5s 调用超时，正常场景 staleness 应在秒级；
-/// 放宽到 30s 以容忍偶发重试窗口，超过即视为刷新链路中断。
+/// 事件驱动下刷新时刻随事件更新；无事件的平静窗口会 stale，属正常
+/// （事件驱动的状态在无事件时天然不变，stale 仅表示"长时间无新事件"）。
 pub const SWAP_BACK_BALANCE_STALE_AFTER: Duration = Duration::from_secs(30);
 
 /// 缓存是否 stale（最后刷新距今超过 [`SWAP_BACK_BALANCE_STALE_AFTER`] 或从未刷新）
@@ -406,7 +537,7 @@ pub fn swap_back_balance_is_stale(token: Address) -> bool {
     }
 }
 
-/// 所有已注册 BuySell 的 token 地址列表（周期任务遍历用）
+/// 所有已注册 BuySell 的 token 地址列表
 pub fn buy_sell_tokens() -> Vec<Address> {
     registry()
         .read()
@@ -593,5 +724,110 @@ mod tests {
         assert_eq!(swap_back_balance(token), U256::ZERO);
         set_swap_back_balance(token, U256::from(1000u32));
         assert_eq!(swap_back_balance(token), U256::from(1000u32));
+    }
+
+    // ===== swapBack 事件驱动同步（2026-08-11 起） =====
+
+    /// 注册两个 BuySell token：一个有限阈值（监控），一个 threshold=MAX（不监控，如 XLS）
+    fn register_monitor_test_tokens() {
+        register_fot_token(
+            Address::repeat_byte(0x51),
+            FotTaxType::BuySell {
+                buy_fee_bps: 300,
+                sell_fee_bps: 300,
+                pairs: vec![Address::repeat_byte(0x52)],
+                swap_back_threshold: U256::from(1250u64)
+                    * U256::from(10u64).pow(U256::from(18)),
+            },
+        );
+        register_fot_token(
+            Address::repeat_byte(0x53),
+            FotTaxType::BuySell {
+                buy_fee_bps: 0,
+                sell_fee_bps: 300,
+                pairs: vec![Address::repeat_byte(0x52)],
+                swap_back_threshold: U256::MAX,
+            },
+        );
+    }
+
+    #[test]
+    fn test_swap_back_monitored_filter() {
+        register_monitor_test_tokens();
+        let monitored = swap_back_monitored_tokens();
+        assert!(monitored.contains(&Address::repeat_byte(0x51)));
+        assert!(!monitored.contains(&Address::repeat_byte(0x53)));
+        assert!(is_swap_back_monitored(Address::repeat_byte(0x51)));
+        assert!(!is_swap_back_monitored(Address::repeat_byte(0x53)));
+        // 未注册地址不监控
+        assert!(!is_swap_back_monitored(Address::repeat_byte(0x99)));
+    }
+
+    #[test]
+    fn test_swap_back_snapshot_plus_events() {
+        // 快照 @100 + 序列事件：税收入 +=v、dump 归零
+        let token = Address::repeat_byte(0x55);
+        let pool = Address::repeat_byte(0x56);
+        init_swap_back_balance_snapshot(token, U256::from(1000u32), 100);
+        // sell 税：Transfer(用户 → token 合约) → +v
+        apply_swap_back_transfer(
+            token,
+            Address::repeat_byte(0x01),
+            token,
+            U256::from(50u32),
+            101,
+        );
+        assert_eq!(swap_back_balance(token), U256::from(1050u32));
+        // buy 税：Transfer(主池 → token 合约) → +v
+        apply_swap_back_transfer(token, pool, token, U256::from(30u32), 102);
+        assert_eq!(swap_back_balance(token), U256::from(1080u32));
+        // swapBack dump：Transfer(token 合约 → 主池) → =0（非减法）
+        apply_swap_back_transfer(token, token, pool, U256::from(1080u32), 103);
+        assert_eq!(swap_back_balance(token), U256::ZERO);
+        // dump 后再进税 → 从 0 重新累加
+        apply_swap_back_transfer(token, Address::repeat_byte(0x02), token, U256::from(7u32), 104);
+        assert_eq!(swap_back_balance(token), U256::from(7u32));
+    }
+
+    #[test]
+    fn test_swap_back_watermark_drops_replays() {
+        let token = Address::repeat_byte(0x57);
+        init_swap_back_balance_snapshot(token, U256::from(1000u32), 100);
+        // 水位 = 100：<=100 的事件丢弃（快照块事件重叠 / backfill-实时边界防重）
+        apply_swap_back_transfer(token, Address::repeat_byte(0x01), token, U256::from(50u32), 100);
+        apply_swap_back_transfer(token, Address::repeat_byte(0x01), token, U256::from(60u32), 99);
+        assert_eq!(swap_back_balance(token), U256::from(1000u32));
+        // 101 应用后，同块重放被丢弃（断线重连重放同一事件）
+        apply_swap_back_transfer(token, Address::repeat_byte(0x01), token, U256::from(40u32), 101);
+        assert_eq!(swap_back_balance(token), U256::from(1040u32));
+        apply_swap_back_transfer(token, Address::repeat_byte(0x01), token, U256::from(40u32), 101);
+        assert_eq!(swap_back_balance(token), U256::from(1040u32));
+    }
+
+    #[test]
+    fn test_swap_back_dump_zeroes_drift() {
+        // 事故场景（67598082）：1s 轮询 stale 缓存 32000 远小于链上 117250；
+        // 事件驱动下，无论此前缓存如何漂移，链上 dump 事件 → 归零 = 强制对齐
+        let token = Address::repeat_byte(0x58);
+        init_swap_back_balance_snapshot(token, U256::from(32000u32), 100);
+        set_swap_back_balance(token, U256::from(32000u32)); // 模拟漂移基线
+        apply_swap_back_transfer(
+            token,
+            token,
+            Address::repeat_byte(0x02),
+            U256::from(117250u32),
+            200,
+        );
+        assert_eq!(swap_back_balance(token), U256::ZERO);
+    }
+
+    #[test]
+    fn test_swap_back_apply_uninitialized_token() {
+        // 未快照 token 的事件：or_insert 0 起点累加（防御性，不应 panic）
+        let token = Address::repeat_byte(0x59);
+        apply_swap_back_transfer(token, Address::repeat_byte(0x01), token, U256::from(77u32), 5);
+        assert_eq!(swap_back_balance(token), U256::from(77u32));
+        apply_swap_back_transfer(token, token, Address::repeat_byte(0x02), U256::from(1u32), 6);
+        assert_eq!(swap_back_balance(token), U256::ZERO);
     }
 }

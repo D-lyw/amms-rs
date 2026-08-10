@@ -463,6 +463,16 @@ sol! {
     }
 }
 
+// FoT BuySell swapBack 自持余额启动快照用 balanceOf probe
+// （owner = token 合约自身；仅 sync() 初始化时调用一次）。
+sol! {
+    #[derive(Debug)]
+    #[sol(rpc)]
+    interface IERC20BalanceOfProbe {
+        function balanceOf(address account) external view returns (uint256);
+    }
+}
+
 #[derive(Clone, Debug)]
 enum QueryMode {
     TopicFiltered(Vec<FixedBytes<32>>),
@@ -1000,6 +1010,31 @@ impl<N, P> StateSpaceManager<N, P> {
         };
         let dedup_ms = t_dedup_start.elapsed().as_millis();
 
+        // FoT BuySell swapBack 自持余额事件驱动同步：
+        // 从日志流中提取监控 token 的 ERC20 Transfer 事件，驱动累加器
+        // （to==token → +=v 税收入；from==token → =0 swapBack dump 归零），
+        // 然后从 logs 移除——这些日志不属于任何池子 sync 事件，避免污染
+        // state.sync 的未知地址静默跳过路径，也避免重复处理。
+        let mut fot_logs: Vec<(Address, Address, Address, U256)> = Vec::new();
+        logs.retain(|l| {
+            let is_fot = l.topics().first() == Some(&crate::amms::fot::ERC20_TRANSFER_SIG)
+                && crate::amms::fot::is_swap_back_monitored(l.address());
+            if is_fot {
+                if let (Some(from_t), Some(to_t)) = (l.topics().get(1), l.topics().get(2)) {
+                    let from = Address::from_slice(&from_t.0[12..]);
+                    let to = Address::from_slice(&to_t.0[12..]);
+                    let value = U256::from_be_slice(&l.data().data);
+                    fot_logs.push((l.address(), from, to, value));
+                }
+                false
+            } else {
+                true
+            }
+        });
+        for (token, from, to, value) in fot_logs {
+            crate::amms::fot::apply_swap_back_transfer(token, from, to, value, block_num);
+        }
+
         if logs.is_empty() {
             return Ok((
                 vec![],
@@ -1367,6 +1402,23 @@ impl<N, P> StateSpaceManager<N, P> {
             address_only_addresses.sort();
 
             for addresses in address_only_addresses.chunks(LOG_ADDRESS_CHUNK_SIZE) {
+                chunks.push(LogQueryChunk {
+                    addresses: addresses.to_vec(),
+                    mode: QueryMode::AddressOnly,
+                });
+            }
+        }
+
+        // FoT BuySell swapBack 监控 token（self-hold balance 事件驱动同步）：
+        // 独立 chunk 订阅 token 合约全部日志（AddressOnly，避免把 ERC20 Transfer
+        // 签名污染全局 topic union）。RTX 等 token 合约只 emit Transfer，量小，
+        // 对实时流/backfill 开销可忽略；不进 chunks 会被 Xlayer flashblocks
+        // matcher 预筛丢弃（xlayer_flashblocks.rs），必须在此显式注册。
+        let swapback_tokens = crate::amms::fot::swap_back_monitored_tokens();
+        if !swapback_tokens.is_empty() {
+            let mut swapback_tokens = swapback_tokens;
+            swapback_tokens.sort();
+            for addresses in swapback_tokens.chunks(LOG_ADDRESS_CHUNK_SIZE) {
                 chunks.push(LogQueryChunk {
                     addresses: addresses.to_vec(),
                     mode: QueryMode::AddressOnly,
@@ -1961,14 +2013,52 @@ where
             ));
         }
 
-        // FoT BuySell token:swapBack 预交易余额 1s 硬编码刷新
-        // （触发判定需实时，且与池子事件流无关，只能轮询；周期暂不配置化）
-        // 任务内部独立使用硬编码 HTTP provider + batch + timeout（见
-        // sync_services::start_fot_swap_back_balance_sync_task 注释），
-        // 不依赖主 WS provider，故不传 state/provider。
-        tokio::spawn(sync_services::start_fot_swap_back_balance_sync_task(
-            Duration::from_secs(1),
-        ));
+        // FoT BuySell token swapBack 自持余额：启动时一次链上快照（chain tip
+        // 块末状态），此后完全由事件驱动增量同步（apply_logs_for_block_timed
+        // 提取 token 合约 Transfer 事件：税收入 +=v、swapBack dump 全额转出
+        // =0 天然强制对齐点）。事件流初始 backfill 从 realtime_head+1 =
+        // chain_tip+1 开始，与快照块精确对齐 → 增量无重叠无缺口。已移除
+        // 原 1s 轮询任务（见 sync_services 删除记录）。
+        let fot_tokens = crate::amms::fot::swap_back_monitored_tokens();
+        if !fot_tokens.is_empty() {
+            for token in &fot_tokens {
+                match IERC20BalanceOfProbe::new(*token, self.provider.clone())
+                    .balanceOf(*token)
+                    .call()
+                    .block(chain_tip)
+                    .await
+                {
+                    Ok(balance) => {
+                        crate::amms::fot::init_swap_back_balance_snapshot(
+                            *token,
+                            balance,
+                            chain_tip_u64,
+                        );
+                        info!(
+                            target: "state_space::sync",
+                            token = ?token,
+                            balance = ?balance,
+                            block = chain_tip_u64,
+                            "Swap-back balance snapshot initialized (event-driven sync)"
+                        );
+                    }
+                    Err(e) => {
+                        // 失败保留无缓存：swap_back_balance 返回 0 → 模拟"不 dump"→
+                        // 输出高估 → 若链上实际余额 >= threshold（dump 常态）可能误判
+                        // profitable → revert 风险（与 67598082 事故同向）。
+                        // 缓解：sync 成功时 RPC 已健康（失败概率低）+ 事件流首个
+                        // Transfer 后即修正 + warn 可观测。真正保守方向（模拟"会
+                        // dump"）需模拟层 stale 降级，超出本次范围。
+                        warn!(
+                            target: "state_space::sync",
+                            token = ?token,
+                            error = ?e,
+                            "Failed to snapshot swap-back balance; swapBack simulated as inactive (revert-risk window until first Transfer event)"
+                        );
+                    }
+                }
+            }
+        }
 
         // Slipstream fee config sync: low-frequency task to refresh DynamicFeeConfig and
         // FeeModuleGlobals (governance changes we don't fully subscribe to via events).
