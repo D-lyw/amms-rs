@@ -471,14 +471,28 @@ impl CaliberPropPool {
         if let Some(first) = self.ladder.ladder_a_to_b.first() {
             // 现货价 = 链上边际价格（docs/caliber_prop_internal.md §5）：
             //   d(out)/d(in) = field0 * (1e6 - (x0 + field1)) / (1e9 * scale * 1e6)
-            // 归一化到人读价格（1 token_a = X token_b）后 scale 与 10^(dec_a-dec_b) 相消，
-            // 得 price_a_in_b = field0 * (1e6 - (x0 + field1)) / 1e15。
+            // ladder 存的是 token_x → token_y 方向，归一化后人读价格为
+            // "1 token_x = X token_y"（X = field0 * (1e6 - (x0 + field1)) / 1e15，
+            // scale 与 10^(dec_x-dec_y) 相消）。
+            //
+            // 注意方向：只有 token_x == token_a 时该值才是 price_a_in_b（token_a 以
+            // token_b 计价）；当 token_x == token_b（如 USDT0/wNVDAx pair，x=wNVDAx）时
+            // 它其实是 price_b_in_a，必须取倒数。旧实现直接赋值，导致该 pair 的
+            // spot_price(USDT0, wNVDAx) 返回 a/b（225.06）而非 b/a（0.004443），与
+            // V3 同调用方向相反，TwoCycle 预筛选错方向、漏掉 V3→Caliber 套利。
             // 注意：不能用首段斜率 y0/x0（旧实现），与真实边际价可差多个数量级。
             let a0 = MILLION - (first.amount_in + self.ladder.field1);
-            let price = u256_to_f64(&(self.ladder.field0 * a0)) / 1e15;
-            if price > 0.0 {
-                self.price_a_in_b = price;
-                self.price_b_in_a = 1.0 / price;
+            let price_xy = u256_to_f64(&(self.ladder.field0 * a0)) / 1e15;
+            if price_xy > 0.0 {
+                // price_a_in_b = price of a in terms of b = b/a（字段文档语义），
+                // price_b_in_a = price of b in terms of a = a/b。
+                let (b_per_a, a_per_b) = if self.token_x == self.token_a.address {
+                    (price_xy, 1.0 / price_xy)
+                } else {
+                    (1.0 / price_xy, price_xy)
+                };
+                self.price_a_in_b = b_per_a;
+                self.price_b_in_a = a_per_b;
             }
         }
     }
@@ -2398,6 +2412,101 @@ mod tests {
             expected
         );
         assert!((pool.price_b_in_a - 1.0 / expected).abs() < 1e-12);
+    }
+
+    /// 回归：XLayer 块 67564091 真实 pair（USDT0/wNVDAx，token_x=wNVDAx != token_a）。
+    ///
+    /// 旧实现把边际价 "1 token_x = X token_y" 直接存进 price_a_in_b，当
+    /// token_x == token_b（本 pair 即如此）时方向被存反：spot_price(USDT0, wNVDAx)
+    /// 返回 225.06（a/b），而同 pair 的 V3 池同调用返回 0.004458（b/a），方向语义
+    /// 相反，TwoCycle 预筛 case 翻转、只评估 Caliber→V3 错误方向，漏掉竞争者吃到的
+    /// V3→Caliber 套利（tx 0xa7d5157714582cd74af70886e10afd2aeaa5d0f825dbd37a97751dbff7001f8e）。
+    #[test]
+    fn test_spot_price_orientation_real_xlayer_pair_67564091() {
+        use std::str::FromStr;
+
+        let usdt0 = Address::from_str("0x779Ded0c9e1022225f8E0630b35a9b54bE713736").unwrap();
+        let wnvda = Address::from_str("0xa8ddb5Cd96b5222AFe198316E9A57CAA642850D5").unwrap();
+
+        // 块 67564091 真实状态（竞争者 tx 17 之前，与回放 A1 一致）：
+        // token_x=wNVDAx(18dp), token_y=USDT0(6dp), ladder=[(10,2e8),(50,9e8),(300,1e9)],
+        // field0=225133337972, field1=298, fee=200, win=500, scale=1e12。
+        let mut pool = CaliberPropPool {
+            contract_address: Address::ZERO,
+            pair_id: B256::ZERO,
+            virtual_address: Address::ZERO,
+            token_x: wnvda,
+            token_y: usdt0,
+            token_a: Token::new_with_decimals(usdt0, 6),
+            token_b: Token::new_with_decimals(wnvda, 18),
+            created_block: 0,
+            last_synced_block: 0,
+            reserve_a: U256::from(1752257155u64),
+            reserve_b: U256::from_str("141552681951730783366").unwrap(),
+            ladder: Default::default(),
+            price_a_in_b: 1.0,
+            price_b_in_a: 1.0,
+        };
+        pool.ladder.ladder_a_to_b = vec![
+            LadderPoint {
+                amount_in: U256::from(10u64),
+                amount_out: U256::from(200_000_000u64),
+            },
+            LadderPoint {
+                amount_in: U256::from(50u64),
+                amount_out: U256::from(900_000_000u64),
+            },
+            LadderPoint {
+                amount_in: U256::from(300u64),
+                amount_out: U256::from(1_000_000_000u64),
+            },
+        ];
+        pool.ladder.field0 = U256::from(225133337972u64);
+        pool.ladder.field1 = U256::from(298u64);
+        pool.ladder.fee_rate = U256::from(200u64);
+        pool.ladder.window = U256::from(500u64);
+        pool.ladder.scale = U256::from_str("1000000000000").unwrap();
+        pool.ladder.pos = U256::ZERO;
+        pool.ladder.deadline = unix_now() + 3600;
+        pool.ladder.validity_window = 20;
+
+        pool.refresh_prices();
+
+        // 边际价 = field0 * (1e6 - (x0 + field1)) / 1e15 = 225.0639969039046
+        // = "1 token_x(wNVDAx) = 225.0639969039046 token_y(USDT0)" = a/b。
+        let price_xy = 225133337972f64 * (1_000_000f64 - (10f64 + 298f64)) / 1e15;
+        // price_a_in_b = price of a(USDT0) in terms of b(wNVDAx) = b/a
+        assert!(
+            (pool.price_a_in_b - 1.0 / price_xy).abs() < 1e-12,
+            "price_a_in_b={}",
+            pool.price_a_in_b
+        );
+        assert!(
+            (pool.price_b_in_a - price_xy).abs() < 1e-9,
+            "price_b_in_a={}",
+            pool.price_b_in_a
+        );
+
+        // trait 契约：spot_price(base, quote) = price of base in terms of quote。
+        // 修复后与同 pair 的 V3 池方向一致：spot(USDT0, wNVDAx) 都是 quote/base。
+        let p_a_in_b = pool.spot_price(usdt0, wnvda).unwrap();
+        let p_b_in_a = pool.spot_price(wnvda, usdt0).unwrap();
+        assert!(
+            (p_a_in_b - 1.0 / price_xy).abs() < 1e-12,
+            "spot(USDT0,wNVDAx)={p_a_in_b}"
+        );
+        assert!(
+            (p_b_in_a - price_xy).abs() < 1e-9,
+            "spot(wNVDAx,USDT0)={p_b_in_a}"
+        );
+
+        // TwoCycle 预筛回归：V3 块 67564091 spot(USDT0,wNVDAx)=0.0044583977，
+        // case_a = p_v3 > p_cal * spread(1.000012) 必须成立 → 选中 V3→Caliber 方向。
+        let p_v3 = 0.004458397727798574f64;
+        assert!(
+            p_v3 > p_a_in_b * 1.000012,
+            "case_a must hold: p_v3={p_v3} p_cal={p_a_in_b}"
+        );
     }
 
     // ── batchUpdateParameters 解码 / raw tx 提取 / 池子应用 ──
