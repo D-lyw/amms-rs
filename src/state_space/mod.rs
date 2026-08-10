@@ -154,7 +154,12 @@ const CONTENT_HASH_DEDUP_CAPACITY: usize = 1_000;
 const DEFAULT_PENDING_SYNC_WORKER_INTERVAL: Duration = Duration::from_secs(2);
 const DEFAULT_DRIFT_PROBE_INTERVAL: Duration = Duration::from_secs(120);
 /// 实时交易驱动下 caliber 周期对账默认间隔（断流/储备变动/漏更新的兜底延迟上界）
-const DEFAULT_CALIBER_RECONCILE_INTERVAL: Duration = Duration::from_secs(45);
+///
+/// ⚠️ 临时兜底（2026-08-10）：生产 RPC 限流（429/-32016）下 45s 一轮全量
+/// `eth_getStorageAt` 仍持续撞限流；caliber 价格新鲜度由 flashblocks 实时
+/// 交易流保证，对账仅是低频兜底，默认放宽到 60s。后续应改为配置化独立
+/// HTTP RPC 端点（见 `caliber_prop::CALIBER_STORAGE_HTTP_RPC` TODO）后恢复。
+const DEFAULT_CALIBER_RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

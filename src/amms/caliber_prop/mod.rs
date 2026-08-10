@@ -1089,6 +1089,17 @@ fn warn_batch_fallback(e: &AMMError) {
     }
 }
 
+/// 判断错误是否属于 RPC 限流/过载类（HTTP 429 / JSON-RPC -32016 over rate limit）。
+///
+/// 限流时继续逐槽回退只会把请求量放大 ~8 倍（72+27+2 个 per-slot
+/// `eth_getStorageAt`）并进一步加剧限流，必须直接放弃本轮、等待下一轮
+/// 对账（配合对账任务的指数退避）。非限流错误（如网关拒绝 batch 的
+/// `-32601 method not whitelisted`）仍走逐槽回退兜底。
+fn is_rate_limited_err(e: &impl std::fmt::Debug) -> bool {
+    let msg = format!("{e:?}");
+    msg.contains("429") || msg.contains("rate limit") || msg.contains("-32016")
+}
+
 /// 存储读取块高钳制告警只输出一次（避免每次 resync/coverage 刷屏）。
 static STORAGE_CLAMP_WARNED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -1165,6 +1176,11 @@ where
     let mut batch_ok = true;
     if let Err(e) = batch.send().await {
         batch_ok = false;
+        if is_rate_limited_err(&e) {
+            return Err(AMMError::Msg(format!(
+                "caliber: batch get_storage_at rate limited: {e}"
+            )));
+        }
         warn_batch_fallback(&AMMError::Msg(format!("caliber: batch send failed: {e}")));
     }
     if batch_ok {
@@ -1173,6 +1189,11 @@ where
                 Ok(value) => out.push(U256::from_be_bytes(value.0)),
                 Err(e) => {
                     batch_ok = false;
+                    if is_rate_limited_err(&e) {
+                        return Err(AMMError::Msg(format!(
+                            "caliber: batch get_storage_at rate limited: {e}"
+                        )));
+                    }
                     warn_batch_fallback(&AMMError::Msg(format!(
                         "caliber: batch get_storage_at failed: {e}"
                     )));

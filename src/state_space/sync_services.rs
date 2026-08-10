@@ -1181,10 +1181,18 @@ pub async fn start_caliber_prop_ladder_sync_task<N, P>(
     N: Network,
     P: Provider<N> + Clone + 'static,
 {
+    // ⚠️ 临时兜底（2026-08-10）：生产 RPC 限流下 caliber 对账轮询禁止低于
+    // 60s（调用方即使传入 25s/45s 也会被钳制到 60s）。caliber 价格新鲜度由
+    // flashblocks 实时交易流保证，对账仅为冷启动/断流/储备/漏更新的低频兜底，
+    // 无需高频轮询。后续应改为配置化独立 HTTP RPC 端点后移除。
+    const MIN_RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
+    let interval = interval.max(MIN_RECONCILE_INTERVAL);
+    // 对账失败退避上限：RPC 限流/网关过载时避免持续硬撞（间隔翻倍，
+    // 成功恢复 `interval`；配合 storage_at_batch 限流时不逐槽回退）。
+    const MAX_RECONCILE_BACKOFF: Duration = Duration::from_secs(300);
     let mut next_sleep = startup_delay_with_jitter(interval, "caliber_prop");
     loop {
         sleep(next_sleep).await;
-        next_sleep = interval;
 
         let mut target_pools: Vec<CaliberPropPool> = {
             let read_guard = state.read().await;
@@ -1199,9 +1207,11 @@ pub async fn start_caliber_prop_ladder_sync_task<N, P>(
         };
 
         if target_pools.is_empty() {
+            next_sleep = interval;
             continue;
         }
 
+        let mut reconcile_failed = false;
         debug!(
             "Reconciling ladder snapshots for {} Caliber propAMM pools",
             target_pools.len()
@@ -1217,10 +1227,12 @@ pub async fn start_caliber_prop_ladder_sync_task<N, P>(
             Ok(flags) => {
                 let failed = flags.iter().filter(|f| !**f).count();
                 if failed > 0 {
+                    reconcile_failed = true;
                     warn!("Caliber reconcile: {}/{} pools failed", failed, flags.len());
                 }
             }
             Err(e) => {
+                reconcile_failed = true;
                 error!(error = ?e, "Caliber reconcile batch snapshot failed");
             }
         }
@@ -1233,6 +1245,14 @@ pub async fn start_caliber_prop_ladder_sync_task<N, P>(
                 }
             }
         }
+
+        // 失败退避：成功恢复基础间隔；失败翻倍（上限 300s），限流恢复后
+        // 不会多实例/多轮集体打爆网关。
+        next_sleep = if reconcile_failed {
+            next_sleep.saturating_mul(2).min(MAX_RECONCILE_BACKOFF)
+        } else {
+            interval
+        };
     }
 }
 
