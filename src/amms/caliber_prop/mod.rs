@@ -1120,6 +1120,20 @@ fn warn_storage_clamp(requested_block: u64, storage_head: u64) {
     }
 }
 
+/// 批量存储读取的固定请求间隔（毫秒）。
+///
+/// ⚠️ 临时节流（2026-08-10）：`rpc.xlayer.tech` 公共 HTTP 端点对
+/// `eth_getStorageAt` 限流严格（`-32016 over rate limit`），初始化/周期对账的
+/// 多个 batch 在极短窗口内连发易叠加触发限流；这里在每批 HTTP 请求前固定
+/// sleep，保证请求间隔均匀（≈ 响应时间 + 200ms），摊平瞬时 RPS。
+/// 后续接入独立/高配额 HTTP 端点后可移除。
+const STORAGE_BATCH_SLEEP_MS: u64 = 200;
+
+/// 固定节流：每批批量存储 HTTP 请求前 sleep `STORAGE_BATCH_SLEEP_MS`。
+async fn throttle_storage_batch() {
+    tokio::time::sleep(std::time::Duration::from_millis(STORAGE_BATCH_SLEEP_MS)).await;
+}
+
 /// 存储读取块高钳制：caliber 存储读取走硬编码 HTTP RPC
 /// （`caliber_storage_provider`），该节点头部可能落后于调用方传入的块高
 /// （如 maintenance Resync/coverage 传入的 flashblocks 乐观头），直接查询会
@@ -1174,6 +1188,7 @@ where
 
     let mut out = Vec::with_capacity(reads.len());
     let mut batch_ok = true;
+    throttle_storage_batch().await;
     if let Err(e) = batch.send().await {
         batch_ok = false;
         if is_rate_limited_err(&e) {
