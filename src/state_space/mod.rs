@@ -1012,44 +1012,23 @@ impl<N, P> StateSpaceManager<N, P> {
 
         // FoT BuySell swapBack 自持余额事件驱动同步：
         // 从日志流中提取监控 token 的 ERC20 Transfer 事件，驱动累加器
-        // （to==token → +=v 税收入；from==token → =0 swapBack dump 归零），
-        // 然后从 logs 移除——这些日志不属于任何池子 sync 事件，避免污染
-        // state.sync 的未知地址静默跳过路径，也避免重复处理。
-        let mut fot_logs: Vec<(Address, Address, Address, U256, u64, u64)> = Vec::new();
+        // （to==token → +=v 税收入；from==token → =0 swapBack dump 归零；
+        // 水位 (block, txIndex, logIndex) 三元组防重放，同块多事件全部
+        // 按序应用——块粒度水位会误丢同块第二条事件，67617009 取证修复）。
+        // 过滤与提取统一走 fot 公开 API（与验证/回放脚本同源，避免手动
+        // 复制逻辑漂移）。随后从 logs 移除——这些日志不属于任何池子 sync
+        // 事件，避免污染 state.sync 的未知地址静默跳过路径。
+        let mut fot_logs: Vec<alloy::rpc::types::Log> = Vec::new();
         logs.retain(|l| {
-            let is_fot = l.topics().first() == Some(&crate::amms::fot::ERC20_TRANSFER_SIG)
-                && crate::amms::fot::is_swap_back_monitored(l.address());
-            if is_fot {
-                if let (Some(from_t), Some(to_t)) = (l.topics().get(1), l.topics().get(2)) {
-                    let from = Address::from_slice(&from_t.0[12..]);
-                    let to = Address::from_slice(&to_t.0[12..]);
-                    let value = U256::from_be_slice(&l.data().data);
-                    // 带 (txIndex, logIndex) 位置：同块内多事件全部按序应用，
-                    // 水位只防完全相同位置的重放（块粒度水位会误丢同块后续事件）
-                    fot_logs.push((
-                        l.address(),
-                        from,
-                        to,
-                        value,
-                        l.transaction_index.unwrap_or(u64::MAX),
-                        l.log_index.unwrap_or(u64::MAX),
-                    ));
-                }
+            if crate::amms::fot::is_swap_back_transfer_log(l) {
+                fot_logs.push(l.clone());
                 false
             } else {
                 true
             }
         });
-        for (token, from, to, value, tx_index, log_index) in fot_logs {
-            crate::amms::fot::apply_swap_back_transfer(
-                token,
-                from,
-                to,
-                value,
-                block_num,
-                tx_index,
-                log_index,
-            );
+        for l in &fot_logs {
+            crate::amms::fot::apply_swap_back_transfer_log(l, block_num);
         }
 
         if logs.is_empty() {

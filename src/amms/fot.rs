@@ -499,6 +499,44 @@ pub fn apply_swap_back_transfer(
     state.refreshed_at = Instant::now();
 }
 
+/// 判断 log 是否为受监控 swapBack token 的 ERC20 Transfer 事件
+///
+/// 生产事件流（state_space `apply_logs_for_block_timed` FoT 分支）与验证/
+/// 回放脚本统一经此过滤：topic0 == Transfer 签名且地址在受监控注册表
+/// （BuySell 且 threshold != MAX）。避免各脚本手动复制提取逻辑产生漂移
+/// （曾因脚本自研累加器未覆盖生产水位逻辑导致盲区，2026-08-11 已修复）。
+pub fn is_swap_back_transfer_log(log: &alloy::rpc::types::Log) -> bool {
+    log.topics().first() == Some(&ERC20_TRANSFER_SIG) && is_swap_back_monitored(log.address())
+}
+
+/// 应用一条受监控 token 的 Transfer 日志（生产事件流与回放脚本的统一入口）
+///
+/// 等价 [`apply_swap_back_transfer`] 的单条语义：从 log 提取
+/// `(from, to, value, txIndex, logIndex)` 后调用。日志必须已按
+/// `(block, txIndex, logIndex)` 排序。非受监控/非 Transfer/字段缺失的日志
+/// 返回 false（不 panic）。
+pub fn apply_swap_back_transfer_log(log: &alloy::rpc::types::Log, block: u64) -> bool {
+    if !is_swap_back_transfer_log(log) {
+        return false;
+    }
+    let (Some(from_t), Some(to_t)) = (log.topics().get(1), log.topics().get(2)) else {
+        return false;
+    };
+    let from = Address::from_slice(&from_t.0[12..]);
+    let to = Address::from_slice(&to_t.0[12..]);
+    let value = U256::from_be_slice(&log.data().data);
+    apply_swap_back_transfer(
+        log.address(),
+        from,
+        to,
+        value,
+        block,
+        log.transaction_index.unwrap_or(u64::MAX),
+        log.log_index.unwrap_or(u64::MAX),
+    );
+    true
+}
+
 /// 更新 token 合约自身持有余额（兼容/测试用途；生产路径已改为事件驱动快照+增量）
 pub fn set_swap_back_balance(token: Address, balance: U256) {
     swap_back_balances().write().unwrap().insert(
@@ -870,6 +908,70 @@ mod tests {
         // 下一块事件正常应用
         apply_swap_back_transfer(token, Address::repeat_byte(0x01), token, U256::from(3u32), 102, 0, 0);
         assert_eq!(swap_back_balance(token), U256::from(10u32));
+    }
+
+    /// 构造一条监控 token 的 Transfer 日志（RPC JSON 格式，位置参数可配）
+    fn mk_transfer_log(
+        token: Address,
+        from: Address,
+        to: Address,
+        value: u64,
+        block: u64,
+        tx_index: u64,
+        log_index: u64,
+    ) -> alloy::rpc::types::Log {
+        // topics 是 32 字节 B256：from/to 地址需左填充到 64 hex
+        let pad = |a: Address| format!("0x{:0>64}", format!("{a:x}"));
+        serde_json::from_value(serde_json::json!({
+            "address": format!("{token:#x}"),
+            "topics": [
+                format!("{ERC20_TRANSFER_SIG:#x}"),
+                pad(from),
+                pad(to),
+            ],
+            "data": format!("0x{:064x}", value),
+            "blockNumber": format!("{block:#x}"),
+            "transactionIndex": format!("{tx_index:#x}"),
+            "logIndex": format!("{log_index:#x}"),
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn test_apply_swap_back_transfer_log_api() {
+        // 统一 Log API（state_space FoT 分支与回放脚本共用）：
+        // 过滤 + 提取 + 位置水位，等价手写 7 参调用
+        let token = Address::repeat_byte(0x5c);
+        let pool = Address::repeat_byte(0x5d);
+        let user = Address::repeat_byte(0x5e);
+        // 未注册地址的 Transfer → 不过滤不应用
+        let unmonitored = mk_transfer_log(user, user, user, 1, 101, 0, 0);
+        assert!(!is_swap_back_transfer_log(&unmonitored));
+        assert!(!apply_swap_back_transfer_log(&unmonitored, 101));
+        // 注册监控后：同块多事件（税入 + dump 归零 + 税入）全部应用
+        register_fot_token(
+            token,
+            FotTaxType::BuySell {
+                buy_fee_bps: 300,
+                sell_fee_bps: 300,
+                pairs: vec![pool],
+                swap_back_threshold: U256::from(1250u64),
+            },
+        );
+        init_swap_back_balance_snapshot(token, U256::from(1000u32), 100);
+        let tax_in = mk_transfer_log(token, pool, token, 50, 101, 14, 0);
+        assert!(is_swap_back_transfer_log(&tax_in));
+        assert!(apply_swap_back_transfer_log(&tax_in, 101));
+        assert_eq!(swap_back_balance(token), U256::from(1050u32));
+        let dump = mk_transfer_log(token, token, pool, 1050, 101, 15, 0);
+        assert!(apply_swap_back_transfer_log(&dump, 101));
+        assert_eq!(swap_back_balance(token), U256::ZERO);
+        let tax_in2 = mk_transfer_log(token, pool, token, 7, 101, 15, 1);
+        assert!(apply_swap_back_transfer_log(&tax_in2, 101));
+        assert_eq!(swap_back_balance(token), U256::from(7u32));
+        // 完全同位置重放 → 丢弃
+        assert!(apply_swap_back_transfer_log(&tax_in2, 101));
+        assert_eq!(swap_back_balance(token), U256::from(7u32));
     }
 
     #[test]
