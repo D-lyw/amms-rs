@@ -80,7 +80,8 @@
 //! 同步链路：启动时 [`init_swap_back_balance_snapshot`] 一次快照（sync chain_tip），
 //! 事件流（实时 flashblocks + 断流 backfill 同源覆盖）按
 //! `(block, txIndex, logIndex)` 序调 [`apply_swap_back_transfer`] 增量累加，
-//! 水位 `last_applied_block` 防重复。旧的 1s 周期 RPC 轮询已移除——
+//! 水位 `(block, txIndex, logIndex)` 三元组防重复（同块内多事件全部应用）。
+//! 旧的 1s 周期 RPC 轮询已移除——
 //! 它无法识别机会区块内的增量（事故 67598082：竞争者 idx14 买入推高自持
 //! 32,071→117,250，模拟仍用 block-1 快照 → swapBack dump 低估 3.66 倍 → revert）。
 //!
@@ -372,7 +373,9 @@ pub fn apply_to_token(token: &mut Token) {
 ///      `(block, txIndex, logIndex)` 序调 [`apply_swap_back_transfer`]：
 ///        to   == token → balance += v（sell/buy 3% 税进自持）
 ///        from == token → balance = 0（swapBack dump 转出全部，置零清漂移）
-///   3. 水位 `last_applied_block` 防重复（backfill/实时重叠的事件丢弃）
+///   3. 水位 `(block, txIndex, logIndex)` 三元组防重复（backfill/实时重叠、
+///      断线重连重放的事件丢弃；**同块内多事件按位置序全部应用**——
+///      块粒度水位会把同块第二条及以后事件误丢，导致 dump 归零失效）
 ///
 /// 旧轮询无法识别机会区块内的增量（事故 67598082：竞争者块内买入推高自持，
 /// 模拟仍用旧快照 → swapBack dump 量低估 3.66 倍 → "V4: unprofitable" revert）。
@@ -382,8 +385,9 @@ pub fn apply_to_token(token: &mut Token) {
 struct SwapBackBalanceState {
     balance: U256,
     refreshed_at: Instant,
-    /// 已应用事件的最高区块（<= 该区块的事件视为已含在状态中，丢弃）
-    last_applied_block: u64,
+    /// 已应用事件的最高链上位置 `(block, txIndex, logIndex)`
+    /// （<= 该位置的事件视为已含在状态中，丢弃）
+    last_applied: (u64, u64, u64),
 }
 
 static FOT_SWAP_BACK_BALANCES: OnceLock<RwLock<HashMap<Address, SwapBackBalanceState>>> =
@@ -442,21 +446,27 @@ pub fn is_swap_back_monitored(token: Address) -> bool {
 ///
 /// block 必须与 state_space `realtime_head` 初始值（sync 的 chain_tip）一致：
 /// 事件流 backfill 从 chain_tip+1 开始，事件全部 > 本水位 → 无重叠无缺口。
+/// 快照水位取块末位置 `(block, u64::MAX, u64::MAX)`：块内 tx/log 索引
+/// 无意义，但任何 block+1 起的事件位置必然 > 块末水位。
 pub fn init_swap_back_balance_snapshot(token: Address, balance: U256, block: u64) {
     swap_back_balances().write().unwrap().insert(
         token,
         SwapBackBalanceState {
             balance,
             refreshed_at: Instant::now(),
-            last_applied_block: block,
+            last_applied: (block, u64::MAX, u64::MAX),
         },
     );
 }
 
-/// 应用一条监控 token 合约的 Transfer 事件（事件流按块内序调用）。
+/// 应用一条监控 token 合约的 Transfer 事件（事件流按
+/// `(block, txIndex, logIndex)` 序调用）。
 ///
-/// - `block <= last_applied_block` → 丢弃（水位防重复：backfill/实时重叠、
-///   断线重连重放）
+/// - `(block, tx_index, log_index) <= last_applied` → 丢弃（水位防重复：
+///   backfill/实时重叠、断线重连重放；**只丢弃完全相同位置的重放**，
+///   同块内多事件按位置序全部应用——块粒度水位会把同块第二条及以后
+///   事件误丢（如竞争者块：税收入账占用水位后，dump 归零事件被丢弃，
+///   余额停在错误值污染后续块模拟））
 /// - `to == token` → `balance += value`（sell/buy 方向 3% 税进自持）
 /// - `from == token` → `balance = 0`（swapBack dump 转出全部自持；**置零而非
 ///   减法**——清除此前任何事件缺失导致的漂移，dump 是天然强制对齐点）
@@ -466,14 +476,16 @@ pub fn apply_swap_back_transfer(
     to: Address,
     value: U256,
     block: u64,
+    tx_index: u64,
+    log_index: u64,
 ) {
     let mut guard = swap_back_balances().write().unwrap();
     let state = guard.entry(token).or_insert(SwapBackBalanceState {
         balance: U256::ZERO,
         refreshed_at: Instant::now(),
-        last_applied_block: 0,
+        last_applied: (0, 0, 0),
     });
-    if block <= state.last_applied_block {
+    if (block, tx_index, log_index) <= state.last_applied {
         return;
     }
     // 语义与 verify_rtx_swapback_balance 取证脚本一致：from==self 优先归零
@@ -483,7 +495,7 @@ pub fn apply_swap_back_transfer(
         (true, _) => state.balance = U256::ZERO,
         _ => {}
     }
-    state.last_applied_block = block;
+    state.last_applied = (block, tx_index, log_index);
     state.refreshed_at = Instant::now();
 }
 
@@ -494,7 +506,7 @@ pub fn set_swap_back_balance(token: Address, balance: U256) {
         SwapBackBalanceState {
             balance,
             refreshed_at: Instant::now(),
-            last_applied_block: 0,
+            last_applied: (0, 0, 0),
         },
     );
 }
@@ -776,16 +788,26 @@ mod tests {
             token,
             U256::from(50u32),
             101,
+            0,
+            0,
         );
         assert_eq!(swap_back_balance(token), U256::from(1050u32));
         // buy 税：Transfer(主池 → token 合约) → +v
-        apply_swap_back_transfer(token, pool, token, U256::from(30u32), 102);
+        apply_swap_back_transfer(token, pool, token, U256::from(30u32), 102, 0, 0);
         assert_eq!(swap_back_balance(token), U256::from(1080u32));
         // swapBack dump：Transfer(token 合约 → 主池) → =0（非减法）
-        apply_swap_back_transfer(token, token, pool, U256::from(1080u32), 103);
+        apply_swap_back_transfer(token, token, pool, U256::from(1080u32), 103, 0, 0);
         assert_eq!(swap_back_balance(token), U256::ZERO);
         // dump 后再进税 → 从 0 重新累加
-        apply_swap_back_transfer(token, Address::repeat_byte(0x02), token, U256::from(7u32), 104);
+        apply_swap_back_transfer(
+            token,
+            Address::repeat_byte(0x02),
+            token,
+            U256::from(7u32),
+            104,
+            0,
+            0,
+        );
         assert_eq!(swap_back_balance(token), U256::from(7u32));
     }
 
@@ -793,15 +815,61 @@ mod tests {
     fn test_swap_back_watermark_drops_replays() {
         let token = Address::repeat_byte(0x57);
         init_swap_back_balance_snapshot(token, U256::from(1000u32), 100);
-        // 水位 = 100：<=100 的事件丢弃（快照块事件重叠 / backfill-实时边界防重）
-        apply_swap_back_transfer(token, Address::repeat_byte(0x01), token, U256::from(50u32), 100);
-        apply_swap_back_transfer(token, Address::repeat_byte(0x01), token, U256::from(60u32), 99);
+        // 快照水位 = (100, MAX, MAX)：<= 该位置的事件丢弃（快照块事件重叠 /
+        // backfill-实时边界防重）
+        apply_swap_back_transfer(token, Address::repeat_byte(0x01), token, U256::from(50u32), 100, 0, 0);
+        apply_swap_back_transfer(token, Address::repeat_byte(0x01), token, U256::from(60u32), 99, 0, 0);
         assert_eq!(swap_back_balance(token), U256::from(1000u32));
-        // 101 应用后，同块重放被丢弃（断线重连重放同一事件）
-        apply_swap_back_transfer(token, Address::repeat_byte(0x01), token, U256::from(40u32), 101);
+        // (101,0,0) 应用后，完全相同位置重放被丢弃（断线重连重放同一事件）
+        apply_swap_back_transfer(token, Address::repeat_byte(0x01), token, U256::from(40u32), 101, 0, 0);
         assert_eq!(swap_back_balance(token), U256::from(1040u32));
-        apply_swap_back_transfer(token, Address::repeat_byte(0x01), token, U256::from(40u32), 101);
+        apply_swap_back_transfer(token, Address::repeat_byte(0x01), token, U256::from(40u32), 101, 0, 0);
         assert_eq!(swap_back_balance(token), U256::from(1040u32));
+    }
+
+    #[test]
+    fn test_swap_back_same_block_multiple_events_all_applied() {
+        // 水位 bug 回归（67617009 取证）：同块内多条 Transfer 必须全部按
+        // (block, txIndex, logIndex) 位置序应用；块粒度水位会把同块第二条
+        // 及以后事件误丢 → 竞争者的 dump 归零失效，余额停在错误值。
+        let token = Address::repeat_byte(0x5a);
+        let pool = Address::repeat_byte(0x5b);
+        init_swap_back_balance_snapshot(token, U256::from(1000u32), 100);
+        // 块 101 内 3 条事件（对应 67617009：tx14 税入 → tx15 dump → tx15 税入）
+        // (101, tx14, log0)：sell 税入 +50
+        apply_swap_back_transfer(
+            token,
+            Address::repeat_byte(0x01),
+            token,
+            U256::from(50u32),
+            101,
+            14,
+            0,
+        );
+        assert_eq!(swap_back_balance(token), U256::from(1050u32));
+        // (101, tx15, log0)：dump 归零（旧块粒度水位下被误丢）
+        apply_swap_back_transfer(token, token, pool, U256::from(1050u32), 101, 15, 0);
+        assert_eq!(swap_back_balance(token), U256::ZERO);
+        // (101, tx15, log1)：dump 后税入 +7（同一 tx 内后续事件）
+        apply_swap_back_transfer(token, pool, token, U256::from(7u32), 101, 15, 1);
+        assert_eq!(swap_back_balance(token), U256::from(7u32));
+        // 完全相同位置重放 → 丢弃
+        apply_swap_back_transfer(token, pool, token, U256::from(7u32), 101, 15, 1);
+        assert_eq!(swap_back_balance(token), U256::from(7u32));
+        // 更早位置乱序重放 → 丢弃（水位单调）
+        apply_swap_back_transfer(
+            token,
+            Address::repeat_byte(0x01),
+            token,
+            U256::from(50u32),
+            101,
+            14,
+            0,
+        );
+        assert_eq!(swap_back_balance(token), U256::from(7u32));
+        // 下一块事件正常应用
+        apply_swap_back_transfer(token, Address::repeat_byte(0x01), token, U256::from(3u32), 102, 0, 0);
+        assert_eq!(swap_back_balance(token), U256::from(10u32));
     }
 
     #[test]
@@ -817,6 +885,8 @@ mod tests {
             Address::repeat_byte(0x02),
             U256::from(117250u32),
             200,
+            0,
+            0,
         );
         assert_eq!(swap_back_balance(token), U256::ZERO);
     }
@@ -825,9 +895,9 @@ mod tests {
     fn test_swap_back_apply_uninitialized_token() {
         // 未快照 token 的事件：or_insert 0 起点累加（防御性，不应 panic）
         let token = Address::repeat_byte(0x59);
-        apply_swap_back_transfer(token, Address::repeat_byte(0x01), token, U256::from(77u32), 5);
+        apply_swap_back_transfer(token, Address::repeat_byte(0x01), token, U256::from(77u32), 5, 0, 0);
         assert_eq!(swap_back_balance(token), U256::from(77u32));
-        apply_swap_back_transfer(token, token, Address::repeat_byte(0x02), U256::from(1u32), 6);
+        apply_swap_back_transfer(token, token, Address::repeat_byte(0x02), U256::from(1u32), 6, 0, 0);
         assert_eq!(swap_back_balance(token), U256::ZERO);
     }
 }

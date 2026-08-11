@@ -1015,7 +1015,7 @@ impl<N, P> StateSpaceManager<N, P> {
         // （to==token → +=v 税收入；from==token → =0 swapBack dump 归零），
         // 然后从 logs 移除——这些日志不属于任何池子 sync 事件，避免污染
         // state.sync 的未知地址静默跳过路径，也避免重复处理。
-        let mut fot_logs: Vec<(Address, Address, Address, U256)> = Vec::new();
+        let mut fot_logs: Vec<(Address, Address, Address, U256, u64, u64)> = Vec::new();
         logs.retain(|l| {
             let is_fot = l.topics().first() == Some(&crate::amms::fot::ERC20_TRANSFER_SIG)
                 && crate::amms::fot::is_swap_back_monitored(l.address());
@@ -1024,15 +1024,32 @@ impl<N, P> StateSpaceManager<N, P> {
                     let from = Address::from_slice(&from_t.0[12..]);
                     let to = Address::from_slice(&to_t.0[12..]);
                     let value = U256::from_be_slice(&l.data().data);
-                    fot_logs.push((l.address(), from, to, value));
+                    // 带 (txIndex, logIndex) 位置：同块内多事件全部按序应用，
+                    // 水位只防完全相同位置的重放（块粒度水位会误丢同块后续事件）
+                    fot_logs.push((
+                        l.address(),
+                        from,
+                        to,
+                        value,
+                        l.transaction_index.unwrap_or(u64::MAX),
+                        l.log_index.unwrap_or(u64::MAX),
+                    ));
                 }
                 false
             } else {
                 true
             }
         });
-        for (token, from, to, value) in fot_logs {
-            crate::amms::fot::apply_swap_back_transfer(token, from, to, value, block_num);
+        for (token, from, to, value, tx_index, log_index) in fot_logs {
+            crate::amms::fot::apply_swap_back_transfer(
+                token,
+                from,
+                to,
+                value,
+                block_num,
+                tx_index,
+                log_index,
+            );
         }
 
         if logs.is_empty() {
