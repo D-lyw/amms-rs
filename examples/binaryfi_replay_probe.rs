@@ -267,7 +267,8 @@ async fn flush_block<P: Provider + Clone>(
         }
     }
     // 大额 SELL（100 整枚）对拍：验证日志驱动后 sell_raw 精确性。
-    // sell_raw = price×999 - sell_off×1000 由 update 事件（L2 增强）直接设置；
+    // sell_raw = price - sell_off（无费，fee 在报价时按 fee_ppm 输入侧扣）
+    // 由 update 事件（L2 增强）直接设置；
     // 单档资产大额 SELL 必须逐位复刻（含超容量归零）；多档阶梯资产
     // （快照两点无法反推第一档 raw）在纯快照路径是近似，日志驱动后应精确。
     for (k, pair) in snap.quotePairs.iter().enumerate() {

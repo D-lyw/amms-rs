@@ -2302,7 +2302,7 @@ impl StateSpace {
         log_address: Address,
         topics: &[FixedBytes<32>],
     ) -> Option<Vec<Address>> {
-        use crate::amms::binaryfi_prop::{BINARYFI_SWAP_EVENT, BINARYFI_UPDATE_EVENT};
+        use crate::amms::binaryfi_prop::{BINARYFI_FEE_EVENT, BINARYFI_SWAP_EVENT, BINARYFI_UPDATE_EVENT};
 
         let mut instances: Vec<(
             Address,
@@ -2376,6 +2376,18 @@ impl StateSpace {
                     .collect();
                 Some(targets)
             }
+            // 引擎 FeeUpdated 事件（topics.len()==1，data 前 32 字节 = 新 fee ppm）：
+            // 费率是 per-account storage（共享 router/engine），同一 engine 的全部
+            // 虚拟子池一起更新，避免 setFee 后各子池 fee_ppm 不一致。
+            Some(topic) if *topic == BINARYFI_FEE_EVENT && has_engine_match => {
+                let targets = instances
+                    .into_iter()
+                    .filter_map(|(key, _, _, _, engine_addr)| {
+                        (engine_addr == log_address).then_some(key)
+                    })
+                    .collect();
+                Some(targets)
+            }
             _ => None,
         }
     }
@@ -2422,6 +2434,14 @@ impl StateSpace {
             let mut target_addresses: Vec<Address> = Vec::new();
             if direct_hit {
                 target_addresses.push(address);
+            } else if log.topics().len() == 1 {
+                // 单 topic 事件（如 BinaryFi FeeUpdated）：非池地址直命中，
+                // 需单独尝试 BinaryFi engine 事件路由（Update/Swap 均在 >=2 分支）
+                if let Some(binaryfi_targets) =
+                    self.resolve_binaryfi_targets(address, log.topics())
+                {
+                    target_addresses.extend(binaryfi_targets);
+                }
             } else if log.topics().len() >= 2 {
                 if Some(address) == get_liquidity_layer(self.chain_id) {
                     let pool_address = Address::from_word(log.topics()[1]);
@@ -2787,6 +2807,54 @@ mod tests {
         assert!(state
             .resolve_algebra_plugin_event_pools(plugin, &topics)
             .is_empty());
+    }
+
+    #[test]
+    fn binaryfi_fee_event_routes_to_all_pools_of_engine() {
+        use crate::amms::binaryfi_prop::{BinaryFiPropPool, BINARYFI_FEE_EVENT, BINARYFI_UPDATE_EVENT};
+
+        let engine = BinaryFiPropPool::default().engine_address;
+        let other_engine = address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let pool1 = address!("1111111111111111111111111111111111111111");
+        let pool2 = address!("2222222222222222222222222222222222222222");
+        let pool_other = address!("3333333333333333333333333333333333333333");
+
+        let mut state = StateSpace::default();
+        let mut p1 = BinaryFiPropPool::default();
+        p1.pool_address = pool1;
+        p1.exposed_pair = Some((3, 0));
+        let mut p2 = BinaryFiPropPool::default();
+        p2.pool_address = pool2;
+        p2.exposed_pair = Some((3, 0));
+        let mut p3 = BinaryFiPropPool::default();
+        p3.pool_address = pool_other;
+        p3.engine_address = other_engine;
+        state.insert_amm(AMM::BinaryFiPropPool(p1));
+        state.insert_amm(AMM::BinaryFiPropPool(p2));
+        state.insert_amm(AMM::BinaryFiPropPool(p3));
+
+        // FeeUpdated（单 topic）→ 命中同一 engine 的全部子池（费率 per-account 共享）
+        let mut routed = state
+            .resolve_binaryfi_targets(engine, &[BINARYFI_FEE_EVENT])
+            .expect("fee event must route");
+        routed.sort_unstable();
+        assert_eq!(routed, vec![pool1, pool2]);
+
+        // 非 fee 单 topic 事件 → 不路由（交由其他分支）
+        assert!(state.resolve_binaryfi_targets(engine, &[B256::ZERO]).is_none());
+        // fee 事件来自另一 engine → 只路由到该 engine 的池子
+        let mut routed_other = state
+            .resolve_binaryfi_targets(other_engine, &[BINARYFI_FEE_EVENT])
+            .expect("fee event must route for its own engine");
+        routed_other.sort_unstable();
+        assert_eq!(routed_other, vec![pool_other]);
+        // 既有 Update 事件路由不受影响
+        let asset_idx = B256::from(U256::from(3u64));
+        let mut routed_update = state
+            .resolve_binaryfi_targets(engine, &[BINARYFI_UPDATE_EVENT, asset_idx])
+            .expect("update event must route");
+        routed_update.sort_unstable();
+        assert_eq!(routed_update, vec![pool1, pool2]);
     }
 
     #[test]

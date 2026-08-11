@@ -22,8 +22,8 @@ use crate::amms::{
 };
 
 use super::{
-    BinaryFiPropPool, BINARYFI_ENGINE_ADDRESS, BINARYFI_POOL_ADDRESS, BINARYFI_ROUTER_ADDRESS,
-    BINARYFI_SWAP_EVENT, BINARYFI_UPDATE_EVENT, BINARYFI_VAULT_ADDRESS,
+    BinaryFiPropPool, BINARYFI_DEFAULT_FEE_PPM, BINARYFI_ENGINE_ADDRESS, BINARYFI_POOL_ADDRESS,
+    BINARYFI_ROUTER_ADDRESS, BINARYFI_SWAP_EVENT, BINARYFI_UPDATE_EVENT, BINARYFI_VAULT_ADDRESS,
 };
 
 // ============================================================================
@@ -117,6 +117,7 @@ impl BinaryFiPropFactory {
             buy_ladder_remaining: Vec::new(),
             ladder_reserves: Vec::new(),
             price0_calibrated: false,
+            fee_ppm: BINARYFI_DEFAULT_FEE_PPM,
         }
     }
 }
@@ -290,6 +291,6 @@ mod tests {
         assert_eq!(pool.router_address, BINARYFI_ROUTER_ADDRESS);
         assert_eq!(pool.created_block, 42);
         assert!(pool.assets.is_empty());
-        assert!(pool.sync_events().len() == 2);
+        assert_eq!(pool.sync_events().len(), 3);
     }
 }

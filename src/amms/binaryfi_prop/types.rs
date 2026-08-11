@@ -58,6 +58,7 @@ sol! {
         uint256[] vaultReserves;
         uint256[] quotePairs;
         QuoteResult[] quotes;
+        uint256 fee;
     }
 }
 

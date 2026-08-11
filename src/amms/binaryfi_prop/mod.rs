@@ -7,37 +7,45 @@
 //! `update(...)` 交易向引擎合约提交带签名的资产价格，池子合约对外提供线性报价
 //! `quote()`，单笔输出受引擎侧 per-asset 输出上限与金库余额约束。
 //!
-//! ## 报价模型（structLogs 反汇编 + 链上采样逐位验证；2026-08 引擎升级引入
-//! `999/1000` 费率因子，旧锚点块 67160388 及此前样例不再适用）
+//! ## 报价模型（structLogs 反汇编 + 链上采样逐位验证；2026-08 引擎升级后
+//! 按账户费率 `fee_ppm` 输入侧扣费，旧锚点块 67160388 及此前样例不再适用）
 //!
 //! 引擎以 USDT0 为 numéraire（`p0 = 100` 固定，无点差），每资产维护整数中间价
-//! `price`（2 位小数定点）与 buy/sell ladder 点差偏移（独立、可不对称）：
+//! `price`（2 位小数定点）与 buy/sell ladder 点差偏移（独立、可不对称）。
+//! 费率 `fee_ppm`（ppm，1e6=100%）是引擎 **per-account storage**：
+//! `getFee(account)` 读取（聚合器白名单 = 0，普通账户 = 运营方 `setFee` 现值，
+//! 历史 500→1000→200），本地 `fee_ppm` 由快照批量合约带回 + `FeeUpdated`
+//! 事件实时同步；**所有价格/阶梯均存无费口径**，报价时输入侧扣费
+//! `rem = in − in×fee_ppm/1e6`（整数除法），fee 变更无需重校准价格：
 //!
-//! - 卖方向：`raw_i = price_i×999 - sellOff_i×1000`（`sellOff = bidOffsetRaw × scale/10000`；
-//!   `bid_i = floor(raw_i/1000) = price_i - ceil(price_i/1000) - sellOff_i`，本地存
-//!   `bid_offset = ceil(price/1000) + sellOff`，`bid = price - bid_offset`）
+//! - 卖方向：`raw_i = price_i - sellOff_i`（`sellOff = bidOffsetRaw × scale/10000`；
+//!   `bid_i = price_i - sellOff_i`；历史 fee=1000 时等价
+//!   `bid = floor((price×999 - sellOff×1000)/1000)`）
 //! - 买方向：`ask_i = price_i + askOff_i`（`askOff = askOffsetRaw × scale/10000`）；
-//!   BUY 报价状态为小额报价 `q0j_j = floor(10^(dj+2)×999 / (1000×ask_j))`（`in=10^d0`）
-//! - `USDT0→j`（BUY）：先扣 0.1% 费 `rem = in − in/1000`（整数除法，与 SELL 同款），
+//!   BUY 报价状态为小额报价 `q0j_j = floor(10^(dj+2) / ask_j)`（无费，`in=10^d0`）
+//! - `USDT0→j`（BUY）：先扣费 `rem = in − in×fee_ppm/1e6`（整数除法，与 SELL 同款；
+//!   链上逐位实证 fee=1000：tx1 in=44,291,018 → 324,080,619,644,034,278、
+//!   tx2 in=122,156,425 → 891,476,871,940,974,505；**不能**用 `in×(1e6−fee)/1e6`
+//!   替代——非整倍数输入有 ~1e-4% 偏差），
 //!   `linear = floor(rem × 10^(dj+2) / (ask_j × 10^d0))`
-//!   （链上逐位对拍：tx1 in=44,291,018 → 324,080,619,644,034,278、
-//!   tx2 in=122,156,425 → 891,476,871,940,974,505；**不能**用 `in×999/1000`
-//!   替代——非 1000 倍数输入有 ~1e-4% 偏差），再按阶梯上限截断：
+//!   （fee=200 实测：asset4~9 BUY 全 -200.0ppm，逐位一致），再按阶梯上限截断：
 //!   - 饱和型（阶梯容量 ≤ 金库余额，大额 probe 可观测 maxOut）：`out = min(linear, maxOut)`
 //!   - 超阈值归零型（阶梯容量 > 金库余额，大额 probe = 0）：`linear > 金库余额 → 0`，
 //!     否则原样返回（有效上限 = 金库余额，由 `getAssetReserves` 观测）
 //! - `i→USDT0`（SELL）：多档阶梯逐档累加
 //!   `out = Σ_k (price − w_k) × min(rem, qty_k×R) × 10^(d0−2) / 10^di`，
-//!   `rem = in − in/1000`（费率因子先扣；链上实测 in<1000 时与 in×999/1000 不同）
+//!   `rem = in − in×fee_ppm/1e6`（费率先扣；链上实测 in<1000 时与 in×999/1000 不同）
 //!   逐档递减，首档 weight = 小额报价偏移。阶梯来自 L2 update calldata `data0`
 //!   （每档 24bit = 12bit weight + 12bit qty，最多 10 档），储备 R 来自快照
 //!   100 整枚 probe + ladder 反推（链上长期稳定、不随 Swap 变化）；
 //!   阶梯未知时回退单档线性（raw 有理数 + maxIn 截断 + 超容量归零）
 //! - `i→j`（非 USDT0）：两段式（与引擎一致，含中间截断）：
-//!   `v = floor(in × raw_i × 10^(d0-2) / (1000 × 10^di))`（受 maxIn_i 截断 + 归零），
-//!   `out = floor(v × 10^(dj-d0+2) / ask_j)`（第二段 BUY **不含** 999/1000 因子，
-//!   链上实测；直接 `0→j` 才带因子），再按上述 BUY 规则截断/归零
-//! - `i→USDT0` 输入受 SELL 阶梯上限 `maxIn_i` 截断（`min(in, maxIn_i)`），
+//!   `v = floor(in × raw_i × 10^(d0-2) / 10^di)`（受 maxIn_i 截断 + 归零），
+//!   `out = floor(v × 10^(dj-d0+2) / ask_j)`（第二段 BUY 无额外费率因子——
+//!   费已在两段输入侧各扣一次，链上实测；直接 `0→j` 才扣一次），
+//!   再按上述 BUY 规则截断/归零
+//! - `i→USDT0` 消耗量受 SELL 阶梯上限截断（`consume = min(rem, maxIn_i)`，
+//!   `rem = in − in×fee_ppm/1e6`；饱和时消耗满 `maxIn_i`，输出 fee 无关），
 //!   `maxIn = ladderWeight_sell × engineReserve`，由 100 整枚 probe 精确恢复；
 //!   多档阶梯资产（如 DOG）100 整枚 probe 与单档线性不兼容，本地仅小额区
 //!   可精确复刻（生产 update 路径由 `apply_l2_update` 直接携带精确 raw）
@@ -133,8 +141,9 @@
 //! - 原生 ETH 支持：`NATIVE_ETH = 0xEeee...EeE`（ethIn 要求 `msg.value ==
 //!   amountIn`、ethOut 要求 `msg.value == 0`）；核心/引擎内部统一按 WETH 处理。
 //! - `getFee(account)`：核心按账户收取费率 → 引擎 bytecode 无硬编码 999/1000
-//!   的原因（费率在核心 storage，可能 per-account）；本地 999/1000 由 quote
-//!   实证锚定，见 `BINARYFI_DEFAULT_*` 与费率推导注释。
+//!   的原因（费率在核心 storage，per-account）；本地 `fee_ppm` 由快照批量合约
+//!   `getFee(recipient)` 带回 + `FeeUpdated` 事件（topic0 `0xc58b3024…`，data
+//!   前 32 字节 = 新 fee）实时同步，报价输入侧按 `fee_ppm` 扣费。
 //! - Swap 事件 topics = `[sig, user, tokenIn, tokenOut]`、data = `(amountIn,
 //!   amountOut)`，与模块 L1 解析（`token_in=topics[2]`、`token_out=topics[3]`）
 //!   逐位一致。
@@ -208,6 +217,19 @@ pub const BINARYFI_UPDATE_EVENT: B256 =
     b256!("af186e2e77ac28f0c051cdd1e2b3b92924e34b314650186bbc14742e373751c8");
 /// 引擎 update 函数选择器
 pub const BINARYFI_UPDATE_SELECTOR: [u8; 4] = [0x02, 0x4b, 0x94, 0xf6];
+/// 引擎 setFee 函数选择器（`setFee(uint256)`，运营方调用；fee 单位 = ppm，1e6 = 100%）。
+/// 链上实证：块 0x4073356 由 0x2db200f40f47… 调用设置 fee=0xc8(200)，该块内
+/// `getFee` 从 1000 变为 200。
+pub const BINARYFI_FEE_SELECTOR: [u8; 4] = [0x6f, 0x7c, 0x86, 0x8b];
+/// 引擎 FeeUpdated 事件签名（data 前 32 字节 = 新 fee ppm）。
+/// 链上实证：`setFee` 会发该事件（topic0 = 0xc58b3024…，data = 0xc8 = 200）。
+pub const BINARYFI_FEE_EVENT: B256 =
+    b256!("c58b3024a07432cfc160ea128eebc11329d444bb61bf7098f09bb6567b943c66");
+/// 默认费率（ppm，1e6 = 100%）：未知/未同步时的兜底。
+/// 历史实证：锚点块 67302528 = 500、失败交易窗口 6748xxxx = 1000、
+/// 2026-08-10 16:16 UTC（块 0x4073356）起 = 200；聚合器 0xd9eccc… = 0（白名单）。
+/// 除白名单外普通账户统一取同一默认值。
+pub const BINARYFI_DEFAULT_FEE_PPM: u64 = 1_000;
 /// update calldata 总长度（实测 452B）= selector(4) + head 6 words(192) +
 /// data0..2(96) + data_len(32) + sig_len(32) + sig(96)
 pub const BINARYFI_UPDATE_CALLDATA_LEN: usize = 4 + 32 * 6 + 96 + 32 + 32 + 96;
@@ -231,6 +253,11 @@ pub const BINARYFI_PRICE0_DEFAULT: u64 = 100;
 pub const BINARYFI_DEFAULT_SPREAD: u64 = 8;
 /// 每次 swap 模拟消耗的默认 gas
 pub const DEFAULT_SWAP_GAS: u64 = 250_000;
+
+/// `fee_ppm` 序列化兜底（旧状态无该字段时 = 1000，行为与历史一致）
+fn default_fee_ppm() -> u64 {
+    BINARYFI_DEFAULT_FEE_PPM
+}
 
 /// 确定性派生 BinaryFi 虚拟子池地址（token_a < token_b 排序，无方向歧义）。
 ///
@@ -271,6 +298,13 @@ pub struct BinaryFiPropPool {
     /// quote 批量读取合约使用的 recipient（Router，随部署配置传入）
     #[serde(default)]
     pub router_address: Address,
+    /// 引擎按账户费率（ppm，1e6 = 100%）：报价时输入侧扣
+    /// `rem = in − in×fee/1e6`。链上 `getFee(account)`（0xb88c9148）按账户返回，
+    /// 除白名单（AGG=0）外普通账户统一取同一默认值（500→1000→200 随时间变，
+    /// 2026-08-10 16:16 UTC 起 = 200）。由 fee 事件（0xc58b3024…）/批量快照
+    /// getFee 实时更新；序列化兜底 = 1000（与历史行为一致）。
+    #[serde(default = "default_fee_ppm")]
+    pub fee_ppm: u64,
     /// 链 ID
     pub chain_id: u64,
     /// 创建区块号（StateSpace 扫描起点）
@@ -284,8 +318,8 @@ pub struct BinaryFiPropPool {
     /// 每资产点差 ask-bid（价格单位；USDT0 恒为 0）
     pub spreads: Vec<u64>,
     /// 每资产卖方向偏移（bid = price - bid_offset）。
-    /// 新引擎含 999/1000 因子：`bid_offset = ceil(price/1000) + sell_off`，
-    /// 即 `bid = floor((price×999 - sell_off×1000)/1000)`；快照路径直接存
+    /// 无费口径：`bid_offset = sell_off`（fee 在报价时输入侧扣；fee=1000 时
+    /// 等价历史 `bid_offset = ceil(price/1000) + sell_off`）；快照路径直接存
     /// `bid_offset=0, price=bid`（0 = 显式无偏移）
     #[serde(default)]
     pub bid_offsets: Vec<u64>,
@@ -293,17 +327,18 @@ pub struct BinaryFiPropPool {
     #[serde(default)]
     pub ask_offsets: Vec<u64>,
     /// 每资产 BUY 小额报价状态 q0j（0→j, in=10^d0 的链上 quote）。
-    /// 快照直接取链上值；update 由 `floor(10^(dj+2)×999/(1000×(price+ask_off)))` 派生。
+    /// 快照取链上含费 quote 后按 `fee_ppm` 无费化（`unfee_quote`），update 由
+    /// `floor(10^(dj+2)/(price+ask_off))` 派生（无费）。
     /// 直接 `0→j` 报价 `linear = floor(in × q0j / 10^d0)`；跨资产第二段用
     /// `ask = price + ask_off`（快照从 q0j 反推，`recover_ask_eff`）
     #[serde(default)]
     pub q0j: Vec<Option<U256>>,
-    /// 每资产 SELL 精确有理数分子 `raw = price×999 - sell_off×1000`
-    /// （SELL 输出 `= floor(in × raw × 10^(d0-2) / (1000 × 10^di))`，链上实测
-    /// 大额 quote 与 `floor(raw/1000)` 整数 bid 不同，含小数部分）。
-    /// 快照从小额 j→0 quote（`bid = floor(raw/1000)`）与 100 整枚 probe 反推；
+    /// 每资产 SELL 精确有理数分子 `raw = price - sell_off`（无费）
+    /// （SELL 输出 `= floor(in × raw × 10^(d0-2) / 10^di)`，链上实测
+    /// 大额 quote 与整数 bid 不同，含小数部分）。
+    /// 快照从小额 j→0 quote（`bid = raw`）与 100 整枚 probe 反推；
     /// update 由 `apply_l2_update` 直接计算。`None` = 未知（多档阶梯或 probe 归零，
-    /// 兜底用 `1000×bid`，等价整数 bid 线性近似）
+    /// 兜底用 `bid`，等价整数 bid 线性近似）
     #[serde(default)]
     pub sell_raw: Vec<Option<U256>>,
     /// 引擎每资产 scale（内部价格 = calldata price × scale/10000；asset[2]=100000，其余 10000）
@@ -325,7 +360,7 @@ pub struct BinaryFiPropPool {
     /// 每资产 SELL 多档阶梯（L2 update calldata data0 解析；weight 已按
     /// scale/10000 折算为内部价格单位，qty = 引擎储备倍数）。引擎 SELL 输出
     /// 逐档累加：`out += (price − w_k) × min(rem, qty_k×R) × 10^(d0−2)/10^di`，
-    /// `rem = in − in/1000` 逐档递减。`None` = 未知（仅快照路径无阶梯信息，
+    /// `rem = in − in×fee_ppm/1e6` 逐档递减。`None` = 未知（仅快照路径无阶梯信息，
     /// 回退单档线性）
     #[serde(default)]
     pub sell_ladders: Vec<Option<Vec<(u32, u32)>>>,
@@ -416,8 +451,9 @@ impl BinaryFiPropPool {
     }
 
     /// bid = price - bid_offset。
-    /// 新引擎：`bid_offset = ceil(price/1000) + sell_off`（见 apply_l2_update），
-    /// 故 `bid = floor((price×999 - sell_off×1000)/1000)`；
+    /// 无费口径：`bid_offset = sell_off`（fee 在报价时按 `fee_ppm` 输入侧扣，
+    /// fee=1000 时等价历史 `bid = floor((price×999 - sell_off×1000)/1000)`；
+    /// 见 apply_l2_update）；
     /// 快照路径直接存 `bid_offset=0, price=bid`（0 = 显式无偏移）。
     pub fn bid_price(&self, i: usize) -> Option<U256> {
         // SELL 容量权威为 0（快照观测 j→0 quote=0）时，卖出价视为不可用，
@@ -446,38 +482,37 @@ impl BinaryFiPropPool {
         Some(p + U256::from(off))
     }
 
-    /// 从 BUY 小额报价 q0j（0→j, in=10^d0）反推引擎有效 ask：
-    /// `q0j = floor(10^(dj+2)×999/(1000×ask))` → `ask = floor(10^(dj+2)×999/(1000×q0j))`。
+    /// 从 BUY 小额报价 q0j（0→j, in=10^d0，**含费**）反推引擎无费 ask：
+    /// `q0j = floor(rem × 10^(dj+2) / (ask × 10^d0))`，`rem = fee_rem(10^d0)`
+    /// → `ask = floor(rem × 10^(dj+2) / (q0j × 10^d0))`。
+    /// 与 unfee_quote 路径等价但无 ceil 二次舍入（fee=1000 时逐位等于历史
+    /// `floor(10^(dj+2)×999/(1000×q0j))`，实测误差 ≤1 被大额 probe 修正）。
     /// q0j 足够大时解唯一（高小数位资产精确；低小数位资产可能差 1，用大额 probe 兜底）。
-    fn recover_ask_eff(q0j: U256, dj: u32) -> Option<U256> {
-        if q0j.is_zero() || dj > 30 {
+    fn recover_ask_eff(q0j: U256, dj: u32, d0: u32, fee_ppm: u64) -> Option<U256> {
+        if q0j.is_zero() || dj > 30 || d0 > 30 {
             return None;
         }
-        let num = U256::from(10u64)
-            .pow(U256::from(dj + 2))
-            .checked_mul(U256::from(999))?;
-        let den = q0j.checked_mul(U256::from(1000))?;
+        let rem = fee_rem(U256::from(10u64).pow(U256::from(d0)), fee_ppm);
+        let num = rem.checked_mul(U256::from(10u64).pow(U256::from(dj + 2)))?;
+        let den = q0j.checked_mul(U256::from(10u64).pow(U256::from(d0)))?;
         if den.is_zero() {
             return None;
         }
         Some(num / den)
     }
 
-    /// 从 BUY 大额线性 quote（0→j, in=10^(d0+4)，未封顶）反推精确 ask：
-    /// `big = floor(big_in × 10^(dj+2) × 999 / (1000 × ask × 10^d0))`
-    /// → `ask = floor(big_in × 10^(dj+2) × 999 / (1000 × big × 10^d0))`。
+    /// 从 BUY 大额线性 quote（0→j, in=10^(d0+4)，未封顶，**含费**）反推精确 ask：
+    /// `big = floor(rem × 10^(dj+2) / (ask × 10^d0))`，`rem = fee_rem(big_in)`
+    /// → `ask = floor(rem × 10^(dj+2) / (big × 10^d0))`。
     /// 低小数位资产 q0j 反推误差可达数千（q0j 只有 3-4 位有效数字），
     /// 大额 probe 消除误差；反推值 ±1 内验证能复刻 big 才采用。
-    fn recover_ask_big(big_out: U256, big_in: U256, dj: u32, d0: u32) -> Option<U256> {
+    fn recover_ask_big(big_out: U256, big_in: U256, dj: u32, d0: u32, fee_ppm: u64) -> Option<U256> {
         if big_out.is_zero() || dj > 30 || d0 > 30 {
             return None;
         }
-        let num = big_in
-            .checked_mul(U256::from(10u64).pow(U256::from(dj + 2)))?
-            .checked_mul(U256::from(999))?;
-        let den = big_out
-            .checked_mul(U256::from(1000))?
-            .checked_mul(U256::from(10u64).pow(U256::from(d0)))?;
+        let rem = fee_rem(big_in, fee_ppm);
+        let num = rem.checked_mul(U256::from(10u64).pow(U256::from(dj + 2)))?;
+        let den = big_out.checked_mul(U256::from(10u64).pow(U256::from(d0)))?;
         if den.is_zero() {
             return None;
         }
@@ -487,12 +522,9 @@ impl BinaryFiPropPool {
             if cand.is_zero() {
                 continue;
             }
-            let out = big_in
+            let out = fee_rem(big_in, fee_ppm)
                 .checked_mul(U256::from(10u64).pow(U256::from(dj + 2)))?
-                .checked_mul(U256::from(999))?
-                / (cand
-                    .checked_mul(U256::from(1000))?
-                    .checked_mul(U256::from(10u64).pow(U256::from(d0)))?);
+                / (cand.checked_mul(U256::from(10u64).pow(U256::from(d0)))?);
             if out == big_out {
                 return Some(cand);
             }
@@ -539,12 +571,12 @@ impl BinaryFiPropPool {
     /// calldata 的 `data0`（sellLadder）/`data1`（buyLadder）为左对齐 256 位字段，
     /// 前 16 位为点差偏移字段（ladder 空间单位）；实际点差偏移
     /// `= (字段/16) × (scale/10000)`（asset[2] scale=100000，其余 10000）。
-    /// 引擎（2026-08 升级后）报价含 `999/1000` 因子：
-    /// - 卖方向：`bid = floor((price×999 - sell_off×1000)/1000)`
-    ///   = `price - ceil(price/1000) - sell_off`，
-    ///   即 `bid_offset = ceil(price/1000) + sell_off`
+    /// 引擎按账户费率（`getFee(recipient)`，ppm）在报价时输入侧扣：
+    /// - 卖方向：`bid = price - sell_off`（无费原始价；fee 在报价时
+    ///   `rem = in − in×fee/1e6` 先扣，`fee=1000` 时等价历史
+    ///   `bid = floor((price×999 - sell_off×1000)/1000)`）
     /// - 买方向：`ask = price + ask_off`，BUY 小额报价状态
-    ///   `q0j = floor(10^(dj+2)×999 / (1000×ask))`
+    ///   `q0j = floor(10^(dj+2) / ask)`（无费；fee 由 engine_quote 输入侧扣）
     /// `spread = ask_offset + bid_offset` 仅作诊断参考（不对称时 price 非算术中点）。
     pub fn apply_l2_update(
         &mut self,
@@ -563,7 +595,10 @@ impl BinaryFiPropPool {
             .checked_mul(U256::from(scale))
             .map(|p| p / U256::from(10_000))
             .unwrap_or(price);
-        let bid_off = (scaled + U256::from(999)) / U256::from(1000) + U256::from(sell_off);
+        // 无费语义：bid = price − sell_off（fee 在报价时按 fee_ppm 输入侧扣，
+        // 不再打包进 bid_offset；历史 `ceil(price/1000)+sell_off` 等价于
+        // fee=1000 时先扣费再报 bid，见模块顶部公式说明）
+        let bid_off = U256::from(sell_off);
         let bid_off_u64 = bid_off.to::<u64>();
         if let Some(o) = self.bid_offsets.get_mut(asset_idx) {
             *o = bid_off_u64;
@@ -574,7 +609,7 @@ impl BinaryFiPropPool {
         if let Some(s) = self.spreads.get_mut(asset_idx) {
             *s = ask_off.saturating_add(bid_off_u64);
         }
-        // BUY 小额报价状态：q0j = floor(10^(dj+2)×999 / (1000×(price+ask_off)))
+        // BUY 小额报价状态（无费）：q0j = floor(10^(dj+2) / (price+ask_off))
         if asset_idx != 0 {
             let dj = self.assets.get(asset_idx).map(|t| t.decimals as u32);
             let ask_eff = scaled + U256::from(ask_off);
@@ -583,20 +618,16 @@ impl BinaryFiPropPool {
                 .filter(|_| !ask_eff.is_zero())
                 .map(|d| {
                     let num = U256::from(10u64)
-                        .pow(U256::from(d + 2))
-                        .checked_mul(U256::from(999))
-                        .unwrap_or(U256::ZERO);
-                    num / (ask_eff * U256::from(1000))
+                        .pow(U256::from(d + 2));
+                    num / ask_eff
                 });
             if let Some(qv) = self.q0j.get_mut(asset_idx) {
                 *qv = q;
             }
         }
-        // SELL 精确有理数分子：raw = scaled×999 - sell_off×1000
-        // （bid = floor(raw/1000) = scaled - ceil(scaled/1000) - sell_off）
-        let sell_raw = scaled
-            .checked_mul(U256::from(999))
-            .and_then(|v| v.checked_sub(U256::from(sell_off).checked_mul(U256::from(1000))?));
+        // SELL 精确有理数分子（无费）：raw = scaled − sell_off
+        // （fee 在报价时按 fee_ppm 输入侧扣，见 sell_out/ladder_sell_out）
+        let sell_raw = scaled.checked_sub(U256::from(sell_off));
         if let Some(r) = self.sell_raw.get_mut(asset_idx) {
             *r = sell_raw;
         }
@@ -666,19 +697,23 @@ impl BinaryFiPropPool {
     fn sell_out(&self, i: usize, amount_in: U256) -> Option<U256> {
         let d0 = self.assets[0].decimals as u32;
         let di = self.assets[i].decimals as u32;
+        let fee = self.fee_ppm;
         if let (Some(ladder), Some(r)) = (
             self.sell_ladders.get(i).cloned().flatten(),
             self.ladder_reserves.get(i).copied().flatten(),
         ) {
             if !ladder.is_empty() && !r.is_zero() {
                 if let Some(p) = self.prices.get(i).copied().filter(|p| !p.is_zero()) {
-                    if let Some(out) = ladder_sell_out(p, &ladder, r, amount_in, d0, di) {
+                    if let Some(out) = ladder_sell_out(p, &ladder, r, amount_in, d0, di, fee) {
                         return self.sell_zero_over_vault(out);
                     }
                 }
             }
         }
-        // 单档线性回退（raw 有理数；maxIn 未知时不截断）
+        // 单档线性回退（raw 有理数）：先按 fee 扣输入再按 maxIn 截断消耗量，
+        // 与引擎逐档 `min(rem, qty×R)` 一致——饱和时消耗满 maxIn（fee 无关，
+        // 链上实测 asset2 fee=1000 饱和输出 = maxIn×raw）。不能先 `min(in, maxIn)`
+        // 再扣费：会把饱和输出低估 ~0.1%（= fee 比例），旧版公式即此偏差。
         let p10 = |e: u32| U256::from(10u64).pow(U256::from(e));
         let k0 = d0.saturating_sub(2);
         let raw = self
@@ -686,12 +721,13 @@ impl BinaryFiPropPool {
             .get(i)
             .copied()
             .flatten()
-            .or_else(|| self.bid_price(i)?.checked_mul(U256::from(1000)))?;
-        let eff_in = match self.max_inputs.get(i).copied().flatten() {
-            Some(m) => amount_in.min(m),
-            None => amount_in,
+            .or_else(|| self.bid_price(i))?;
+        let rem = fee_rem(amount_in, fee);
+        let consume = match self.max_inputs.get(i).copied().flatten() {
+            Some(m) => rem.min(m),
+            None => rem,
         };
-        let out = eff_in.checked_mul(raw)?.checked_mul(p10(k0))? / (U256::from(1000) * p10(di));
+        let out = consume.checked_mul(raw)?.checked_mul(p10(k0))? / p10(di);
         self.sell_zero_over_vault(out)
     }
 
@@ -719,7 +755,8 @@ impl BinaryFiPropPool {
         let p = self.prices.get(i).copied().filter(|p| !p.is_zero())?;
         let d0 = self.assets[0].decimals as u32;
         let di = self.assets[i].decimals as u32;
-        ladder_sell_out(p, &ladder, r, U256::MAX, d0, di).and_then(|v| self.sell_zero_over_vault(v))
+        ladder_sell_out(p, &ladder, r, U256::MAX, d0, di, self.fee_ppm)
+            .and_then(|v| self.sell_zero_over_vault(v))
     }
 
     /// 用候选储备 R 重算 100 整枚 SELL probe 输出并与链上 q_big 对拍；
@@ -737,14 +774,14 @@ impl BinaryFiPropPool {
         }
         let p10 = |e: u32| U256::from(10u64).pow(U256::from(e));
         let probe_in = U256::from(100u64).checked_mul(p10(di))?;
-        let rem = probe_in - probe_in / U256::from(1000);
+        let rem = fee_rem(probe_in, self.fee_ppm);
         let total: U256 = ladder.iter().try_fold(U256::ZERO, |acc, &(_, q)| {
             acc.checked_add(U256::from(q).checked_mul(r)?)
         })?;
         if total > rem {
             return None; // 未饱和：probe 输出非封顶，无法反推 R
         }
-        if ladder_sell_out(p, &ladder, r, probe_in, d0, di) == Some(q_big) {
+        if ladder_sell_out(p, &ladder, r, probe_in, d0, di, self.fee_ppm) == Some(q_big) {
             Some(r)
         } else {
             None
@@ -752,10 +789,12 @@ impl BinaryFiPropPool {
     }
 
     /// 由 raw/q0j 推导 rate(i→j)，与引擎报价公式一致（精确有理数，约分后大整数分数）：
-    ///   - `i→0`：`rate = raw_i × 10^(d0-2) / (1000 × 10^di)`
-    ///     （raw = price×999 - sell_off×1000，含 999/1000 因子）
-    ///   - `0→j`：`rate = q0j_j / 10^d0`（BUY 小额报价状态）
-    ///   - `i→j`：两段式 `rate = raw_i × q0j_j / (1000 × 10^(di+2))`
+    ///   - `i→0`：`rate = raw_i × 10^(d0-2) / 10^di`
+    ///     （raw = price - sell_off，无费；再按 fee_ppm 折算可执行价）
+    ///   - `0→j`：`rate = q0j_j / 10^d0`（BUY 小额报价状态，无费）
+    ///   - `i→j`：两段式 `rate = raw_i × q0j_j / 10^(di+2)`（无费）
+    /// 返回值均为**含当前 fee 的可执行中间价**（无费 rate × (1e6−fee)/1e6），
+    /// 供 spot/预过滤与下游可执行价对齐。
     fn derive_rate(&self, i: usize, j: usize) -> Option<Rate> {
         if i == j || i >= self.assets.len() || j >= self.assets.len() {
             return None;
@@ -772,43 +811,43 @@ impl BinaryFiPropPool {
         }
         let p10 = |e: u32| U256::from(10u64).pow(U256::from(e));
         let k0 = d0.saturating_sub(2);
-        // SELL 精确有理数分子（None → 1000×bid 兜底，等价整数 bid 线性）
+        // SELL 精确有理数分子（无费；None → bid_price 兜底，等价整数 bid 线性）
         let raw = |k: usize| -> Option<U256> {
             self.sell_raw
                 .get(k)
                 .copied()
                 .flatten()
-                .or_else(|| self.bid_price(k)?.checked_mul(U256::from(1000)))
+                .or_else(|| self.bid_price(k))
         };
         if j == 0 {
             let raw_i = raw(i)?;
-            if di >= k0 {
-                Some(Rate {
+            let rate = if di >= k0 {
+                Rate {
                     num: raw_i,
-                    den: U256::from(1000).checked_mul(p10(di - k0))?,
-                })
+                    den: p10(di - k0),
+                }
             } else {
-                Some(Rate {
+                Rate {
                     num: raw_i.checked_mul(p10(k0 - di))?,
-                    den: U256::from(1000),
-                })
-            }
+                    den: U256::from(1),
+                }
+            };
+            // 含当前 fee 的可执行中间价（输出侧 ×(1e6−fee)/1e6）
+            apply_fee_rate(rate, self.fee_ppm)
         } else if i == 0 {
-            // rate = q0j / 10^d0（0→j 小额报价精确值）
+            // rate = q0j / 10^d0（0→j 小额报价精确值，无费；再按 fee 折算可执行价）
             let q = self
                 .q0j
                 .get(j)
                 .copied()
                 .flatten()
                 .filter(|q| !q.is_zero())?;
-            Some(Rate {
-                num: q,
-                den: p10(d0),
-            })
+            apply_fee_rate(Rate { num: q, den: p10(d0) }, self.fee_ppm)
         } else {
-            // 两段式相乘：raw_i×10^(d0-2)/(1000×10^di) × q0j/10^d0
-            // = raw_i×q0j / (1000×10^(di+2))
-            // （跨资产第二段不含 999/1000 因子，链上实测）
+            // 两段式相乘（无费）：raw_i×10^(d0-2)/10^di × q0j/10^d0
+            // = raw_i×q0j / 10^(di+2)
+            // （跨资产第二段不含费因子，链上实测；第一段扣费一次，
+            //  可执行价整体 ×(1e6−fee)/1e6）
             let raw_i = raw(i)?;
             let q = self
                 .q0j
@@ -816,10 +855,13 @@ impl BinaryFiPropPool {
                 .copied()
                 .flatten()
                 .filter(|q| !q.is_zero())?;
-            Some(Rate {
-                num: raw_i.checked_mul(q)?,
-                den: U256::from(1000).checked_mul(p10(di + 2))?,
-            })
+            apply_fee_rate(
+                Rate {
+                    num: raw_i.checked_mul(q)?,
+                    den: p10(di + 2),
+                },
+                self.fee_ppm,
+            )
         }
     }
 
@@ -948,14 +990,16 @@ impl BinaryFiPropPool {
     }
 
     /// 与链上引擎 quote 完全一致的计算（含两段式截断与阶梯上限）：
-    ///   - SELL（j==0）：`out = min(in, maxIn_i) · bid_i · 10^(d0-2) / 10^di`
-    ///     （`bid_i = floor((price_i×999 - sell_off×1000)/1000)`，含 999/1000 因子）
-    ///   - BUY（i==0）：先扣费 `rem = in − in/1000`，再
+    ///   - SELL（j==0）：`out = min(rem, maxIn_i) · bid_i · 10^(d0-2) / 10^di`，
+    ///     `rem = in − in×fee_ppm/1e6`（先扣费再截断；饱和时消耗满 maxIn，
+    ///     输出 fee 无关，链上实测 asset2）
+    ///   - BUY（i==0）：先扣费 `rem = in − in×fee_ppm/1e6`，再
     ///     `linear = floor(rem × 10^(dj+2) / (ask × 10^d0))`（链上逐位对拍，
     ///     tx1/tx2 失败交易零偏差），再按 `buy_capped` 截断（饱和型
     ///     `min(linear, maxOut)` / 归零型 `linear > 金库余额 → 0` / 未知不截断）
     ///   - 跨资产：先按 maxIn_i 截断输入走 i→0，第二段
-    ///     `floor(v × 10^(dj-d0+2) / ask_j)`（**不含** 999/1000 因子，链上实测），
+    ///     `floor(v × 10^(dj-d0+2) / ask_j)`（无额外费率因子——费已在两段输入
+    ///     侧各扣一次，链上实测），
     ///     再按 BUY 规则截断/归零
     /// 价格未知或资产缺失时返回 `None`。
     /// 引擎报价核心：`i→j` 全方向（含 SELL 截断、BUY 阶梯上限/归零、跨资产两段式）
@@ -988,16 +1032,17 @@ impl BinaryFiPropPool {
             // SELL：ladder + R 已知时多档阶梯逐位复刻；否则单档线性回退
             self.sell_out(i, amount_in)
         } else if i == 0 {
-            // BUY：先扣 0.1% 费（rem = in − in/1000，整数除法，与 SELL 同款），
+            // BUY：先扣费（rem = in − in×fee_ppm/1e6，整数除法，与 SELL 同款），
             // 再对 rem 线性报价：out = floor(rem × 10^(dj+2) / (ask × 10^d0))。
             // 链上实测逐位一致（tx1 in=44,291,018 → 324,080,619,644,034,278；
-            // tx2 in=122,156,425 → 891,476,871,940,974,505）；不能用
-            // in×999/1000 替代——非 1000 倍数输入有 ~1e-4% 偏差。
+            // tx2 in=122,156,425 → 891,476,871,940,974,505，fee=1000）；
+            // fee=200 实测 asset4~9 全 -200.0ppm 逐位一致。不能用
+            // in×(1e6−fee)/1e6 替代——非整倍数输入有 ~1e-4% 偏差。
             let ask = self.ask_price(j)?;
             if ask.is_zero() {
                 return Some(U256::ZERO);
             }
-            let rem = amount_in - amount_in / U256::from(1000);
+            let rem = fee_rem(amount_in, self.fee_ppm);
             let linear = rem.checked_mul(p10(dj + 2))? / (ask.checked_mul(p10(d0))?);
             Some(self.buy_capped(j, linear))
         } else {
@@ -1006,7 +1051,8 @@ impl BinaryFiPropPool {
                 return Some(U256::ZERO);
             }
             // 两段式：第一段 i→USDT0（sell_out 含多档阶梯 + 超容量归零），
-            // 第二段 0→j；第二段 **不含** 999/1000 因子（链上实测，见模块文档）
+            // 第二段 0→j；第二段 **无额外费率因子**（费已由 sell_out 输入侧
+            // 扣一次，链上实测，见模块文档）
             let value = self.sell_out(i, amount_in)?;
             let linear = if dj + 2 >= d0 {
                 value.checked_mul(p10(dj + 2 - d0))? / ask
@@ -1141,7 +1187,10 @@ impl BinaryFiPropPool {
                 return Some(cap);
             }
             return match self.max_inputs.get(i).copied().flatten() {
-                Some(m) => self.engine_quote(i, 0, m),
+                // 满档输入（U256::MAX）→ rem ≥ maxIn → consume = maxIn，
+                // 输出 = 全阶梯容量（fee 无关），与 sell_cap 语义一致；
+                // 用 maxIn 本身会走 fee_rem(maxIn) 低估 ~0.1%。
+                Some(_) => self.engine_quote(i, 0, U256::MAX),
                 None => Some(self.capped_out(0, U256::MAX)),
             };
         }
@@ -1223,6 +1272,26 @@ impl BinaryFiPropPool {
             }
         }
 
+        // 引擎按账户费率（ppm）：批量合约 `getFee(recipient)` 带回，非 0 时更新。
+        // 必须先于下方 quote 反推——快照 quote 是含费可执行输出，无费化反推
+        // （unfee_quote）依赖当前 fee 口径；fee 变更只换字段、价格无需重校准
+        // （L2 存无费原始价，报价时按 fee 扣）。
+        if !snap.fee.is_zero() {
+            let new_fee = snap
+                .fee
+                .min(U256::from(1_000_000u64))
+                .to::<u64>();
+            if new_fee != self.fee_ppm {
+                tracing::debug!(
+                    old_fee = self.fee_ppm,
+                    new_fee = new_fee,
+                    snap_block = snap_block,
+                    "binaryfi engine fee updated"
+                );
+                self.fee_ppm = new_fee;
+            }
+        }
+
         // 余额以引擎 getAssetReserves()（= 金库余额）为准
         if snap.vaultReserves.len() == n {
             self.reserves = snap.vaultReserves.clone();
@@ -1275,13 +1344,51 @@ impl BinaryFiPropPool {
                 j0_out[i] = Some(snap.quotes[k].amountOut);
             }
         }
+
+        // 价格反推统一无费口径（与 L2 calldata 路径一致）：链上 quote 为含费
+        // 可执行输出，需按 fee 反推无费 bid/ask/q0j/raw。BUY q0j 直接
+        // `unfee_quote` 无费化（供 spot/预过滤，fee 由 apply_fee_rate 再折回）；
+        // **bid/ask 不用 unfee 路径**——ceil 二次舍入会把误差放大 ±1
+        // （0.004% 量级，NVDAx 实测），改用含费 quote 带费率直接反推
+        // （`recover_ask_*` / 下方 bid 公式，与 1.4 SELL raw 的 ±1 修正同款精度）。
+        let zj_nofee: Vec<Option<U256>> = zj_out
+            .iter()
+            .map(|o| o.and_then(|v| unfee_quote(v, self.fee_ppm)))
+            .collect();
+        // j→0（amountIn=10^(dj-4)，含费）→ 无费 bid：`bid = out×10^dj /
+        // (fee_rem(10^(dj-4))×10^(d0-2))`（d0=6、fee=1000 时 = out×1e14/9.99e13，
+        // 逐位等于链上 raw；unfee 路径会差 1）
+        let d0_all = self.assets[0].decimals as u32;
+        let bid_nofee: Vec<Option<U256>> = (0..n)
+            .map(|j| {
+                j0_out[j]
+                    .filter(|out| !out.is_zero())
+                    .and_then(|out| {
+                        if j == 0 {
+                            return None;
+                        }
+                        let dj = self.assets[j].decimals as u32;
+                        if dj > 30 || d0_all > 30 {
+                            return None;
+                        }
+                        let in_j = U256::from(10u64).pow(U256::from(dj.saturating_sub(4)));
+                        let rem = fee_rem(in_j, self.fee_ppm);
+                        let num = out.checked_mul(U256::from(10u64).pow(U256::from(dj)))?;
+                        let den = rem.checked_mul(U256::from(10u64).pow(U256::from(d0_all.saturating_sub(2))))?;
+                        if den.is_zero() {
+                            None
+                        } else {
+                            Some(num / den)
+                        }
+                    })
+            })
+            .collect();
         for j in 1..n {
             let d0 = self.assets[0].decimals as u32;
-            // j→0（amountIn=10^(dj-4)）：out = bid 精确值
-            let bid = j0_out[j].filter(|out| !out.is_zero());
-            let zj = zj_out[j];
+            let bid = bid_nofee[j];
+            let zj = zj_nofee[j];
             // 0→j quote 成功返回 0：引擎禁用该资产买入（BUY 不可报价）
-            let disabled = zj == Some(U256::ZERO);
+            let disabled = zj_out[j] == Some(U256::ZERO);
             // 保鲜判断（日志优先、快照补缺）：该资产 update 日志已给出 >= 快照块的
             // 价格时，快照 quote 不覆盖本地（防止旧块 quote 回退新日志价格）；
             // 容量/禁用状态仍以快照为准（见 1.5 节）
@@ -1308,16 +1415,16 @@ impl BinaryFiPropPool {
             }
             self.buy_disabled[j] = false;
             if !log_fresh {
-                // BUY 小额报价直接取链上 0→j quote（精确，无恢复误差）
+                // BUY 小额报价（无费口径，与 L2 q0j 一致）
                 self.q0j[j] = zj.filter(|z| !z.is_zero());
             }
             match (bid, zj) {
-                (Some(b), Some(z)) => {
+                (Some(b), Some(_)) => {
                     if !log_fresh {
-                        // bid 权威 = j→0 小额 quote；快照不解析 ladder 偏移，
+                        // bid 权威 = 无费 j→0 小额 quote；快照不解析 ladder 偏移，
                         // 直接存 price=bid、bid_offset=0（bid_price == price 精确）；
                         // ask 由 q0j 反推（跨资产第二段需要），存 ask_offset = ask - price；
-                        // 低小数位资产 q0j 反推误差大，big_out 线性（>= q0j×10^4）时
+                        // 低小数位资产 q0j 反推误差大，big 线性（>= q0j×10^4）时
                         // 用大额 probe 反推精确 ask（链上实测 asset2 需此修正）
                         self.prices[j] = b;
                         self.spreads[j] = 0;
@@ -1326,7 +1433,8 @@ impl BinaryFiPropPool {
                         let ask_eff = big_out[j]
                             .filter(|qb| !qb.is_zero())
                             .and_then(|qb| {
-                                let q4 = z.checked_mul(U256::from(10_000))?;
+                                // 阈值比较用含费口径（两边同含费，比值一致）
+                                let q4 = zj_out[j]?.checked_mul(U256::from(10_000))?;
                                 if qb < q4 {
                                     return None; // 封顶，非线性
                                 }
@@ -1335,9 +1443,10 @@ impl BinaryFiPropPool {
                                     U256::from(10u64).pow(U256::from(d0 + 4)),
                                     dj,
                                     d0,
+                                    self.fee_ppm,
                                 )
                             })
-                            .or_else(|| Self::recover_ask_eff(z, dj))
+                            .or_else(|| Self::recover_ask_eff(zj_out[j]?, dj, d0, self.fee_ppm))
                             .unwrap_or(U256::ZERO);
                         self.ask_offsets[j] = ask_eff.saturating_sub(b).to::<u64>();
                     }
@@ -1351,7 +1460,7 @@ impl BinaryFiPropPool {
                         self.ask_offsets[j] = (BINARYFI_DEFAULT_SPREAD + 1) / 2;
                     }
                 }
-                (None, Some(z)) => {
+                (None, Some(_)) => {
                     if !log_fresh {
                         // 仅 BUY 可用（j→0 缺失/为 0）：SELL 不可报价（price=0），
                         // ask 由 q0j 反推（price=0 → ask_price = ask_offset）
@@ -1359,7 +1468,7 @@ impl BinaryFiPropPool {
                         let ask_eff = big_out[j]
                             .filter(|qb| !qb.is_zero())
                             .and_then(|qb| {
-                                let q4 = z.checked_mul(U256::from(10_000))?;
+                                let q4 = zj_out[j]?.checked_mul(U256::from(10_000))?;
                                 if qb < q4 {
                                     return None;
                                 }
@@ -1368,9 +1477,10 @@ impl BinaryFiPropPool {
                                     U256::from(10u64).pow(U256::from(d0 + 4)),
                                     dj,
                                     d0,
+                                    self.fee_ppm,
                                 )
                             })
-                            .or_else(|| Self::recover_ask_eff(z, dj))
+                            .or_else(|| Self::recover_ask_eff(zj_out[j]?, dj, d0, self.fee_ppm))
                             .unwrap_or(U256::ZERO);
                         self.prices[j] = U256::ZERO;
                         self.spreads[j] = 0;
@@ -1391,19 +1501,22 @@ impl BinaryFiPropPool {
             }
         }
 
-        // 1.4) 反推 SELL 精确有理数分子 raw = price×999 - sell_off×1000：
+        // 1.4) 反推 SELL 精确有理数分子 raw = price - sell_off（无费口径）：
         let d0 = self.assets[0].decimals as u32;
         let k0 = d0.saturating_sub(2);
-        //    - `bid = j→0 小额 quote`（= floor(raw/1000) 权威）
-        //    - 100 整枚 probe 线性（`big = floor(big_in×raw×10^(d0-2)/(1000×10^di))`）
-        //      时在 `[1000×bid, 1000×bid+999]` 内反推精确 raw（含 raw/1000 小数部分，
-        //      链上大额 quote 与整数 bid 有差，xETH/xSOL/CRCLx 实测）
-        //    - probe 归零（超容量）→ `1000×bid`（δ 不可观测，等价整数 bid 线性）；
+        //    - `bid = 带费率直接反推的 j→0 小额 quote`（= raw 权威；d0=6 时
+        //      小额 in=10^(dj-4) 经 fee_rem 后线性系数恰为 1，反推输出 = raw
+        //      精确整数，unfee 路径会差 1）
+        //    - 100 整枚 probe（含费）线性时用 `est = qb×10^di /
+        //      (fee_rem(big_in)×10^(d0-2))` 在 `[bid−1, bid+1]` 内反推，
+        //      修正 unfee_quote 的 ±1 舍入（fee=1000 时代替历史
+        //      `[1000×bid, 1000×bid+999]` 的 raw/1000 小数部分反推）
+        //    - probe 归零（超容量）→ `bid`（δ 不可观测，等价整数 bid 线性）；
         //      probe 与单档不兼容（多档阶梯，如 DOG）→ None（engine_quote 同样兜底
-        //      `1000×bid`，但测试可识别放宽）
+        //      `bid_price`，但测试可识别放宽）
         let p10a = |e: u32| U256::from(10u64).pow(U256::from(e));
         for j in 1..n {
-            let Some(bid) = j0_out[j].filter(|o| !o.is_zero()) else {
+            let Some(bid) = bid_nofee[j].filter(|o| !o.is_zero()) else {
                 continue;
             };
             let dj = self.assets[j].decimals as u32;
@@ -1413,28 +1526,30 @@ impl BinaryFiPropPool {
             let big_in = U256::from(100u64)
                 .checked_mul(p10a(dj))
                 .unwrap_or(U256::ZERO);
-            let lo = bid.checked_mul(U256::from(1000)).unwrap_or(U256::ZERO);
-            let hi = lo + U256::from(999);
             let raw = match big_sell_out[j] {
                 Some(qb) if !qb.is_zero() && !big_in.is_zero() => {
-                    // raw_est = qb × 1000×10^di / (big_in×10^(d0-2))
+                    // raw_est = qb × 10^di / (fee_rem(big_in)×10^(d0-2))
+                    // （big_in 为 100 整枚，含费输出 = fee_rem(big_in)×raw×10^(d0-2)/10^di）
+                    let rem = fee_rem(big_in, self.fee_ppm);
                     let num = qb
-                        .checked_mul(U256::from(1000))
-                        .and_then(|v| v.checked_mul(p10a(dj)))
+                        .checked_mul(p10a(dj))
                         .unwrap_or(U256::ZERO);
-                    let den = big_in.checked_mul(p10a(k0)).unwrap_or(U256::ZERO);
+                    let den = rem.checked_mul(p10a(k0)).unwrap_or(U256::ZERO);
                     if den.is_zero() {
-                        Some(lo)
+                        Some(bid)
                     } else {
                         let est = num / den;
                         let ok = |r: U256| -> bool {
-                            if r < lo || r > hi || r.is_zero() {
+                            if r < bid.saturating_sub(U256::from(1))
+                                || r > bid + U256::from(1)
+                                || r.is_zero()
+                            {
                                 return false;
                             }
-                            let out = big_in
+                            let out = fee_rem(big_in, self.fee_ppm)
                                 .checked_mul(r)
                                 .and_then(|v| v.checked_mul(p10a(k0)))
-                                .map(|v| v / (U256::from(1000) * p10a(dj)))
+                                .map(|v| v / p10a(dj))
                                 .unwrap_or(U256::ZERO);
                             out == qb
                         };
@@ -1444,13 +1559,15 @@ impl BinaryFiPropPool {
                             Some(est + U256::from(1))
                         } else if est > U256::ZERO && ok(est - U256::from(1)) {
                             Some(est - U256::from(1))
+                        } else if ok(bid) {
+                            Some(bid)
                         } else {
                             // 多档阶梯：probe 与单档线性不兼容
                             None
                         }
                     }
                 }
-                _ => Some(lo),
+                _ => Some(bid),
             };
             self.sell_raw[j] = raw;
         }
@@ -1600,7 +1717,8 @@ impl BinaryFiPropPool {
                     let mut hi = base.max(U256::from(1));
                     for _ in 0..256 {
                         let out_hi =
-                            ladder_sell_out(p, &ladder, hi, probe_in, d0, dj).unwrap_or(U256::ZERO);
+                            ladder_sell_out(p, &ladder, hi, probe_in, d0, dj, self.fee_ppm)
+                                .unwrap_or(U256::ZERO);
                         if out_hi >= qb {
                             break;
                         }
@@ -1614,7 +1732,7 @@ impl BinaryFiPropPool {
                     }
                     while lo < hi {
                         let mid = lo + (hi - lo) / U256::from(2);
-                        let out_mid = ladder_sell_out(p, &ladder, mid, probe_in, d0, dj)
+                        let out_mid = ladder_sell_out(p, &ladder, mid, probe_in, d0, dj, self.fee_ppm)
                             .unwrap_or(U256::ZERO);
                         if out_mid < qb {
                             lo = mid + U256::from(1);
@@ -1622,7 +1740,7 @@ impl BinaryFiPropPool {
                             hi = mid;
                         }
                     }
-                    if ladder_sell_out(p, &ladder, lo, probe_in, d0, dj) == Some(qb) {
+                    if ladder_sell_out(p, &ladder, lo, probe_in, d0, dj, self.fee_ppm) == Some(qb) {
                         self.ladder_reserves[j] = Some(lo);
                         let total: U256 = ladder
                             .iter()
@@ -1746,7 +1864,8 @@ fn decode_ladder(data: U256) -> Option<Vec<(u32, u32)>> {
 }
 
 /// SELL 逐档输出（纯函数，与引擎逐位一致）：
-/// `rem = in − in/1000`（费率因子先扣；链上实测 in<1000 时与 in×999/1000 不同），
+/// `rem = in − in×fee/1e6`（费率因子先扣，fee=1000 时 = in − in/1000；
+/// 链上实测 in<1000 时与 in×999/1000 不同，必须整数除法），
 /// 每档 `consume = min(rem, qty_k×R)`，
 /// `out += (price − w_k) × consume × 10^(d0−2) / 10^di`，rem 递减。
 fn ladder_sell_out(
@@ -1756,6 +1875,7 @@ fn ladder_sell_out(
     amount_in: U256,
     d0: u32,
     di: u32,
+    fee_ppm: u64,
 ) -> Option<U256> {
     if di > 30 || d0 > 30 || reserve.is_zero() || ladder.is_empty() {
         return None;
@@ -1764,7 +1884,7 @@ fn ladder_sell_out(
     let k0 = d0.saturating_sub(2);
     let scale = p10(k0);
     let den = p10(di);
-    let mut rem = amount_in - amount_in / U256::from(1000);
+    let mut rem = fee_rem(amount_in, fee_ppm);
     let mut out = U256::ZERO;
     for &(w, q) in ladder {
         if rem.is_zero() {
@@ -1777,6 +1897,42 @@ fn ladder_sell_out(
         rem = rem.checked_sub(consume)?;
     }
     Some(out)
+}
+
+/// 引擎输入侧扣费：`rem = in − in×fee/1e6`（整数除法）。
+/// fee=1000 时逐位等于历史 `in − in/1000`；fee=200 时 = `in − in/5000`。
+/// 乘法溢出（实际不可能：输入受引擎容量上限约束）时回退历史 1000ppm 口径。
+fn fee_rem(amount_in: U256, fee_ppm: u64) -> U256 {
+    let fee = U256::from(fee_ppm);
+    match amount_in.checked_mul(fee) {
+        Some(v) => amount_in - v / U256::from(1_000_000u64),
+        None => amount_in - amount_in / U256::from(1000),
+    }
+}
+
+/// 无费 rate 转"含当前 fee 的可执行中间价"：`rate × (1e6 − fee) / 1e6`
+/// （输出侧乘；与引擎输入侧扣费在线性区等价，供 spot/预过滤使用）。
+fn apply_fee_rate(rate: Rate, fee_ppm: u64) -> Option<Rate> {
+    let one = U256::from(1_000_000u64);
+    let fee = U256::from(fee_ppm.min(1_000_000));
+    let num = rate.num.checked_mul(one.checked_sub(fee)?)?;
+    let den = rate.den.checked_mul(one)?;
+    Some(Rate { num, den })
+}
+
+/// 链上含费 quote → 无费 quote：`out_nofee = ceil(out × 1e6 / (1e6 − fee))`
+/// （引擎 `out = floor(out_nofee × (1e6−fee)/1e6)`，反推取 ceil；对实际
+/// fee 范围（≤1000）误差 ≤ 1，由下游 ±1 反推验证吸收；fee=0 时恒等）。
+/// 仅供快照**价格反推**使用（bid/ask/q0j/raw 需无费口径与 L2 路径统一）；
+/// 容量/饱和判断与报价验证仍用原始含费 quote（比值中 fee 抵消）。
+fn unfee_quote(out: U256, fee_ppm: u64) -> Option<U256> {
+    if fee_ppm == 0 {
+        return Some(out);
+    }
+    let one = U256::from(1_000_000u64);
+    let den = one.checked_sub(U256::from(fee_ppm.min(1_000_000)))?;
+    let num = out.checked_mul(one)?;
+    Some((num + den - U256::from(1)) / den)
 }
 
 /// 将 U256 全精度转换为 f64
@@ -1807,11 +1963,59 @@ impl AutomatedMarketMaker for BinaryFiPropPool {
     }
 
     fn sync_events(&self) -> Vec<B256> {
-        vec![BINARYFI_SWAP_EVENT, BINARYFI_UPDATE_EVENT]
+        vec![
+            BINARYFI_SWAP_EVENT,
+            BINARYFI_UPDATE_EVENT,
+            BINARYFI_FEE_EVENT,
+        ]
     }
 
     fn sync(&mut self, log: &Log) -> Result<SyncAction, AMMError> {
         let topics = log.topics();
+
+        // L0: 引擎 FeeUpdated 事件 → 按账户费率实时更新。
+        // 费率是引擎 per-account storage（getFee），报价在输入侧按 fee_ppm 扣；
+        // 无费价格/阶梯无需重校准，仅更新 fee_ppm 即让后续 engine_quote/sell_out
+        // 立即对齐链上（事件与 setFee 交易同块）。
+        // 实际变更时返回 AsyncUpdate：快照观测的含费 maxOut/maxIn/大额 probe
+        // 依赖旧费率（快照与事件之间费率已变），需按新费率重新探测容量锚点；
+        // 费率未变（重复事件）不触发。
+        if log.address() == self.engine_address
+            && topics.len() == 1
+            && topics[0] == BINARYFI_FEE_EVENT
+        {
+            let data = log.data().data.as_ref();
+            if data.len() >= 32 {
+                let new_fee = U256::from_be_slice(&data[..32])
+                    .min(U256::from(1_000_000u64))
+                    .to::<u64>();
+                if new_fee != self.fee_ppm {
+                    tracing::debug!(
+                        old_fee = self.fee_ppm,
+                        new_fee = new_fee,
+                        block = log.block_number,
+                        "binaryfi engine fee event"
+                    );
+                    self.fee_ppm = new_fee;
+                    // 同步重导全部 rates（spot/预过滤立即对齐新费率），
+                    // 不依赖 AsyncUpdate 快照的异步窗口；无费价格/阶梯不变。
+                    let n = self.assets.len();
+                    for i in 0..n {
+                        for j in 0..n {
+                            if i == j {
+                                continue;
+                            }
+                            if let Some(rate) = self.derive_rate(i, j) {
+                                let idx = self.pair_index(i, j);
+                                self.rates[idx] = rate;
+                            }
+                        }
+                    }
+                    return Ok(SyncAction::AsyncUpdate);
+                }
+            }
+            return Ok(SyncAction::None);
+        }
 
         // L1: 池子 Swap 事件 → 余额增减 + 费率锚定
         if log.address() == self.pool_address
@@ -2316,6 +2520,7 @@ impl BinaryFiPropPool {
                 vaultReserves: Vec::new(),
                 quotePairs: Vec::new(),
                 quotes: Vec::new(),
+                fee: U256::ZERO,
             };
             return Ok((empty, 0));
         }
@@ -2354,6 +2559,7 @@ impl Default for BinaryFiPropPool {
             engine_address: BINARYFI_ENGINE_ADDRESS,
             vault_address: BINARYFI_VAULT_ADDRESS,
             router_address: BINARYFI_ROUTER_ADDRESS,
+            fee_ppm: BINARYFI_DEFAULT_FEE_PPM,
             chain_id: BINARYFI_CHAIN_ID,
             created_block: 0,
             last_synced_block: 0,

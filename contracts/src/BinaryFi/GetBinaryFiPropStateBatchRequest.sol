@@ -10,6 +10,7 @@ pragma solidity ^0.8.0;
  *         - per-asset decimals + pool balanceOf (ERC20)
  *         - per-asset engine config scale (getAssetConfig)
  *         - engine getAssetReserves() -> (assets[], vaultBalances[])
+ *         - engine getFee(recipient) -> (feePpm, 0 if read fails)
  *         - pool.quote() for each requested directed pair (try/catch per pair)
  *
  *         quotePairs are encoded as i * n + j (n = assets.length). Quote
@@ -52,6 +53,7 @@ contract GetBinaryFiPropStateBatchRequest {
         uint256[] vaultReserves;
         uint256[] quotePairs;
         QuoteResult[] quotes;
+        uint256 fee;
     }
 
     constructor(
@@ -111,6 +113,14 @@ contract GetBinaryFiPropStateBatchRequest {
                 snap.vaultReserves = reserves;
             } catch {
                 snap.vaultReserves = new uint256[](0);
+            }
+            // 按账户费率（ppm）：recipient = 报价账户（本系统 router）。费率是
+            // 引擎 per-account storage，非 0 时 Rust 侧用其做报价输入侧扣费；
+            // 读取失败保持 0 → Rust 侧沿用本地已知费率。
+            try IBinaryFiEngine(engine).getFee(recipient) returns (uint256 feePpm) {
+                snap.fee = feePpm;
+            } catch {
+                snap.fee = 0;
             }
         }
 
@@ -221,4 +231,8 @@ interface IBinaryFiEngine {
         external
         view
         returns (address asset, uint8 decimals, uint256 scale, uint256 cap);
+
+    /// @notice 查询账户费率（ppm，1e6 = 100%）。
+    ///         聚合器白名单账户返回 0；普通账户返回当前 setFee 值。
+    function getFee(address account) external view returns (uint256 feePpm);
 }

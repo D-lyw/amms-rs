@@ -161,23 +161,23 @@ fn test_enrich_update_log_data() {
     );
 }
 
-/// L2 完整应用：price + ladder 点差（新引擎 999/1000 因子，链上逐位对拍）：
+/// L2 完整应用：price + ladder 点差（无费口径，fee=1000 时报价输入侧扣费）：
 ///   - SKHYx（index 1）：price=13984，ask 字段=3、sell 字段=3 →
-///     bid_offset = ceil(13984/1000)+3 = 17 → bid=13967；ask=13987
+///     bid = price − sell_off = 13981；ask=13987
 ///   - asset2（index 2，scale=100000）：price=640774，raw 252/252 →
-///     ask_off=2520、sell_off=2520 → bid_offset = ceil(6407740/1000)+2520 = 8928
+///     ask_off=2520、sell_off=2520 → bid = 6,405,220
 #[test]
 fn test_apply_l2_update_spread_and_scale() {
     let mut pool = test_pool();
     // SKHYx（index 1，dj=18，scale=10000 默认）
     pool.apply_l2_update(1, U256::from(13_984u64), 100, 3, 3);
     assert_eq!(pool.prices[1], U256::from(13_984u64));
-    assert_eq!(pool.bid_price(1).unwrap(), U256::from(13_967u64));
+    assert_eq!(pool.bid_price(1).unwrap(), U256::from(13_981u64));
     assert_eq!(pool.ask_price(1).unwrap(), U256::from(13_987u64));
-    // q0j = floor(1e20×999/(1000×13987))，链上 0→SKHYx in=1e6 逐位对拍
+    // q0j = floor(1e20/13987)（无费）；链上 0→SKHYx in=1e6 报价 = fee_rem 后逐位对拍
     assert_eq!(
         pool.q0j[1],
-        Some(U256::from_str_radix("7142346464574247", 10).unwrap())
+        Some(U256::from_str_radix("7149495960534782", 10).unwrap())
     );
     let out = pool.engine_quote(0, 1, U256::from(1_000_000u64)).unwrap();
     assert_eq!(out, U256::from_str_radix("7142346464574247", 10).unwrap());
@@ -206,11 +206,11 @@ fn test_apply_l2_update_spread_and_scale() {
     pool.apply_l2_update(2, U256::from(640_774u64), 100, 252, 252);
     // 内部价格 = 640,774 × 100000/10000 = 6,407,740
     assert_eq!(pool.prices[2], U256::from(6_407_740u64));
-    assert_eq!(pool.spreads[2], 11448);
+    assert_eq!(pool.spreads[2], 5040);
     assert_eq!(pool.ask_price(2).unwrap(), U256::from(6_410_260u64));
-    assert_eq!(pool.bid_price(2).unwrap(), U256::from(6_398_812u64));
-    // q0j = floor(10^10×999/(1000×6,410,260)) = 1558（dj=8）
-    assert_eq!(pool.q0j[2], Some(U256::from(1558u64)));
+    assert_eq!(pool.bid_price(2).unwrap(), U256::from(6_405_220u64));
+    // q0j = floor(10^10/6,410,260) = 1559（dj=8，无费）
+    assert_eq!(pool.q0j[2], Some(U256::from(1559u64)));
 }
 
 fn test_enrich_wrong_tx_hash_returns_none() {
@@ -292,18 +292,18 @@ fn test_swap_event_anchors_rate_and_reserves() {
 fn test_price_update_is_idempotent_set() {
     let mut pool = test_pool();
     pool.apply_l2_update(1, U256::from(13_984u64), 100, 3, 3);
-    // 0→SKHYx：rate = q0j/10^6 = 7,142,346,464,574,247 / 1e6
+    // 0→SKHYx：rate = q0j/10^6 × (1e6−fee)/1e6 = q0j×999000 / 1e12
     let rate = pool.rates[pool.pair_index(0, 1)];
     assert_eq!(
         rate.num,
-        U256::from_str_radix("7142346464574247", 10).unwrap()
+        U256::from_str_radix("7142346464574247218000", 10).unwrap()
     );
-    assert_eq!(rate.den, U256::from(1_000_000u64));
-    // SKHYx→0：raw = 13984×999 − 3×1000 = 13,967,016，
-    // rate = raw×10^4/(1000×10^18) = 13,967,016/(1×10^17)
+    assert_eq!(rate.den, U256::from(1_000_000_000_000u64));
+    // SKHYx→0：raw = 13984−3 = 13,981（无费），
+    // rate = raw/10^14 × (1e6−fee)/1e6 = 13,981×999,000 / 1e20
     let rate_ba = pool.rates[pool.pair_index(1, 0)];
-    assert_eq!(rate_ba.num, U256::from(13_967_016u64));
-    assert_eq!(rate_ba.den, U256::from(100_000_000_000_000_000u64));
+    assert_eq!(rate_ba.num, U256::from(13_967_019_000u64));
+    assert_eq!(rate_ba.den, U256::from(10u64).pow(U256::from(20)));
 
     // 重复同 price 更新：费率不变（幂等）
     pool.apply_l2_update(1, U256::from(13_984u64), 101, 3, 3);
@@ -325,8 +325,8 @@ fn test_simulate_swap_matches_onchain_sample() {
         )
         .unwrap();
     assert_eq!(out, U256::from_str_radix("7142346464574247", 10).unwrap());
-    // SELL：SKHYx→0 in=1e18 → 139,670,160
-    // （精确有理数 raw=13,967,016，含 raw/1000 小数部分；整数 bid=13,967 会低估 160）
+    // SELL：SKHYx→0 in=1e18 → 139,670,190
+    // （输入侧扣费：rem=in−in/1000 × bid=13,981；fee=1000 链上逐位一致）
     let sell = pool
         .simulate_swap(
             pool.assets[1].address,
@@ -334,7 +334,7 @@ fn test_simulate_swap_matches_onchain_sample() {
             U256::from(1_000_000_000_000_000_000u64),
         )
         .unwrap();
-    assert_eq!(sell, U256::from(139_670_160u64));
+    assert_eq!(sell, U256::from(139_670_190u64));
 
     // 大额 linear > 金库余额 → 实时金库零门槛归零（链上实测：linear 超金库即 0）
     let huge = pool
@@ -347,10 +347,10 @@ fn test_simulate_swap_matches_onchain_sample() {
     assert_eq!(huge, U256::ZERO);
 }
 
-/// SELL 阶梯上限：maxIn 截断。新引擎因子：
-///   - price=15005/askOff=4/sellOff=4 → bid_offset=ceil(15005/1000)+4=20 → bid=14985
-///   - in=1e18（< maxIn）：149,859,950（线性）
-///   - in=1e20 / 1e24（> maxIn）：3,680,380,540（饱和 = maxIn × bid × 1e-14）
+/// SELL 阶梯上限：先扣费再按 maxIn 截断消耗量（consume = min(rem, maxIn)）。
+///   - price=15005/askOff=4/sellOff=4 → bid=15001（无费）
+///   - in=1e18（< maxIn）：149,859,990（线性，输入侧扣费）
+///   - in=1e20 / 1e24（> maxIn）：3,684,065,588（饱和 = maxIn×bid×1e-14，fee 无关）
 #[test]
 fn test_engine_quote_sell_cap_matches_onchain() {
     let mut pool = test_pool();
@@ -365,8 +365,8 @@ fn test_engine_quote_sell_cap_matches_onchain() {
     // USDT0 金库余额调大，避免超容量归零（本测试只验证 maxIn 饱和截断）
     pool.reserves[0] = U256::from(10u64.pow(15));
 
-    // 线性区（in=1e18 < maxIn）：out = in×raw×1e4/(1000×1e18)
-    // raw = 15005×999 − 4×1000 = 14,985,995 → out(1e18) = 149,859,950
+    // 线性区（in=1e18 < maxIn）：out = fee_rem(in)×raw×1e4/1e18
+    // raw = 15005−4 = 15,001 → out(1e18) = 149,859,990
     let out = pool
         .simulate_swap(
             pool.assets[1].address,
@@ -374,9 +374,9 @@ fn test_engine_quote_sell_cap_matches_onchain() {
             U256::from(10u64.pow(18)),
         )
         .unwrap();
-    assert_eq!(out, U256::from(149_859_950u64));
+    assert_eq!(out, U256::from(149_859_990u64));
 
-    // 饱和区：in=1e20 与 1e24 均为 min(in, maxIn)×raw×1e4/(1000×1e18)
+    // 饱和区：in=1e20 与 1e24 均为 consume=min(rem,maxIn)=maxIn → maxIn×raw×1e4/1e18
     let out = pool
         .simulate_swap(
             pool.assets[1].address,
@@ -384,7 +384,7 @@ fn test_engine_quote_sell_cap_matches_onchain() {
             U256::from(10u128.pow(20)),
         )
         .unwrap();
-    assert_eq!(out, U256::from(3_680_380_540u64));
+    assert_eq!(out, U256::from(3_684_065_588u64));
     let out = pool
         .simulate_swap(
             pool.assets[1].address,
@@ -392,7 +392,7 @@ fn test_engine_quote_sell_cap_matches_onchain() {
             U256::from(10u128.pow(24)),
         )
         .unwrap();
-    assert_eq!(out, U256::from(3_680_380_540u64));
+    assert_eq!(out, U256::from(3_684_065_588u64));
 }
 
 /// P0 回归：BUY 费率先按 rem = in − in/1000 整数扣减再线性报价（非最后乘 999/1000）。
@@ -494,14 +494,14 @@ fn test_engine_quote_buy_zero_over_vault() {
     );
     // 跨资产两段式：SKHYx(1) → xSOL(2), in=5e16（第二段不含 999/1000 因子）
     pool.apply_l2_update(1, U256::from(13_984u64), 100, 3, 3);
-    // v = floor(5e16 × 13,967,016 × 1e4 / (1000×1e18)) = 6,983,508
-    // linear = floor(6,983,508 × 1e5 / 7379) = 94,640,303 ≤ 金库 → 返回
+    // v = floor(fee_rem(5e16) × 13,981 × 1e4 / 1e18) = 6,983,509
+    // linear = floor(6,983,509 × 1e5 / 7379) = 94,640,317 ≤ 金库 → 返回
     assert_eq!(
         pool.engine_quote(1, 2, U256::from(50_000_000_000_000_000u64))
             .unwrap(),
-        U256::from(94_640_303u64)
+        U256::from(94_640_317u64)
     );
-    // in=1e17：v = 13,967,016 → linear = 189,280,607 > 金库 → 0
+    // in=1e17：v = 13,967,019 → linear = 189,280,647 > 金库 → 0
     assert_eq!(
         pool.engine_quote(1, 2, U256::from(100_000_000_000_000_000u64))
             .unwrap(),
@@ -525,25 +525,25 @@ fn test_engine_quote_cross_two_stage() {
     pool.sell_raw.push(None);
     pool.rates = vec![Rate::zero(); n * n];
     pool.price_updated_block.push(0);
-    // asset4(2)：price=32481/askOff=18/sellOff=9 → ask=32499、raw4=32,439,519
+    // asset4(2)：price=32481/askOff=18/sellOff=9 → ask=32499、raw4=32,472（无费）
     pool.apply_l2_update(2, U256::from(32_481u64), 100, 18, 9);
     pool.apply_l2_update(1, U256::from(13_984u64), 100, 3, 3);
-    // SKHYx(1) -> asset4(2), in=1e18：两段式（第二段不含 999/1000 因子）
-    // v = floor(1e18 × 13,967,016 × 1e4 / (1000×1e18)) = 139,670,160
-    // out = floor(139,670,160 × 1e14 / 32499) = 429,767,562,078,833,194
+    // SKHYx(1) -> asset4(2), in=1e18：两段式（第一段输入侧扣费，第二段无额外因子）
+    // v = floor(fee_rem(1e18) × 13,981 × 1e4 / 1e18) = 139,670,190
+    // out = floor(139,670,190 × 1e14 / 32499) = 429,767,654,389,365,826
     let out = pool
         .engine_quote(1, 2, U256::from(10u64.pow(18)))
         .expect("engine quote");
-    assert_eq!(out, U256::from_str_radix("429767562078833194", 10).unwrap());
-    // asset4(2) -> SKHYx(1)：raw4 = 32481×999 − 9×1000 = 32,439,519
-    // v = floor(1e18 × 32,439,519 × 1e4 / (1000×1e18)) = 324,395,190
-    // out = floor(324,395,190 × 1e14 / 13987) = 2,319,262,100,521,913,205
+    assert_eq!(out, U256::from_str_radix("429767654389365826", 10).unwrap());
+    // asset4(2) -> SKHYx(1)：raw4 = 32481−9 = 32,472（无费）
+    // v = floor(fee_rem(1e18) × 32,472 × 1e4 / 1e18) = 324,395,280
+    // out = floor(324,395,280 × 1e14 / 13987) = 2,319,262,743,976,549,653
     let out = pool
         .engine_quote(2, 1, U256::from(10u64.pow(18)))
         .expect("engine quote");
     assert_eq!(
         out,
-        U256::from_str_radix("2319262100521913205", 10).unwrap()
+        U256::from_str_radix("2319262743976549653", 10).unwrap()
     );
 }
 
@@ -619,6 +619,50 @@ fn test_sync_swap_log_anchors() {
 }
 
 #[test]
+fn test_sync_fee_event_updates_fee_and_rederives_rates() {
+    let mut pool = test_pool();
+    // 先建立无费价格（L2 语义）：默认 fee=1000 → rates 含 fee 折算
+    pool.apply_l2_update(1, U256::from(13_984u64), 100, 3, 3);
+    assert_eq!(pool.fee_ppm, BINARYFI_DEFAULT_FEE_PPM);
+    let rate_old = pool.rates[pool.pair_index(0, 1)];
+    assert!(rate_old.num > U256::ZERO);
+
+    // 引擎 FeeUpdated：单 topic，data 前 32 字节 = 新 fee ppm（200）
+    let data = U256::from(200u64).to_be_bytes::<32>().to_vec();
+    let log_data = LogData::new(vec![BINARYFI_FEE_EVENT], Bytes::from(data)).unwrap();
+    let log = Log {
+        inner: AlloyLog {
+            address: BINARYFI_ENGINE_ADDRESS,
+            data: log_data.clone(),
+        },
+        ..Default::default()
+    };
+
+    let action = pool.sync(&log).expect("sync ok");
+    assert!(matches!(action, SyncAction::AsyncUpdate));
+    assert_eq!(pool.fee_ppm, 200);
+    // rates 同步重导：fee 1000→200 → 可执行中间价上移（0→1 方向）
+    let rate_new = pool.rates[pool.pair_index(0, 1)];
+    assert!(rate_new.num > rate_old.num, "rate should rise after fee cut");
+    assert_eq!(rate_new.den, rate_old.den);
+
+    // 重复同 fee 事件 → 无动作
+    let action2 = pool.sync(&log).expect("sync ok");
+    assert!(matches!(action2, SyncAction::None));
+
+    // 事件地址不是 engine（池子地址 + fee topic）→ 不进 fee 分支（默认 Resync）
+    let log_other = Log {
+        inner: AlloyLog {
+            address: BINARYFI_POOL_ADDRESS,
+            data: log_data.clone(),
+        },
+        ..Default::default()
+    };
+    let action3 = pool.sync(&log_other).expect("sync ok");
+    assert!(matches!(action3, SyncAction::Resync));
+}
+
+#[test]
 fn test_sync_enriched_update_applies_price() {
     let mut pool = test_pool();
     // 增强后的 data = price / blockNumber / data0..2 / askOffsetRaw / bidOffsetRaw
@@ -647,18 +691,18 @@ fn test_sync_enriched_update_applies_price() {
     assert!(matches!(action, SyncAction::None));
     assert_eq!(pool.prices[1], U256::from(15005));
     assert_eq!(pool.price_updated_block[1], 0x400c944);
-    // 点差偏移 0/0 → raw = 15005×999 = 14,989,995，
-    // rate(1→0) = raw×10^4/(1000×10^18) = 14,989,995/(1×10^17)
+    // 点差偏移 0/0 → raw = 15005（无费），
+    // rate(1→0) = raw/10^14 × (1e6−fee)/1e6 = 15,005×999,000/1e20
     let rate_ba = pool.rates[pool.pair_index(1, 0)];
-    assert_eq!(rate_ba.num, U256::from(14_989_995u64));
-    assert_eq!(rate_ba.den, U256::from(100_000_000_000_000_000u64));
-    // BUY：q0j = floor(1e20×999/(1000×15005))，rate(0→1) = q0j/1e6
+    assert_eq!(rate_ba.num, U256::from(14_989_995_000u64));
+    assert_eq!(rate_ba.den, U256::from(10u64).pow(U256::from(20)));
+    // BUY：q0j = floor(1e20/15005)（无费），rate(0→1) = q0j×999,000/1e12
     let rate = pool.rates[pool.pair_index(0, 1)];
     assert_eq!(
         rate.num,
-        U256::from_str_radix("6657780739753415", 10).unwrap()
+        U256::from_str_radix("6657780739753414647000", 10).unwrap()
     );
-    assert_eq!(rate.den, U256::from(1_000_000u64));
+    assert_eq!(rate.den, U256::from(1_000_000_000_000u64));
 }
 
 #[test]
@@ -972,6 +1016,7 @@ fn test_apply_snapshot_degenerate_maxout_cleared() {
             ok("10916672400"),         // 1→0 100 整枚
             ok("4456402343463560796"), // 0→1 mid：线性 4.456e18
         ],
+        fee: U256::from(1000), // 失败交易窗口费率为 1000ppm
     };
     pool.apply_snapshot(&snap, 67_430_640);
     // 退化检测：mid(4.456e18) > big(1.301e18) → maxOut 清除（不得截断线性区）
@@ -1046,6 +1091,7 @@ fn test_sell_ladder_r_derived_when_probe_unsaturated() {
             ok("14193000000"),          // 1→0 100 整枚：两档部分消费、未饱和
             ok("1000000000000000000"),  // 0→1 mid
         ],
+        fee: U256::from(1000), // L2 同块快照，费率锚定 1000ppm
     };
     pool.apply_snapshot(&snap, snap_block);
     // 多档 probe 与单档不兼容 → sell_raw 清空（快照近似），但 R 必须恢复

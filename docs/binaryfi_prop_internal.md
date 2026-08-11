@@ -70,7 +70,7 @@ asset2 sell ladder calldata：`0x0c91f10e93c800...` → `[(201,241),(233,968)]`
 链上逐位验证的精确公式（ladder + 引擎储备 R 已知时）：
 
 ```
-rem = in − in/1000                      // 费率因子先扣（in<1000 时 ≠ in×999/1000，实测）
+rem = in − in×fee_ppm/1e6              // 按账户费率输入侧先扣（整数除法）
 out = Σ_k (price − w_k) × min(rem, qty_k × R) × 10^(d0−2) / 10^di
 rem -= min(rem, qty_k × R)              // 逐档递减
 ```
@@ -78,34 +78,37 @@ rem -= min(rem, qty_k × R)              // 逐档递减
 - 首档 weight = 小额报价偏移（w=0 时退化为单档线性 `price×rem×10^(d0−2)/10^di`）
 - 每档输出 = `(price − w) × consume × 10^(d0−2) / 10^di`，EVM 向零截断
 - 输出超 USDT0 金库余额 → **归零**（`sell_zero_over_vault`，链上实测）
-- ladder / R 未知 → 回退单档线性：`out = in × raw × 10^(d0−2) / (1000 × 10^di)`，
-  `raw = price×999 − sellOff×1000`，受 `maxIn` 截断
+- ladder / R 未知 → 回退单档线性：`out = in × raw × 10^(d0−2) / 10^di`，
+  `raw = price − sellOff`（无费），受 `maxIn` 截断
 
 ## 5. BUY 报价（USDT0 → j）
 
 ```
 ask = price + askOff        // askOff = askOffsetRaw × scale/10000
-rem  = in − in/1000         // 0.1% 费先按整数除法扣（与 SELL 同款）
-q0j  = floor(10^(dj+2) × 999 / (1000 × ask))          // 小额报价状态 in=10^d0
+rem  = in − in×fee_ppm/1e6  // 按账户费率输入侧先扣（整数除法，与 SELL 同款）
+q0j  = floor(10^(dj+2) / ask)                         // 小额报价状态 in=10^d0（无费）
 linear = floor(rem × 10^(dj+2) / (ask × 10^d0))
 ```
 
-- **必须先扣费再线性报价**，不能 `in × 999/1000` 替代（非 1000 倍数输入有
-  ~1e-4% 偏差；tx1/tx2 失败交易逐位对拍：in=44,291,018 → 324,080,619,644,034,278、
-  in=122,156,425 → 891,476,871,940,974,505）
+- **必须先扣费再线性报价**，不能 `in × (1e6−fee_ppm)/1e6` 替代（非整倍数输入有
+  ~1e-4% 偏差；tx1/tx2 失败交易逐位对拍，fee=1000：in=44,291,018 →
+  324,080,619,644,034,278、in=122,156,425 → 891,476,871,940,974,505；
+  fee=200 实测 asset4~9 BUY 全 -200.0ppm 逐位一致）
 - 输出再按阶梯上限截断：
   - 饱和型（阶梯容量 ≤ 金库余额）：`out = min(linear, maxOut)`
   - 超阈值归零型（阶梯容量 > 金库余额）：`linear > 金库余额 → 0`，否则原样
-- BUY 方向费率 0.1%（`rem = in − in/1000`），与 SELL 同一扣法
+- 饱和输出 = 阶梯全容量输出，**与 fee 无关**（fee 只影响剩余输入，不影响
+  满档 consume；块 0x40832F5 fee=200 实测 asset8 大额 router==agg 平顶相等）
 
 ## 6. 跨资产（i → j，均非 USDT0）两段式
 
 ```
-v   = floor(in × raw_i × 10^(d0−2) / (1000 × 10^di))   // 第一段 SELL（含 maxIn 截断 + 归零）
-out = floor(v × 10^(dj−d0+2) / ask_j)                  // 第二段 BUY，**不含** 999/1000 因子（实测）
+v   = floor(in × raw_i × 10^(d0−2) / 10^di)            // 第一段 SELL（含 maxIn 截断 + 归零）
+out = floor(v × 10^(dj−d0+2) / ask_j)                  // 第二段 BUY，无额外费率因子（实测）
 ```
 
-第二段不带因子是关键差异（直接 `0→j` 才带），本地 `engine_quote` 与引擎一致。
+第二段不再扣费是关键差异（费已由第一段 SELL 输入侧扣一次；直接 `0→j` 才扣一次），
+本地 `engine_quote` 与引擎一致。
 
 ## 7. 引擎储备 R 与 maxIn / maxOut
 
@@ -192,6 +195,40 @@ out = floor(v × 10^(dj−d0+2) / ask_j)                  // 第二段 BUY，**�
   容量，直到下一次 update/快照重置——容量变化**通过交易实时更新**，不再等快照。
 - `buy_capped`/`max_achievable_out`/`ladder_cap_known` 封顶优先取
   `buy_ladder_remaining`，其次快照 `max_outputs`，再叠加 7.5 金库零门槛。
+
+## 7.9 按账户费率（fee_ppm）参数化（P0 修复）
+
+根因：引擎费率是 **per-account storage**（`getFee(account)` = `0xb88c9148`，
+聚合器白名单 0 费率），本地此前硬编码 999/1000 报价——fee 实际为 200 时
+本地每个 quote 高估 ~0.08%（0.1%−0.02%），是 08-09 两笔失败套利交易的
+直接原因（tx 0x93abd8… / 0x9216f8…，fee=1000 时逐位一致）。
+
+- 费率时间线（ppm）：锚点块 `0x402f480` = 500 → 失败交易窗口
+  `0x405B7E9`/`0x4062DAE` = 1000 → `0x4073356`（2026-08-10 16:16 UTC，
+  `setFee` 由 `0x2db200f40f47…` 调用）起 = 200。默认兜底 `BINARYFI_DEFAULT_FEE_PPM` = 1000。
+- 公式（块 `0x40832F5`，fee=200 实测）：BUY `rem = in − in×200/1e6` 后线性
+  报价，asset4~9 全 -200.0ppm 逐位一致（asset9 `7,324,397,568,300,007 →
+  7,322,932,688,786,347`）；SELL XETH `1,875,910 → 1,875,534`、CRCLx
+  `66,990 → 66,976`。**输入侧整数除法扣费**，不能用 `in×(1e6−fee)/1e6` 替代
+  （非整倍数输入 ±1 舍入，实测 8 采样仅输入侧口径全一致）。
+- 饱和输出与 fee 无关（fee 只减剩余输入、不影响满档 consume）：块 0x40832F5
+  asset8 大额 router==agg 平顶相等；`buy_capped` 直接 `min(fee'd linear, 观测
+  饱和值)`，无需再折算。
+- 本地获取/同步：
+  1. 批量合约 `GetBinaryFiPropStateBatchRequest` 新增 `getFee(recipient)` 字段
+     （`Snapshot.fee`，非 0 才覆盖本地），快照报价反推统一无费口径，与 L2
+     calldata 无费价格一致；**bid/ask 用含费 quote 带费率直接反推**
+     （`recover_ask_eff`/`recover_ask_big` 带 `fee_ppm`，bid =
+     `out×10^dj/(fee_rem(10^(dj−4))×10^(d0−2))`），不走 `unfee_quote` 二次
+     舍入——NVDAx 实测 unfee 路径 ask 偏差 1 → 输出差 0.004%；
+  2. `FeeUpdated` 事件（topic0 `0xc58b3024a07432cfc160ea128eebc11329d444bb61bf7098f09bb6567b943c66`，
+     data 前 32 字节 = 新 fee ppm）实时同步：`sync()` L0 分支更新 `fee_ppm`，
+     并**同步重导全部 rates**（spot/预过滤立即对齐，不依赖异步窗口）；实际
+     变更时返回 `AsyncUpdate` 触发一次快照重锚（含费 maxOut/大额 probe 需按
+     新费率重新观测）。事件路由依赖 `state_space::resolve_binaryfi_targets`
+     新增 `BINARYFI_FEE_EVENT` 分支（单 topic 事件走 `topics.len()==1` 分发
+     通道），同一 engine 的全部虚拟子池一起更新。
+- 存量状态兼容：`fee_ppm` serde 兜底 1000，旧序列化状态行为与历史一致。
 
 ## 8. 三层数据同步（事件驱动，无轮询）
 
