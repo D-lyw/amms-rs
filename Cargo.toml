@@ -1,6 +1,6 @@
 [package]
 name = "amms"
-version = "1.16.11"
+version = "1.16.12"
 edition = "2021"
 license = "MIT"
 description = "A library to interact with automated market makers across EVM chains."

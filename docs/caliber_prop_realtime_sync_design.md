@@ -217,3 +217,34 @@ start_caliber_prop_ladder_sync_task(降频保留)     ← 对账/兜底
   对账间隔即回填延迟上界。
 - XLayer flashblocks 的 `diff.transactions` 覆盖 slice 内全部交易（现有 `tx_tracker`
   按它计数），多 slice 顺序用 `tx_base` 拼接——实现时复用该机制，勿自行假设。
+
+---
+
+## 附：swap 消耗事件实时同步（2026-08-11，v1.16.12）
+
+### 背景
+
+链上实测推翻"合约不 emit 任何事件"的旧假设：市场合约每次 swap 后 emit
+`Swap(bytes32,address,address,address,uint256,uint256,uint256)`（topic0
+`0x36d90ab6…`，topics `[sig, pairId, caller]`，data
+`[tokenIn, tokenOut, amountIn, amountOut, flags]`）。此前本地 ladder 只随
+`batchUpdateParameters` 与低频对账更新，链上 swap 消耗从不回流 → 同块内被
+竞争套利消费后，本地仍按消耗前报价，产生幻影利润被 precheck（`PC: stale`）拦截。
+
+### 设计
+
+- **提取**：flashblocks 提取阶段新增 caliber swap 通道，按 `caliber_contracts`
+  地址预筛 receipt logs，仅 `status == 0x1` 交易；`pairId + 合约地址 → virtual_address`
+  路由，与 `batchUpdateParameters` 同一批次、按 `tx_index` 顺序合并应用。
+- **应用**：`apply_chain_swap` 增量更新 `reserve_a/b`（token 方向映射）与
+  `pos_forward`（low96）/`pos_reverse`（mid96，方向切换归零）；与链上
+  `cfg+7.block` 门控语义一致，快照与实时两路径幂等。
+- **容错**：pairId 不匹配 / 块号落后于已同步块 → 静默跳过；周期对账（45s）保留兜底。
+- **不变量**：`consumed_*` 是 `simulate_swap_mut` 专属纯模拟状态，实时事件直接写
+  pos 字段，不累加 consumed，避免双重计数。
+
+### 验证
+
+事故块 67650064 重放：tx#15 消费后 `quote(W→U, 977,689,766,888,449,551)` =
+19,443,347（链上 `0x128ae93` 逐位一致）；块末 = 287,076。详见
+`docs/2026-08-11_caliber_swap_consumption_sync_report.md`。

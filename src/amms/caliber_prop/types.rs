@@ -46,12 +46,26 @@ pub struct CaliberLadderState {
     pub window: U256,
     /// scale = 10^(dec_token_x - dec_token_y)，用于链上 quote 公式
     pub scale: U256,
-    /// 反向报价的当前位置（链上 `cfg+7` 的 pos 字段，bits 96..191）。
+    /// 反向报价（token_y → token_x）的当前位置（链上 `cfg+7` bits 96..191
+    /// = mid96，即该 pair 在 token_y → token_x 方向已累计的"扣费后输入量"
+    /// amountIn_y - floor(amountIn_y * fee / 1e6)，2026-08-11 链上取证：
+    /// 82,580,656 in → mid96=82,564,140 = in - in*200/1e6，与
+    /// `quote_reverse_exact` 的 pos（y 单位）语义一致；不是累计输出量）。
     ///
     /// 链上合约只在 `cfg+7` 的 block 字段 == 当前执行块时才使用真实 pos，
     /// 否则按 pos=0（整段）计算；本字段在 `fetch_exact_snapshot` 中已完成
     /// 该判断（无效时为 0），`quote_reverse_exact` 直接使用。
-    pub pos: U256,
+    /// 旧字段名 `pos`（2026-08-09 前为反向 pos）通过 `#[serde(alias)]` 兼容。
+    #[serde(alias = "pos", default)]
+    pub pos_reverse: U256,
+    /// 正向报价（token_x → token_y）的当前位置（链上 `cfg+7` bits 0..95
+    /// = low96，即该 pair 在 token_x → token_y 方向已被累计兑换的输出量）。
+    ///
+    /// 与 `pos_reverse` 相同的 block 门控语义：仅当 `cfg+7.block` == 当前
+    /// 执行块时有效，否则为 0。由快照路径与实时 swap 事件共同维护，
+    /// `quote_forward_pos_exact` 直接使用。
+    #[serde(default)]
+    pub pos_forward: U256,
     /// 报价过期时间戳（完整 64 位 deadline = `(tsY << 32) | tsX`，data+0 槽
     /// bits 96..160）。`batchUpdateParameters` 更新写入时 tsY 置 0，故该路径下
     /// deadline 即更新交易的 deadline 参数；快照路径保留完整 64 位，tsY 非零时

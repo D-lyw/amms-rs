@@ -3,10 +3,14 @@
 //! 集成 Makina 协议的 Caliber propAMM 做市商定价 AMM。
 //!
 //! ## 架构
-//! - **Ladder 定价模型**: 做市商通过链下引擎上传分段线性定价阶梯，链上合约不 emit Swap/Liquidity 事件。
-//! - **同步策略**: `sync_events()` 返回空（无事件）。XLayer 实时报价更新由 flashblocks
-//!   原始交易流驱动（`batchUpdateParameters` calldata → `apply_batch_update`，详见
-//!   `docs/caliber_prop_realtime_sync_design.md`）；周期任务降频为对账/兜底
+//! - **Ladder 定价模型**: 做市商通过链下引擎上传分段线性定价阶梯，链上合约在每次
+//!   swap 后 emit `Swap` 事件（2026-08-11 链上实测确认，见
+//!   `docs/2026-08-11_caliber_swap_consumption_sync_report.md`）。
+//! - **同步策略**: `sync_events()` 返回空——swap 日志不进入通用日志管道，而是由
+//!   XLayer flashblocks 提取通道（`caliber_contracts` 地址预筛）单独解析，避免
+//!   与 `apply_logs_for_block_timed` 双重应用。XLayer 实时报价更新由 flashblocks
+//!   原始交易流驱动（`batchUpdateParameters` calldata → `apply_batch_update`，
+//!   详见 `docs/caliber_prop_realtime_sync_design.md`）；周期任务降频为对账/兜底
 //!   （`sync_services::start_caliber_prop_ladder_sync_task` → `update()` →
 //!   `fetch_exact_snapshot` 直读合约 storage `cfg`/`data`/`ladder` 槽位）。
 //! - **本地 Swap 模拟**: 用 `quote_forward_exact` / `quote_reverse_exact` 精确复刻链上
@@ -54,7 +58,7 @@ use alloy::{
     consensus::BlockHeader,
     eips::BlockId,
     network::{BlockResponse, Network},
-    primitives::{keccak256, Address, B256, U256},
+    primitives::{address, b256, keccak256, Address, B256, U256},
     providers::{DynProvider, Provider, ProviderBuilder},
     rpc::types::Log,
     sol,
@@ -90,6 +94,16 @@ pub const DEFAULT_SWAP_GAS: u64 = 250_000;
 /// deadline→tsX），只写 `data+0` 一个槽、**不 emit 任何事件**，
 /// 只能通过 flashblocks 原始交易流发现（见 `docs/caliber_prop_realtime_sync_design.md`）。
 pub const CALIBER_BATCH_UPDATE_SELECTOR: [u8; 4] = [0x00, 0x8d, 0xcc, 0x8e];
+
+/// `Swap(bytes32,address,address,address,uint256,uint256,uint256)` 事件签名。
+///
+/// XLayer Caliber 合约在每次 swap 后 emit 该事件（topic0），
+/// topics = `[sig, pairId, caller]`，data =
+/// `[tokenIn, tokenOut, amountIn, amountOut, flags]`（各 32B 左对齐）。
+/// 与 `batchUpdateParameters`（0 日志）不同，swap 有日志可驱动实时同步：
+/// 消费追踪（ladder consumption）+ 储备/pos 更新（2026-08-11 新增）。
+pub const CALIBER_SWAP_EVENT: B256 =
+    b256!("36d90ab6736dbd42ac28b968350d068640e9aea3f7b807679fe64d2a50dcbb03");
 
 /// 1e6：fee 的基数（200 = 2 bps）
 pub const MILLION: U256 = U256::from_limbs([1_000_000, 0, 0, 0]);
@@ -200,6 +214,56 @@ pub struct CaliberBatchUpdate {
     pub flags: u32,
     /// 报价过期时间戳 deadline（→ data+0 bits 96..128 tsX）
     pub deadline: u64,
+}
+
+/// 链上 `Swap` 事件（XLayer flashblocks 日志驱动实时消费同步）。
+///
+/// 从 receipt 日志中解码：`topics = [sig, pairId, caller]`，
+/// `data = [tokenIn, tokenOut, amountIn, amountOut, flags]`。
+/// 提取侧已按 `receipt.status == 0x1` 过滤未确认/回滚交易（P0 纪律，
+/// 与 caliber 更新路径一致）；块内按 `tx_index` 排序应用。
+///
+/// 注意：事件 `amountIn`/`amountOut` 是 swap 调用方传入/期望的参数值，
+/// 对走路由器聚合的复杂交易可能与实际转账金额有微小出入（取证块
+/// 67650064 tx#22 差 3072 U），由周期对账快照兜底纠正；直接 swap 调用
+/// 两者一致。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CaliberSwapEvent {
+    /// 被调用的 caliber 合约地址（路由层推导 virtual_address 用）
+    pub contract: Address,
+    /// 块内全局交易索引（EVM 语义：块内按序应用）
+    pub tx_index: u64,
+    /// 目标 pair 的原始 pairId
+    pub pair_id: B256,
+    /// 输入 token（合约 token 序）
+    pub token_in: Address,
+    /// 输出 token（合约 token 序）
+    pub token_out: Address,
+    /// 输入量（原始量纲）
+    pub amount_in: U256,
+    /// 输出量（原始量纲）
+    pub amount_out: U256,
+}
+
+/// 从 caliper `Swap` 日志（topics + data）解码事件。
+///
+/// 结构不符 / 解码失败返回 `None`（fail-safe：调用方静默跳过）。
+/// data 为 5 个 32B 字：`[tokenIn, tokenOut, amountIn, amountOut, flags]`。
+pub fn decode_caliber_swap_log(topics: &[B256], data: &[u8]) -> Option<CaliberSwapEvent> {
+    if topics.len() < 2 || topics[0] != CALIBER_SWAP_EVENT || data.len() < 160 {
+        return None;
+    }
+    let word = |start: usize| U256::from_be_slice(&data[start..start + 32]);
+    let addr = |start: usize| Address::from_slice(&data[start + 12..start + 32]);
+    Some(CaliberSwapEvent {
+        contract: Address::ZERO, // 由调用方填充（日志地址）
+        tx_index: 0,             // 由调用方填充（块内索引）
+        pair_id: topics[1],
+        token_in: addr(0),
+        token_out: addr(32),
+        amount_in: word(64),
+        amount_out: word(96),
+    })
 }
 
 /// 标准 ABI 解码 `batchUpdateParameters` 的完整 calldata（含选择器）。
@@ -531,6 +595,144 @@ impl CaliberPropPool {
         self.ladder.deadline = u.deadline;
         self.last_synced_block = block_number;
     }
+
+    /// 应用链上 `Swap` 事件（XLayer flashblocks 日志驱动实时消费同步）。
+    ///
+    /// 只更新 swap 影响的状态：储备（`reserve_a`/`reserve_b`）与当前位置
+    /// （`pos_forward` = cfg+7 low96 / `pos_reverse` = cfg+7 mid96）。
+    /// 与链上行为一致（2026-08-11 块 67650064 取证）：每次 swap 只写当前
+    /// 方向的 pos 字段并归零另一方向（同一区块连续同向 swap 为累计，
+    /// 方向切换后旧方向 pos 失效）。
+    ///
+    /// `consumed_*` 是**纯模拟**状态（`simulate_swap_mut` 专属，快照刷新时
+    /// 清零），不随真实事件更新——实时事件已直接写入 pos 字段，若再累加
+    /// consumed 会在后续模拟中双重计数。
+    ///
+    /// `pair_id` 不匹配时静默忽略（fail-safe，防跨 pair 污染）；
+    /// 提取侧已按 `receipt.status == 0x1` 过滤回滚/未确认交易。
+    pub fn apply_chain_swap(&mut self, swap: &CaliberSwapEvent, block_number: u64) {
+        if swap.pair_id != self.pair_id {
+            return;
+        }
+        let forward = swap.token_in == self.token_x;
+        // 输入侧储备增量 = "ladder 一致输入"（2026-08-11 块 67650064 取证）：
+        // 输出未被限制（amount_out == quote(amount_in)）时链上按事件 amountIn
+        // 全额入账；输出被限制（router minOut / 储备封顶，amount_out <
+        // quote(amount_in)）时链上只按"产生该输出的 ladder 输入"入账，超出
+        // 部分停留在合约余额、不记入 pair 储备（tx#22：事件 amountIn=526e15，
+        // 链上仅入账 87.35e15）。用 `ladder_input_for_output` 复刻。
+        let input_consumed = self.ladder_input_for_output(swap, forward);
+        // 储备按 token_a/token_b 映射（虚拟池子视角，与 simulate_swap_mut
+        // 同一约定）：token_in == token_a → reserve_a += input_consumed /
+        // reserve_b -= out；token_in == token_b → 反之。输出侧始终按事件
+        // amountOut 全额扣减（链上 cfg+4/5 与事件输出逐位一致）。
+        // 方向（forward/reverse）只决定 pos 字段。
+        match self.get_token_index(swap.token_in) {
+            0 => {
+                self.reserve_a += input_consumed;
+                self.reserve_b = self.reserve_b.saturating_sub(swap.amount_out);
+            }
+            1 => {
+                self.reserve_b += input_consumed;
+                self.reserve_a = self.reserve_a.saturating_sub(swap.amount_out);
+            }
+            _ => return, // token 不在 pair 内 → 静默忽略（fail-safe）
+        }
+        if forward {
+            // 正向 swap：low96 累计 +out，mid96 归零（链上方向切换语义）
+            self.ladder.pos_forward += swap.amount_out;
+            self.ladder.pos_reverse = U256::ZERO;
+        } else {
+            // 反向 swap（token_y → token_x）：链上 mid96 累计"扣费后的 y 输入"
+            // amountIn_y - floor(amountIn_y * fee / 1e6)（2026-08-11 取证：
+            // 块 67650064 附近两笔反向 swap 的 mid96 与事件输入逐位一致，
+            // 如 82,580,656 in → 82,564,140 = in - floor(in*200/1e6)），
+            // 与 quote_reverse_exact 的 pos（y 单位）语义一致。
+            let fee = evm_div(swap.amount_in * self.ladder.fee_rate, MILLION);
+            self.ladder.pos_reverse += swap.amount_in - fee;
+            self.ladder.pos_forward = U256::ZERO;
+        }
+        self.last_synced_block = block_number;
+    }
+
+    /// 链上 swap 对"输入侧储备"的入账增量（2026-08-11 块 67650064 取证）。
+    ///
+    /// 链上行为：`amount_out == quote(amount_in)`（输出未被调用方限制）时按
+    /// 事件 amountIn 全额入账；`amount_out < quote(amount_in)`（如 router
+    /// minOut / 储备封顶）时只按"产生该输出的 ladder 输入"入账——即
+    /// `{x ∈ [0, amountIn] : quote(x) == amountOut}` 平台区的上沿，超出部分
+    /// 停留在合约余额、不记入 pair 储备（取证 tx#22：事件 amountIn=526e15、
+    /// amountOut=19,156,271，链上 cfg+4 仅入账 87,349,782,419,593,420）。
+    ///
+    /// 本地用二分求"最小的 x 使 quote(x) > amountOut 再减 1"复刻平台区上沿：
+    /// - 未受限（quote(amountIn) == amountOut）→ 直接返回 amountIn（链上
+    ///   逐位一致，避免平台区下探 1 wei）；
+    /// - 受限 → 平台区上沿，与链上偏差 < 2.2e9 wei（远低于 dust，对账兜底）；
+    /// - ladder 为空 / quote(amountIn) < amountOut（异常）→ 回退 amountIn。
+    ///
+    /// 与 `quote_forward_pos_exact` / `quote_reverse_exact` 同语义（EVM
+    /// uint256 截断），pos 取应用本笔 swap 前的当前位置。
+    fn ladder_input_for_output(&self, swap: &CaliberSwapEvent, forward: bool) -> U256 {
+        if swap.amount_out.is_zero() {
+            return U256::ZERO;
+        }
+        let (ladder, pos) = if forward {
+            (&self.ladder.ladder_a_to_b, self.ladder.pos_forward)
+        } else {
+            (&self.ladder.ladder_a_to_b, self.ladder.pos_reverse)
+        };
+        if ladder.is_empty() {
+            return swap.amount_in;
+        }
+        let cap = U256::MAX;
+        let quote = |x: U256| {
+            if forward {
+                quote_forward_pos_exact(
+                    ladder,
+                    self.ladder.field0,
+                    self.ladder.field1,
+                    self.ladder.fee_rate,
+                    self.ladder.window,
+                    self.ladder.scale,
+                    pos,
+                    cap,
+                    x,
+                )
+            } else {
+                quote_reverse_exact(
+                    ladder,
+                    self.ladder.field0,
+                    self.ladder.field1,
+                    self.ladder.fee_rate,
+                    self.ladder.window,
+                    self.ladder.scale,
+                    pos,
+                    cap,
+                    x,
+                )
+            }
+        };
+        let q_in = quote(swap.amount_in);
+        if q_in == swap.amount_out {
+            return swap.amount_in;
+        }
+        if q_in < swap.amount_out {
+            // 异常（空 ladder 已在上方处理，这里覆盖 quote 上限等异常）：保守全额入账
+            return swap.amount_in;
+        }
+        // q(amount_in) > amount_out：求平台区上沿 = min{x | quote(x) > amount_out} - 1
+        let mut lo = U256::ZERO;
+        let mut hi = swap.amount_in;
+        while lo < hi {
+            let mid = lo + (hi - lo) / U256::from(2u64);
+            if quote(mid) > swap.amount_out {
+                hi = mid;
+            } else {
+                lo = mid + U256::from(1u64);
+            }
+        }
+        lo.saturating_sub(U256::from(1u64))
+    }
 }
 
 // ============================================================================
@@ -619,6 +821,89 @@ pub fn quote_forward_exact(
     min_u256(acc, reserve_y)
 }
 
+/// 精确复刻链上 `quote(token_x -> token_y)` 正向报价（有状态，pos 版本）
+///
+/// 链上正向报价同样维护"当前位置" `pos`（= `cfg+7` 的 **low96**，即该 pair
+/// 已从 token_x 侧被兑换掉的累计 y 量，见 `docs/caliber_prop_internal.md` §4）：
+/// - 跳过 `pos` 已完全消费的段；`pos` 所在段按段内剩余量 `R = y_i - offset`
+///   报价，并用当前位置插值的斜率 `a_eff`（EVM 截断）
+/// - 逐段 `P = 1e6 * 2 * R / (a_eff + a_next)`、`th = ceil(P * 1e9 * scale / field0)`；
+///   `xp >= th` 时整段消费 `R`，否则段内
+///   `part = r2 * 2 * R * a_eff / (1e6 * 2 * R + r2 * delta_eff)`，
+///   `r2 = field0 * xp / (1e9 * scale)`、`delta_eff = a_eff - a_next`
+/// - 尾段按 `a_last` 直线外推；输出上限 `min(out, reserve_y)`
+///
+/// **关键差异（2026-08-11 EVM trace + 48 数据点验证）**：正向的段内插值
+/// `a_eff` 与反向不同——正向 `a_i` 随段递减（`a_i = 1e6 - (x_i + field1)`），
+/// 合约用**正数 floor 减法** `a_eff = a_i - trunc((a_i - a_next) * offset / y_i)`，
+/// 而非反向的负数截断形式 `a_i + trunc((a_next - a_i) * offset / y_i)`；两者在
+/// `(a_i - a_next) * offset` 不能整除 `y_i` 时相差 1（`a_eff` 正向偏大 1），
+/// 段内报价因此系统性偏大（实测 -17 ~ -308 输出偏差，事故块取证定位）。
+/// 若误用反向形式，`delta_eff` 会少 1，段内输出整体偏小。
+///
+/// `pos` 为 0 时退化为 `quote_forward_exact`（链上在 pos 过期/无效时的行为）。
+pub fn quote_forward_pos_exact(
+    ladder: &[LadderPoint],
+    field0: U256,
+    field1: U256,
+    fee_rate: U256,
+    window: U256,
+    scale: U256,
+    pos: U256,
+    reserve_y: U256,
+    amount_in: U256,
+) -> U256 {
+    if ladder.is_empty() {
+        return U256::ZERO;
+    }
+    let n = ladder.len();
+    let mut xp = amount_in - evm_div(amount_in * fee_rate, MILLION);
+    let mut acc = U256::ZERO;
+    let mut cum = U256::ZERO;
+    let mut started = false;
+    for i in 0..n {
+        let x_i = ladder[i].amount_in;
+        let y_i = ladder[i].amount_out;
+        let offset = if !started {
+            if pos >= cum + y_i {
+                cum += y_i;
+                continue;
+            }
+            started = true;
+            pos - cum
+        } else {
+            U256::ZERO
+        };
+        let r = y_i - offset;
+        let x_next = if i + 1 < n {
+            ladder[i + 1].amount_in
+        } else {
+            x_i + window
+        };
+        let a_i = MILLION - (x_i + field1);
+        let a_next = MILLION - (x_next + field1);
+        // 正向用正数 floor 减法（见函数文档的 +1 差异说明）
+        let a_eff = a_i - evm_div((a_i - a_next) * offset, y_i);
+        let delta_eff = a_eff - a_next;
+        let p = evm_div(MILLION * TWO * r, a_eff + a_next);
+        let th = evm_div(p * BILLION * scale + field0 - U256::from(1), field0);
+        if xp >= th {
+            acc += r;
+            xp -= th;
+        } else {
+            let r2 = evm_div(field0 * xp, BILLION * scale);
+            let part = evm_div(r2 * TWO * r * a_eff, MILLION * TWO * r + r2 * delta_eff);
+            acc += part;
+            return min_u256(acc, reserve_y);
+        }
+    }
+    // pos 超过全部段或 xp 未耗尽：按末段 a 直线外推
+    let a_last = MILLION - (ladder[n - 1].amount_in + window + field1);
+    let tail = evm_div(field0 * xp * a_last, BILLION * scale * MILLION);
+    acc += tail;
+    min_u256(acc, reserve_y)
+}
+
 /// 精确复刻链上 `quote(token_y -> token_x)` 反向报价（有状态，pos 版本）
 ///
 /// 链上反向报价维护一个"当前位置" `pos`（= 该 pair 已从 x 侧被兑换掉的累计
@@ -693,7 +978,13 @@ pub fn quote_reverse_exact(
 
 /// 计算给定输入量产生的输出量（包含 consumed 追踪）
 ///
-/// `total_out = quote(consumed_in + amount_in)`，`amount_out = total_out - consumed_out`。
+/// - 正向：链上 quote 是"当前位置感知"的（`cfg+7` low96），本地直接在
+///   `pos_forward + consumed_out` 位置对本次输入报价，用当前剩余储备封顶
+///   （与链上 `min(out, reserveY)` 一致）；段内分数线性插值不可加，不能
+///   用旧版 `quote(consumed_in + amount_in) - consumed_out` 全量重报。
+/// - 反向：保持已验证公式（112 条链上 quote 零偏差），
+///   `total_out = quote_reverse(pos_reverse, consumed_in + amount_in)` 封顶
+///   快照总储备，`amount_out = total_out - consumed_out`。
 /// 返回 0 表示链上报价本身为 0（如输入过小），属正常结果。
 fn swap_amount_out(
     ladder: &[LadderPoint],
@@ -708,40 +999,43 @@ fn swap_amount_out(
         return Err(AMMError::Msg("caliber: zero amount in".to_string()));
     }
 
-    let total_in = *consumed_in + amount_in;
-    // 封顶使用"快照总储备"（consumed_out + 当前剩余 reserve）：
-    // 模拟 swap 序列不会改变链上真实储备，链上 quote() 始终按快照储备封顶。
-    let total_reserve = *reserve_out + *consumed_out;
-    let total_out = if forward {
-        quote_forward_exact(
+    let amount_out = if forward {
+        // 正向：当前链上位置 + 本次模拟已消费的输出量，对本次输入直接报价；
+        // 封顶用当前剩余储备（模拟 swap 使 reserve 递减，与链上实时一致）。
+        let pos = state.pos_forward + *consumed_out;
+        quote_forward_pos_exact(
             ladder,
             state.field0,
             state.field1,
             state.fee_rate,
             state.window,
             state.scale,
-            total_reserve,
-            total_in,
+            pos,
+            *reserve_out,
+            amount_in,
         )
     } else {
-        quote_reverse_exact(
+        // 反向：保持已验证公式（封顶快照总储备，全量重报减已消费）。
+        let total_in = *consumed_in + amount_in;
+        let total_reserve = *reserve_out + *consumed_out;
+        let total_out = quote_reverse_exact(
             ladder,
             state.field0,
             state.field1,
             state.fee_rate,
             state.window,
             state.scale,
-            state.pos,
+            state.pos_reverse,
             total_reserve,
             total_in,
-        )
+        );
+        if *consumed_out > total_out {
+            return Err(AMMError::Msg("caliber: insufficient liquidity".to_string()));
+        }
+        total_out - *consumed_out
     };
 
-    if *consumed_out > total_out {
-        return Err(AMMError::Msg("caliber: insufficient liquidity".to_string()));
-    }
-
-    Ok(total_out - *consumed_out)
+    Ok(amount_out)
 }
 
 // ============================================================================
@@ -754,8 +1048,10 @@ impl AutomatedMarketMaker for CaliberPropPool {
     }
 
     fn sync_events(&self) -> Vec<B256> {
-        // Caliber 合约不 emit 任何 Swap/ModifyLiquidity 事件
-        // 无法通过事件驱动同步
+        // Caliber 合约确实 emit Swap 事件（2026-08-11 实测），但不走通用日志管道：
+        // 由 flashblocks 提取通道按 `caliber_contracts` 地址预筛单独解析并
+        // `apply_chain_swap` 应用，此处返回空避免双重应用（同一事件被
+        // `apply_logs_for_block_timed` 再应用一次会重复扣减储备/pos）。
         vec![]
     }
 
@@ -983,7 +1279,8 @@ impl CaliberPropPool {
         self.ladder.fee_rate = snap.fee_rate;
         self.ladder.window = snap.window;
         self.ladder.scale = snap.scale;
-        self.ladder.pos = snap.pos;
+        self.ladder.pos_reverse = snap.pos_reverse;
+        self.ladder.pos_forward = snap.pos_forward;
         self.ladder.deadline = snap.deadline;
         self.ladder.validity_window = snap.validity_window;
         self.ladder.paused = snap.paused;
@@ -1023,8 +1320,10 @@ struct CaliberSnapshot {
     window: U256,
     /// 10^(dec_token_x - dec_token_y)
     scale: U256,
-    /// 反向报价位置（cfg+7 的 pos，仅当 cfg+7.block == 当前块时有效，否则 0）
-    pos: U256,
+    /// 反向报价位置（cfg+7 mid96，仅当 cfg+7.block == 当前块时有效，否则 0）
+    pos_reverse: U256,
+    /// 正向报价位置（cfg+7 low96，仅当 cfg+7.block == 当前块时有效，否则 0）
+    pos_forward: U256,
     /// data+0 完整 64 位 deadline（tsY<<32|tsX），报价过期时间戳
     deadline: u64,
     /// 全局 slot2 有效期（本合约 20s）
@@ -1299,7 +1598,8 @@ fn pair_stale(
 /// 存储布局（XLayer 合约 `0x154586B2479b9a11e3d4db90024Dc0e26F097312`，经字节码逆向确认）：
 /// - `cfg = keccak256(pairId || 6)`：`+1` token1（byte@0xa0=dec_x，byte@0xa8=dec_y），
 ///   `+2` ladder 长度，`+3` window，`+4` reserveX，`+5` reserveY，`+6` 低 64 位 = fee，
-///   `+7` = [block:32][0:64][pos:96][0:96]（pos 仅当 block == 当前块时有效）
+///   `+7` = [block:32][0:64][mid96:96][low96:96]（仅当 block == 当前块时有效：
+///   反向读 mid96、正向读 low96，方向切换时另一字段归零）
 /// - `data = keccak256(pairId || 7)`：`+0` = [uint32 tsX][uint32 tsY][uint32 field1][uint64 field0]
 /// - ladder 元素：`keccak256(uint256(cfg+2)) + i`，每槽 `[amountIn:128][amountOut:128]`
 fn build_snapshot_from_slots(
@@ -1331,13 +1631,22 @@ fn build_snapshot_from_slots(
     let field0 = raw.data0 & U256::from(u64::MAX);
     let field1 = (raw.data0 >> U256::from(64)) & U256::from(u32::MAX);
 
-    // 反向报价位置：cfg+7 bits 96..191 为 pos，高 64 位为最近更新区块。
-    // 链上（EVM trace 确认）仅在 cfg+7.block == 当前执行块时使用真实 pos，
-    // 否则按 pos=0（从段 0 整段）计算。
+    // 报价位置：cfg+7 = [block:32][0:64][mid96:96][low96:96]，高 64 位
+    // 低 32 位为最近更新区块。链上（EVM trace 确认）仅在 cfg+7.block ==
+    // 当前执行块时使用真实 pos，否则按 pos=0（从段 0 整段）计算：
+    // - 反向（token_y → token_x）读 mid96（bits 96..191）
+    // - 正向（token_x → token_y）读 low96（bits 0..95）
+    // 每次 swap 只写当前方向的 pos 字段并将另一方向归零，因此两个字段
+    // 必须分别门控，不能合并。
     let pos_block = raw.cfg7 >> U256::from(192);
-    let pos = (raw.cfg7 >> U256::from(96)) & ((U256::from(1) << U256::from(96)) - U256::from(1));
-    let pos = if pos_block == cur_block {
-        pos
+    let pos_mask = (U256::from(1) << U256::from(96)) - U256::from(1);
+    let pos_reverse = if pos_block == cur_block {
+        (raw.cfg7 >> U256::from(96)) & pos_mask
+    } else {
+        U256::ZERO
+    };
+    let pos_forward = if pos_block == cur_block {
+        raw.cfg7 & pos_mask
     } else {
         U256::ZERO
     };
@@ -1377,7 +1686,8 @@ fn build_snapshot_from_slots(
         fee_rate,
         window: raw.window,
         scale,
-        pos,
+        pos_reverse,
+        pos_forward,
         deadline: deadline64,
         validity_window: validity_window.to::<u64>(),
         paused,
@@ -2144,7 +2454,8 @@ mod tests {
         pool.ladder.fee_rate = U256::from(200u64);
         pool.ladder.window = U256::from(500u64);
         pool.ladder.scale = U256::from(1000u64);
-        pool.ladder.pos = U256::ZERO;
+        pool.ladder.pos_reverse = U256::ZERO;
+        pool.ladder.pos_forward = U256::ZERO;
         pool.ladder.deadline = unix_now() + 3600; // 默认新鲜
         pool.ladder.validity_window = 20;
         pool
@@ -2316,7 +2627,8 @@ mod tests {
             fee_rate: U256::from(200u64),
             window: U256::from(500u64),
             scale: U256::from(1000u64),
-            pos: U256::ZERO,
+            pos_reverse: U256::ZERO,
+            pos_forward: U256::ZERO,
             deadline: now - 3600,
             validity_window: 20,
             paused: false,
@@ -2353,7 +2665,8 @@ mod tests {
             fee_rate: U256::from(200u64),
             window: U256::from(500u64),
             scale: U256::from(1000u64),
-            pos: U256::ZERO,
+            pos_reverse: U256::ZERO,
+            pos_forward: U256::ZERO,
             deadline: now + 3600,
             validity_window: 20,
             paused: false,
@@ -2478,7 +2791,7 @@ mod tests {
             created_block: 0,
             last_synced_block: 0,
             reserve_a: U256::from(1752257155u64),
-            reserve_b: U256::from_str("141552681951730783366").unwrap(),
+            reserve_b: "141552681951730783366".parse::<U256>().unwrap(),
             ladder: Default::default(),
             price_a_in_b: 1.0,
             price_b_in_a: 1.0,
@@ -2501,8 +2814,9 @@ mod tests {
         pool.ladder.field1 = U256::from(298u64);
         pool.ladder.fee_rate = U256::from(200u64);
         pool.ladder.window = U256::from(500u64);
-        pool.ladder.scale = U256::from_str("1000000000000").unwrap();
-        pool.ladder.pos = U256::ZERO;
+        pool.ladder.scale = "1000000000000".parse::<U256>().unwrap();
+        pool.ladder.pos_reverse = U256::ZERO;
+        pool.ladder.pos_forward = U256::ZERO;
         pool.ladder.deadline = unix_now() + 3600;
         pool.ladder.validity_window = 20;
 
@@ -2638,6 +2952,573 @@ mod tests {
         );
         // 短于选择器 → None
         assert_eq!(decode_batch_update_parameters(&[0x00, 0x8d]), None);
+    }
+
+    /// 正向 pos 版本公式：48 数据点（块 67650064 anvil fork 链上 quote 实测，
+    /// 2026-08-11 验证，零偏差）。
+    ///
+    /// 该 pair（b2d5c47f…）ladder=[(10,2e8),(50,9e8),(300,1e9)]，
+    /// field0=219438865054 field1=296 fee=200 win=500 scale=1e12
+    /// reserve_y=436263828（cfg+5 @ 67650063）。POS 为 cfg+7 low96
+    /// （正向累计已兑换 y），AMTS 为输入（W→U，1e6 基数）。
+    #[test]
+    fn test_quote_forward_pos_exact_vectors_accident_block() {
+        let ladder = vec![
+            LadderPoint {
+                amount_in: U256::from(10u64),
+                amount_out: U256::from(200_000_000u64),
+            },
+            LadderPoint {
+                amount_in: U256::from(50u64),
+                amount_out: U256::from(900_000_000u64),
+            },
+            LadderPoint {
+                amount_in: U256::from(300u64),
+                amount_out: U256::from(1_000_000_000u64),
+            },
+        ];
+        let field0 = U256::from(219_438_865_054u64);
+        let field1 = U256::from(296u64);
+        let fee_rate = U256::from(200u64);
+        let window = U256::from(500u64);
+        let scale = U256::from(1_000_000_000_000u64);
+        let ry = U256::from(436_263_828u64);
+
+        let amts: [u64; 6] = [
+            100_000_000_000_000_000,
+            500_000_000_000_000_000,
+            977_689_766_888_449_551,
+            1_200_000_000_000_000_000,
+            1_900_532_488_745_085_420,
+            2_500_000_000_000_000_000,
+        ];
+        let poss: [(u64, [u64; 6]); 8] = [
+            (
+                0,
+                [
+                    21_932_735,
+                    109_662_717,
+                    214_429_979,
+                    263_186_326,
+                    416_820_481,
+                    436_263_828,
+                ],
+            ),
+            (
+                300_000_000,
+                [
+                    21_931_246,
+                    109_654_894,
+                    214_413_805,
+                    263_166_114,
+                    416_787_531,
+                    436_263_828,
+                ],
+            ),
+            (
+                416_820_481,
+                [
+                    21_930_522,
+                    109_651_278,
+                    214_406_741,
+                    263_157_448,
+                    416_773_828,
+                    436_263_828,
+                ],
+            ),
+            (
+                500_000_000,
+                [
+                    21_930_017,
+                    109_648_753,
+                    214_401_803,
+                    263_151_385,
+                    416_764_219,
+                    436_263_828,
+                ],
+            ),
+            (
+                700_000_000,
+                [
+                    21_928_810,
+                    109_642_710,
+                    214_389_967,
+                    263_136_848,
+                    416_741_112,
+                    436_263_828,
+                ],
+            ),
+            (
+                1_050_000_000,
+                [
+                    21_926_660,
+                    109_631_569,
+                    214_365_974,
+                    263_106_050,
+                    416_685_482,
+                    436_263_828,
+                ],
+            ),
+            (
+                1_300_000_000,
+                [
+                    21_924_106,
+                    109_618_132,
+                    214_339_437,
+                    263_073_418,
+                    416_633_642,
+                    436_263_828,
+                ],
+            ),
+            (
+                1_900_000_000,
+                [
+                    21_917_525,
+                    109_585_223,
+                    214_275_142,
+                    262_995_434,
+                    416_520_296,
+                    436_263_828,
+                ],
+            ),
+        ];
+
+        for (pos, expected) in poss {
+            for (amt, exp) in amts.iter().zip(expected) {
+                let out = quote_forward_pos_exact(
+                    &ladder,
+                    field0,
+                    field1,
+                    fee_rate,
+                    window,
+                    scale,
+                    U256::from(pos),
+                    ry,
+                    U256::from(*amt),
+                );
+                assert_eq!(out, U256::from(exp), "fwd pos={pos} amt={amt}");
+            }
+        }
+
+        // pos=0 退化为无状态公式：与 quote_forward_exact 逐位一致
+        for amt in amts {
+            assert_eq!(
+                quote_forward_pos_exact(
+                    &ladder,
+                    field0,
+                    field1,
+                    fee_rate,
+                    window,
+                    scale,
+                    U256::ZERO,
+                    ry,
+                    U256::from(amt),
+                ),
+                quote_forward_exact(
+                    &ladder,
+                    field0,
+                    field1,
+                    fee_rate,
+                    window,
+                    scale,
+                    ry,
+                    U256::from(amt),
+                ),
+                "pos=0 退化一致性 amt={amt}"
+            );
+        }
+    }
+
+    /// 事故块 67650064 端到端回放（取证 2026-08-09，现 bug 根因）：
+    ///
+    /// 块内两笔正向 swap（W→U）后，链上 cfg+7 low96=435976752、
+    /// cfg+5=287076。此时再 quote(W→U, A2=977689766888449551)，
+    /// 链上 = 287076（= 当前剩余储备封顶）；旧实现忽略 low96 pos 且按
+    /// 快照总储备封顶，给出 214429979（pos=0 的无状态全量报价），
+    /// 导致本地产生"幻影利润"误报套利计划。
+    #[test]
+    fn test_simulate_swap_forward_pos_block_end_accident() {
+        let contract = address!("0x154586B2479b9a11e3d4db90024Dc0e26F097312");
+        let pair_id = b256!("b2d5c47f635aa119fc5e911aa881db33bc77b61a1872d035d6122869e24a9673");
+        let w = address!("0xa8ddb5cd96b5222afe198316e9a57caa642850d5");
+        let u = address!("0x779ded0c9e1022225f8e0630b35a9b54be713736");
+        let mut pool = CaliberPropPool {
+            contract_address: contract,
+            pair_id,
+            virtual_address: CaliberPropPool::virtual_address_from_pair_id(pair_id, contract),
+            token_x: w,
+            token_y: u,
+            token_a: Token::new_with_decimals(u, 6),
+            token_b: Token::new_with_decimals(w, 18),
+            created_block: 0,
+            last_synced_block: 0,
+            reserve_a: U256::from(287_076u64), // cfg+5 @ 块末（token_a=U）
+            reserve_b: "151028739041011564335".parse::<U256>().unwrap(), // cfg+4 @ 块末（token_b=W）
+            ladder: Default::default(),
+            price_a_in_b: 0.0,
+            price_b_in_a: 0.0,
+        };
+        pool.ladder.ladder_a_to_b = vec![
+            LadderPoint {
+                amount_in: U256::from(10u64),
+                amount_out: U256::from(200_000_000u64),
+            },
+            LadderPoint {
+                amount_in: U256::from(50u64),
+                amount_out: U256::from(900_000_000u64),
+            },
+            LadderPoint {
+                amount_in: U256::from(300u64),
+                amount_out: U256::from(1_000_000_000u64),
+            },
+        ];
+        pool.ladder.ladder_b_to_a = pool.ladder.ladder_a_to_b.clone();
+        pool.ladder.field0 = U256::from(219_438_865_054u64);
+        pool.ladder.field1 = U256::from(296u64);
+        pool.ladder.fee_rate = U256::from(200u64);
+        pool.ladder.window = U256::from(500u64);
+        pool.ladder.scale = U256::from(1_000_000_000_000u64);
+        // 块末 cfg+7：low96=435976752（两笔正向 swap 累计），mid96=0
+        pool.ladder.pos_forward = U256::from(435_976_752u64);
+        pool.ladder.pos_reverse = U256::ZERO;
+        pool.ladder.deadline = u64::MAX; // 永不过期
+        pool.ladder.validity_window = 20;
+
+        let out = pool
+            .simulate_swap(w, u, U256::from(977_689_766_888_449_551u64))
+            .expect("quote");
+        assert_eq!(
+            out,
+            U256::from(287_076u64),
+            "块末正向 quote 应与链上 cfg+5 封顶一致"
+        );
+
+        // 对照组：旧实现用快照总储备（reserve+consumed）封顶时，pos=0
+        // 的无状态全量报价 214429979 不会因当前剩余储备封顶被截断——
+        // 本地模拟路径已改为按当前剩余储备封顶，这里验证无状态报价本身。
+        let total_reserve = U256::from(436_263_828u64); // 块起始 cfg+5
+        let no_pos_total = quote_forward_exact(
+            &pool.ladder.ladder_a_to_b,
+            pool.ladder.field0,
+            pool.ladder.field1,
+            pool.ladder.fee_rate,
+            pool.ladder.window,
+            pool.ladder.scale,
+            total_reserve,
+            U256::from(977_689_766_888_449_551u64),
+        );
+        assert_eq!(
+            no_pos_total,
+            U256::from(214_429_979u64),
+            "旧实现（忽略 low96 + 快照总储备封顶）的幻影报价"
+        );
+    }
+
+    /// 实时 swap 事件应用：正向/反向储备与 pos 更新、方向切换归零、
+    /// pairId 不匹配静默忽略。
+    #[test]
+    fn test_apply_chain_swap_updates_reserve_and_pos() {
+        let contract = address!("0x154586B2479b9a11e3d4db90024Dc0e26F097312");
+        let pair_id = b256!("b2d5c47f635aa119fc5e911aa881db33bc77b61a1872d035d6122869e24a9673");
+        let w = address!("0xa8ddb5cd96b5222afe198316e9a57caa642850d5");
+        let u = address!("0x779ded0c9e1022225f8e0630b35a9b54be713736");
+        let mut pool = CaliberPropPool {
+            contract_address: contract,
+            pair_id,
+            virtual_address: CaliberPropPool::virtual_address_from_pair_id(pair_id, contract),
+            token_x: w,
+            token_y: u,
+            token_a: Token::new_with_decimals(u, 6),
+            token_b: Token::new_with_decimals(w, 18),
+            created_block: 0,
+            last_synced_block: 0,
+            reserve_a: U256::from(436_263_828u64), // 块起始 cfg+5（token_a=U）
+            reserve_b: "149040856769846885495".parse::<U256>().unwrap(), // 块起始 cfg+4
+            ladder: Default::default(),
+            price_a_in_b: 0.0,
+            price_b_in_a: 0.0,
+        };
+        pool.ladder.deadline = u64::MAX;
+        pool.ladder.validity_window = 20;
+        // 与事故块一致的手续费率（U→W 反向入账扣 200/1e6）
+        pool.ladder.fee_rate = U256::from(200u64);
+
+        // 块 67650064 tx#15：W→U ain=1900532488745085420 aout=416820481
+        pool.apply_chain_swap(
+            &CaliberSwapEvent {
+                contract,
+                tx_index: 15,
+                pair_id,
+                token_in: w,
+                token_out: u,
+                amount_in: U256::from(1_900_532_488_745_085_420u64),
+                amount_out: U256::from(416_820_481u64),
+            },
+            67_650_064,
+        );
+        assert_eq!(
+            pool.reserve_a,
+            U256::from(19_443_347u64),
+            "tx15 后 reserve_a(U)"
+        );
+        assert_eq!(
+            pool.reserve_b,
+            "149040856769846885495".parse::<U256>().unwrap()
+                + U256::from(1_900_532_488_745_085_420u64),
+            "tx15 后 reserve_b(W)"
+        );
+        assert_eq!(
+            pool.ladder.pos_forward,
+            U256::from(416_820_481u64),
+            "tx15 后 low96 pos"
+        );
+        assert_eq!(pool.ladder.pos_reverse, U256::ZERO);
+        assert_eq!(pool.last_synced_block, 67_650_064);
+
+        // 块内 tx#22：同向 W→U，low96 累计（链上块末 = 435976752）
+        pool.apply_chain_swap(
+            &CaliberSwapEvent {
+                contract,
+                tx_index: 22,
+                pair_id,
+                token_in: w,
+                token_out: u,
+                amount_in: U256::from(87_349_782_419_593_420u64),
+                amount_out: U256::from(19_156_271u64),
+            },
+            67_650_064,
+        );
+        assert_eq!(
+            pool.ladder.pos_forward,
+            U256::from(435_976_752u64),
+            "tx22 后 low96 pos 累计"
+        );
+        assert_eq!(
+            pool.reserve_a,
+            U256::from(287_076u64),
+            "tx22 后 reserve_a(U)"
+        );
+
+        // 反向 swap（U→W）：pos_reverse 累计"扣费后的 y 输入"
+        // （amountIn - floor(amountIn * fee / 1e6)，链上 cfg+7 mid96 语义），
+        // pos_forward 归零。
+        pool.apply_chain_swap(
+            &CaliberSwapEvent {
+                contract,
+                tx_index: 30,
+                pair_id,
+                token_in: u,
+                token_out: w,
+                amount_in: U256::from(1_000_000u64),
+                amount_out: U256::from(500_000u64),
+            },
+            67_650_064,
+        );
+        assert_eq!(
+            pool.ladder.pos_reverse,
+            U256::from(999_800u64),
+            "反向 pos_reverse = in - in*200/1e6"
+        );
+        assert_eq!(pool.ladder.pos_forward, U256::ZERO, "方向切换归零另一字段");
+        assert_eq!(pool.reserve_a, U256::from(287_076u64 + 1_000_000u64));
+        assert_eq!(
+            pool.reserve_b,
+            "149040856769846885495".parse::<U256>().unwrap()
+                + U256::from(1_900_532_488_745_085_420u64)
+                + U256::from(87_349_782_419_593_420u64)
+                - U256::from(500_000u64)
+        );
+
+        // pairId 不匹配 → 静默忽略（fail-safe）
+        let before = (pool.reserve_a, pool.reserve_b, pool.ladder.pos_forward);
+        pool.apply_chain_swap(
+            &CaliberSwapEvent {
+                contract,
+                tx_index: 40,
+                pair_id: b256!("deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
+                token_in: w,
+                token_out: u,
+                amount_in: U256::from(1u64),
+                amount_out: U256::from(1u64),
+            },
+            67_650_064,
+        );
+        assert_eq!(
+            (pool.reserve_a, pool.reserve_b, pool.ladder.pos_forward),
+            before
+        );
+    }
+
+    /// `ladder_input_for_output`（输入侧储备入账增量）语义验证（事故块
+    /// 67650064 真实 ladder）：
+    /// - 未受限（amount_out == quote(amount_in)）→ 全额返回 amount_in；
+    /// - 受限（amount_out < quote(amount_in)，如 router minOut）→ 返回
+    ///   "平台区上沿"（最大的 x 使 quote(x) == amount_out），与链上入账
+    ///   逐位接近（取证 tx#22 链上入账 87,349,782,419,593,420，二分上沿
+    ///   偏差 < 1e10 wei，远低于 dust，对账兜底）。
+    #[test]
+    fn test_apply_chain_swap_ladder_input_for_output() {
+        let contract = address!("0x154586B2479b9a11e3d4db90024Dc0e26F097312");
+        let pair_id = b256!("b2d5c47f635aa119fc5e911aa881db33bc77b61a1872d035d6122869e24a9673");
+        let w = address!("0xa8ddb5cd96b5222afe198316e9a57caa642850d5");
+        let u = address!("0x779ded0c9e1022225f8e0630b35a9b54be713736");
+        let mut pool = CaliberPropPool {
+            contract_address: contract,
+            pair_id,
+            virtual_address: CaliberPropPool::virtual_address_from_pair_id(pair_id, contract),
+            token_x: w,
+            token_y: u,
+            token_a: Token::new_with_decimals(u, 6),
+            token_b: Token::new_with_decimals(w, 18),
+            created_block: 0,
+            last_synced_block: 0,
+            reserve_a: U256::ZERO,
+            reserve_b: U256::ZERO,
+            ladder: Default::default(),
+            price_a_in_b: 0.0,
+            price_b_in_a: 0.0,
+        };
+        pool.ladder.ladder_a_to_b = vec![
+            LadderPoint {
+                amount_in: U256::from(10u64),
+                amount_out: U256::from(200_000_000u64),
+            },
+            LadderPoint {
+                amount_in: U256::from(50u64),
+                amount_out: U256::from(900_000_000u64),
+            },
+            LadderPoint {
+                amount_in: U256::from(300u64),
+                amount_out: U256::from(1_000_000_000u64),
+            },
+        ];
+        pool.ladder.ladder_b_to_a = pool.ladder.ladder_a_to_b.clone();
+        pool.ladder.field0 = U256::from(219_438_865_054u64);
+        pool.ladder.field1 = U256::from(296u64);
+        pool.ladder.fee_rate = U256::from(200u64);
+        pool.ladder.window = U256::from(500u64);
+        pool.ladder.scale = U256::from(1_000_000_000_000u64);
+        pool.ladder.deadline = u64::MAX;
+        pool.ladder.validity_window = 20;
+
+        let mk_swap = |tin: Address, tout: Address, ain: u64, aout: u64| CaliberSwapEvent {
+            contract,
+            tx_index: 0,
+            pair_id,
+            token_in: tin,
+            token_out: tout,
+            amount_in: U256::from(ain),
+            amount_out: U256::from(aout),
+        };
+
+        // 未受限正向：amount_out == quote(amount_in) → 全额入账 amountIn
+        let ain = 977_689_766_888_449_551u64;
+        let q = quote_forward_pos_exact(
+            &pool.ladder.ladder_a_to_b,
+            pool.ladder.field0,
+            pool.ladder.field1,
+            pool.ladder.fee_rate,
+            pool.ladder.window,
+            pool.ladder.scale,
+            U256::ZERO,
+            U256::MAX,
+            U256::from(ain),
+        );
+        let input = pool.ladder_input_for_output(&mk_swap(w, u, ain, q.as_limbs()[0] as u64), true);
+        assert_eq!(input, U256::from(ain), "未受限正向应全额入账");
+
+        // 未受限反向：同上（pos_reverse=0）
+        let rin = 1_000_000u64;
+        let rq = quote_reverse_exact(
+            &pool.ladder.ladder_a_to_b,
+            pool.ladder.field0,
+            pool.ladder.field1,
+            pool.ladder.fee_rate,
+            pool.ladder.window,
+            pool.ladder.scale,
+            U256::ZERO,
+            U256::MAX,
+            U256::from(rin),
+        );
+        let input = pool.ladder_input_for_output(&mk_swap(u, w, rin, rq.as_limbs()[0] as u64), false);
+        assert_eq!(input, U256::from(rin), "未受限反向应全额入账");
+
+        // 受限正向（块 67650064 tx#22）：pos=416820481、事件
+        // in=526057675902332428、out=19156271，链上 cfg+4 仅入账
+        // 87,349,782,419,593,420（产生该输出的 ladder 输入，超出部分
+        // 停留合约余额不进储备）。二分上沿应与之接近。
+        pool.ladder.pos_forward = U256::from(416_820_481u64);
+        let chain_recorded = U256::from(87_349_782_419_593_420u64);
+        let restricted = CaliberSwapEvent {
+            contract,
+            tx_index: 22,
+            pair_id,
+            token_in: w,
+            token_out: u,
+            amount_in: U256::from(526_057_675_902_332_428u64),
+            amount_out: U256::from(19_156_271u64),
+        };
+        let input = pool.ladder_input_for_output(&restricted, true);
+        assert!(
+            input <= restricted.amount_in,
+            "受限时入账量不得超过事件输入"
+        );
+        let diff = if input > chain_recorded {
+            input - chain_recorded
+        } else {
+            chain_recorded - input
+        };
+        assert!(
+            diff < U256::from(10_000_000_000u64),
+            "受限入账应与链上记录接近（二分偏差 < 1e10 wei），got {input}, chain {chain_recorded}"
+        );
+        assert_eq!(
+            quote_forward_pos_exact(
+                &pool.ladder.ladder_a_to_b,
+                pool.ladder.field0,
+                pool.ladder.field1,
+                pool.ladder.fee_rate,
+                pool.ladder.window,
+                pool.ladder.scale,
+                U256::from(416_820_481u64),
+                U256::MAX,
+                input,
+            ),
+            restricted.amount_out,
+            "入账量对应的报价应恰为事件输出"
+        );
+    }
+
+    /// Swap 日志 ABI 解码（块 67650064 tx#15 真实日志：W→U）。
+    #[test]
+    fn test_decode_caliber_swap_log_real_event() {
+        let topics = vec![
+            CALIBER_SWAP_EVENT,
+            b256!("b2d5c47f635aa119fc5e911aa881db33bc77b61a1872d035d6122869e24a9673"),
+            b256!("000000000000000000000000311350ded40088b8504bb67a7d5974e9da287bd1"),
+        ];
+        let data = alloy::hex::decode(
+            "000000000000000000000000a8ddb5cd96b5222afe198316e9a57caa642850d5000000000000000000000000779ded0c9e1022225f8e0630b35a9b54be7137360000000000000000000000000000000000000000000000001a600c3aa3bd69ec0000000000000000000000000000000000000000000000000000000018d82d010000000000000000000000000000000000000000000000000000000000000002",
+        )
+        .unwrap();
+        let ev = decode_caliber_swap_log(&topics, &data).expect("decode");
+        assert_eq!(ev.pair_id, topics[1]);
+        assert_eq!(
+            ev.token_in,
+            address!("0xa8ddb5cd96b5222afe198316e9a57caa642850d5")
+        );
+        assert_eq!(
+            ev.token_out,
+            address!("0x779ded0c9e1022225f8e0630b35a9b54be713736")
+        );
+        assert_eq!(ev.amount_in, U256::from(1_900_532_488_745_085_420u64));
+        assert_eq!(ev.amount_out, U256::from(416_820_481u64));
+
+        // 错误签名 / 截断 data → None（fail-safe）
+        let bad_topics = vec![B256::ZERO, topics[1]];
+        assert_eq!(decode_caliber_swap_log(&bad_topics, &data), None);
+        assert_eq!(decode_caliber_swap_log(&topics, &data[..64]), None);
+        assert_eq!(decode_caliber_swap_log(&topics, &[]), None);
     }
 
     #[test]

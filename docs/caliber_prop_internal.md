@@ -92,9 +92,12 @@ return min(acc + tail, reserveY)
 ### 反向（token1 → token0）—— 有状态，必须先读 pos
 
 链上反向报价**不是**从段 0 开始：合约维护一个"当前位置 `pos`"
-（`cfg+7`，即该 pair 已从 token0 侧被兑换掉的累计输出量），
+（`cfg+7` bits 96..191 = mid96，即该 pair 在 token1→token0 方向已累计的
+**扣费后输入量** `amountIn_y - floor(amountIn_y * fee / 1e6)`，2026-08-11
+链上取证：U→W 事件 in=82,580,656 时 mid96=82,564,140 = in - in*200/1e6；
+注意不是正向方向的"累计输出量"，两者方向相反、单位同为 y），
 反向兑换从这个位置开始按剩余量计算。**反向公式与正向不对称**，本地必须
-读 `cfg+7` 的 pos 才能逐位对齐（§4 详解）。
+读 `cfg+7` 的 mid96 才能逐位对齐（§4 详解）。
 
 ```
 xp = amountIn - trunc(amountIn * fee / 1e6)
@@ -128,23 +131,30 @@ return min(acc + tail, reserveX)
 `cfg+7` 的 256 位布局：
 
 ```
-cfg+7 = [ block(32bit) | 0(64bit) | pos(96bit) | 0(96bit) ]
-         └ 高 64 位       └ bits 96..191   └ 低 96 位
+cfg+7 = [ block(32bit) | 0(64bit) | mid96(96bit) | low96(96bit) ]
+         └ 高 64 位       └ bits 96..191  └ 低 96 位
 ```
 
-- `pos = (cfg7 >> 96) & (2^96 - 1)`（bits 96..191）。
+- `mid96 = (cfg7 >> 96) & (2^96 - 1)`（bits 96..191）= 反向 pos（token1→token0
+  方向累计的扣费后 y 输入量，`pos_reverse`）。
+- `low96 = cfg7 & (2^96 - 1)`（低 96 位）= 正向 pos（token0→token1 方向累计的
+  y 输出量，`pos_forward`）。
 - 高 64 位是最近一次更新该 pair 的区块号（实际只用低 32 位）。
 - **有效性规则（EVM trace 确认）**：仅当 `cfg+7.block == 当前执行块` 时，
   反向报价才使用真实 `pos`；否则按 `pos=0`（从段 0 整段）计算。
   本次 4 pair 中仅 pair1 的 `cfg+7.block` 等于当前块（pos 有效），
   pair2/3/4 均按 `pos=0` 计算。
 - 例（块 66309105）：pair1 `cfg7 = 0x0000000003f3cbf1 0000000000000000 0f962ef7 000000000000000000000000`
-  → block=`0x3f3cbf1`=66309105，pos=`0x0f962ef7`=261500663。
+  → block=`0x3f3cbf1`=66309105，mid96=`0x0f962ef7`=261500663（反向 pos），
+  low96=0。
 
-**语义**：`pos` 是 ladder 在 token0→token1 方向已被累计兑换的 `y` 总量。
-反向报价从 `pos` 所在段开始，只对**段内剩余量** `R = y_i - offset` 报价，
-并用当前位置插值出的斜率 `a_eff`，而不是整段从头计算。这就是"黑箱报价"
-与本地 `pos=0` 实现产生差异的根因。
+**语义**：正向 pos（low96）= token0→token1 方向累计兑换的 y 输出量；反向
+pos（mid96）= token1→token0 方向累计的扣费后 y 输入量。两者同属一个
+ladder 的 y 轴位置，方向切换时链上只写当前方向字段并归零另一字段（2026-08-11
+块 67650064 取证：两笔 W→U 后 low96=435,976,752、mid96=0）。报价从 pos 所在
+段开始，只对**段内剩余量** `R = y_i - offset` 报价，并用当前位置插值出的斜率
+`a_eff`，而不是整段从头计算。这就是"黑箱报价"与本地 `pos=0` 实现产生差异的
+根因。
 
 **完整数值示例（pair1 @ 66309105，反向 amount=1）**：
 

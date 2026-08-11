@@ -423,13 +423,14 @@ async fn test_caliber_prop_full_verification() -> Result<()> {
         pool.ladder.ladder_b_to_a.len()
     );
     println!(
-        "  quote params: field0={} field1={} fee={} window={} scale={} pos={}",
+        "  quote params: field0={} field1={} fee={} window={} scale={} pos_reverse={} pos_forward={}",
         pool.ladder.field0,
         pool.ladder.field1,
         pool.ladder.fee_rate,
         pool.ladder.window,
         pool.ladder.scale,
-        pool.ladder.pos,
+        pool.ladder.pos_reverse,
+        pool.ladder.pos_forward,
     );
     println!(
         "  price_a_in_b={:.6} price_b_in_a={:.6}",

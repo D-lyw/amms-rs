@@ -119,7 +119,8 @@ struct RefSnapshot {
     fee: U256,
     window: U256,
     scale: U256,
-    pos: U256,
+    pos_reverse: U256,
+    pos_forward: U256,
     deadline: u64,
     field0: U256,
     field1: U256,
@@ -183,11 +184,17 @@ async fn reference_snapshot<P: Provider>(
     let field1 = (data0 >> U256::from(64)) & U256::from(u32::MAX);
     let deadline = ((data0 >> U256::from(96)) & U256::from(u32::MAX)).to::<u64>();
 
-    // 有效 pos
+    // 有效 pos（cfg+7 = [block:32][0:64][mid96:96][low96:96]）：
+    // 反向读 mid96、正向读 low96，各自仅当 block == 当前块时有效
     let pos_block = cfg7 >> U256::from(192);
-    let pos_raw = (cfg7 >> U256::from(96)) & ((U256::from(1) << U256::from(96)) - U256::from(1));
-    let pos = if pos_block == cur_block {
-        pos_raw
+    let pos_mask = (U256::from(1) << U256::from(96)) - U256::from(1);
+    let pos_reverse = if pos_block == cur_block {
+        (cfg7 >> U256::from(96)) & pos_mask
+    } else {
+        U256::ZERO
+    };
+    let pos_forward = if pos_block == cur_block {
+        cfg7 & pos_mask
     } else {
         U256::ZERO
     };
@@ -225,7 +232,8 @@ async fn reference_snapshot<P: Provider>(
         fee,
         window,
         scale,
-        pos,
+        pos_reverse,
+        pos_forward,
         deadline,
         field0,
         field1,
@@ -286,8 +294,17 @@ fn compare_pool(pool: &CaliberPropPool, r: &RefSnapshot) -> (bool, Vec<String>) 
             pool.ladder.scale, r.scale
         ));
     }
-    if pool.ladder.pos != r.pos {
-        diffs.push(format!("pos: batch={} ref={}", pool.ladder.pos, r.pos));
+    if pool.ladder.pos_reverse != r.pos_reverse {
+        diffs.push(format!(
+            "pos_reverse: batch={} ref={}",
+            pool.ladder.pos_reverse, r.pos_reverse
+        ));
+    }
+    if pool.ladder.pos_forward != r.pos_forward {
+        diffs.push(format!(
+            "pos_forward: batch={} ref={}",
+            pool.ladder.pos_forward, r.pos_forward
+        ));
     }
     if pool.ladder.deadline != r.deadline {
         diffs.push(format!(

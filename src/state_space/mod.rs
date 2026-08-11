@@ -57,6 +57,7 @@ use std::time::Instant;
 use std::{future::Future, marker::PhantomData, sync::Arc};
 use tokio::sync::{Mutex, Notify, RwLock};
 
+use crate::amms::caliber_prop::CaliberSwapEvent;
 use tokio::time::{sleep, Duration};
 use tracing::{error, info, warn};
 use xlayer_flashblocks::CaliberTxEvent;
@@ -1119,6 +1120,38 @@ impl<N, P> StateSpaceManager<N, P> {
 
         let mut guard = state.write().await;
         Ok(guard.apply_caliber_updates(&updates, block_num))
+    }
+
+    /// 应用 Xlayer flashblocks 提取的 caliber swap 事件（日志驱动实时消费同步）。
+    ///
+    /// 与 `apply_caliber_updates_for_block` 同锁同序（同一 RwLock、同一
+    /// realtime_head 推进语义）：
+    /// - 提取侧已按 `receipt.status == 0x1` 过滤回滚/未确认交易；
+    /// - 块内按 `tx_index` 排序（EVM 语义：后者覆盖前者）；
+    /// - `pairId + 合约地址 → virtual_address` 路由，命中本地池子后
+    ///   `apply_chain_swap` 增量更新储备 + pos（ladder 消费）；
+    /// - pairId 不在本地 / 块号落后于池子已同步块 → 静默跳过（对账兜底）。
+    async fn apply_caliber_swaps_for_block(
+        state: &Arc<RwLock<StateSpace>>,
+        block_num: u64,
+        swaps: Vec<CaliberSwapEvent>,
+        realtime_head: &Arc<AtomicU64>,
+    ) -> Result<Vec<Address>, StateSpaceError> {
+        let mut prev = realtime_head.load(Ordering::Relaxed);
+        while block_num > prev
+            && realtime_head
+                .compare_exchange(prev, block_num, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            prev = realtime_head.load(Ordering::Relaxed);
+        }
+
+        if swaps.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut guard = state.write().await;
+        Ok(guard.apply_caliber_swaps(&swaps, block_num))
     }
 
     async fn collect_logs_for_chunks(
@@ -2298,7 +2331,9 @@ impl StateSpace {
         log_address: Address,
         topics: &[FixedBytes<32>],
     ) -> Option<Vec<Address>> {
-        use crate::amms::binaryfi_prop::{BINARYFI_FEE_EVENT, BINARYFI_SWAP_EVENT, BINARYFI_UPDATE_EVENT};
+        use crate::amms::binaryfi_prop::{
+            BINARYFI_FEE_EVENT, BINARYFI_SWAP_EVENT, BINARYFI_UPDATE_EVENT,
+        };
 
         let mut instances: Vec<(
             Address,
@@ -2433,8 +2468,7 @@ impl StateSpace {
             } else if log.topics().len() == 1 {
                 // 单 topic 事件（如 BinaryFi FeeUpdated）：非池地址直命中，
                 // 需单独尝试 BinaryFi engine 事件路由（Update/Swap 均在 >=2 分支）
-                if let Some(binaryfi_targets) =
-                    self.resolve_binaryfi_targets(address, log.topics())
+                if let Some(binaryfi_targets) = self.resolve_binaryfi_targets(address, log.topics())
                 {
                     target_addresses.extend(binaryfi_targets);
                 }
@@ -2606,6 +2640,41 @@ impl StateSpace {
                 continue;
             }
             pool.apply_batch_update(&event.update, block_num);
+            affected_set.insert(virtual_address);
+        }
+        affected_set.into_iter().collect()
+    }
+
+    /// 应用 caliber swap 事件（XLayer flashblocks 日志驱动实时消费同步）。
+    ///
+    /// 与 `apply_caliber_updates` 同锁调用；块内按 `tx_index` 排序
+    /// （EVM 语义：后者覆盖前者），`pairId + 合约地址 → virtual_address`
+    /// 路由，命中本地池子后 `apply_chain_swap` 增量更新储备 + pos
+    /// （ladder 消费）。pairId 不在本地 / 块号落后于池子已同步块 →
+    /// 静默跳过（对账兜底）。
+    fn apply_caliber_swaps(&mut self, swaps: &[CaliberSwapEvent], block_num: u64) -> Vec<Address> {
+        if swaps.is_empty() {
+            return vec![];
+        }
+
+        let mut sorted: Vec<&CaliberSwapEvent> = swaps.iter().collect();
+        sorted.sort_by_key(|s| s.tx_index);
+
+        let mut affected_set = HashSet::new();
+        for event in sorted {
+            let virtual_address =
+                CaliberPropPool::virtual_address_from_pair_id(event.pair_id, event.contract);
+            let Some(amm) = self.get_mut_cow(&virtual_address) else {
+                continue;
+            };
+            let AMM::CaliberPropPool(pool) = amm else {
+                continue;
+            };
+            // 幂等保护：与 sync() 相同语义，禁止回卷池子状态
+            if block_num < pool.last_synced_block() {
+                continue;
+            }
+            pool.apply_chain_swap(event, block_num);
             affected_set.insert(virtual_address);
         }
         affected_set.into_iter().collect()
@@ -2807,7 +2876,9 @@ mod tests {
 
     #[test]
     fn binaryfi_fee_event_routes_to_all_pools_of_engine() {
-        use crate::amms::binaryfi_prop::{BinaryFiPropPool, BINARYFI_FEE_EVENT, BINARYFI_UPDATE_EVENT};
+        use crate::amms::binaryfi_prop::{
+            BinaryFiPropPool, BINARYFI_FEE_EVENT, BINARYFI_UPDATE_EVENT,
+        };
 
         let engine = BinaryFiPropPool::default().engine_address;
         let other_engine = address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
@@ -2837,7 +2908,9 @@ mod tests {
         assert_eq!(routed, vec![pool1, pool2]);
 
         // 非 fee 单 topic 事件 → 不路由（交由其他分支）
-        assert!(state.resolve_binaryfi_targets(engine, &[B256::ZERO]).is_none());
+        assert!(state
+            .resolve_binaryfi_targets(engine, &[B256::ZERO])
+            .is_none());
         // fee 事件来自另一 engine → 只路由到该 engine 的池子
         let mut routed_other = state
             .resolve_binaryfi_targets(other_engine, &[BINARYFI_FEE_EVENT])
@@ -3068,6 +3141,100 @@ mod tests {
         let stale = mk_event(pair_id, 3, 300, 30);
         let affected = state.apply_caliber_updates(&[stale], 67_329_557);
         assert!(affected.is_empty());
+    }
+
+    #[test]
+    fn caliber_swaps_route_apply_in_tx_order_and_skip_unknown() {
+        use crate::amms::caliber_prop::{CaliberPropPool, CaliberSwapEvent};
+        use crate::amms::Token;
+
+        let contract: Address = "0x154586b2479b9a11e3d4db90024dc0e26f097312"
+            .parse()
+            .unwrap();
+        let pair_id = B256::from([0x11u8; 32]);
+        let virtual_address = CaliberPropPool::virtual_address_from_pair_id(pair_id, contract);
+        let token_x = Address::from([0x01u8; 20]); // token_a（地址较小）
+        let token_y = Address::from([0x02u8; 20]); // token_b
+
+        let mut state = StateSpace::default();
+        state.insert_amm(AMM::CaliberPropPool(CaliberPropPool {
+            contract_address: contract,
+            pair_id,
+            virtual_address,
+            token_x,
+            token_y,
+            token_a: Token::new_with_decimals(token_x, 18),
+            token_b: Token::new_with_decimals(token_y, 6),
+            created_block: 0,
+            last_synced_block: 0,
+            reserve_a: U256::from(1_000_000),
+            reserve_b: U256::from(2_000_000),
+            ladder: Default::default(),
+            price_a_in_b: 1.0,
+            price_b_in_a: 1.0,
+        }));
+
+        let mk_swap =
+            |pair: B256, tx_index: u64, tin: Address, tout: Address, ain: u64, aout: u64| {
+                CaliberSwapEvent {
+                    contract,
+                    tx_index,
+                    pair_id: pair,
+                    token_in: tin,
+                    token_out: tout,
+                    amount_in: U256::from(ain),
+                    amount_out: U256::from(aout),
+                }
+            };
+
+        // 乱序传入两笔正向 swap（x→y）：排序后按 tx_index 应用，pos_forward 累计
+        let swaps = vec![
+            mk_swap(pair_id, 2, token_x, token_y, 10, 5),
+            mk_swap(pair_id, 0, token_x, token_y, 100, 30),
+        ];
+        let affected = state.apply_caliber_swaps(&swaps, 67_329_558);
+        assert_eq!(affected, vec![virtual_address]);
+        let pool = match state.get(&virtual_address).unwrap() {
+            AMM::CaliberPropPool(p) => p,
+            _ => unreachable!(),
+        };
+        // 正向 x→y：token_x==token_a 为输入 → reserve_a += in、reserve_b -= out
+        // tx0: +100 / -30；tx2: +10 / -5
+        assert_eq!(pool.reserve_a, U256::from(1_000_000u64 + 100 + 10));
+        assert_eq!(pool.reserve_b, U256::from(2_000_000u64 - 30 - 5));
+        assert_eq!(pool.ladder.pos_forward, U256::from(35u64));
+        assert_eq!(pool.ladder.pos_reverse, U256::ZERO);
+        assert_eq!(pool.last_synced_block, 67_329_558);
+
+        // 反向 swap（y→x）：pos_reverse 累计"扣费后的输入"（fee_rate=0 时为
+        // 全额 amountIn，链上 cfg+7 mid96 语义）、pos_forward 归零
+        let rev = mk_swap(pair_id, 3, token_y, token_x, 7, 4);
+        let affected = state.apply_caliber_swaps(&[rev], 67_329_558);
+        assert_eq!(affected, vec![virtual_address]);
+        let pool = match state.get(&virtual_address).unwrap() {
+            AMM::CaliberPropPool(p) => p,
+            _ => unreachable!(),
+        };
+        // 反向 y→x：token_y==token_b 为输入 → reserve_b += in、reserve_a -= out
+        assert_eq!(pool.reserve_a, U256::from(1_000_000u64 + 100 + 10 - 4));
+        assert_eq!(pool.reserve_b, U256::from(2_000_000u64 - 30 - 5 + 7));
+        assert_eq!(pool.ladder.pos_reverse, U256::from(7u64));
+        assert_eq!(pool.ladder.pos_forward, U256::ZERO);
+
+        // 未知 pairId → 静默跳过
+        let unknown = mk_swap(B256::from([0x22u8; 32]), 4, token_x, token_y, 1, 1);
+        let affected = state.apply_caliber_swaps(&[unknown], 67_329_559);
+        assert!(affected.is_empty());
+
+        // 块号落后于池子已同步块 → 跳过（幂等保护）
+        let stale = mk_swap(pair_id, 5, token_x, token_y, 1, 1);
+        let affected = state.apply_caliber_swaps(&[stale], 67_329_557);
+        assert!(affected.is_empty());
+        let pool = match state.get(&virtual_address).unwrap() {
+            AMM::CaliberPropPool(p) => p,
+            _ => unreachable!(),
+        };
+        assert_eq!(pool.ladder.pos_forward, U256::ZERO);
     }
 }
 
