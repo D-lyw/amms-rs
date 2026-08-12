@@ -436,7 +436,7 @@ impl AutomatedMarketMaker for PancakeV2Pool {
         // 输入侧不做 FoT 扣税（同 simulate_swap）：reserve 增量 = amount_in
         // （= 实收值，链上 balance 增量与 hop N 输出一致）。输出侧池子付出
         // gross（reserve 减少量含税部分），返回值扣税后 net。
-        if self.token_a.address == base_token {
+        let amount_out = if self.token_a.address == base_token {
             let amount_out = self.get_amount_out(
                 amount_in,
                 U256::from(self.reserve_0),
@@ -459,9 +459,7 @@ impl AutomatedMarketMaker for PancakeV2Pool {
                 .checked_sub(amount_out_u128)
                 .ok_or(AMMError::Msg("reserve_1 underflow".to_string()))?;
 
-            Ok(self
-                .output_token(base_token, quote_token)
-                .fot_net(amount_out))
+            amount_out
         } else {
             let amount_out = self.get_amount_out(
                 amount_in,
@@ -485,10 +483,22 @@ impl AutomatedMarketMaker for PancakeV2Pool {
                 .checked_add(amount_in_u128)
                 .ok_or(AMMError::Msg("reserve_1 overflow".to_string()))?;
 
-            Ok(self
-                .output_token(base_token, quote_token)
-                .fot_net(amount_out))
+            amount_out
+        };
+
+        // 刷新缓存 spot price（reserve 已更新为 swap 后状态）
+        if let Ok(p) = self.calculate_price(self.token_a.address, self.token_b.address) {
+            self.token_a_price = p;
+            if p != 0.0 {
+                self.token_b_price = 1.0 / p;
+            } else {
+                self.token_b_price = 0.0;
+            }
         }
+
+        Ok(self
+            .output_token(base_token, quote_token)
+            .fot_net(amount_out))
     }
 }
 

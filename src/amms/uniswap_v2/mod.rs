@@ -241,6 +241,16 @@ impl AutomatedMarketMaker for UniswapV2Pool {
                 .ok_or(AMMError::Msg("reserve_1 overflow".to_string()))?;
         }
 
+        // 刷新缓存 spot price（reserve 已更新为 swap 后状态）
+        if let Ok(p) = self.calculate_price(self.token_a.address, self.token_b.address) {
+            self.token_a_price = p;
+            if p != 0.0 {
+                self.token_b_price = 1.0 / p;
+            } else {
+                self.token_b_price = 0.0;
+            }
+        }
+
         // 输出侧 FoT：仅税种对该池生效时扣税（BuySell 扣 buy_fee）
         Ok(self
             .output_token(base_token, quote_token)
@@ -1303,6 +1313,24 @@ mod tests {
         // reserve 变化量 = gross（与链上 Sync 口径一致，扣税不反映在池子余额上）
         let gross_u128: u128 = gross.try_into().unwrap();
         assert_eq!(pool.reserve_1, pre_reserve_1 - gross_u128);
+
+        // 缓存 spot price 已刷新为 swap 后状态（与重新计算一致）
+        let expect_a = pool
+            .calculate_price(pool.token_a.address, pool.token_b.address)
+            .unwrap();
+        assert_eq!(
+            pool.spot_price(pool.token_a.address, pool.token_b.address)
+                .unwrap(),
+            expect_a
+        );
+        let expect_b = pool
+            .calculate_price(pool.token_b.address, pool.token_a.address)
+            .unwrap();
+        assert_eq!(
+            pool.spot_price(pool.token_b.address, pool.token_a.address)
+                .unwrap(),
+            expect_b
+        );
     }
 
     #[test]

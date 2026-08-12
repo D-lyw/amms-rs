@@ -208,14 +208,14 @@ impl AutomatedMarketMaker for ERC4626Vault {
         _quote_token: Address,
         amount_in: U256,
     ) -> Result<U256, AMMError> {
-        if self.vault_token == base_token {
+        let amount_out = if self.vault_token == base_token {
             let amount_out =
                 self.get_amount_out(amount_in, self.vault_reserve, self.asset_reserve)?;
 
             self.vault_reserve -= amount_in;
             self.asset_reserve -= amount_out;
 
-            Ok(amount_out)
+            amount_out
         } else {
             let amount_out =
                 self.get_amount_out(amount_in, self.asset_reserve, self.vault_reserve)?;
@@ -223,8 +223,18 @@ impl AutomatedMarketMaker for ERC4626Vault {
             self.asset_reserve += amount_in;
             self.vault_reserve += amount_out;
 
-            Ok(amount_out)
+            amount_out
+        };
+
+        // 刷新缓存 spot price（reserve 已更新为 swap 后状态）
+        if let Ok(p) = self.calculate_price(self.vault_token, self.asset_token) {
+            self.vault_token_price = p;
         }
+        if let Ok(p) = self.calculate_price(self.asset_token, self.vault_token) {
+            self.asset_token_price = p;
+        }
+
+        Ok(amount_out)
     }
 
     fn simulate_swap_exact_out(

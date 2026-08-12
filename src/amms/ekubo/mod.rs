@@ -90,6 +90,65 @@ mod tests {
         let pool_id = pool_key.pool_id();
         assert_ne!(pool_id, B256::ZERO);
     }
+
+    #[test]
+    fn test_simulate_swap_mut_advances_local_pool_state() {
+        use crate::amms::amm::AutomatedMarketMaker;
+        use crate::amms::Token;
+
+        let token0 = alloy::primitives::address!("0000000000000000000000000000000000000001");
+        let token1 = alloy::primitives::address!("0000000000000000000000000000000000000002");
+
+        let pool_key = EkuboPoolKey::new_concentrated(token0, token1, 3000, 60, Address::ZERO);
+        let mut pool = EkuboPool::new(Address::ZERO, pool_key);
+
+        pool.token_a = Token::new_with_decimals(token0, 18);
+        pool.token_b = Token::new_with_decimals(token1, 18);
+        // tick 0 -> sqrt ratio = 2^128 (Q64.128 fixed point)
+        pool.sqrt_price = U256::from(1u128) << 128;
+        pool.tick = 0;
+        pool.tick_spacing = 60;
+        pool.fee = 3689348814741910u128; // ~0.02%
+
+        // Wide position so a small swap does not cross any tick
+        let liquidity = 1_000_000_000_000_000_000u128;
+        pool.modify_position(-240, 240, liquidity as i128).unwrap();
+
+        pool.token_a_price = pool.calculate_price(token0, token1).unwrap();
+        pool.token_b_price = pool.calculate_price(token1, token0).unwrap();
+
+        let amount_in = U256::from(1_000_000_000_000u128);
+        let before_sqrt = pool.sqrt_price;
+        let before_tick = pool.tick;
+        let before_liquidity = pool.liquidity;
+        let before_price_a = pool.token_a_price;
+        let before_price_b = pool.token_b_price;
+
+        // simulate_swap must be read-only
+        let out_read = pool.simulate_swap(token0, token1, amount_in).unwrap();
+        assert_eq!(pool.sqrt_price, before_sqrt);
+        assert_eq!(pool.tick, before_tick);
+        assert_eq!(pool.liquidity, before_liquidity);
+        assert_eq!(pool.token_a_price, before_price_a);
+        assert_eq!(pool.token_b_price, before_price_b);
+
+        // simulate_swap_mut must advance the local pool state
+        let out_mut = pool.simulate_swap_mut(token0, token1, amount_in).unwrap();
+        assert_eq!(out_mut, out_read);
+        assert_ne!(
+            pool.sqrt_price, before_sqrt,
+            "simulate_swap_mut should advance local pool state"
+        );
+        assert!(pool.token_a_price.is_finite() && pool.token_a_price > 0.0);
+        assert!(pool.token_b_price.is_finite() && pool.token_b_price > 0.0);
+
+        // The next simulation on the same input must observe the advanced state
+        let out_after = pool.simulate_swap(token0, token1, amount_in).unwrap();
+        assert_ne!(
+            out_after, out_read,
+            "same input after simulate_swap_mut should observe advanced local state"
+        );
+    }
 }
 
 #[cfg(test)]

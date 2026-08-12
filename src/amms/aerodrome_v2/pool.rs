@@ -709,7 +709,7 @@ impl AutomatedMarketMaker for AerodromeV2Pool {
         amount_in: U256,
     ) -> Result<U256, AMMError> {
         // reserve 更新保持 gross（与链上 Sync 事件一致），返回值为扣税后 net
-        if self.token_a.address == base_token {
+        let amount_out = if self.token_a.address == base_token {
             let amount_out = if self.stable {
                 self.get_amount_out_stable_with_decimals(
                     amount_in,
@@ -746,9 +746,7 @@ impl AutomatedMarketMaker for AerodromeV2Pool {
                     "simulate_swap_mut: reserve_1 underflow".to_string(),
                 ))?;
 
-            Ok(self
-                .output_token(base_token, quote_token)
-                .fot_net(amount_out))
+            amount_out
         } else {
             let amount_out = if self.stable {
                 self.get_amount_out_stable_with_decimals(
@@ -786,10 +784,22 @@ impl AutomatedMarketMaker for AerodromeV2Pool {
                     "simulate_swap_mut: reserve_1 overflow".to_string(),
                 ))?;
 
-            Ok(self
-                .output_token(base_token, quote_token)
-                .fot_net(amount_out))
+            amount_out
+        };
+
+        // 刷新缓存 spot price（reserve 已更新为 swap 后状态）
+        if let Ok(p) = self.calculate_price(self.token_a.address, self.token_b.address) {
+            self.token_a_price = p;
+            if p != 0.0 {
+                self.token_b_price = 1.0 / p;
+            } else {
+                self.token_b_price = 0.0;
+            }
         }
+
+        Ok(self
+            .output_token(base_token, quote_token)
+            .fot_net(amount_out))
     }
 
     fn simulate_swap_exact_out(

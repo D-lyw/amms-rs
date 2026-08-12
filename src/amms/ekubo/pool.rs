@@ -372,11 +372,162 @@ impl AutomatedMarketMaker for EkuboPool {
         _quote_token: Address,
         amount_in: U256,
     ) -> Result<U256, AMMError> {
+        let (amount_out, _, _, _) = self.simulate_swap_exact_in_state(base_token, amount_in)?;
+        Ok(amount_out)
+    }
+
+    fn simulate_swap_mut(
+        &mut self,
+        base_token: Address,
+        quote_token: Address,
+        amount_in: U256,
+    ) -> Result<U256, AMMError> {
+        let (amount_out, sqrt_price, tick, liquidity) =
+            self.simulate_swap_exact_in_state(base_token, amount_in)?;
+
+        // 写回 swap 后的池子状态
+        self.sqrt_price = sqrt_price;
+        self.tick = tick;
+        self.liquidity = liquidity;
+
+        // 刷新缓存 spot price（sqrt_price 已更新）
+        if let Ok(p) = self.calculate_price(self.token_a.address, self.token_b.address) {
+            self.token_a_price = p;
+            if p != 0.0 {
+                self.token_b_price = 1.0 / p;
+            } else {
+                self.token_b_price = 0.0;
+            }
+        }
+
+        Ok(amount_out)
+    }
+
+    fn tokens(&self) -> Vec<Address> {
+        vec![self.token_a.address, self.token_b.address]
+    }
+
+    fn calculate_price(&self, base_token: Address, _quote_token: Address) -> Result<f64, AMMError> {
+        if self.sqrt_price.is_zero() {
+            return Err(AMMError::Msg("sqrt_price is zero".into()));
+        }
+        let sqrt_price_x96 = self.sqrt_price;
+
+        let sqrt_price_str = sqrt_price_x96.to_string();
+        let sqrt_price_val = Float::parse_radix(&sqrt_price_str, 10)
+            .map_err(|e| AMMError::Msg(format!("Float parse error: {}", e)))?;
+        let sqrt_price_float = Float::with_val(MPFR_T_PRECISION, sqrt_price_val);
+
+        // Ekubo uses 64.128 fixed-point, so divide by 2^128, not 2^96
+        let mut denom = Float::with_val(MPFR_T_PRECISION, 1);
+        denom <<= 128u32;
+
+        let p_raw = (sqrt_price_float / denom).pow(2);
+
+        let shift = self.token_a.decimals as i32 - self.token_b.decimals as i32;
+        let scale_factor = Float::with_val(MPFR_T_PRECISION, 10).pow(shift);
+
+        let price_a: Float = p_raw * scale_factor;
+        let price_a_f64 = price_a.to_f64();
+
+        if base_token == self.token_a.address {
+            Ok(price_a_f64)
+        } else {
+            if price_a_f64 == 0.0 {
+                Ok(0.0)
+            } else {
+                Ok(1.0 / price_a_f64)
+            }
+        }
+    }
+
+    async fn init<N, P>(mut self, block_number: BlockId, provider: P) -> Result<Self, AMMError>
+    where
+        Self: Sized,
+        N: Network,
+        P: Provider<N> + Clone,
+    {
+        // 1. Fetch core state (sqrt_price, tick, liquidity)
+        self = self
+            .fetch_core_state(block_number, provider.clone())
+            .await?;
+
+        // 2. Fetch full tick data (batched for single pool)
+        // Wrap self in AMM wrapper for the factory sync methods
+        {
+            use super::factory::EkuboFactory;
+            use crate::amms::amm::AMM;
+
+            let mut pools = vec![AMM::EkuboPool(self.clone())];
+
+            // Sync tick bitmaps
+            EkuboFactory::sync_tick_bitmaps::<N, _>(&mut pools, block_number, provider.clone())
+                .await?;
+
+            // Sync tick data
+            EkuboFactory::sync_tick_data::<N, _>(&mut pools, block_number, provider.clone())
+                .await?;
+
+            // Update self with synced data
+            if let AMM::EkuboPool(synced_pool) = pools.remove(0) {
+                self.tick_bitmap = synced_pool.tick_bitmap;
+                self.ticks = synced_pool.ticks;
+            }
+        }
+
+        info!(
+            target: "amms::ekubo::init",
+            pool_id = ?self.pool_id,
+            tick_bitmap_words = ?self.tick_bitmap.len(),
+            ticks_count = ?self.ticks.len(),
+            "Pool fully initialized with all tick data"
+        );
+
+        Ok(self)
+    }
+
+    async fn update<N, P>(&mut self, _provider: P) -> Result<(), AMMError>
+    where
+        N: Network,
+        P: Provider<N> + Clone,
+    {
+        Ok(())
+    }
+}
+
+// ========== EkuboPool Implementation ==========
+
+impl EkuboPool {
+    pub fn new(address: Address, pool_key: EkuboPoolKey) -> Self {
+        let pool_id = pool_key.pool_id();
+        EkuboPool {
+            address,
+            pool_key,
+            pool_id,
+            token_a_price: 0.0,
+            token_b_price: 0.0,
+            ..Default::default()
+        }
+    }
+
+    pub fn pool_id(&self) -> B256 {
+        self.pool_key.pool_id()
+    }
+
+    /// Simulates an exact-in swap and returns the post-swap state:
+    /// `(amount_out, final_sqrt_price, final_tick, final_liquidity)`.
+    /// This is the shared engine for both `simulate_swap` (read-only) and
+    /// `simulate_swap_mut` (which persists the final state back to the pool).
+    fn simulate_swap_exact_in_state(
+        &self,
+        base_token: Address,
+        amount_in: U256,
+    ) -> Result<(U256, U256, i32, u128), AMMError> {
         // Multi-tick swap simulation
         // This implements the full tick iteration logic matching on-chain behavior
 
         if amount_in.is_zero() {
-            return Ok(U256::ZERO);
+            return Ok((U256::ZERO, self.sqrt_price, self.tick, self.liquidity));
         }
 
         // 防御性检查
@@ -531,138 +682,12 @@ impl AutomatedMarketMaker for EkuboPool {
             liquidity = ?self.liquidity,
         );
 
-        Ok(U256::from(amount_out))
-    }
-
-    fn simulate_swap_mut(
-        &mut self,
-        base_token: Address,
-        quote_token: Address,
-        amount_in: U256,
-    ) -> Result<U256, AMMError> {
-        let amount_out = self.simulate_swap(base_token, quote_token, amount_in)?;
-
-        if let Ok(p) = self.calculate_price(self.token_a.address, self.token_b.address) {
-            self.token_a_price = p;
-            if p != 0.0 {
-                self.token_b_price = 1.0 / p;
-            } else {
-                self.token_b_price = 0.0;
-            }
-        }
-
-        Ok(amount_out)
-    }
-
-    fn tokens(&self) -> Vec<Address> {
-        vec![self.token_a.address, self.token_b.address]
-    }
-
-    fn calculate_price(&self, base_token: Address, _quote_token: Address) -> Result<f64, AMMError> {
-        if self.sqrt_price.is_zero() {
-            return Err(AMMError::Msg("sqrt_price is zero".into()));
-        }
-        let sqrt_price_x96 = self.sqrt_price;
-
-        let sqrt_price_str = sqrt_price_x96.to_string();
-        let sqrt_price_val = Float::parse_radix(&sqrt_price_str, 10)
-            .map_err(|e| AMMError::Msg(format!("Float parse error: {}", e)))?;
-        let sqrt_price_float = Float::with_val(MPFR_T_PRECISION, sqrt_price_val);
-
-        // Ekubo uses 64.128 fixed-point, so divide by 2^128, not 2^96
-        let mut denom = Float::with_val(MPFR_T_PRECISION, 1);
-        denom <<= 128u32;
-
-        let p_raw = (sqrt_price_float / denom).pow(2);
-
-        let shift = self.token_a.decimals as i32 - self.token_b.decimals as i32;
-        let scale_factor = Float::with_val(MPFR_T_PRECISION, 10).pow(shift);
-
-        let price_a: Float = p_raw * scale_factor;
-        let price_a_f64 = price_a.to_f64();
-
-        if base_token == self.token_a.address {
-            Ok(price_a_f64)
-        } else {
-            if price_a_f64 == 0.0 {
-                Ok(0.0)
-            } else {
-                Ok(1.0 / price_a_f64)
-            }
-        }
-    }
-
-    async fn init<N, P>(mut self, block_number: BlockId, provider: P) -> Result<Self, AMMError>
-    where
-        Self: Sized,
-        N: Network,
-        P: Provider<N> + Clone,
-    {
-        // 1. Fetch core state (sqrt_price, tick, liquidity)
-        self = self
-            .fetch_core_state(block_number, provider.clone())
-            .await?;
-
-        // 2. Fetch full tick data (batched for single pool)
-        // Wrap self in AMM wrapper for the factory sync methods
-        {
-            use super::factory::EkuboFactory;
-            use crate::amms::amm::AMM;
-
-            let mut pools = vec![AMM::EkuboPool(self.clone())];
-
-            // Sync tick bitmaps
-            EkuboFactory::sync_tick_bitmaps::<N, _>(&mut pools, block_number, provider.clone())
-                .await?;
-
-            // Sync tick data
-            EkuboFactory::sync_tick_data::<N, _>(&mut pools, block_number, provider.clone())
-                .await?;
-
-            // Update self with synced data
-            if let AMM::EkuboPool(synced_pool) = pools.remove(0) {
-                self.tick_bitmap = synced_pool.tick_bitmap;
-                self.ticks = synced_pool.ticks;
-            }
-        }
-
-        info!(
-            target: "amms::ekubo::init",
-            pool_id = ?self.pool_id,
-            tick_bitmap_words = ?self.tick_bitmap.len(),
-            ticks_count = ?self.ticks.len(),
-            "Pool fully initialized with all tick data"
-        );
-
-        Ok(self)
-    }
-
-    async fn update<N, P>(&mut self, _provider: P) -> Result<(), AMMError>
-    where
-        N: Network,
-        P: Provider<N> + Clone,
-    {
-        Ok(())
-    }
-}
-
-// ========== EkuboPool Implementation ==========
-
-impl EkuboPool {
-    pub fn new(address: Address, pool_key: EkuboPoolKey) -> Self {
-        let pool_id = pool_key.pool_id();
-        EkuboPool {
-            address,
-            pool_key,
-            pool_id,
-            token_a_price: 0.0,
-            token_b_price: 0.0,
-            ..Default::default()
-        }
-    }
-
-    pub fn pool_id(&self) -> B256 {
-        self.pool_key.pool_id()
+        Ok((
+            U256::from(amount_out),
+            current_sqrt_ratio,
+            current_tick,
+            current_liquidity,
+        ))
     }
 
     /// Internal helper to fetch core state (sqrt_price, tick, liquidity) from chain

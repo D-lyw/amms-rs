@@ -165,3 +165,88 @@ fn meta_pool_can_simulate_underlying_routes_locally() {
         .expect("base -> base underlying quote should work");
     assert!(out_base_to_base > U256::ZERO);
 }
+
+#[test]
+fn meta_pool_simulate_swap_mut_advances_underlying_routes() {
+    let base_pool = make_base_pool();
+    let meta_pool = make_meta_pool(&base_pool);
+
+    let eurs = meta_pool.coins[0];
+    let usdc = base_pool.coins[0];
+    let usdt = base_pool.coins[1];
+    let lp_idx = meta_pool.base_token_index.unwrap();
+
+    let cases = [
+        ("meta_to_base", eurs, usdt, wad(10)),
+        ("base_to_meta", usdc, eurs, usdc_amount(10)),
+        // 加大金额确保滑点可见（10 USDC 在 10M 储备上会被取整吞掉）
+        ("base_to_base", usdc, usdt, usdc_amount(1_000_000)),
+    ];
+
+    for (name, token_in, token_out, amount_in) in cases {
+        let mut pool = meta_pool.clone();
+        let pre_meta_balances = pool.balances.clone();
+        let pre_base_balances = pool.base_pool_view.as_ref().unwrap().balances.clone();
+        let pre_base_supply = pool.base_pool_view.as_ref().unwrap().total_supply;
+
+        let out_read = meta_pool
+            .simulate_swap(token_in, token_out, amount_in)
+            .unwrap();
+        let out_mut = pool
+            .simulate_swap_mut(token_in, token_out, amount_in)
+            .unwrap();
+        assert_eq!(out_mut, out_read, "{}: mut output must match read", name);
+
+        // 状态推进：同输入再次模拟，输出必须变小
+        let out_again = pool.simulate_swap(token_in, token_out, amount_in).unwrap();
+        assert!(out_again < out_read, "{}: state should advance", name);
+
+        // 缓存 spot price 已刷新（非零、有限）
+        let spot = pool.spot_price(token_in, token_out).unwrap();
+        assert!(
+            spot > 0.0 && spot.is_finite(),
+            "{}: spot price refreshed",
+            name
+        );
+
+        match name {
+            "meta_to_base" => {
+                // meta 池：卖出 meta 币增加、LP 持仓减少；base 快照：base_j 减少、LP 总量销毁
+                assert_eq!(pool.balances[0], pre_meta_balances[0] + amount_in);
+                assert!(pool.balances[lp_idx] < pre_meta_balances[lp_idx]);
+                assert_eq!(
+                    pool.base_pool_view.as_ref().unwrap().balances[1],
+                    pre_base_balances[1] - out_read
+                );
+                assert!(pool.base_pool_view.as_ref().unwrap().total_supply < pre_base_supply);
+            }
+            "base_to_meta" => {
+                // meta 池：LP 持仓增加、meta_j 减少；base 快照：base_i 增加、LP 总量铸造
+                assert!(pool.balances[lp_idx] > pre_meta_balances[lp_idx]);
+                assert_eq!(pool.balances[0], pre_meta_balances[0] - out_read);
+                assert_eq!(
+                    pool.base_pool_view.as_ref().unwrap().balances[0],
+                    pre_base_balances[0] + amount_in
+                );
+                assert!(pool.base_pool_view.as_ref().unwrap().total_supply > pre_base_supply);
+            }
+            "base_to_base" => {
+                // 只动 base 快照：meta 表完全不变，base_i 增 / base_j 减，LP 总量不变
+                assert_eq!(pool.balances, pre_meta_balances);
+                assert_eq!(
+                    pool.base_pool_view.as_ref().unwrap().balances[0],
+                    pre_base_balances[0] + amount_in
+                );
+                assert_eq!(
+                    pool.base_pool_view.as_ref().unwrap().balances[1],
+                    pre_base_balances[1] - out_read
+                );
+                assert_eq!(
+                    pool.base_pool_view.as_ref().unwrap().total_supply,
+                    pre_base_supply
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+}

@@ -1120,11 +1120,154 @@ impl AutomatedMarketMaker for CurveLegacyPool {
                                 "Balance underflow in simulate_swap_mut".into(),
                             ))?;
                 }
+                // 刷新 spot price 缓存（balances 已更新为 swap 后状态）
+                self.update_spot_prices();
                 Ok(amount_out)
             }
-            _ => Err(AMMError::Msg(
-                "simulate_swap_mut is unsupported for Curve Legacy meta underlying routes".into(),
-            )),
+            CurveLegacySwapRoute::BaseToBase { i, j } => {
+                let view = self
+                    .base_pool_view
+                    .as_ref()
+                    .ok_or_else(|| AMMError::Msg("Meta pool missing base_pool_view".into()))?;
+                let amount_out = view.simulate_direct_swap(i, j, amount_in)?;
+
+                // 两阶段：先校验全部增量，再一次性写回，避免半修改状态
+                let new_balance_i =
+                    view.balances[i]
+                        .checked_add(amount_in)
+                        .ok_or(AMMError::Msg(
+                            "Base view balance overflow in simulate_swap_mut".into(),
+                        ))?;
+                let new_balance_j =
+                    view.balances[j]
+                        .checked_sub(amount_out)
+                        .ok_or(AMMError::Msg(
+                            "Base view balance underflow in simulate_swap_mut".into(),
+                        ))?;
+                let mut new_view = (**view).clone();
+                new_view.balances[i] = new_balance_i;
+                new_view.balances[j] = new_balance_j;
+                self.base_pool_view = Some(Arc::new(new_view));
+
+                // 刷新 spot price 缓存（base 快照已更新为 swap 后状态）
+                self.update_spot_prices();
+                Ok(amount_out)
+            }
+            CurveLegacySwapRoute::MetaToBase { meta_i, base_j } => {
+                let lp_idx = self
+                    .base_token_index
+                    .ok_or_else(|| AMMError::Msg("Meta pool missing base_token_index".into()))?;
+                if lp_idx >= self.balances.len() {
+                    return Err(AMMError::Msg(
+                        "Meta pool base_token_index out of bounds in simulate_swap_mut".into(),
+                    ));
+                }
+                let view = self
+                    .base_pool_view
+                    .as_ref()
+                    .ok_or_else(|| AMMError::Msg("Meta pool missing base_pool_view".into()))?;
+
+                // 只读计算（与 simulate_swap 同款公式）
+                let lp_out = self.simulate_direct_swap(meta_i, lp_idx, amount_in)?;
+                let base_out = view.simulate_remove_liquidity_one_coin(lp_out, base_j)?;
+
+                // 校验全部增量
+                let new_meta_balance =
+                    self.balances[meta_i]
+                        .checked_add(amount_in)
+                        .ok_or(AMMError::Msg(
+                            "Balance overflow in simulate_swap_mut".into(),
+                        ))?;
+                let new_lp_balance =
+                    self.balances[lp_idx]
+                        .checked_sub(lp_out)
+                        .ok_or(AMMError::Msg(
+                            "Balance underflow in simulate_swap_mut".into(),
+                        ))?;
+                let new_base_j =
+                    view.balances[base_j]
+                        .checked_sub(base_out)
+                        .ok_or(AMMError::Msg(
+                            "Base view balance underflow in simulate_swap_mut".into(),
+                        ))?;
+                let new_base_supply = view.total_supply.checked_sub(lp_out).ok_or(
+                    AMMError::Msg("Base view total_supply underflow in simulate_swap_mut".into()),
+                )?;
+
+                // 一次性写回（meta 表 + base 快照）
+                self.balances[meta_i] = new_meta_balance;
+                self.balances[lp_idx] = new_lp_balance;
+                let mut new_view = (**view).clone();
+                new_view.balances[base_j] = new_base_j;
+                new_view.total_supply = new_base_supply;
+                self.base_pool_view = Some(Arc::new(new_view));
+
+                // 刷新 spot price 缓存
+                self.update_spot_prices();
+                Ok(base_out)
+            }
+            CurveLegacySwapRoute::BaseToMeta { base_i, meta_j } => {
+                let lp_idx = self
+                    .base_token_index
+                    .ok_or_else(|| AMMError::Msg("Meta pool missing base_token_index".into()))?;
+                if lp_idx >= self.balances.len() {
+                    return Err(AMMError::Msg(
+                        "Meta pool base_token_index out of bounds in simulate_swap_mut".into(),
+                    ));
+                }
+                let view = self
+                    .base_pool_view
+                    .as_ref()
+                    .ok_or_else(|| AMMError::Msg("Meta pool missing base_pool_view".into()))?;
+
+                // 只读计算（与 simulate_swap 同款 fee 处理）
+                let lp_out = if self.pool_type == CurveLegacyPoolType::StableSwap
+                    && self.stable_type == LegacyStableSwapType::Meta
+                {
+                    let minted_lp = view.simulate_calc_token_amount_one_coin(base_i, amount_in)?;
+                    minted_lp.saturating_sub(
+                        minted_lp * view.fee / (U256::from(2) * CURVE_FEE_DENOMINATOR),
+                    )
+                } else {
+                    view.simulate_add_liquidity_one_coin(base_i, amount_in)?
+                };
+                let meta_out = self.simulate_direct_swap(lp_idx, meta_j, lp_out)?;
+
+                // 校验全部增量
+                let new_base_i =
+                    view.balances[base_i]
+                        .checked_add(amount_in)
+                        .ok_or(AMMError::Msg(
+                            "Base view balance overflow in simulate_swap_mut".into(),
+                        ))?;
+                let new_base_supply = view.total_supply.checked_add(lp_out).ok_or(
+                    AMMError::Msg("Base view total_supply overflow in simulate_swap_mut".into()),
+                )?;
+                let new_lp_balance =
+                    self.balances[lp_idx]
+                        .checked_add(lp_out)
+                        .ok_or(AMMError::Msg(
+                            "Balance overflow in simulate_swap_mut".into(),
+                        ))?;
+                let new_meta_j =
+                    self.balances[meta_j]
+                        .checked_sub(meta_out)
+                        .ok_or(AMMError::Msg(
+                            "Balance underflow in simulate_swap_mut".into(),
+                        ))?;
+
+                // 一次性写回（base 快照 + meta 表）
+                let mut new_view = (**view).clone();
+                new_view.balances[base_i] = new_base_i;
+                new_view.total_supply = new_base_supply;
+                self.base_pool_view = Some(Arc::new(new_view));
+                self.balances[lp_idx] = new_lp_balance;
+                self.balances[meta_j] = new_meta_j;
+
+                // 刷新 spot price 缓存
+                self.update_spot_prices();
+                Ok(meta_out)
+            }
         }
     }
 

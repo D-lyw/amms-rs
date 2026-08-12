@@ -396,6 +396,16 @@ impl AutomatedMarketMaker for PancakeInfinityPool {
         self.tick = current_state.tick;
         self.liquidity = current_state.liquidity;
 
+        // 刷新缓存 spot price（状态已推进到 swap 后）
+        if let Ok(p) = self.calculate_price(self.token_a.address, self.token_b.address) {
+            self.token_a_price = p;
+            if p != 0.0 {
+                self.token_b_price = 1.0 / p;
+            } else {
+                self.token_b_price = 0.0;
+            }
+        }
+
         Ok((-current_state.amount_calculated).into_raw())
     }
 

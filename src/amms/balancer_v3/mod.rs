@@ -1068,6 +1068,9 @@ impl AutomatedMarketMaker for BalancerV3Pool {
             .checked_sub(amount_out)
             .ok_or(AMMError::Msg("BalancerV3 balance underflow".into()))?;
 
+        // 刷新 spot price 缓存（balances 已更新为 swap 后状态）
+        self.update_spot_prices();
+
         Ok(amount_out)
     }
 
