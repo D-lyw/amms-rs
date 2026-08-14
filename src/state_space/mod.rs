@@ -51,13 +51,12 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Debug;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use std::{future::Future, marker::PhantomData, sync::Arc};
 use tokio::sync::{Mutex, Notify, RwLock};
 
-use crate::amms::caliber_prop::CaliberSwapEvent;
+use crate::amms::caliber_prop::{decode_caliber_swap_log, CaliberSwapEvent, CALIBER_SWAP_EVENT};
 use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
 use xlayer_flashblocks::CaliberTxEvent;
@@ -154,13 +153,12 @@ const APPLIED_LOG_DEDUP_CAPACITY: usize = 300_000;
 const CONTENT_HASH_DEDUP_CAPACITY: usize = 1_000;
 const DEFAULT_PENDING_SYNC_WORKER_INTERVAL: Duration = Duration::from_secs(2);
 const DEFAULT_DRIFT_PROBE_INTERVAL: Duration = Duration::from_secs(120);
-/// 实时交易驱动下 caliber 周期对账默认间隔（断流/储备变动/漏更新的兜底延迟上界）
+/// 实时交易驱动下 caliber 周期对账默认间隔（断流/储备变动/漏更新的兜底延迟上界）。
 ///
-/// ⚠️ 临时兜底（2026-08-10）：生产 RPC 限流（429/-32016）下 45s 一轮全量
-/// `eth_getStorageAt` 仍持续撞限流；caliber 价格新鲜度由 flashblocks 实时
-/// 交易流保证，对账仅是低频兜底，默认放宽到 60s。后续应改为配置化独立
-/// HTTP RPC 端点（见 `caliber_prop::CALIBER_STORAGE_HTTP_RPC` TODO）后恢复。
-const DEFAULT_CALIBER_RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
+/// 断流期间报价滞后上界由此间隔决定：30s 兼顾 RPC 限流（`eth_getStorageAt`
+/// 批量刷新）与陈旧报价窗口；正常时 flashblocks 实时交易流保证新鲜度，
+/// 对账仅作低频兜底。后续应改为配置化独立 HTTP RPC 端点后恢复更细粒度。
+const DEFAULT_CALIBER_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1096,9 +1094,68 @@ impl<N, P> StateSpaceManager<N, P> {
             crate::amms::fot::apply_swap_back_transfer_log(l, block_num);
         }
 
+        // Caliber swap 事件断流回补（XLayer）：get_logs/backfill 拉回的
+        // caliber swap 日志地址是合约地址而非池子地址，通用 sync() 路由
+        // 会静默丢弃；在此显式提取并应用。仅对非实时来源生效：backfill/
+        // canonical get_logs（NewHeadsPull）天然只含已确认交易日志；实时
+        // XlayerFlashblock 路径的 caliber swap 已由预提取循环以 receipt
+        // status==0x1 过滤处理，此处再提取会把 status!=0x1（回滚/未确认）
+        // 日志当已确认应用，产生幻影消费（P0）。
+        // 日志已在上方 applied_log_dedup 占位，跨路径不会重放。
+        let mut caliber_swap_affected: Vec<Address> = Vec::new();
+        if !matches!(source, LogSource::XlayerFlashblock) && !logs.is_empty() {
+            let caliber_contracts: HashSet<Address> = {
+                let guard = state.read().await;
+                guard
+                    .state
+                    .values()
+                    .filter_map(|amm| match amm.as_ref() {
+                        AMM::CaliberPropPool(p) => Some(p.contract_address),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            if !caliber_contracts.is_empty() {
+                let (caliber_swap_logs, other_logs): (Vec<Log>, Vec<Log>) =
+                    logs.into_iter().partition(|l| {
+                        caliber_contracts.contains(&l.inner.address)
+                            && l.inner.data.topics().first() == Some(&CALIBER_SWAP_EVENT)
+                    });
+                logs = other_logs;
+                let swaps: Vec<CaliberSwapEvent> = caliber_swap_logs
+                    .iter()
+                    .filter_map(|l| {
+                        let topics = l.inner.data.topics();
+                        let mut ev = decode_caliber_swap_log(topics, l.inner.data.data.as_ref())?;
+                        ev.contract = l.inner.address;
+                        ev.tx_index = l.transaction_index.unwrap_or_default();
+                        Some(ev)
+                    })
+                    .collect();
+                if !swaps.is_empty() {
+                    match Self::apply_caliber_swaps_for_block(
+                        state,
+                        block_num,
+                        swaps,
+                        realtime_head,
+                    )
+                    .await
+                    {
+                        Ok(affected_swaps) => caliber_swap_affected.extend(affected_swaps),
+                        Err(e) => {
+                            error!(
+                                "Caliber swap backfill apply failed at block {}: {}",
+                                block_num, e
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         if logs.is_empty() {
             return Ok((
-                vec![],
+                caliber_swap_affected,
                 ApplyLogsTiming {
                     sort_ms,
                     dedup_ms,
@@ -1109,7 +1166,9 @@ impl<N, P> StateSpaceManager<N, P> {
         }
 
         let t_sync_start = Instant::now();
-        let (affected, needs_resync, needs_async_update) = state.write().await.sync(&logs)?;
+        let (mut affected, needs_resync, needs_async_update) =
+            state.write().await.sync(&logs)?;
+        affected.extend(caliber_swap_affected);
         let sync_ms = t_sync_start.elapsed().as_millis();
 
         if !needs_resync.is_empty() || !needs_async_update.is_empty() {
@@ -1434,6 +1493,16 @@ impl<N, P> StateSpaceManager<N, P> {
                         topic_addresses.insert(p.pool_address);
                         topic_addresses.insert(p.engine_address);
                     }
+                }
+                AMM::CaliberPropPool(p) => {
+                    // Caliber 无 sync_events（batchUpdateParameters 0 日志），
+                    // 但 Swap 事件是断流 gap catch-up 唯一可回补的消费同步来源。
+                    // 把合约地址 + CALIBER_SWAP_EVENT 注册进 query chunks，
+                    // 让 get_logs/backfill 能拉回 caliber swap 日志；
+                    // 实时提取层（xlayer_flashblocks）先占用 dedup 键，
+                    // apply_logs_for_block_timed 内显式提取应用，不会重复处理。
+                    topic_addresses.insert(p.contract_address);
+                    topic_signatures.insert(CALIBER_SWAP_EVENT);
                 }
                 _ => {
                     if has_events {

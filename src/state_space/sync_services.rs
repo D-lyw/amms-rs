@@ -1171,12 +1171,20 @@ pub async fn start_caliber_prop_ladder_sync_task<N, P>(
     N: Network,
     P: Provider<N> + Clone + 'static,
 {
-    // ⚠️ 临时兜底（2026-08-10）：生产 RPC 限流下 caliber 对账轮询禁止低于
-    // 60s（调用方即使传入 25s/45s 也会被钳制到 60s）。caliber 价格新鲜度由
-    // flashblocks 实时交易流保证，对账仅为冷启动/断流/储备/漏更新的低频兜底，
-    // 无需高频轮询。后续应改为配置化独立 HTTP RPC 端点后移除。
-    const MIN_RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
+    // caliber 对账轮询下限 30s（断流期间报价滞后上界，兼顾 RPC 限流与
+    // 陈旧报价窗口）。caliber 价格新鲜度由 flashblocks 实时交易流保证，
+    // 对账仅为冷启动/断流/储备/漏更新的低频兜底。
+    const MIN_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
+    let configured_interval = interval;
     let interval = interval.max(MIN_RECONCILE_INTERVAL);
+    if configured_interval < MIN_RECONCILE_INTERVAL {
+        warn!(
+            configured_secs = configured_interval.as_secs(),
+            effective_secs = interval.as_secs(),
+            "Caliber reconcile interval clamped to 30s (RPC rate-limit guard); \
+             realtime flashblock stream remains the primary freshness source"
+        );
+    }
     // 对账失败退避上限：RPC 限流/网关过载时避免持续硬撞（间隔翻倍，
     // 成功恢复 `interval`；配合 storage_at_batch 限流时不逐槽回退）。
     const MAX_RECONCILE_BACKOFF: Duration = Duration::from_secs(300);
@@ -1219,6 +1227,11 @@ pub async fn start_caliber_prop_ladder_sync_task<N, P>(
                 if failed > 0 {
                     reconcile_failed = true;
                     warn!("Caliber reconcile: {}/{} pools failed", failed, flags.len());
+                } else {
+                    info!(
+                        pools = target_pools.len(),
+                        "Caliber reconcile ok (flashblock realtime sync healthy)"
+                    );
                 }
             }
             Err(e) => {
@@ -1239,7 +1252,12 @@ pub async fn start_caliber_prop_ladder_sync_task<N, P>(
         // 失败退避：成功恢复基础间隔；失败翻倍（上限 300s），限流恢复后
         // 不会多实例/多轮集体打爆网关。
         next_sleep = if reconcile_failed {
-            next_sleep.saturating_mul(2).min(MAX_RECONCILE_BACKOFF)
+            let doubled = next_sleep.saturating_mul(2).min(MAX_RECONCILE_BACKOFF);
+            warn!(
+                next_sleep_secs = doubled.as_secs(),
+                "Caliber reconcile backed off after failure (RPC limit / gateway overload)"
+            );
+            doubled
         } else {
             interval
         };
