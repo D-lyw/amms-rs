@@ -9,6 +9,7 @@ use alloy::network::Network;
 use alloy::providers::Provider;
 use async_stream::stream;
 use futures::{Stream, StreamExt};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -38,13 +39,38 @@ impl<N, P> StateSpaceManager<N, P> {
     where
         P: Provider<N> + Clone + 'static,
         N: Network + 'static,
+        N::HeaderResponse: Send,
     {
         stream! {
             loop {
-                let mut heads_stream = match provider.subscribe_blocks().await {
-                    Ok(sub) => sub.into_stream(),
-                    Err(e) => {
-                        error!("Failed to subscribe to newHeads: {}", e);
+                // XLayer 公共网关不再白名单 eth_subscribe（-32601），newHeads 订阅
+                // 使用专用 WS provider；其余链沿用主 provider（回填仍走主 provider）。
+                let subscribed: Option<
+                    Pin<Box<dyn Stream<Item = N::HeaderResponse> + Send>>,
+                > = if chain_id == super::XLAYER_CHAIN_ID {
+                    match Self::connect_xlayer_subscribe_provider().await {
+                        Some(sub_provider) => match sub_provider.subscribe_blocks().await {
+                            Ok(sub) => Some(Box::pin(sub.into_stream())),
+                            Err(e) => {
+                                error!("Failed to subscribe to newHeads: {}", e);
+                                None
+                            }
+                        },
+                        None => None,
+                    }
+                } else {
+                    match provider.subscribe_blocks().await {
+                        Ok(sub) => Some(Box::pin(sub.into_stream())),
+                        Err(e) => {
+                            error!("Failed to subscribe to newHeads: {}", e);
+                            None
+                        }
+                    }
+                };
+
+                let mut heads_stream = match subscribed {
+                    Some(stream) => stream,
+                    None => {
                         sleep(STREAM_RECONNECT_DELAY).await;
                         continue;
                     }

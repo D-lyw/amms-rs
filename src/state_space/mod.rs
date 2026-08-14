@@ -36,7 +36,7 @@ use alloy::eips::BlockId;
 use alloy::network::Network;
 
 use alloy::primitives::{keccak256, Address, Bloom, BloomInput, FixedBytes, B256, U256};
-use alloy::providers::Provider;
+use alloy::providers::{DynProvider, Identity, Provider, ProviderBuilder, WsConnect};
 use alloy::rpc::types::{eth::Log, Filter, FilterSet};
 use alloy::sol;
 use alloy::sol_types::SolEvent;
@@ -142,6 +142,16 @@ const ROBINHOOD_CHAIN_ID: u64 = 4663;
 /// - wss://testws.xlayer.tech/flashblocks
 /// - wss://xlayertestws.okx.com/flashblocks
 const XLAYER_FLASHBLOCKS_RAW_WS_URL: &str = "wss://ws.xlayer.tech/flashblocks";
+/// XLayer `eth_subscribe`（newHeads）专用 WebSocket 端点。
+///
+/// 生产公共网关 `wss://ws.xlayer.tech` 不再白名单 `eth_subscribe`
+/// （实测 `-32601: rpc method is not whitelisted`），而 XLayer 实时路径的
+/// canonical head tracker / NewHeadsPull 依赖 `newHeads` 订阅；
+/// 因此 XLayer 的 newHeads 订阅统一走该 Alchemy 端点，其余路径
+/// （flashblocks 流、caliber HTTP storage、主 provider 读写）保持不变。
+/// 可通过环境变量 XLAYER_SUBSCRIBE_WS 覆盖默认值。
+const XLAYER_SUBSCRIBE_WS_URL: &str =
+    "wss://xlayer-mainnet.g.alchemy.com/v2/rlZ_GRJMzmQl6xsfCa2pD";
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const STREAM_RECONNECT_DELAY: Duration = Duration::from_secs(2);
 const APPLIED_LOG_DEDUP_CAPACITY: usize = 300_000;
@@ -578,7 +588,14 @@ impl<N, P> StateSpaceManager<N, P> {
             let notify = self.pending_sync_notify.clone();
             let canonical_head = self.canonical_head.clone();
             tokio::spawn(async move {
-                Self::run_canonical_head_tracker(provider, state, notify, canonical_head).await;
+                Self::run_canonical_head_tracker(
+                    provider,
+                    state,
+                    notify,
+                    canonical_head,
+                    chain_id,
+                )
+                .await;
             });
         }
 
@@ -1669,46 +1686,97 @@ impl<N, P> StateSpaceManager<N, P> {
         }
     }
 
+    /// 连接 XLayer newHeads 订阅专用 WS provider。
+    ///
+    /// 生产公共网关 `wss://ws.xlayer.tech` 不再开放 `eth_subscribe`，
+    /// XLayer 的 newHeads 订阅统一使用该专用端点（其余链仍走主 provider）。
+    /// 连接失败返回 `None`，由调用方告警并按重连策略重试。
+    async fn connect_xlayer_subscribe_provider() -> Option<DynProvider<N>>
+    where
+        N: Network,
+    {
+        let url = std::env::var("XLAYER_SUBSCRIBE_WS")
+            .unwrap_or_else(|_| XLAYER_SUBSCRIBE_WS_URL.to_string());
+        let ws = WsConnect::new(url);
+        match <ProviderBuilder<Identity, Identity, N> as Default>::default()
+            .connect_ws(ws)
+            .await
+        {
+            Ok(provider) => Some(provider.erased()),
+            Err(e) => {
+                warn!(error = %e, "XLayer subscribe ws connect failed");
+                None
+            }
+        }
+    }
+
     async fn run_canonical_head_tracker(
         provider: P,
         state: Arc<RwLock<StateSpace>>,
         pending_sync_notify: Arc<Notify>,
         canonical_head: Arc<AtomicU64>,
+        chain_id: u64,
     ) where
         P: Provider<N> + Clone + 'static,
         N: Network + 'static,
+        N::HeaderResponse: Send,
     {
         let stream_idle_timeout = Duration::from_secs(15);
         loop {
-            match provider.subscribe_blocks().await {
-                Ok(sub) => {
-                    info!("canonical head tracker subscribed to newHeads");
-                    let mut stream = sub.into_stream();
-
-                    loop {
-                        match tokio::time::timeout(stream_idle_timeout, stream.next()).await {
-                            Ok(Some(header)) => {
-                                let block = header.number();
-                                Self::store_monotonic_head(&canonical_head, block);
-                                {
-                                    let guard = state.read().await;
-                                    Self::store_monotonic_head(&guard.canonical_head, block);
-                                }
-                                pending_sync_notify.notify_one();
-                            }
-                            Ok(None) => {
-                                warn!("canonical newHeads stream ended, reconnecting");
-                                break;
-                            }
-                            Err(_) => {
-                                warn!("canonical newHeads stream timeout, reconnecting");
-                                break;
-                            }
+            // XLayer 公共网关不再白名单 eth_subscribe（-32601），newHeads 订阅
+            // 使用专用 WS provider；其余链沿用主 provider。
+            let subscribed: Option<
+                Pin<Box<dyn Stream<Item = N::HeaderResponse> + Send>>,
+            > = if chain_id == XLAYER_CHAIN_ID {
+                match Self::connect_xlayer_subscribe_provider().await {
+                    Some(sub_provider) => match sub_provider.subscribe_blocks().await {
+                        Ok(sub) => Some(Box::pin(sub.into_stream())),
+                        Err(e) => {
+                            warn!("canonical newHeads subscribe failed: {}", e);
+                            None
                         }
+                    },
+                    None => None,
+                }
+            } else {
+                match provider.subscribe_blocks().await {
+                    Ok(sub) => Some(Box::pin(sub.into_stream())),
+                    Err(e) => {
+                        warn!("canonical newHeads subscribe failed: {}", e);
+                        None
                     }
                 }
-                Err(e) => {
-                    warn!("canonical newHeads subscribe failed: {}", e);
+            };
+
+            let mut stream = match subscribed {
+                Some(stream) => stream,
+                None => {
+                    sleep(STREAM_RECONNECT_DELAY).await;
+                    continue;
+                }
+            };
+
+            info!("canonical head tracker subscribed to newHeads");
+
+            loop {
+                match tokio::time::timeout(stream_idle_timeout, stream.next()).await {
+                    Ok(Some(header)) => {
+                        let block = header.number();
+                        Self::store_monotonic_head(&canonical_head, block);
+                        {
+                            let guard = state.read().await;
+                            Self::store_monotonic_head(&guard.canonical_head, block);
+                        }
+                        pending_sync_notify.notify_one();
+                    }
+                    Ok(None) => {
+                        warn!("canonical newHeads stream ended, reconnecting");
+                        break;
+                    }
+                    Err(_) => {
+                        warn!("canonical newHeads stream timeout, reconnecting");
+                        break;
+                    }
                 }
             }
             sleep(STREAM_RECONNECT_DELAY).await;
