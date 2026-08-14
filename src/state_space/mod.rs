@@ -1725,36 +1725,34 @@ impl<N, P> StateSpaceManager<N, P> {
         loop {
             // XLayer 公共网关不再白名单 eth_subscribe（-32601），newHeads 订阅
             // 使用专用 WS provider；其余链沿用主 provider。
-            let subscribed: Option<
-                Pin<Box<dyn Stream<Item = N::HeaderResponse> + Send>>,
-            > = if chain_id == XLAYER_CHAIN_ID {
-                match Self::connect_xlayer_subscribe_provider().await {
-                    Some(sub_provider) => match sub_provider.subscribe_blocks().await {
-                        Ok(sub) => Some(Box::pin(sub.into_stream())),
-                        Err(e) => {
-                            warn!("canonical newHeads subscribe failed: {}", e);
-                            None
-                        }
-                    },
-                    None => None,
-                }
+            // 注意：专用 provider 必须与流同生命周期（pubsub service 由 provider
+            // 持有，提前 drop 会立即关闭订阅导致无限重连）。
+            let sub_provider: Option<DynProvider<N>> = if chain_id == XLAYER_CHAIN_ID {
+                Self::connect_xlayer_subscribe_provider().await
             } else {
-                match provider.subscribe_blocks().await {
-                    Ok(sub) => Some(Box::pin(sub.into_stream())),
-                    Err(e) => {
-                        warn!("canonical newHeads subscribe failed: {}", e);
-                        None
-                    }
-                }
+                None
             };
 
-            let mut stream = match subscribed {
-                Some(stream) => stream,
-                None => {
-                    sleep(STREAM_RECONNECT_DELAY).await;
-                    continue;
-                }
-            };
+            let mut stream: Pin<Box<dyn Stream<Item = N::HeaderResponse> + Send>> =
+                if let Some(sp) = &sub_provider {
+                    match sp.subscribe_blocks().await {
+                        Ok(sub) => Box::pin(sub.into_stream()),
+                        Err(e) => {
+                            warn!("canonical newHeads subscribe failed: {}", e);
+                            sleep(STREAM_RECONNECT_DELAY).await;
+                            continue;
+                        }
+                    }
+                } else {
+                    match provider.subscribe_blocks().await {
+                        Ok(sub) => Box::pin(sub.into_stream()),
+                        Err(e) => {
+                            warn!("canonical newHeads subscribe failed: {}", e);
+                            sleep(STREAM_RECONNECT_DELAY).await;
+                            continue;
+                        }
+                    }
+                };
 
             info!("canonical head tracker subscribed to newHeads");
 
