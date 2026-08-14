@@ -59,7 +59,7 @@ use tokio::sync::{Mutex, Notify, RwLock};
 
 use crate::amms::caliber_prop::CaliberSwapEvent;
 use tokio::time::{sleep, Duration};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use xlayer_flashblocks::CaliberTxEvent;
 
 #[derive(Clone, Debug, Default)]
@@ -669,6 +669,70 @@ impl<N, P> StateSpaceManager<N, P> {
     /// Subscribes to AMM state changes and includes lightweight realtime metadata
     /// for latency attribution in downstream consumers.
     pub async fn subscribe_with_meta(
+        &self,
+    ) -> Result<
+        Pin<
+            Box<
+                dyn Stream<Item = Result<(RealtimeUpdateMeta, Vec<Address>), StateSpaceError>>
+                    + Send,
+            >,
+        >,
+        StateSpaceError,
+    >
+    where
+        P: Provider<N> + Clone + 'static,
+        N: Network,
+    {
+        self.build_realtime_stream().await
+    }
+
+    /// 自动启动完备的 realtime 状态同步（内部消费流），**不产出 affected pools 通知**。
+    ///
+    /// 用于"只维护状态、不触发下游检测"的场景（如 core 的 pending-only 模式）：
+    /// 状态应用在流内部完成（含按链实时源 + `pending_sync_worker` /
+    /// `silent_drift_probe` 等后台任务，见 `ensure_background_tasks`），
+    /// 本方法只负责消费流，affected pools 仅用于日志，不转发下游。
+    ///
+    /// 流自带重连 loop，任务长期运行；返回 `JoinHandle` 供调用方监控
+    /// （与外部消费路径的 `subscribe_with_meta` 互斥：二选一启动，不可同时消费）。
+    /// 幂等：重复调用安全（`ensure_background_tasks` 内部 AtomicBool；流构造无副作用）。
+    pub async fn spawn_realtime_state_sync(
+        &self,
+    ) -> Result<tokio::task::JoinHandle<()>, StateSpaceError>
+    where
+        P: Provider<N> + Clone + 'static,
+        N: Network,
+    {
+        let stream = self.build_realtime_stream().await?;
+        Ok(tokio::spawn(async move {
+            let mut stream = stream;
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok((meta, addrs)) => {
+                        // 状态应用已在流内部完成；affected pools 仅用于日志，不转发下游
+                        debug!(
+                            seq = meta.seq,
+                            block = meta.block_number,
+                            affected = addrs.len(),
+                            "realtime state sync (no downstream notification)"
+                        );
+                    }
+                    Err(e) => {
+                        debug!(error = ?e, "realtime state sync stream item error");
+                    }
+                }
+            }
+            warn!("realtime state sync stream ended");
+        }))
+    }
+
+    /// 构造 realtime 状态流（不消费）：按链 resolve source + ensure_background_tasks
+    /// + match 分发四种 subscribe_*_stream。
+    ///
+    /// `subscribe_with_meta`（外部消费，产出 affected pools 通知）与
+    /// `spawn_realtime_state_sync`（内部消费，只维护状态）共用同一构造路径，
+    /// 保证两种模式下实时同步覆盖与后台任务完全一致。
+    async fn build_realtime_stream(
         &self,
     ) -> Result<
         Pin<
