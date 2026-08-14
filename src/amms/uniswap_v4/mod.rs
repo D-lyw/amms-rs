@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::collections::HashMap;
 
 use crate::amms::amm::{AutomatedMarketMaker, SyncAction};
@@ -166,8 +167,10 @@ pub struct UniswapV4Pool {
     /// low 12 bits are 0->1 (zeroForOne), high 12 bits are 1->0 (oneForZero).
     pub protocol_fee: u32,
     pub lp_fee: u32,
-    pub tick_bitmap: HashMap<i16, U256>,
-    pub ticks: HashMap<i32, Info>,
+    /// 只读背景数据（swap 模拟/链上 swap 均不修改，仅 Mint/Burn 同步时写入）：
+    /// Arc 共享使 `Clone` 退化为 O(1) 引用计数，pending 模拟链每事件少一次 O(N) 深拷贝。
+    pub tick_bitmap: Arc<HashMap<i16, U256>>,
+    pub ticks: Arc<HashMap<i32, Info>>,
     pub token_a_price: f64,
     pub token_b_price: f64,
 }
@@ -896,7 +899,9 @@ impl UniswapV4Pool {
     ) -> Result<(), AMMError> {
         let flipped;
         {
-            let info = self.ticks.entry(tick).or_insert(Info::new(0, 0, false));
+            let info = Arc::make_mut(&mut self.ticks)
+                .entry(tick)
+                .or_insert(Info::new(0, 0, false));
             let liquidity_gross_before = info.liquidity_gross;
 
             let liquidity_gross_after = if liquidity_delta < 0 {
@@ -932,10 +937,11 @@ impl UniswapV4Pool {
         let (word_pos, bit_pos) = uniswap_v3_math::tick_bitmap::position(compressed);
         let mask = U256::from(1) << bit_pos;
 
-        if let Some(word) = self.tick_bitmap.get_mut(&word_pos) {
+        let bitmap = Arc::make_mut(&mut self.tick_bitmap);
+        if let Some(word) = bitmap.get_mut(&word_pos) {
             *word ^= mask;
         } else {
-            self.tick_bitmap.insert(word_pos, mask);
+            bitmap.insert(word_pos, mask);
         }
     }
 }

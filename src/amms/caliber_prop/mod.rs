@@ -65,7 +65,7 @@ use alloy::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use tracing::instrument;
 
 use crate::amms::{
@@ -1266,8 +1266,8 @@ impl CaliberPropPool {
         // 快照因过期/暂停返回空 ladder 时保留最近一次有效 ladder + consumed，
         // 使后续实时更新（刷新 deadline）能立即恢复报价，而不是等下一轮对账。
         if !snap.ladder.is_empty() {
-            self.ladder.ladder_a_to_b = snap.ladder.clone();
-            self.ladder.ladder_b_to_a = snap.ladder;
+            self.ladder.ladder_a_to_b = Arc::new(snap.ladder.clone());
+            self.ladder.ladder_b_to_a = Arc::new(snap.ladder);
             self.ladder.consumed_in_ab = U256::ZERO;
             self.ladder.consumed_out_ab = U256::ZERO;
             self.ladder.consumed_in_ba = U256::ZERO;
@@ -2447,8 +2447,8 @@ mod tests {
                 amount_out: U256::from(1000000000u64),
             },
         ];
-        pool.ladder.ladder_a_to_b = ladder.clone();
-        pool.ladder.ladder_b_to_a = ladder;
+        pool.ladder.ladder_a_to_b = Arc::new(ladder.clone());
+        pool.ladder.ladder_b_to_a = Arc::new(ladder);
         pool.ladder.field0 = U256::from(75111231784u64);
         pool.ladder.field1 = U256::from(283u64);
         pool.ladder.fee_rate = U256::from(200u64);
@@ -2734,7 +2734,7 @@ mod tests {
             price_a_in_b: 1.0,
             price_b_in_a: 1.0,
         };
-        pool.ladder.ladder_a_to_b = vec![
+        pool.ladder.ladder_a_to_b = Arc::new(vec![
             LadderPoint {
                 amount_in: U256::from(10u64),
                 amount_out: U256::from(200000000u64),
@@ -2747,7 +2747,7 @@ mod tests {
                 amount_in: U256::from(300u64),
                 amount_out: U256::from(1000000000u64),
             },
-        ];
+        ]);
         pool.ladder.field0 = U256::from(75111231784u64);
         pool.ladder.field1 = U256::from(283u64);
 
@@ -2796,7 +2796,7 @@ mod tests {
             price_a_in_b: 1.0,
             price_b_in_a: 1.0,
         };
-        pool.ladder.ladder_a_to_b = vec![
+        pool.ladder.ladder_a_to_b = Arc::new(vec![
             LadderPoint {
                 amount_in: U256::from(10u64),
                 amount_out: U256::from(200_000_000u64),
@@ -2809,7 +2809,7 @@ mod tests {
                 amount_in: U256::from(300u64),
                 amount_out: U256::from(1_000_000_000u64),
             },
-        ];
+        ]);
         pool.ladder.field0 = U256::from(225133337972u64);
         pool.ladder.field1 = U256::from(298u64);
         pool.ladder.fee_rate = U256::from(200u64);
@@ -3158,7 +3158,7 @@ mod tests {
             price_a_in_b: 0.0,
             price_b_in_a: 0.0,
         };
-        pool.ladder.ladder_a_to_b = vec![
+        pool.ladder.ladder_a_to_b = Arc::new(vec![
             LadderPoint {
                 amount_in: U256::from(10u64),
                 amount_out: U256::from(200_000_000u64),
@@ -3171,8 +3171,8 @@ mod tests {
                 amount_in: U256::from(300u64),
                 amount_out: U256::from(1_000_000_000u64),
             },
-        ];
-        pool.ladder.ladder_b_to_a = pool.ladder.ladder_a_to_b.clone();
+        ]);
+        pool.ladder.ladder_b_to_a = Arc::new((*pool.ladder.ladder_a_to_b).clone());
         pool.ladder.field0 = U256::from(219_438_865_054u64);
         pool.ladder.field1 = U256::from(296u64);
         pool.ladder.fee_rate = U256::from(200u64);
@@ -3378,7 +3378,7 @@ mod tests {
             price_a_in_b: 0.0,
             price_b_in_a: 0.0,
         };
-        pool.ladder.ladder_a_to_b = vec![
+        pool.ladder.ladder_a_to_b = Arc::new(vec![
             LadderPoint {
                 amount_in: U256::from(10u64),
                 amount_out: U256::from(200_000_000u64),
@@ -3391,8 +3391,8 @@ mod tests {
                 amount_in: U256::from(300u64),
                 amount_out: U256::from(1_000_000_000u64),
             },
-        ];
-        pool.ladder.ladder_b_to_a = pool.ladder.ladder_a_to_b.clone();
+        ]);
+        pool.ladder.ladder_b_to_a = Arc::new((*pool.ladder.ladder_a_to_b).clone());
         pool.ladder.field0 = U256::from(219_438_865_054u64);
         pool.ladder.field1 = U256::from(296u64);
         pool.ladder.fee_rate = U256::from(200u64);

@@ -20,6 +20,7 @@ use futures::{stream::FuturesUnordered, StreamExt};
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 use tracing::{info, warn};
 use uniswap_v3_math::tick_math::{MAX_TICK, MIN_TICK};
@@ -399,7 +400,7 @@ impl AlgebraIntegralFactory {
     {
         let contract = IAlgebraPool::new(pool.inner.address, provider);
         let root = contract.tickTreeRoot().block(block).call().await?;
-        pool.inner.tick_bitmap.clear();
+        Arc::make_mut(&mut pool.inner.tick_bitmap).clear();
 
         for node_idx in 0..ALGEBRA_TICK_TREE_ROOT_BITS {
             if (root & (1u32 << node_idx)) == 0 {
@@ -466,7 +467,7 @@ impl AlgebraIntegralFactory {
                     liquidity_net: data.liquidityDelta,
                     initialized: liquidity_gross > 0,
                 };
-                pool.inner.ticks.insert(*tick, info);
+                Arc::make_mut(&mut pool.inner.ticks).insert(*tick, info);
             }
         }
 
@@ -735,7 +736,7 @@ impl AlgebraIntegralFactory {
                         let AMM::AlgebraIntegralPool(pool) = pool else {
                             continue;
                         };
-                        pool.inner.tick_bitmap.clear();
+                        Arc::make_mut(&mut pool.inner.tick_bitmap).clear();
                         for chunk in tables.chunks_exact(2) {
                             let word_pos = I256::from_raw(chunk[0]).as_i16();
                             let bitmap = chunk[1];
@@ -756,7 +757,7 @@ impl AlgebraIntegralFactory {
                 let AMM::AlgebraIntegralPool(pool) = pool else {
                     continue;
                 };
-                pool.inner.tick_bitmap.clear();
+                Arc::make_mut(&mut pool.inner.tick_bitmap).clear();
                 for chunk in tables.chunks_exact(2) {
                     let word_pos = I256::from_raw(chunk[0]).as_i16();
                     let bitmap = chunk[1];
@@ -871,7 +872,7 @@ impl AlgebraIntegralFactory {
                                 liquidity_net: tick_data.2,
                                 initialized: tick_data.0,
                             };
-                            pool.inner.ticks.insert(tick_idx.as_i32(), info);
+                            Arc::make_mut(&mut pool.inner.ticks).insert(tick_idx.as_i32(), info);
                         }
                     }
                     sleep(Duration::from_millis(2)).await;
@@ -896,7 +897,7 @@ impl AlgebraIntegralFactory {
                         liquidity_net: tick_data.2,
                         initialized: tick_data.0,
                     };
-                    pool.inner.ticks.insert(tick_idx.as_i32(), info);
+                    Arc::make_mut(&mut pool.inner.ticks).insert(tick_idx.as_i32(), info);
                 }
             }
             sleep(Duration::from_millis(2)).await;
@@ -1237,8 +1238,8 @@ impl AlgebraIntegralFactory {
 
         for amm in &mut pools {
             if let AMM::AlgebraIntegralPool(pool) = amm {
-                pool.inner.tick_bitmap.clear();
-                pool.inner.ticks.clear();
+                Arc::make_mut(&mut pool.inner.tick_bitmap).clear();
+                Arc::make_mut(&mut pool.inner.ticks).clear();
                 // Clear stale timepoint cache — will be re-seeded below.
                 pool.timepoints = None;
                 pool.fee_config = None;
@@ -1430,8 +1431,7 @@ impl AlgebraIntegralPool {
             let compressed = raw_tick / spacing;
             let (word_pos, bit_pos) = uniswap_v3_math::tick_bitmap::position(compressed);
             let compressed_mask = U256::from(1u8) << U256::from(bit_pos as u32);
-            self.inner
-                .tick_bitmap
+            Arc::make_mut(&mut self.inner.tick_bitmap)
                 .entry(word_pos)
                 .and_modify(|word| *word |= compressed_mask)
                 .or_insert(compressed_mask);
@@ -1445,7 +1445,7 @@ impl AlgebraIntegralPool {
             return ticks;
         }
 
-        for (&word_pos, &bitmap) in &self.inner.tick_bitmap {
+        for (&word_pos, &bitmap) in self.inner.tick_bitmap.iter() {
             if bitmap == U256::ZERO {
                 continue;
             }
@@ -2006,8 +2006,8 @@ impl AutomatedMarketMaker for AlgebraIntegralPool {
 
         AlgebraIntegralFactory::sync_pool_state::<N, _>(&mut self, block_number, provider.clone())
             .await?;
-        self.inner.tick_bitmap.clear();
-        self.inner.ticks.clear();
+        Arc::make_mut(&mut self.inner.tick_bitmap).clear();
+        Arc::make_mut(&mut self.inner.ticks).clear();
 
         AlgebraIntegralFactory::sync_tick_table_for_pool::<N, _>(
             &mut self,

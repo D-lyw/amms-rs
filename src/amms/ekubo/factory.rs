@@ -414,7 +414,8 @@ impl EkuboFactory {
                     for (i, bitmap) in bitmaps.iter().enumerate() {
                         if !bitmap.is_zero() {
                             let word = (min_word + i as i64) as i32;
-                            ekubo_pool.tick_bitmap.insert(word, *bitmap);
+                            std::sync::Arc::make_mut(&mut ekubo_pool.tick_bitmap)
+                                .insert(word, *bitmap);
                         }
                     }
 
@@ -605,7 +606,7 @@ impl EkuboFactory {
                         for (tick_data, &tick) in tick_info_vec.iter().zip(ticks.iter()) {
                             if tick_data.0 {
                                 // initialized
-                                ekubo_pool.ticks.insert(
+                                std::sync::Arc::make_mut(&mut ekubo_pool.ticks).insert(
                                     tick,
                                     TickInfo {
                                         liquidity_gross: tick_data.1,

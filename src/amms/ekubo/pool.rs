@@ -92,8 +92,10 @@ pub struct EkuboPool {
     pub tick_spacing: i32,
 
     // Tick 数据（与 UniswapV3 相同）
-    pub tick_bitmap: HashMap<i32, U256>,
-    pub ticks: HashMap<i32, TickInfo>,
+    ///
+    /// Arc 包裹：swap_mut 只读背景数据，避免模拟前 clone 整张 bitmap。
+    pub tick_bitmap: std::sync::Arc<HashMap<i32, U256>>,
+    pub ticks: std::sync::Arc<HashMap<i32, TickInfo>>,
 
     // 缓存价格
     #[serde(default)]
@@ -784,7 +786,7 @@ impl EkuboPool {
     /// Update tick data from PositionUpdated event
     /// This handles both liquidity_gross and liquidity_net updates, plus tick_bitmap flipping
     fn update_tick_from_event(&mut self, tick: i32, liquidity_delta: i128, is_upper: bool) {
-        let info = self.ticks.entry(tick).or_default();
+        let info = std::sync::Arc::make_mut(&mut self.ticks).entry(tick).or_default();
 
         let liquidity_gross_before = info.liquidity_gross;
 
@@ -821,7 +823,7 @@ impl EkuboPool {
 
         // Remove tick entry if it's now empty
         if liquidity_gross_after == 0 {
-            self.ticks.remove(&tick);
+            std::sync::Arc::make_mut(&mut self.ticks).remove(&tick);
         }
     }
 
@@ -986,10 +988,10 @@ impl EkuboPool {
 
         if liquidity_delta < 0 {
             if flipped_lower {
-                self.ticks.remove(&tick_lower);
+                std::sync::Arc::make_mut(&mut self.ticks).remove(&tick_lower);
             }
             if flipped_upper {
-                self.ticks.remove(&tick_upper);
+                std::sync::Arc::make_mut(&mut self.ticks).remove(&tick_upper);
             }
         }
 
@@ -1003,7 +1005,7 @@ impl EkuboPool {
         liquidity_delta: i128,
         upper: bool,
     ) -> Result<bool, AMMError> {
-        let info = self.ticks.entry(tick).or_default();
+        let info = std::sync::Arc::make_mut(&mut self.ticks).entry(tick).or_default();
 
         let liquidity_gross_before = info.liquidity_gross;
 
@@ -1062,14 +1064,14 @@ impl EkuboPool {
         let bit_pos = (raw_index % 256) as u8;
         let mask = U256::from(1) << bit_pos;
 
-        if let Some(word) = self.tick_bitmap.get_mut(&word_pos) {
+        if let Some(word) = std::sync::Arc::make_mut(&mut self.tick_bitmap).get_mut(&word_pos) {
             if initialized {
                 *word |= mask;
             } else {
                 *word &= !mask;
             }
         } else if initialized {
-            self.tick_bitmap.insert(word_pos, mask);
+            std::sync::Arc::make_mut(&mut self.tick_bitmap).insert(word_pos, mask);
         }
     }
 }

@@ -3,6 +3,7 @@
 //! 通过 `getAllPairIds` + `eth_getStorageAt` 发现链上池子。
 //! Caliber 无池子创建事件，无法通过 sync_events 增量同步。
 
+use std::sync::Arc;
 use alloy::{
     eips::BlockId,
     hex::FromHex,
@@ -428,8 +429,8 @@ where
 impl Default for super::types::CaliberLadderState {
     fn default() -> Self {
         Self {
-            ladder_a_to_b: Vec::new(),
-            ladder_b_to_a: Vec::new(),
+            ladder_a_to_b: Arc::new(Vec::new()),
+            ladder_b_to_a: Arc::new(Vec::new()),
             consumed_in_ab: U256::ZERO,
             consumed_out_ab: U256::ZERO,
             consumed_in_ba: U256::ZERO,

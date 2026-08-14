@@ -1,5 +1,6 @@
 use alloy::primitives::U256;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// Ladder 定价曲线的一个段点
 ///
@@ -25,9 +26,10 @@ pub struct LadderPoint {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CaliberLadderState {
     /// token_a → token_b 方向的定价阶梯（= 合约原始 ladder）
-    pub ladder_a_to_b: Vec<LadderPoint>,
+    /// Arc 共享：swap 模拟只读 ladder（仅 reserve 标量写回），Clone 退化为 O(1)。
+    pub ladder_a_to_b: Arc<Vec<LadderPoint>>,
     /// token_b → token_a 方向的定价阶梯（= 合约原始 ladder）
-    pub ladder_b_to_a: Vec<LadderPoint>,
+    pub ladder_b_to_a: Arc<Vec<LadderPoint>>,
     /// a→b 方向已消费的输入量（区间累计）
     pub consumed_in_ab: U256,
     /// a→b 方向已消费的输出量（区间累计）

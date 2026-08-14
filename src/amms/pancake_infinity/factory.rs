@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 
@@ -413,7 +414,7 @@ impl PancakeInfinityFactory {
                                 }
                                 let (liquidity_gross, liquidity_net) =
                                     decode_liquidity_gross_and_net(B256::from(word));
-                                manager_pools[pool_idx].ticks.insert(
+                                Arc::make_mut(&mut manager_pools[pool_idx].ticks).insert(
                                     tick,
                                     crate::amms::uniswap_v3::Info {
                                         liquidity_gross,
@@ -526,7 +527,8 @@ impl PancakeInfinityFactory {
                                     continue;
                                 }
                                 let bitmap = U256::from_be_bytes(bitmap_word.0);
-                                manager_pools[pool_idx].tick_bitmap.insert(word, bitmap);
+                                Arc::make_mut(&mut manager_pools[pool_idx].tick_bitmap)
+                                    .insert(word, bitmap);
                             }
                         }
                         Err(err) => {
@@ -574,8 +576,8 @@ impl PancakeInfinityFactory {
 
         // Clear previous tick data to prevent stale data buildup
         for pool in pools.iter_mut() {
-            pool.tick_bitmap.clear();
-            pool.ticks.clear();
+            Arc::make_mut(&mut pool.tick_bitmap).clear();
+            Arc::make_mut(&mut pool.ticks).clear();
         }
 
         failed_pool_ids
@@ -672,8 +674,8 @@ impl PancakeInfinityFactory {
 
         // Clear previous tick data to prevent stale data buildup
         for pool in pools.iter_mut() {
-            pool.tick_bitmap.clear();
-            pool.ticks.clear();
+            Arc::make_mut(&mut pool.tick_bitmap).clear();
+            Arc::make_mut(&mut pool.ticks).clear();
         }
 
         failed_pool_ids
@@ -760,8 +762,8 @@ impl AutomatedMarketMakerFactory for PancakeInfinityFactory {
             liquidity: 0,
             protocol_fee: 0,
             manager_address: self.address,
-            tick_bitmap: HashMap::new(),
-            ticks: HashMap::new(),
+            tick_bitmap: Arc::new(HashMap::new()),
+            ticks: Arc::new(HashMap::new()),
             last_synced_block: 0,
             token_a_price: 0.0,
             token_b_price: 0.0,

@@ -26,6 +26,7 @@ use alloy::{
     sol_types::{SolCall, SolEvent, SolValue},
     transports::BoxFuture,
 };
+use std::sync::Arc;
 
 const MULTICALL3_ADDRESS: Address = address!("cA11bde05977b3631167028862bE2a173976CA11");
 sol! {
@@ -254,9 +255,11 @@ pub struct AerodromeSlipstreamPool {
     /// Tick spacing (typically 2x Uniswap V3)
     pub tick_spacing: i32,
     /// Tick bitmap for efficient initialized tick lookup
-    pub tick_bitmap: std::collections::HashMap<i16, U256>,
+    ///
+    /// Arc 包裹：swap_mut 只读背景数据，避免模拟前 clone 整张 bitmap。
+    pub tick_bitmap: std::sync::Arc<std::collections::HashMap<i16, U256>>,
     /// Tick data (liquidity_net, liquidity_gross, fee_growth, etc.)
-    pub ticks: std::collections::HashMap<i32, TickInfo>,
+    pub ticks: std::sync::Arc<std::collections::HashMap<i32, TickInfo>>,
     /// Cached price of token A in terms of token B
     #[serde(default)]
     pub token_a_price: f64,
@@ -1712,15 +1715,15 @@ impl AerodromeSlipstreamPool {
                 self.preview_tick_update(tick_upper, liquidity_delta, true)?;
 
             if lower_info.liquidity_gross == 0 {
-                self.ticks.remove(&tick_lower);
+                Arc::make_mut(&mut self.ticks).remove(&tick_lower);
             } else {
-                self.ticks.insert(tick_lower, lower_info);
+                Arc::make_mut(&mut self.ticks).insert(tick_lower, lower_info);
             }
 
             if upper_info.liquidity_gross == 0 {
-                self.ticks.remove(&tick_upper);
+                Arc::make_mut(&mut self.ticks).remove(&tick_upper);
             } else {
-                self.ticks.insert(tick_upper, upper_info);
+                Arc::make_mut(&mut self.ticks).insert(tick_upper, upper_info);
             }
 
             if flipped_lower {
@@ -1757,14 +1760,14 @@ impl AerodromeSlipstreamPool {
         let (word_pos, bit_pos) = uniswap_v3_math::tick_bitmap::position(compressed);
         let mask = U256::from(1) << bit_pos;
 
-        if let Some(word) = self.tick_bitmap.get_mut(&word_pos) {
+        if let Some(word) = Arc::make_mut(&mut self.tick_bitmap).get_mut(&word_pos) {
             if initialized {
                 *word |= mask;
             } else {
                 *word &= !mask;
             }
         } else if initialized {
-            self.tick_bitmap.insert(word_pos, mask);
+            Arc::make_mut(&mut self.tick_bitmap).insert(word_pos, mask);
         }
     }
 
@@ -2359,7 +2362,8 @@ impl AerodromeSlipstreamFactory {
                         for chunk in tick_bitmaps.chunks_exact(2) {
                             let word_pos = I256::from_raw(chunk[0]).as_i16();
                             let tick_bitmap = chunk[1];
-                            slipstream_pool.tick_bitmap.insert(word_pos, tick_bitmap);
+                            Arc::make_mut(&mut slipstream_pool.tick_bitmap)
+                                .insert(word_pos, tick_bitmap);
                         }
                     }
 
@@ -2402,7 +2406,7 @@ impl AerodromeSlipstreamFactory {
                 for chunk in tick_bitmaps.chunks_exact(2) {
                     let word_pos = I256::from_raw(chunk[0]).as_i16();
                     let tick_bitmap = chunk[1];
-                    slipstream_pool.tick_bitmap.insert(word_pos, tick_bitmap);
+                    Arc::make_mut(&mut slipstream_pool.tick_bitmap).insert(word_pos, tick_bitmap);
                 }
             }
 
@@ -2579,7 +2583,7 @@ impl AerodromeSlipstreamFactory {
                                 liquidity_net: tick.1,
                                 initialized: tick.0 > 0,
                             };
-                            slipstream_pool.ticks.insert(tick_idx.as_i32(), info);
+                            Arc::make_mut(&mut slipstream_pool.ticks).insert(tick_idx.as_i32(), info);
                         }
                     }
 
@@ -2625,7 +2629,7 @@ impl AerodromeSlipstreamFactory {
                         liquidity_net: tick.1,
                         initialized: tick.0 > 0,
                     };
-                    slipstream_pool.ticks.insert(tick_idx.as_i32(), info);
+                    Arc::make_mut(&mut slipstream_pool.ticks).insert(tick_idx.as_i32(), info);
                 }
             }
 
@@ -3037,8 +3041,8 @@ impl AerodromeSlipstreamFactory {
             let AMM::AerodromeSlipstreamPool(pool) = amm else {
                 continue;
             };
-            pool.tick_bitmap.clear();
-            pool.ticks.clear();
+            Arc::make_mut(&mut pool.tick_bitmap).clear();
+            Arc::make_mut(&mut pool.ticks).clear();
         }
 
         let pools_step = 30;
@@ -3238,7 +3242,7 @@ mod tests {
     #[test]
     fn modify_position_is_atomic_on_upper_tick_failure() {
         let mut pool = seeded_pool(150);
-        pool.ticks.insert(
+        std::sync::Arc::make_mut(&mut pool.ticks).insert(
             100,
             TickInfo {
                 liquidity_gross: 1,
@@ -3246,7 +3250,7 @@ mod tests {
                 initialized: true,
             },
         );
-        pool.tick_bitmap.insert(0, U256::from(1) << 100usize);
+        std::sync::Arc::make_mut(&mut pool.tick_bitmap).insert(0, U256::from(1) << 100usize);
         pool.liquidity = 1;
 
         let before = pool.clone();

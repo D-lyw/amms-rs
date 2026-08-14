@@ -14,6 +14,7 @@ use amms::amms::{
     Token,
 };
 use std::collections::HashMap;
+use std::sync::Arc;
 
 // Pancake Infinity CLPoolManager on BNB Chain
 #[allow(dead_code)]
@@ -77,8 +78,8 @@ fn create_test_pool(
         tick_spacing,
         protocol_fee,
         lp_fee,
-        tick_bitmap: HashMap::new(),
-        ticks: HashMap::new(),
+        tick_bitmap: Arc::new(HashMap::new()),
+        ticks: Arc::new(HashMap::new()),
         token_a_price: 0.0,
         token_b_price: 0.0,
     }
@@ -112,7 +113,7 @@ fn create_pool_with_ticks(
 
     for &(tick_idx, liquidity_gross, liquidity_net) in initialized_ticks {
         // Add tick info
-        pool.ticks.insert(
+        Arc::make_mut(&mut pool.ticks).insert(
             tick_idx,
             Info {
                 liquidity_gross,
@@ -129,7 +130,7 @@ fn create_pool_with_ticks(
         };
         let (word_pos, bit_pos) = uniswap_v3_math::tick_bitmap::position(compressed);
         let mask = U256::from(1) << bit_pos;
-        pool.tick_bitmap
+        Arc::make_mut(&mut pool.tick_bitmap)
             .entry(word_pos)
             .and_modify(|w| *w |= mask)
             .or_insert(mask);

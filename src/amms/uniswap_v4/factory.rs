@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::time::Duration;
@@ -452,7 +453,7 @@ impl UniswapV4Factory {
                                 let (liquidity_gross, liquidity_net) =
                                     decode_liquidity_gross_and_net(B256::from(word));
 
-                                manager_pools[pool_idx].ticks.insert(
+                                Arc::make_mut(&mut manager_pools[pool_idx].ticks).insert(
                                     tick,
                                     Info {
                                         liquidity_gross,
@@ -575,7 +576,8 @@ impl UniswapV4Factory {
                                 }
 
                                 let bitmap = U256::from_be_bytes(bitmap_word.0);
-                                manager_pools[pool_idx].tick_bitmap.insert(word, bitmap);
+                                Arc::make_mut(&mut manager_pools[pool_idx].tick_bitmap)
+                                    .insert(word, bitmap);
                             }
                         }
                         Err(err) => {
@@ -724,8 +726,8 @@ impl UniswapV4Factory {
 
         // Clear previous tick data to prevent stale data buildup
         for pool in pools.iter_mut() {
-            pool.tick_bitmap.clear();
-            pool.ticks.clear();
+            Arc::make_mut(&mut pool.tick_bitmap).clear();
+            Arc::make_mut(&mut pool.ticks).clear();
         }
 
         failed_pool_ids
@@ -817,8 +819,8 @@ impl AutomatedMarketMakerFactory for UniswapV4Factory {
             liquidity: 0,
             protocol_fee: 0,
             manager_address: self.address,
-            tick_bitmap: HashMap::new(),
-            ticks: HashMap::new(),
+            tick_bitmap: Arc::new(HashMap::new()),
+            ticks: Arc::new(HashMap::new()),
             token_a_price: 0.0,
             token_b_price: 0.0,
         }))

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use super::{
     amm::{AutomatedMarketMaker, SyncAction, AMM},
     consts::{MIN_V3_LIQUIDITY, MPFR_T_PRECISION},
@@ -89,8 +91,10 @@ pub struct PancakeV3Pool {
     pub fee: u32,
     pub tick: i32,
     pub tick_spacing: i32,
-    pub tick_bitmap: HashMap<i16, U256>,
-    pub ticks: HashMap<i32, Info>,
+    /// 只读背景数据（swap 模拟/链上 swap 均不修改，仅 Mint/Burn 同步时写入）：
+    /// Arc 共享使 `Clone` 退化为 O(1) 引用计数，pending 模拟链每事件少一次 O(N) 深拷贝。
+    pub tick_bitmap: Arc<HashMap<i16, U256>>,
+    pub ticks: Arc<HashMap<i32, Info>>,
     #[serde(default)]
     pub token_a_price: f64,
     #[serde(default)]
@@ -934,11 +938,12 @@ impl PancakeV3Pool {
         }
 
         if liquidity_delta < 0 {
+            let ticks = Arc::make_mut(&mut self.ticks);
             if flipped_lower {
-                self.ticks.remove(&tick_lower);
+                ticks.remove(&tick_lower);
             }
             if flipped_upper {
-                self.ticks.remove(&tick_upper);
+                ticks.remove(&tick_upper);
             }
         }
         Ok(())
@@ -950,7 +955,7 @@ impl PancakeV3Pool {
         liquidity_delta: i128,
         upper: bool,
     ) -> Result<bool, AMMError> {
-        let info = self.ticks.entry(tick).or_default();
+        let info = Arc::make_mut(&mut self.ticks).entry(tick).or_default();
         let liquidity_gross_before = info.liquidity_gross;
         let liquidity_gross_after = if liquidity_delta < 0 {
             liquidity_gross_before
@@ -983,7 +988,8 @@ impl PancakeV3Pool {
         let (word_pos, bit_pos) = uniswap_v3_math::tick_bitmap::position(compressed);
         let mask = U256::from(1) << bit_pos;
 
-        if let Some(word) = self.tick_bitmap.get_mut(&word_pos) {
+        let bitmap = Arc::make_mut(&mut self.tick_bitmap);
+        if let Some(word) = bitmap.get_mut(&word_pos) {
             if initialized {
                 *word |= mask;
             } else {
@@ -991,7 +997,7 @@ impl PancakeV3Pool {
             }
         } else {
             if initialized {
-                self.tick_bitmap.insert(word_pos, mask);
+                bitmap.insert(word_pos, mask);
             }
         }
     }
@@ -1324,8 +1330,8 @@ impl PancakeV3Factory {
         // 4. Clear stale tick data before re-syncing to avoid residual entries
         for amm in pools.iter_mut() {
             if let AMM::PancakeV3Pool(p) = amm {
-                p.tick_bitmap.clear();
-                p.ticks.clear();
+                Arc::make_mut(&mut p.tick_bitmap).clear();
+                Arc::make_mut(&mut p.ticks).clear();
             }
         }
 
@@ -1549,7 +1555,7 @@ impl PancakeV3Factory {
                         for chunk in tick_bitmaps.chunks_exact(2) {
                             let word_pos = I256::from_raw(chunk[0]).as_i16();
                             let tick_bitmap = chunk[1];
-                            pv3_pool.tick_bitmap.insert(word_pos, tick_bitmap);
+                            Arc::make_mut(&mut pv3_pool.tick_bitmap).insert(word_pos, tick_bitmap);
                         }
                     }
 
@@ -1573,7 +1579,7 @@ impl PancakeV3Factory {
                 for chunk in tick_bitmaps.chunks_exact(2) {
                     let word_pos = I256::from_raw(chunk[0]).as_i16();
                     let tick_bitmap = chunk[1];
-                    pv3_pool.tick_bitmap.insert(word_pos, tick_bitmap);
+                    Arc::make_mut(&mut pv3_pool.tick_bitmap).insert(word_pos, tick_bitmap);
                 }
             }
 
@@ -1704,7 +1710,7 @@ impl PancakeV3Factory {
                                 liquidity_net: tick.2,
                                 initialized: tick.0,
                             };
-                            pv3_pool.ticks.insert(tick_idx.as_i32(), info);
+                            Arc::make_mut(&mut pv3_pool.ticks).insert(tick_idx.as_i32(), info);
                         }
                     }
 
@@ -1731,7 +1737,7 @@ impl PancakeV3Factory {
                         liquidity_net: tick.2,
                         initialized: tick.0,
                     };
-                    pv3_pool.ticks.insert(tick_idx.as_i32(), info);
+                    Arc::make_mut(&mut pv3_pool.ticks).insert(tick_idx.as_i32(), info);
                 }
             }
 

@@ -1,6 +1,7 @@
 //! 说明：Pancake Infinity 目前仅部署在 BNB Chain；本套利系统主要运行在
 //! Ethereum 主网，因此该模块实现尚未进行充分的链上测试与验证。请在 BNB
 //! Chain 环境下进一步验证后再用于生产。
+use std::sync::Arc;
 use std::collections::HashMap;
 
 use alloy::eips::BlockId;
@@ -78,8 +79,10 @@ pub struct PancakeInfinityPool {
     pub tick_spacing: i32,
     pub protocol_fee: u32,
     pub lp_fee: u32,
-    pub tick_bitmap: HashMap<i16, U256>,
-    pub ticks: HashMap<i32, Info>,
+    /// 只读背景数据（swap 模拟/链上 swap 均不修改，仅 Mint/Burn 同步时写入）：
+    /// Arc 共享使 `Clone` 退化为 O(1) 引用计数，pending 模拟链每事件少一次 O(N) 深拷贝。
+    pub tick_bitmap: Arc<HashMap<i16, U256>>,
+    pub ticks: Arc<HashMap<i32, Info>>,
     pub token_a_price: f64,
     pub token_b_price: f64,
 }
@@ -719,7 +722,9 @@ impl PancakeInfinityPool {
     ) -> Result<(), AMMError> {
         let flipped;
         {
-            let info = self.ticks.entry(tick).or_insert(Info::new(0, 0, false));
+            let info = Arc::make_mut(&mut self.ticks)
+                .entry(tick)
+                .or_insert(Info::new(0, 0, false));
             let before = info.liquidity_gross;
             let after = if liquidity_delta < 0 {
                 info.liquidity_gross - ((-liquidity_delta) as u128)
@@ -747,10 +752,11 @@ impl PancakeInfinityPool {
         let compressed = compress_tick(tick, tick_spacing);
         let (word_pos, bit_pos) = uniswap_v3_math::tick_bitmap::position(compressed);
         let mask = U256::from(1) << bit_pos;
-        if let Some(word) = self.tick_bitmap.get_mut(&word_pos) {
+        let bitmap = Arc::make_mut(&mut self.tick_bitmap);
+        if let Some(word) = bitmap.get_mut(&word_pos) {
             *word ^= mask;
         } else {
-            self.tick_bitmap.insert(word_pos, mask);
+            bitmap.insert(word_pos, mask);
         }
     }
 }

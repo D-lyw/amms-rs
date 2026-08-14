@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use super::{
     amm::{AutomatedMarketMaker, SyncAction, AMM},
     consts::{MIN_V3_LIQUIDITY, MPFR_T_PRECISION},
@@ -148,8 +149,10 @@ pub struct UniswapV3Pool {
     pub fee: u32,
     pub tick: i32,
     pub tick_spacing: i32,
-    pub tick_bitmap: HashMap<i16, U256>,
-    pub ticks: HashMap<i32, Info>,
+    /// 只读背景数据（swap 模拟/链上 swap 均不修改，仅 Mint/Burn 同步时写入）：
+    /// Arc 共享使 `Clone` 退化为 O(1) 引用计数，pending 模拟链每事件少一次 O(N) 深拷贝。
+    pub tick_bitmap: Arc<HashMap<i16, U256>>,
+    pub ticks: Arc<HashMap<i32, Info>>,
     #[serde(default)]
     pub token_a_price: f64,
     #[serde(default)]
@@ -1084,12 +1087,15 @@ impl UniswapV3Pool {
         }
 
         if liquidity_delta < 0 {
+            // Mint/Burn 同步路径写 ticks：Arc::make_mut 保证唯一所有权（共享引用存在时复制，
+            // 模拟路径的 Arc 共享不受影响——swap 模拟从不写 map）。
+            let ticks = Arc::make_mut(&mut self.ticks);
             if flipped_lower {
-                self.ticks.remove(&tick_lower);
+                ticks.remove(&tick_lower);
             }
 
             if flipped_upper {
-                self.ticks.remove(&tick_upper);
+                ticks.remove(&tick_upper);
             }
         }
 
@@ -1102,7 +1108,7 @@ impl UniswapV3Pool {
         liquidity_delta: i128,
         upper: bool,
     ) -> Result<bool, AMMError> {
-        let info = self.ticks.entry(tick).or_default();
+        let info = Arc::make_mut(&mut self.ticks).entry(tick).or_default();
 
         let liquidity_gross_before = info.liquidity_gross;
 
@@ -1145,7 +1151,8 @@ impl UniswapV3Pool {
         let (word_pos, bit_pos) = uniswap_v3_math::tick_bitmap::position(compressed);
         let mask = U256::from(1) << bit_pos;
 
-        if let Some(word) = self.tick_bitmap.get_mut(&word_pos) {
+        let bitmap = Arc::make_mut(&mut self.tick_bitmap);
+        if let Some(word) = bitmap.get_mut(&word_pos) {
             if initialized {
                 *word |= mask;
             } else {
@@ -1153,7 +1160,7 @@ impl UniswapV3Pool {
             }
         } else {
             if initialized {
-                self.tick_bitmap.insert(word_pos, mask);
+                bitmap.insert(word_pos, mask);
             }
         }
     }
@@ -1434,8 +1441,8 @@ impl UniswapV3Factory {
         // Clear previous tick data to prevent stale data buildup
         for pool in pools.iter_mut() {
             if let AMM::UniswapV3Pool(uv3_pool) = pool {
-                uv3_pool.tick_bitmap.clear();
-                uv3_pool.ticks.clear();
+                Arc::make_mut(&mut uv3_pool.tick_bitmap).clear();
+                Arc::make_mut(&mut uv3_pool.ticks).clear();
             }
         }
 
@@ -1683,7 +1690,7 @@ impl UniswapV3Factory {
                             let word_pos = I256::from_raw(chunk[0]).as_i16();
                             let tick_bitmap = chunk[1];
 
-                            uv3_pool.tick_bitmap.insert(word_pos, tick_bitmap);
+                            Arc::make_mut(&mut uv3_pool.tick_bitmap).insert(word_pos, tick_bitmap);
                         }
                     }
                     sleep(Duration::from_millis(2)).await;
@@ -1706,7 +1713,7 @@ impl UniswapV3Factory {
                     let word_pos = I256::from_raw(chunk[0]).as_i16();
                     let tick_bitmap = chunk[1];
 
-                    uv3_pool.tick_bitmap.insert(word_pos, tick_bitmap);
+                    Arc::make_mut(&mut uv3_pool.tick_bitmap).insert(word_pos, tick_bitmap);
                 }
             }
             sleep(Duration::from_millis(2)).await;
@@ -1839,7 +1846,7 @@ impl UniswapV3Factory {
                                 initialized: tick.0,
                             };
 
-                            uv3_pool.ticks.insert(tick_idx.as_i32(), info);
+                            Arc::make_mut(&mut uv3_pool.ticks).insert(tick_idx.as_i32(), info);
                         }
                     }
                     sleep(Duration::from_millis(2)).await;
@@ -1865,7 +1872,7 @@ impl UniswapV3Factory {
                         initialized: tick.0,
                     };
 
-                    uv3_pool.ticks.insert(tick_idx.as_i32(), info);
+                    Arc::make_mut(&mut uv3_pool.ticks).insert(tick_idx.as_i32(), info);
                 }
             }
             sleep(Duration::from_millis(2)).await;
