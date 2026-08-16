@@ -594,6 +594,9 @@ impl CaliberPropPool {
         self.ladder.field1 = U256::from(u.flags);
         self.ladder.deadline = u.deadline;
         self.last_synced_block = block_number;
+        // field0/field1 是现货边际价公式的输入，实时更新后必须立即刷新
+        // spot 缓存（否则下游 price filter 会用旧价格直到下一轮对账）。
+        self.refresh_prices();
     }
 
     /// 应用链上 `Swap` 事件（XLayer flashblocks 日志驱动实时消费同步）。
@@ -2756,6 +2759,39 @@ mod tests {
         let expected = 75111231784f64 * (1_000_000f64 - (10f64 + 283f64)) / 1e15;
         assert!(
             (pool.price_a_in_b - expected).abs() < 1e-9,
+            "price_a_in_b={} expected={}",
+            pool.price_a_in_b,
+            expected
+        );
+        assert!((pool.price_b_in_a - 1.0 / expected).abs() < 1e-12);
+    }
+
+    /// 实时更新（batchUpdateParameters）必须立即刷新现货缓存：
+    /// field0/field1 是边际价公式的输入，若只写不读 refresh_prices，
+    /// spot 会滞后到下一轮对账（最长 30s），下游 price filter 用过时价格。
+    #[test]
+    fn test_apply_batch_update_refreshes_spot_price() {
+        let mut pool = test_pool_with_ladder();
+        pool.refresh_prices();
+        let before = pool.price_a_in_b;
+        assert!(before > 0.0);
+
+        let update = CaliberBatchUpdate {
+            pair_id: pool.pair_id,
+            price: U256::from(2_000_000_000_000u64), // 模拟新报价 field0
+            flags: 283,
+            deadline: unix_now() + 3600,
+        };
+        pool.apply_batch_update(&update, 12345);
+
+        // 期望 = field0 * (1e6 - (x0 + field1)) / 1e15（x0=10, field1=283）
+        let expected = 2_000_000_000_000f64 * (1_000_000f64 - 293f64) / 1e15;
+        assert_ne!(
+            pool.price_a_in_b, before,
+            "spot price must refresh on batch update"
+        );
+        assert!(
+            (pool.price_a_in_b - expected).abs() < 1e-6,
             "price_a_in_b={} expected={}",
             pool.price_a_in_b,
             expected
