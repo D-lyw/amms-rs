@@ -251,6 +251,7 @@ pub(super) struct PendingSyncQueue {
 enum PendingExecutionOutcome {
     Applied,
     SkippedStale,
+    DeferredStale(u64),
     MissingPool,
 }
 
@@ -447,6 +448,40 @@ impl PendingSyncQueue {
         if let Some((action, reason)) = enqueue_follow_up {
             self.enqueue(address, action, required_block, reason);
         }
+    }
+
+    /// 把队首任务推迟到更晚的 `required_block`（本地状态已新于目标块时使用）。
+    /// 与 `defer_task` 不同：移除旧队首并以新 `required_block` 重新入队，
+    /// 避免 canonical 落后期间同一任务被反复认领、反复执行链上读取。
+    pub(super) fn postpone(
+        &mut self,
+        address: Address,
+        action: PendingSyncAction,
+        reason: PendingSyncReason,
+        required_block: u64,
+    ) {
+        self.in_flight.remove(&address);
+        let same_block = self
+            .tasks
+            .get(&address)
+            .and_then(|queue| queue.tasks.front())
+            .map(|task| task.required_block == required_block)
+            .unwrap_or(false);
+        if same_block {
+            if let Some(task) = self
+                .tasks
+                .get_mut(&address)
+                .and_then(|queue| queue.tasks.front_mut())
+            {
+                task.next_retry_at = Instant::now();
+                task.retry_count = 0;
+            }
+            return;
+        }
+        if let Some(queue) = self.tasks.get_mut(&address) {
+            queue.tasks.pop_front();
+        }
+        self.enqueue(address, action, required_block, reason);
     }
 }
 
@@ -654,6 +689,14 @@ impl<N, P> StateSpaceManager<N, P> {
                 let Some(local_amm) = ({ state.read().await.get(&address).cloned() }) else {
                     return Ok(PendingExecutionOutcome::MissingPool);
                 };
+                // 新鲜度保护（前置检查，避免无谓的链上点读）：本地实时状态已新于
+                // 目标 canonical 块时，禁止用旧块快照覆盖/回卷；把任务推迟到
+                // canonical 追上本地状态后，再以更新的块做纠错。
+                if local_amm.last_synced_block() > target_block {
+                    return Ok(PendingExecutionOutcome::DeferredStale(
+                        local_amm.last_synced_block(),
+                    ));
+                }
                 let variant = local_amm.variant();
                 let mut refreshed = variant
                     .sync_all_pools::<N, _>(
@@ -670,6 +713,14 @@ impl<N, P> StateSpaceManager<N, P> {
                 };
                 synced.set_last_synced_block(target_block);
                 let mut guard = state.write().await;
+                // 竞态兜底：RPC 读取期间实时流可能已推进，写锁内再校验一次。
+                if let Some(existing) = guard.get(&address) {
+                    if existing.last_synced_block() > target_block {
+                        return Ok(PendingExecutionOutcome::DeferredStale(
+                            existing.last_synced_block(),
+                        ));
+                    }
+                }
                 guard.insert_amm(synced);
                 Ok(PendingExecutionOutcome::Applied)
             }
@@ -769,6 +820,23 @@ impl<N, P> StateSpaceManager<N, P> {
                         .lock()
                         .await
                         .complete_success(address, canonical);
+                }
+                Ok(PendingExecutionOutcome::DeferredStale(deferred_to_block)) => {
+                    warn!(
+                        ?address,
+                        action = ?task.action,
+                        reason = ?task.reason,
+                        first_seen_ms = task.first_seen_at.elapsed().as_millis(),
+                        target_block = canonical,
+                        deferred_to_block = deferred_to_block,
+                        "Pending sync task deferred: local state newer than target block"
+                    );
+                    pending_sync_queue.lock().await.postpone(
+                        address,
+                        task.action,
+                        task.reason,
+                        deferred_to_block,
+                    );
                 }
                 Ok(PendingExecutionOutcome::MissingPool) => {
                     pending_sync_queue.lock().await.drop_task(address);
@@ -2522,6 +2590,72 @@ mod tests {
             1,
             "task should be claimable at canonical boundary"
         );
+    }
+
+    #[test]
+    fn test_pending_queue_postpone_defers_to_newer_block() {
+        let mut queue = PendingSyncQueue::default();
+        let addr = address!("00000000000000000000000000000000000000ad");
+
+        queue.enqueue(
+            addr,
+            PendingSyncAction::Resync,
+            100,
+            PendingSyncReason::Resync,
+        );
+
+        // 本地实时状态已到 120，目标块 100 → 推迟到 120
+        queue.postpone(
+            addr,
+            PendingSyncAction::Resync,
+            PendingSyncReason::Resync,
+            120,
+        );
+
+        // canonical 100 时不应再被认领
+        let none_due = queue.claim_due_non_coverage(100, usize::MAX);
+        assert!(
+            none_due.is_empty(),
+            "deferred task must not be claimable at old block"
+        );
+
+        // canonical 120 时重新可认领，action/reason 保留
+        let due = queue.claim_due_non_coverage(120, usize::MAX);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].1.required_block, 120);
+        assert_eq!(due[0].1.action, PendingSyncAction::Resync);
+    }
+
+    #[test]
+    fn test_pending_queue_postpone_same_block_resets_retry() {
+        let mut queue = PendingSyncQueue::default();
+        let addr = address!("00000000000000000000000000000000000000ae");
+
+        queue.enqueue(
+            addr,
+            PendingSyncAction::Resync,
+            120,
+            PendingSyncReason::Resync,
+        );
+        let _due = queue.claim_due_non_coverage(120, usize::MAX);
+        queue.on_failure(addr, None);
+
+        queue.postpone(
+            addr,
+            PendingSyncAction::Resync,
+            PendingSyncReason::Resync,
+            120,
+        );
+
+        let queue_ref = queue.tasks.get(&addr).expect("task must remain queued");
+        assert_eq!(
+            queue_ref.tasks.len(),
+            1,
+            "postpone must not duplicate tasks"
+        );
+        let task = queue_ref.tasks.front().unwrap();
+        assert_eq!(task.required_block, 120);
+        assert_eq!(task.retry_count, 0, "postpone must reset retry backoff");
     }
 
     #[test]
