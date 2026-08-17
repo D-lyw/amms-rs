@@ -1262,6 +1262,86 @@ fn test_buy_ladder_remaining_caps_and_consumes() {
     assert_eq!(pool.buy_ladder_remaining[1], Some(cap));
 }
 
+/// BUY 梯子被 MM 清空（data1=0）：容量必须权威归零，不能残留 alive 期非零值
+/// （链上 0→j quote=0 而本地仍报价 → 幻影利润/执行 revert）。再次非空则恢复。
+#[test]
+fn test_buy_ladder_remaining_zeroed_when_ladder_cleared() {
+    let mut pool = test_pool();
+    let n = pool.assets.len();
+    pool.sell_ladders = vec![None; n];
+    pool.buy_ladders = vec![None; n];
+    pool.ladder_reserves = vec![None; n];
+    pool.buy_ladder_remaining = vec![None; n];
+    pool.ladder_reserves[1] = Some(U256::from(20_000u64)); // 引擎 cap = R（链上实测）
+    let tier1 = U256::from(3u64 << 12 | 767);
+    let tier2 = U256::from(3u64 << 12 | 1150);
+    let tier3 = U256::from(3u64 << 12 | 1183);
+    let data1 = (tier1 << 232) | (tier2 << 208) | (tier3 << 184);
+    let cap = U256::from(62_000_000u64);
+
+    // alive 期：非空 data1 → Σqty×R
+    pool.apply_l2_update_full(1, U256::from(13_984u64), 100, 3, 3, U256::ZERO, data1);
+    assert_eq!(pool.buy_ladder_remaining[1], Some(cap));
+
+    // MM 清空 BUY 梯子：data1=0 → 容量必须归零，报价/spot 同步归零
+    pool.apply_l2_update_full(1, U256::from(13_984u64), 101, 3, 3, U256::ZERO, U256::ZERO);
+    assert_eq!(pool.buy_ladder_remaining[1], Some(U256::ZERO));
+    assert_eq!(
+        pool.engine_quote(0, 1, U256::from(10u64).pow(U256::from(24)))
+            .unwrap(),
+        U256::ZERO
+    );
+    assert_eq!(
+        pool.calculate_price(pool.assets[0].address, pool.assets[1].address)
+            .unwrap(),
+        0.0
+    );
+
+    // MM 重新启用 BUY：非空 data1 → 容量恢复
+    pool.apply_l2_update_full(1, U256::from(13_984u64), 102, 3, 3, U256::ZERO, data1);
+    assert_eq!(pool.buy_ladder_remaining[1], Some(cap));
+    assert_eq!(
+        pool.engine_quote(0, 1, U256::from(10u64).pow(U256::from(24)))
+            .unwrap(),
+        cap
+    );
+}
+
+/// SELL 梯子被 MM 清空（data0=0）：max_inputs 必须权威归零（线性回退不再沿用
+/// alive 期快照容量），j→0 quote/spot 同步归零。
+#[test]
+fn test_sell_dead_when_ladder_cleared() {
+    let mut pool = test_pool();
+    let n = pool.assets.len();
+    pool.sell_ladders = vec![None; n];
+    pool.buy_ladders = vec![None; n];
+    pool.ladder_reserves = vec![None; n];
+    pool.buy_ladder_remaining = vec![None; n];
+    // alive 期快照观测的非零 SELL 容量
+    pool.max_inputs[1] = Some(U256::from(1_000_000u64));
+    let data0 = U256::from(3u64 << 12 | 767) << 232; // 单档 (w=3, qty=767)
+
+    // alive 期：非空 data0 → sell_ladders 解析、max_inputs 不受影响
+    pool.apply_l2_update_full(1, U256::from(13_984u64), 100, 3, 3, data0, U256::ZERO);
+    assert_eq!(pool.sell_ladders[1], Some(vec![(3, 767)]));
+    assert_eq!(pool.max_inputs[1], Some(U256::from(1_000_000u64)));
+
+    // MM 清空 SELL 梯子：data0=0 → max_inputs 归零，j→0 quote/spot 归零
+    pool.apply_l2_update_full(1, U256::from(13_984u64), 101, 3, 3, U256::ZERO, U256::ZERO);
+    assert_eq!(pool.sell_ladders[1], None);
+    assert_eq!(pool.max_inputs[1], Some(U256::ZERO));
+    assert_eq!(
+        pool.engine_quote(1, 0, U256::from(10u64).pow(U256::from(24)))
+            .unwrap(),
+        U256::ZERO
+    );
+    assert_eq!(
+        pool.calculate_price(pool.assets[1].address, pool.assets[0].address)
+            .unwrap(),
+        0.0
+    );
+}
+
 /// spot 与链上可交易性对齐（P2 加固）：方向容量恒为 0 时 spot 必须为 0.0，
 /// 与 simulate_swap/链上 quote 一致，避免 multihop/2hop 预过滤把已死方向排高。
 /// SELL 死 = maxIn==0（ladderWeight×reserve=0，只买不卖）；BUY 死 =

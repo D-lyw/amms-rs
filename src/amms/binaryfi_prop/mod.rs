@@ -673,14 +673,37 @@ impl BinaryFiPropPool {
         if let Some(l) = self.buy_ladders.get_mut(asset_idx) {
             *l = decode(data1);
         }
+        // SELL 梯子为空（MM 在链上清空 SELL 侧，data0=0）：方向死亡，容量权威归零。
+        // 否则 sell_out 线性回退会沿用快照 max_inputs，快照若来自 alive 期则残留
+        // 非零容量——链上 j→0 quote=0 而本地仍报价（幻影利润）。表示与
+        // apply_snapshot 的死方向一致（max_inputs[j]=Some(0)），快照/update 恢复时重观测。
+        if asset_idx != 0
+            && self
+                .sell_ladders
+                .get(asset_idx)
+                .cloned()
+                .flatten()
+                .map_or(true, |l| l.is_empty())
+        {
+            if let Some(v) = self.max_inputs.get_mut(asset_idx) {
+                *v = Some(U256::ZERO);
+            }
+        }
         // BUY 阶梯容量重置：Σqty×R（R 已知时；链上实测 asset2 平顶 = Σqty×R）。
         // 之后由 Swap 事件逐笔消费（见 anchor_rate），直到下一次 update 重置。
+        // 梯子为空（data1=0，MM 清空 BUY 侧）：方向死亡，容量权威归零——残留
+        // alive 期非零容量会让链上 0→j quote=0 时本地仍报价（本次事故根因）。
         if asset_idx != 0 {
-            if let (Some(ladder), Some(r)) = (
-                self.buy_ladders.get(asset_idx).cloned().flatten(),
+            let ladder = self.buy_ladders.get(asset_idx).cloned().flatten();
+            if ladder.as_ref().map_or(true, |l| l.is_empty()) {
+                if let Some(v) = self.buy_ladder_remaining.get_mut(asset_idx) {
+                    *v = Some(U256::ZERO);
+                }
+            } else if let (Some(ladder), Some(r)) = (
+                ladder,
                 self.ladder_reserves.get(asset_idx).copied().flatten(),
             ) {
-                if !ladder.is_empty() && !r.is_zero() {
+                if !r.is_zero() {
                     let total: Option<U256> = ladder.iter().try_fold(U256::ZERO, |acc, &(_, q)| {
                         acc.checked_add(U256::from(q).checked_mul(r)?)
                     });
@@ -1397,6 +1420,10 @@ impl BinaryFiPropPool {
             if disabled {
                 self.buy_disabled[j] = true;
                 self.q0j[j] = Some(U256::ZERO);
+                // BUY 容量字段一并归零：buy_disabled 只门控 engine_quote，
+                // calculate_price/max_achievable_out 直接读 buy_ladder_remaining，
+                // 残留 alive 期非零值会让 spot/可达性预过滤误判方向存活。
+                self.buy_ladder_remaining[j] = Some(U256::ZERO);
                 if !log_fresh {
                     // 卖出侧看 bid：可用则 price=bid（SELL 报价精确），否则清空
                     if let Some(b) = bid {
