@@ -6,10 +6,9 @@ use crate::state_space::{STREAM_IDLE_TIMEOUT, STREAM_RECONNECT_DELAY};
 use alloy::consensus::BlockHeader;
 use alloy::network::primitives::HeaderResponse;
 use alloy::network::Network;
-use alloy::providers::{DynProvider, Provider};
+use alloy::providers::Provider;
 use async_stream::stream;
 use futures::{Stream, StreamExt};
-use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -39,40 +38,17 @@ impl<N, P> StateSpaceManager<N, P> {
     where
         P: Provider<N> + Clone + 'static,
         N: Network + 'static,
-        N::HeaderResponse: Send,
     {
         stream! {
             loop {
-                // XLayer 公共网关不再白名单 eth_subscribe（-32601），newHeads 订阅
-                // 使用专用 WS provider；其余链沿用主 provider（回填仍走主 provider）。
-                // 注意：专用 provider 必须与流同生命周期（pubsub service 由 provider
-                // 持有，提前 drop 会立即关闭订阅导致无限重连）。
-                let sub_provider: Option<DynProvider<N>> = if chain_id == super::XLAYER_CHAIN_ID {
-                    Self::connect_xlayer_subscribe_provider().await
-                } else {
-                    None
+                let mut heads_stream = match provider.subscribe_blocks().await {
+                    Ok(sub) => sub.into_stream(),
+                    Err(e) => {
+                        error!("Failed to subscribe to newHeads: {}", e);
+                        sleep(STREAM_RECONNECT_DELAY).await;
+                        continue;
+                    }
                 };
-
-                let mut heads_stream: Pin<Box<dyn Stream<Item = N::HeaderResponse> + Send>> =
-                    if let Some(sp) = &sub_provider {
-                        match sp.subscribe_blocks().await {
-                            Ok(sub) => Box::pin(sub.into_stream()),
-                            Err(e) => {
-                                error!("Failed to subscribe to newHeads: {}", e);
-                                sleep(STREAM_RECONNECT_DELAY).await;
-                                continue;
-                            }
-                        }
-                    } else {
-                        match provider.subscribe_blocks().await {
-                            Ok(sub) => Box::pin(sub.into_stream()),
-                            Err(e) => {
-                                error!("Failed to subscribe to newHeads: {}", e);
-                                sleep(STREAM_RECONNECT_DELAY).await;
-                                continue;
-                            }
-                        }
-                    };
 
                 match Self::initial_backfill_results(
                     &provider,
