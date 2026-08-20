@@ -56,6 +56,7 @@ sol! {
         uint256[] scales;
         uint256[] poolBalances;
         uint256[] vaultReserves;
+        uint256[] vaultBalances;
         uint256[] quotePairs;
         QuoteResult[] quotes;
         uint256 fee;

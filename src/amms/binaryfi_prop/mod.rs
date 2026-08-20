@@ -70,8 +70,11 @@
 //! ## 三层数据同步（事件驱动，无轮询）
 //!
 //! 1. **L1 — Swap 事件**（池子 `0x2d651e...`）：
-//!    `Swap(sender, tokenIn, tokenOut, amountIn, amountOut)` 更新本地池子余额；
-//!    费率以引擎价格精确推导为准（价格未知时才用 out/in 锚定兜底）。
+//!    `Swap(sender, tokenIn, tokenOut, amountIn, amountOut)` 更新**部署级共享
+//!    金库账本**（`reserves[in]+=in`、`reserves[out]-=out`、
+//!    `buy_ladder_remaining[out]-=out`）：单部署所有虚拟子池共用 vault，任何
+//!    Swap（含跨 pair 抽干）都必须全局可见；费率/价格锚定仍限本 exposed pair
+//!    （防跨 pair 污染），价格未知时才用 out/in 锚定兜底。
 //! 2. **L2 — flashblocks 原始交易增强**（仅实时流）：
 //!    引擎 `update` 日志本身 data 为空；`xlayer_flashblocks` 解析器在 raw bytes
 //!    边缘通过 `keccak256(raw) == tx_hash` 定位交易，RLP 解码后解析
@@ -903,16 +906,22 @@ impl BinaryFiPropPool {
         }
     }
 
-    /// Swap 事件锚定：余额增减 + price0 标定。
+    /// Swap 事件锚定（完整路径，测试/旧调用点保留）：共享金库账本 + price0 标定。
     ///
     /// 费率以引擎价格精确推导为准；仅当方向两侧价格未知时才用 Swap 的
     /// `out/in` 锚定（保证池子在未收到 update 时可用，不作为精度来源）。
     pub fn anchor_rate(&mut self, i: usize, j: usize, amount_in: U256, amount_out: U256) {
-        let price_known = self.prices.get(i).map(|p| !p.is_zero()).unwrap_or(false)
-            && self.prices.get(j).map(|p| !p.is_zero()).unwrap_or(false);
-        if !price_known {
-            self.set_rate(i, j, amount_in, amount_out);
-        }
+        self.update_shared_vault(i, j, amount_in, amount_out);
+        self.anchor_prices_only(i, j, amount_in, amount_out);
+    }
+
+    /// 共享金库账本更新（部署级，任何 Swap 都动共享 vault）：
+    /// `reserves[tokenIn] += in`、`reserves[tokenOut] -= out`、
+    /// `buy_ladder_remaining[tokenOut] -= out`（BUY 阶梯容量按输出资产消耗）。
+    /// 不涉及价格——跨 pair swap 对共享金库的增减必须全局可见
+    /// （2026-08-19 事故：其他 pair 的 SELL 抽干 USDT0 金库，本实例不可见
+    /// → 本地金库门控放行必然失败的交易）。
+    fn update_shared_vault(&mut self, i: usize, j: usize, amount_in: U256, amount_out: U256) {
         if let Some(r) = self.reserves.get_mut(i) {
             *r = r.saturating_add(amount_in);
         }
@@ -927,6 +936,16 @@ impl BinaryFiPropPool {
                     *r = r.saturating_sub(amount_out);
                 }
             }
+        }
+    }
+
+    /// 价格锚定（仅限本 pair 命中时调用，防跨 pair 污染价格）：
+    /// 价格未知时用 `out/in` 兜底 + price0 标定。
+    fn anchor_prices_only(&mut self, i: usize, j: usize, amount_in: U256, amount_out: U256) {
+        let price_known = self.prices.get(i).map(|p| !p.is_zero()).unwrap_or(false)
+            && self.prices.get(j).map(|p| !p.is_zero()).unwrap_or(false);
+        if !price_known {
+            self.set_rate(i, j, amount_in, amount_out);
         }
         if !self.price0_calibrated {
             if let Some(p0) = self.implied_price0(i, j, amount_in, amount_out) {
@@ -1315,8 +1334,14 @@ impl BinaryFiPropPool {
             }
         }
 
-        // 余额以引擎 getAssetReserves()（= 金库余额）为准
-        if snap.vaultReserves.len() == n {
+        // 余额以 **真实共享金库 ERC20 余额**（vault.balanceOf）为准：vault 持有
+        // 全部 12 资产，任何 pair 的 swap 都会增减它；引擎内部记账
+        // （getAssetReserves）会与真实金库脱节（2026-08-19 事故：引擎 quote
+        // 606.7M 而真实金库仅 280.7M），本地门控必须以真实余额为准才能挡住
+        // 必然失败的交易。读取失败回退引擎内部记账，再回退 pool 余额。
+        if snap.vaultBalances.len() == n {
+            self.reserves = snap.vaultBalances.clone();
+        } else if snap.vaultReserves.len() == n {
             self.reserves = snap.vaultReserves.clone();
         } else if snap.poolBalances.len() == n {
             self.reserves = snap.poolBalances.clone();
@@ -2064,15 +2089,20 @@ impl AutomatedMarketMaker for BinaryFiPropPool {
             if i == j {
                 return Ok(SyncAction::Resync);
             }
-            // 虚拟子池只处理完全落在自身 exposed pair 内的 Swap（与 simulate_swap
-            // 一致：两个资产都必须在本 pair，避免仅含单一资产时用他人 pair 的
-            // 成交锚定/影响自身 affected 判定）
+            // 共享金库账本（部署级）：同一 router/engine/vault 的所有虚拟子池
+            // 共用金库，任何 Swap（无论是否落在本实例 exposed pair 内）都增减
+            // reserves、消耗 BUY 阶梯容量。2026-08-19 事故根因：跨 pair SELL
+            // 抽干 USDT0 金库对本实例不可见 → 本地金库门控放行必然失败的交易。
+            self.update_shared_vault(i, j, amount_in, amount_out);
+            // 费率锚定仍限本 pair（防跨 pair 污染价格）：仅当 Swap 完全落在自身
+            // exposed pair 内才用成交价标定；跨 pair 只更新金库、不动价格。
             if let Some((a, b)) = self.exposed_pair {
-                if !((i == a || i == b) && (j == a || j == b)) {
-                    return Ok(SyncAction::None);
+                if (i == a || i == b) && (j == a || j == b) {
+                    self.anchor_prices_only(i, j, amount_in, amount_out);
                 }
+            } else {
+                self.anchor_prices_only(i, j, amount_in, amount_out);
             }
-            self.anchor_rate(i, j, amount_in, amount_out);
             return Ok(SyncAction::None);
         }
 
@@ -2545,6 +2575,7 @@ impl BinaryFiPropPool {
                 scales: Vec::new(),
                 poolBalances: Vec::new(),
                 vaultReserves: Vec::new(),
+                vaultBalances: Vec::new(),
                 quotePairs: Vec::new(),
                 quotes: Vec::new(),
                 fee: U256::ZERO,

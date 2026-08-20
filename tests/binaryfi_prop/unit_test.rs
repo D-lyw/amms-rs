@@ -259,6 +259,93 @@ fn test_pool() -> BinaryFiPropPool {
     pool
 }
 
+/// 3 资产实例（USDT0 + 2 个可交易资产），用于跨 pair 共享金库测试。
+fn test_pool_3() -> BinaryFiPropPool {
+    let mut pool = test_pool();
+    pool.assets.push(Token::new_with_decimals(
+        address!("0x68fa48b1c2fe52b3d776e1953e0e782b5044ce28"),
+        18,
+    ));
+    let n = pool.assets.len();
+    pool.prices.push(U256::ZERO);
+    pool.spreads.push(0);
+    pool.bid_offsets.push(0);
+    pool.ask_offsets.push(0);
+    pool.q0j.push(None);
+    pool.sell_raw.push(None);
+    pool.buy_zero_over_vault.push(false);
+    pool.max_outputs.push(None);
+    pool.max_inputs.push(None);
+    pool.reserves.push(U256::from(9_000_000_000_000_000_000u64));
+    pool.rates.resize(n * n, Rate::zero());
+    pool.price_updated_block.push(0);
+    // test_pool() 未初始化阶梯/容量向量（Default 为空），按 3 资产补齐
+    pool.sell_ladders = vec![None; n];
+    pool.buy_ladders = vec![None; n];
+    pool.ladder_reserves = vec![None; n];
+    pool.buy_ladder_remaining = vec![None; n];
+    pool
+}
+
+/// 共享金库账本（L1）：跨 pair Swap 只更新金库余额、不锚定本实例价格
+/// （2026-08-19 事故根因：其他 pair 的 SELL 抽干 USDT0 金库，本实例不可见 →
+/// 本地金库门控放行必然失败的交易）。Swap 涉及非本 exposed pair 资产时：
+///  - reserves 按部署级共享金库口径增减（in += / out -=），跨 pair 抽干全局可见；
+///  - 费率/价格不因跨 pair 成交被污染（rates 保持原值）；
+///  - 本 pair 的 BUY 阶梯容量不因他人 pair 成交被消耗。
+#[test]
+fn test_sync_cross_pair_swap_updates_shared_vault_only() {
+    let mut pool = test_pool_3();
+    // 实例暴露 pair = (0,1)；资产 2 不在本 pair
+    pool.exposed_pair = Some((0, 1));
+    // 本 pair BUY 阶梯容量（asset1）
+    pool.buy_ladder_remaining[1] = Some(U256::from(62_000_000u64));
+    // 预置 0→2 费率，验证跨 pair 成交不覆盖价格
+    pool.set_rate(0, 2, U256::from(1_000_000u64), U256::from(1_000_000u64));
+
+    let amount_in = U256::from(400_000_000u64);
+    let amount_out = U256::from(53_100_000u64);
+    let mut data = amount_in.to_be_bytes::<32>().to_vec();
+    data.extend_from_slice(&amount_out.to_be_bytes::<32>());
+    let log_data = LogData::new(
+        vec![
+            BINARYFI_SWAP_EVENT,
+            address_topic(BINARYFI_ROUTER_ADDRESS),
+            address_topic(pool.assets[0].address), // USDT0 in
+            address_topic(pool.assets[2].address), // asset2 out（跨 pair）
+        ],
+        Bytes::from(data),
+    )
+    .unwrap();
+    let log = Log {
+        inner: AlloyLog {
+            address: BINARYFI_POOL_ADDRESS,
+            data: log_data,
+        },
+        ..Default::default()
+    };
+
+    let action = pool.sync(&log).expect("sync ok");
+    assert!(matches!(action, SyncAction::None));
+
+    // 共享金库账本：reserves[0] += in、reserves[2] -= out（跨 pair 抽干全局可见）
+    assert_eq!(pool.reserves[0], U256::from(350_000_000u64) + amount_in);
+    assert_eq!(
+        pool.reserves[2],
+        U256::from(9_000_000_000_000_000_000u64) - amount_out
+    );
+    // 本 pair 资产 1 的金库/容量不受他人 pair 成交影响
+    assert_eq!(pool.reserves[1], U256::from(8_000_000_000_000_000_000u64));
+    assert_eq!(
+        pool.buy_ladder_remaining[1],
+        Some(U256::from(62_000_000u64))
+    );
+    // 跨 pair 成交不污染本实例费率（0→2 不在 exposed pair，rates 保持原值）
+    let r = pool.rates[pool.pair_index(0, 2)];
+    assert_eq!(r.num, U256::from(1_000_000u64));
+    assert_eq!(r.den, U256::from(1_000_000u64));
+}
+
 #[test]
 fn test_swap_event_anchors_rate_and_reserves() {
     let mut pool = test_pool();
@@ -1000,6 +1087,7 @@ fn test_apply_snapshot_degenerate_maxout_cleared() {
             U256::from(11_281_542_985u64),
             U256::from_str_radix("21087064247644425879", 10).unwrap(),
         ],
+        vaultBalances: Vec::new(),
         // n=2：small 0→1=1、1→0=2；big(1e10)=n²+1=5；bigsell(1e20)=2n²+1=9；
         // mid(1e9)=3n²+1=13
         quotePairs: vec![
@@ -1077,6 +1165,7 @@ fn test_sell_ladder_r_derived_when_probe_unsaturated() {
             U256::from(10u64).pow(U256::from(30)),
             U256::from(10u64).pow(U256::from(30)),
         ],
+        vaultBalances: Vec::new(),
         quotePairs: vec![
             U256::from(1),
             U256::from(2),

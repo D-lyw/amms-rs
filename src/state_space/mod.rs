@@ -2572,17 +2572,18 @@ impl StateSpace {
                         let Some((a, b)) = exposed else {
                             return None;
                         };
-                        // Swap 两资产都必须在本 exposed pair 内：Swap(0→8) 只命中
-                        // (0,8) 这一个虚拟子池，避免含 0/8 的其他实例被过度标记
-                        // affected（与 sync/simulate_swap 的 pair 守卫一致）。
-                        let in_pair = match (assets.get(a), assets.get(b)) {
+                        // 共享金库是部署级：Swap 只要涉及本实例任一资产（含 USDT0
+                        // 这类全局共享资产），就必须路由到该实例更新金库账本
+                        // （reserves/buy_ladder_remaining）。费率锚定仍限本 pair，
+                        // 由 sync() L1 内层守卫保证，不在此过滤。
+                        let touches = match (assets.get(a), assets.get(b)) {
                             (Some(ta), Some(tb)) => {
-                                (ta == &token_in || tb == &token_in)
-                                    && (ta == &token_out || tb == &token_out)
+                                ta == &token_in || tb == &token_in
+                                    || ta == &token_out || tb == &token_out
                             }
                             _ => false,
                         };
-                        in_pair.then_some(key)
+                        touches.then_some(key)
                     })
                     .collect();
                 Some(targets)
@@ -3123,6 +3124,73 @@ mod tests {
             .expect("update event must route");
         routed_update.sort_unstable();
         assert_eq!(routed_update, vec![pool1, pool2]);
+    }
+
+    #[test]
+    fn binaryfi_swap_routes_to_instances_touching_shared_asset() {
+        use crate::amms::binaryfi_prop::{BinaryFiPropPool, BINARYFI_SWAP_EVENT};
+        use crate::amms::Token;
+
+        let pool_addr = address!("1111111111111111111111111111111111111111");
+        let v1 = address!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let v2 = address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let usdt0 = address!("0x779ded0c9e1022225f8e0630b35a9b54be713736");
+        let a = address!("0x58100046a4afcd4ee4fadbd4244f3f895a341c56");
+        let b = address!("0x68fa48b1c2fe52b3d776e1953e0e782b5044ce28");
+        let c = address!("0x535aabfaf9a6fbc1a04317b98885706dc6bf1650");
+
+        let mk = |virt: Address, pair: (usize, usize)| {
+            let mut p = BinaryFiPropPool::default();
+            p.pool_address = pool_addr;
+            p.virtual_address = virt;
+            p.exposed_pair = Some(pair);
+            p.assets = vec![
+                Token::new_with_decimals(usdt0, 6),
+                Token::new_with_decimals(a, 18),
+                Token::new_with_decimals(b, 18),
+                Token::new_with_decimals(c, 18),
+            ];
+            p
+        };
+        let mut state = StateSpace::default();
+        state.insert_amm(AMM::BinaryFiPropPool(mk(v1, (0, 1))));
+        state.insert_amm(AMM::BinaryFiPropPool(mk(v2, (0, 2))));
+
+        let swap_topics = |tin: Address, tout: Address| {
+            vec![
+                BINARYFI_SWAP_EVENT,
+                tin.into_word(),
+                tin.into_word(),
+                tout.into_word(),
+            ]
+        };
+
+        // 含 USDT0（全局共享资产）的 swap → 命中全部实例（USDT0 在每个 pair 中）
+        let mut routed = state
+            .resolve_binaryfi_targets(pool_addr, &swap_topics(a, usdt0))
+            .expect("swap must route");
+        routed.sort_unstable();
+        assert_eq!(routed, vec![v1, v2]);
+
+        // 跨资产 swap（A→B）：A 在 v1 pair、B 在 v2 pair → 命中 2 实例
+        let mut routed2 = state
+            .resolve_binaryfi_targets(pool_addr, &swap_topics(a, b))
+            .expect("swap must route");
+        routed2.sort_unstable();
+        assert_eq!(routed2, vec![v1, v2]);
+
+        // 只触碰单一 pair 资产的 swap（A→C，C 不在任何 pair）→ 只命中 v1
+        let mut routed3 = state
+            .resolve_binaryfi_targets(pool_addr, &swap_topics(a, c))
+            .expect("swap must route");
+        routed3.sort_unstable();
+        assert_eq!(routed3, vec![v1]);
+
+        // 其他部署的 swap 事件不路由（pool 地址不同）
+        let other_pool = address!("2222222222222222222222222222222222222222");
+        assert!(state
+            .resolve_binaryfi_targets(other_pool, &swap_topics(a, usdt0))
+            .is_none());
     }
 
     #[test]

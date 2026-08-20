@@ -10,6 +10,7 @@ pragma solidity ^0.8.0;
  *         - per-asset decimals + pool balanceOf (ERC20)
  *         - per-asset engine config scale (getAssetConfig)
  *         - engine getAssetReserves() -> (assets[], vaultBalances[])
+ *         - per-asset vault.balanceOf (真实共享金库 ERC20 余额，见 vaultBalances)
  *         - engine getFee(recipient) -> (feePpm, 0 if read fails)
  *         - pool.quote() for each requested directed pair (try/catch per pair)
  *
@@ -51,6 +52,7 @@ contract GetBinaryFiPropStateBatchRequest {
         uint256[] scales;
         uint256[] poolBalances;
         uint256[] vaultReserves;
+        uint256[] vaultBalances;
         uint256[] quotePairs;
         QuoteResult[] quotes;
         uint256 fee;
@@ -113,6 +115,26 @@ contract GetBinaryFiPropStateBatchRequest {
                 snap.vaultReserves = reserves;
             } catch {
                 snap.vaultReserves = new uint256[](0);
+            }
+            // 真实共享金库 ERC20 余额：vault 持有全部资产，其他 pair 的 swap
+            // 会抽干它，引擎内部记账（getAssetReserves）会与真实余额脱节
+            // （2026-08-19 事故：引擎 quote 606.7M 而金库只剩 280.7M）。
+            // Rust 侧用它锚定 reserves 做执行安全门控；读取失败保持空 → 回退
+            // vaultReserves（引擎内部口径）。
+            try IBinaryFiEngine(engine).vault() returns (address vault) {
+                if (vault != address(0)) {
+                    snap.vaultBalances = new uint256[](n);
+                    for (uint256 i = 0; i < n; ++i) {
+                        (bool ok, bytes memory data) = assets[i].call{gas: 20000}(
+                            abi.encodeWithSignature("balanceOf(address)", vault)
+                        );
+                        if (ok && data.length == 32) {
+                            snap.vaultBalances[i] = abi.decode(data, (uint256));
+                        }
+                    }
+                }
+            } catch {
+                snap.vaultBalances = new uint256[](0);
             }
             // 按账户费率（ppm）：recipient = 报价账户（本系统 router）。费率是
             // 引擎 per-account storage，非 0 时 Rust 侧用其做报价输入侧扣费；
@@ -226,6 +248,9 @@ interface IBinaryFiEngine {
         external
         view
         returns (address[] memory assets, uint256[] memory reserves);
+
+    /// @notice 共享金库地址（持有全部资产的真实 ERC20 余额来源）。
+    function vault() external view returns (address);
 
     function getAssetConfig(uint8 assetId)
         external

@@ -234,12 +234,35 @@ out = floor(v × 10^(dj−d0+2) / ask_j)                  // 第二段 BUY，无
 
 | 层 | 来源 | 处理 |
 |---|---|---|
-| L1 | Swap 事件 | 更新本地余额；费率以引擎价格精确推导为准 |
+| L1 | Swap 事件 | **部署级共享金库账本**：`reserves[in]+=in`、`reserves[out]-=out`、
+  `buy_ladder_remaining[out]-=out`（任何 Swap 都动共享 vault，跨 pair 也全局
+  可见）；费率/价格锚定仍限本 exposed pair（防跨 pair 污染价格） |
 | L2 | flashblocks raw tx 增强 | 解析 `0x024b94f6` calldata → 注入 7 word → `apply_l2_update_full`，零 RPC |
 | L3 | 无 raw bytes 的 update 日志 | 标记 stale → `AsyncUpdate` → 批量静态调用拉取 quote 恢复 bid/ask |
 
 周期性快照任务（`binaryfi_sync_interval_secs`，默认 15s）只做**容量/上限观测**，
 不做价格覆盖（价格以日志为准，快照补缺 + 保鲜判断防止旧块 quote 覆盖新价格）。
+快照额外读取 `vault.balanceOf(asset)`（批量合约新增 `vaultBalances` 字段）并
+用它**重锚真实金库余额**（校正非 Swap 途径的金库漂移），余额解析优先级：
+`vaultBalances`（真实 ERC20）→ `vaultReserves`（引擎记账）→ `poolBalances`。
+
+### 共享金库（2026-08-19 抽干事故修复）
+
+单 BinaryFi 部署是共享金库：所有虚拟子池的 `reserves` 都代表同一个 vault 的
+各资产余额。L1 事件路由与处理必须按部署级口径：
+
+- **路由**：Swap 命中"exposed pair 含任一交易资产"的实例（由"双 token 都在
+  pair"放宽为"至少一个 token 在 pair"）。生产 11 个实例均为 `(USDT0, X)`，
+  每笔 swap 必触碰 USDT0 → 命中全部 11 实例（USDT0 全局共享，正确）。
+- **处理**：命中实例统一 `reserves[in]+=in`、`reserves[out]-=out`、
+  `buy_ladder_remaining[out]-=out`；**费率锚定仍限本 pair**，跨 pair swap 只
+  更新金库、不动价格，防跨 pair 污染。
+- **门控**：`buy_capped`/`sell_zero_over_vault` 金库门控按真实 vault 口径
+  （漂移场景比引擎更保守 = 保护方向；无漂移时与链上逐位一致）。
+
+修复前：跨 pair 的 SELL 抽干 USDT0 金库（1.349B→280.7M→4.2M）对本实例
+不可见 → 本地金库门控放行必然失败的交易（`transferFrom(vault)` 余额不足
+revert，见 `dex-arbitrage/docs/2026-08-19_binaryfi_shared_vault_drain_forensics.md`）。
 
 ## 9. 链上实测验证数据（SELL）
 
@@ -268,6 +291,10 @@ SELL 归零样例（xETH，金库 17,347,345,227）：`in=9.13e18 → 17,343,984
 - 点差偏移首档 = `(data >> 240) / 16`，**不是 `& 0xfff`**（易错点）
 - `rem = in − in/1000`，in<1000 时与 `in×999/1000` 不同（易错点）
 - 买入被禁用资产（0→j quote 恒 0）仍可能收到 update 日志 → 只更新价格，费率保持 0
+- 共享金库按部署分组：L1 必须把**所有** Swap（含跨 pair）应用到全部命中实例的
+  `reserves`/`buy_ladder_remaining`，价格锚定除外（仍限本 pair）。跳过跨 pair
+  更新会导致金库漂移 → 本地报价高估 → 链上 `transferFrom(vault)` 余额不足
+  revert（2026-08-19 事故根因）
 - 周期快照不能覆盖日志驱动的更新价格（保鲜判断：日志优先、快照补缺）
 - **时效只在 L2 日志路径生效**：canonical/L3 路径无 raw bytes → 无 update 块号，
   按"未知不过期"兜底；快照路径的 `price_updated_block` 恒为 0，不会把过期资产
