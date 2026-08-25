@@ -30,6 +30,7 @@ pub mod ekubo;
 pub mod erc_4626;
 pub mod error;
 pub mod factory;
+pub mod fermi_prop;
 pub mod float;
 pub mod fluid_dex;
 pub mod fot;

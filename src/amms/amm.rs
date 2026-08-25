@@ -8,6 +8,7 @@ use crate::amms::caliber_prop::CaliberPropPool;
 use crate::amms::curve_legacy::CurveLegacyPool;
 use crate::amms::curve_ng::CurveNGPool;
 use crate::amms::ekubo::EkuboPool;
+use crate::amms::fermi_prop::FermiPropPool;
 use crate::amms::fluid_dex::FluidDexPool;
 use crate::amms::pancake_infinity::PancakeInfinityPool;
 use crate::amms::pancake_v2::PancakeV2Pool;
@@ -319,4 +320,5 @@ amm!(
     PendlePool,
     CaliberPropPool,
     BinaryFiPropPool,
+    FermiPropPool,
 );

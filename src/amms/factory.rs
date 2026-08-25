@@ -9,6 +9,8 @@ use crate::amms::curve_legacy::factory::CurveLegacyFactory;
 use crate::amms::curve_ng::factory::CurveNGFactory;
 use crate::amms::ekubo::EkuboFactory;
 use crate::amms::erc_4626::ERC4626Vault;
+use crate::amms::fermi_prop::factory::FermiPropFactory;
+use crate::amms::fermi_prop::FermiPropPool;
 use crate::amms::fluid_dex::FluidDexFactory;
 use crate::amms::pancake_infinity::factory::PancakeInfinityFactory;
 use crate::amms::pancake_v2::PancakeV2Factory;
@@ -160,6 +162,9 @@ impl Variant {
             Variant::BinaryFiPropPool => {
                 BinaryFiPropPool::init_batch::<N, _>(amms, to_block, provider).await
             }
+            Variant::FermiPropPool => {
+                FermiPropPool::init_batch::<N, _>(amms, to_block, provider).await
+            }
         }
     }
 
@@ -243,6 +248,9 @@ impl Variant {
             }
             Variant::BinaryFiPropPool => {
                 BinaryFiPropPool::init_batch::<N, _>(amms, to_block, provider).await
+            }
+            Variant::FermiPropPool => {
+                FermiPropPool::init_batch::<N, _>(amms, to_block, provider).await
             }
         }
     }
@@ -354,7 +362,8 @@ factory!(
     AerodromeV2Factory,
     AerodromeSlipstreamFactory,
     CaliberPropFactory,
-    BinaryFiPropFactory
+    BinaryFiPropFactory,
+    FermiPropFactory
 );
 
 #[derive(Default)]

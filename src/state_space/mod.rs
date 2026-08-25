@@ -13,6 +13,8 @@ mod flashblocks;
 pub mod hooks;
 mod maintenance;
 pub mod sync_services;
+pub mod titan_consumer;
+pub mod titan_stream;
 mod ws_logs;
 mod xlayer_flashblocks;
 
@@ -54,6 +56,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use std::{future::Future, marker::PhantomData, sync::Arc};
+use titan_stream::TitanPammStreamConfig;
 use tokio::sync::{Mutex, Notify, RwLock};
 
 use crate::amms::caliber_prop::{decode_caliber_swap_log, CaliberSwapEvent, CALIBER_SWAP_EVENT};
@@ -119,6 +122,7 @@ pub struct StateSpaceManager<N, P> {
     drift_probe_interval: Duration,
     maintenance_interval: Option<Duration>,
     realtime_source: RealtimeSyncSource,
+    titan_stream_config: Option<TitanPammStreamConfig>,
     hooks: HookRegistry<Vec<Address>>,
     phantom: PhantomData<N>,
 }
@@ -631,6 +635,59 @@ impl<N, P> StateSpaceManager<N, P> {
                 )
                 .await;
             });
+        }
+
+        // Titan pAMM 流消费（M4）：Ethereum 主网且启用时挂载。
+        // 启用判定：
+        // - 显式 `with_titan_pamm_stream(Some(config))` → 强制启用（用户给定参数）；
+        // - 默认 None → 自动检测：state 中存在需要 Titan 实时流的 PropAMM 池
+        //   （Fermi 等，见 `titan_consumer::pool_requires_titan_stream`）时，
+        //   以 `TitanPammStreamConfig::default()`（eu 区域）自动启用；
+        // 与 realtime 日志路径解耦：独立 slot 守卫/重连/校准，快照经
+        // `apply_titan_snapshot` 应用到 Fermi pools 后触发 hooks 通知。
+        let titan_config = match self.titan_stream_config.clone() {
+            Some(config) => Some(config),
+            None => {
+                let has_titan_pamm = {
+                    let state = self.state.read().await;
+                    state
+                        .state
+                        .values()
+                        .any(|amm| titan_consumer::pool_requires_titan_stream(amm.as_ref()))
+                };
+                if has_titan_pamm {
+                    info!(
+                        target: "state_space::titan_consumer",
+                        "detected PropAMM pools requiring Titan stream, auto-enabling with default config"
+                    );
+                    Some(TitanPammStreamConfig::default())
+                } else {
+                    None
+                }
+            }
+        };
+        if chain_id == ETHEREUM_MAINNET_CHAIN_ID {
+            if let Some(titan_config) = titan_config {
+                let state = self.state.clone();
+                let hooks = self.hooks.clone();
+                let provider = self.provider.clone();
+                info!(
+                    target: "state_space::titan_consumer",
+                    ws = %titan_config.ws_url,
+                    rpc = %titan_config.rpc_url,
+                    reconcile_s = titan_config.reconcile_interval.as_secs(),
+                    "Titan pAMM stream consumer enabled"
+                );
+                tokio::spawn(async move {
+                    titan_consumer::run_titan_pamm_stream_task::<N, P>(
+                        titan_config,
+                        state,
+                        hooks,
+                        provider,
+                    )
+                    .await;
+                });
+            }
         }
 
         Ok(())
@@ -1166,8 +1223,7 @@ impl<N, P> StateSpaceManager<N, P> {
         }
 
         let t_sync_start = Instant::now();
-        let (mut affected, needs_resync, needs_async_update) =
-            state.write().await.sync(&logs)?;
+        let (mut affected, needs_resync, needs_async_update) = state.write().await.sync(&logs)?;
         affected.extend(caliber_swap_affected);
         let sync_ms = t_sync_start.elapsed().as_millis();
 
@@ -1749,6 +1805,8 @@ pub struct StateSpaceBuilder<N, P> {
     pub maintenance_interval: Option<Duration>,
     pub realtime_source: RealtimeSyncSource,
     pub realtime_ws_endpoints: Option<Vec<String>>,
+    /// Titan pAMM 流消费配置（M4；Ethereum 主网 + Fermi 时启用）。
+    pub titan_stream_config: Option<TitanPammStreamConfig>,
     phantom: PhantomData<N>,
 }
 
@@ -1780,6 +1838,7 @@ where
             maintenance_interval: None,
             realtime_source: RealtimeSyncSource::Auto,
             realtime_ws_endpoints: None,
+            titan_stream_config: None,
             hooks: vec![],
         }
     }
@@ -1952,6 +2011,20 @@ where
             realtime_ws_endpoints: (!normalized.is_empty()).then_some(normalized),
             ..self
         }
+    }
+
+    /// 配置 Titan pAMM 流消费（M4，可选）。
+    ///
+    /// - `None`（默认）：**自动检测**——state 中存在需要 Titan 实时流的 PropAMM 池
+    ///   （如 Fermi）时，以 `TitanPammStreamConfig::default()`（eu 区域端点）自动启用，
+    ///   无需手动调用；
+    /// - `Some(config)`：显式配置并强制启用（可定制区域/空闲超时/校准周期）。
+    pub fn with_titan_pamm_stream(
+        mut self,
+        config: Option<TitanPammStreamConfig>,
+    ) -> StateSpaceBuilder<N, P> {
+        self.titan_stream_config = config;
+        self
     }
 
     pub async fn sync(mut self) -> Result<StateSpaceManager<N, P>, AMMError> {
@@ -2337,6 +2410,7 @@ where
             pending_sync_worker_interval: self.pending_sync_worker_interval,
             drift_probe_interval: self.drift_probe_interval,
             maintenance_interval: self.maintenance_interval,
+            titan_stream_config: self.titan_stream_config,
             phantom: PhantomData,
             hooks: HookRegistry::new(self.hooks),
         })
@@ -2512,8 +2586,10 @@ impl StateSpace {
                         // 由 sync() L1 内层守卫保证，不在此过滤。
                         let touches = match (assets.get(a), assets.get(b)) {
                             (Some(ta), Some(tb)) => {
-                                ta == &token_in || tb == &token_in
-                                    || ta == &token_out || tb == &token_out
+                                ta == &token_in
+                                    || tb == &token_in
+                                    || ta == &token_out
+                                    || tb == &token_out
                             }
                             _ => false,
                         };
