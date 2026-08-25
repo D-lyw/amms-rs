@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{Mutex, Notify, RwLock};
 use tokio::time::{sleep, Duration};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 pub(super) const DRIFT_HOT_POOL_INTERVAL: Duration = Duration::from_secs(30);
 pub(super) const DRIFT_COLD_POOL_INTERVAL: Duration = Duration::from_secs(300);
@@ -486,6 +486,31 @@ impl PendingSyncQueue {
         }
         self.enqueue(address, action, required_block, reason);
     }
+
+    /// `BlockNotAvailable` 重试：保持 `required_block` 不变，等存储 RPC 收录
+    /// 目标块。与 `postpone` 不同，不立即重试——RPC 落后窗口内（通常 ≤1 块、
+    /// <2s 追平）立即重试只会空转热循环；用 250ms→2s 短退避，既及时重试又
+    /// 不刷 RPC、不空转。
+    pub(super) fn retry_later(&mut self, address: Address, required_block: u64) {
+        self.in_flight.remove(&address);
+        let Some(queue) = self.tasks.get_mut(&address) else {
+            return;
+        };
+        let Some(task) = queue.tasks.front_mut() else {
+            return;
+        };
+        if task.required_block == required_block {
+            task.retry_count = task.retry_count.saturating_add(1);
+            let exp = task.retry_count.min(3);
+            let delay_ms = 250u64.saturating_mul(1u64 << exp).min(2_000);
+            task.next_retry_at = Instant::now() + Duration::from_millis(delay_ms);
+        } else {
+            // 队首任务目标块已变化（如新鲜度守卫推迟到更晚块）：旧任务按新块重排。
+            let (action, reason) = (task.action, task.reason);
+            queue.tasks.pop_front();
+            self.enqueue(address, action, required_block, reason);
+        }
+    }
 }
 
 impl<N, P> StateSpaceManager<N, P> {
@@ -606,6 +631,21 @@ impl<N, P> StateSpaceManager<N, P> {
                         }
                     }
                     synced_pools.append(&mut pools);
+                }
+                // flashblocks 乐观头领先存储 RPC 时，coverage 读到超前块是预期
+                // 状态（下一轮 tick 再试），不打 warn 刷屏。
+                Err(AMMError::BlockNotAvailable {
+                    requested_block,
+                    storage_head,
+                }) => {
+                    debug!(
+                        ?variant,
+                        count = requested.len(),
+                        requested_block,
+                        storage_head,
+                        "Maintenance coverage batch sync deferred: storage RPC head behind required block"
+                    );
+                    failed_addresses.extend(requested);
                 }
                 Err(e) => {
                     warn!(
@@ -801,7 +841,16 @@ impl<N, P> StateSpaceManager<N, P> {
         N: Network,
     {
         for (address, task) in due_tasks {
-            match Self::execute_pending_task(provider, state, address, &task, canonical).await {
+            // Resync 是"按指定块精确纠错"：以任务携带的 required_block 为读取
+            // 目标，不随每次执行时的 canonical（flashblocks 乐观头，可能领先
+            // 存储 RPC 1 块）漂移——否则目标块永远追不上、任务永远失败。
+            // AsyncUpdate 保持以当前 canonical 做普通刷新（update() 走 latest）。
+            let target_block = if matches!(task.action, PendingSyncAction::Resync) {
+                task.required_block
+            } else {
+                canonical
+            };
+            match Self::execute_pending_task(provider, state, address, &task, target_block).await {
                 Ok(PendingExecutionOutcome::Applied) => {
                     if matches!(task.action, PendingSyncAction::AsyncUpdate)
                         && matches!(task.reason, PendingSyncReason::AsyncUpdate)
@@ -811,7 +860,7 @@ impl<N, P> StateSpaceManager<N, P> {
                             action = ?task.action,
                             reason = ?task.reason,
                             first_seen_ms = task.first_seen_at.elapsed().as_millis(),
-                            target_block = canonical,
+                            target_block = target_block,
                             "Pending sync task applied"
                         );
                     } else {
@@ -820,7 +869,7 @@ impl<N, P> StateSpaceManager<N, P> {
                             action = ?task.action,
                             reason = ?task.reason,
                             first_seen_ms = task.first_seen_at.elapsed().as_millis(),
-                            target_block = canonical,
+                            target_block = target_block,
                             "Pending sync task applied"
                         );
                     }
@@ -835,7 +884,7 @@ impl<N, P> StateSpaceManager<N, P> {
                         action = ?task.action,
                         reason = ?task.reason,
                         first_seen_ms = task.first_seen_at.elapsed().as_millis(),
-                        target_block = canonical,
+                        target_block = target_block,
                         "Pending sync task skipped due to newer local state"
                     );
                     pending_sync_queue
@@ -849,7 +898,7 @@ impl<N, P> StateSpaceManager<N, P> {
                         action = ?task.action,
                         reason = ?task.reason,
                         first_seen_ms = task.first_seen_at.elapsed().as_millis(),
-                        target_block = canonical,
+                        target_block = target_block,
                         deferred_to_block = deferred_to_block,
                         "Pending sync task deferred: local state newer than target block"
                     );
@@ -861,19 +910,30 @@ impl<N, P> StateSpaceManager<N, P> {
                     );
                 }
                 Ok(PendingExecutionOutcome::RetryLater(required_block)) => {
-                    warn!(
-                        ?address,
-                        action = ?task.action,
-                        reason = ?task.reason,
-                        required_block,
-                        "Pending sync task deferred: storage RPC head behind required block; will retry"
-                    );
-                    pending_sync_queue.lock().await.postpone(
-                        address,
-                        task.action,
-                        task.reason,
-                        required_block,
-                    );
+                    // 首次 warn，后续退避重试期间降为 debug，避免 RPC 落后窗口
+                    // 内（通常 ≤1 块、<2s 追平）连续刷屏。
+                    if task.retry_count == 0 {
+                        warn!(
+                            ?address,
+                            action = ?task.action,
+                            reason = ?task.reason,
+                            required_block,
+                            "Pending sync task deferred: storage RPC head behind required block; will retry"
+                        );
+                    } else {
+                        debug!(
+                            ?address,
+                            action = ?task.action,
+                            reason = ?task.reason,
+                            required_block,
+                            retry_count = task.retry_count,
+                            "Pending sync task still waiting for storage RPC head; retrying later"
+                        );
+                    }
+                    pending_sync_queue
+                        .lock()
+                        .await
+                        .retry_later(address, required_block);
                     pending_sync_notify.notify_one();
                 }
                 Ok(PendingExecutionOutcome::MissingPool) => {
@@ -2769,5 +2829,83 @@ mod tests {
         let due_next = queue.claim_due_non_coverage(201, usize::MAX);
         assert_eq!(due_next.len(), 1);
         assert_eq!(due_next[0].1.required_block, 201);
+    }
+
+    #[test]
+    fn test_retry_later_keeps_block_and_throttles() {
+        let mut queue = PendingSyncQueue::default();
+        let addr = address!("00000000000000000000000000000000000000ad");
+
+        queue.enqueue(
+            addr,
+            PendingSyncAction::Resync,
+            68872128,
+            PendingSyncReason::Resync,
+        );
+        let claimed = queue.claim_due_non_coverage(68872128, usize::MAX);
+        assert_eq!(claimed.len(), 1);
+
+        queue.retry_later(addr, 68872128);
+
+        let task = queue
+            .tasks
+            .get(&addr)
+            .and_then(|q| q.tasks.front())
+            .expect("task must stay queued after BlockNotAvailable retry");
+        assert_eq!(
+            task.required_block, 68872128,
+            "must keep the exact target block"
+        );
+        assert_eq!(task.retry_count, 1);
+        assert!(
+            task.next_retry_at > Instant::now(),
+            "must not retry immediately (busy-loop guard)"
+        );
+
+        // 退避未到期前不可再次出队
+        let none_due = queue.claim_due_non_coverage(68872128, usize::MAX);
+        assert!(
+            none_due.is_empty(),
+            "throttled task must not be claimed early"
+        );
+
+        // 第二次 retry_later：退避继续增长，不换块、不重复入队
+        queue.retry_later(addr, 68872128);
+        let task = queue
+            .tasks
+            .get(&addr)
+            .and_then(|q| q.tasks.front())
+            .expect("task must stay queued");
+        assert_eq!(task.required_block, 68872128);
+        assert_eq!(task.retry_count, 2);
+        let queue_ref = queue.tasks.get(&addr).unwrap();
+        assert_eq!(
+            queue_ref.tasks.len(),
+            1,
+            "retry_later must not duplicate tasks"
+        );
+    }
+
+    #[test]
+    fn test_retry_later_re_enqueues_on_new_block() {
+        let mut queue = PendingSyncQueue::default();
+        let addr = address!("00000000000000000000000000000000000000ae");
+
+        queue.enqueue(
+            addr,
+            PendingSyncAction::Resync,
+            100,
+            PendingSyncReason::Resync,
+        );
+        let _ = queue.claim_due_non_coverage(100, usize::MAX);
+        queue.retry_later(addr, 110);
+
+        let task = queue
+            .tasks
+            .get(&addr)
+            .and_then(|q| q.tasks.front())
+            .expect("task must be re-queued at new block");
+        assert_eq!(task.required_block, 110);
+        assert_eq!(task.retry_count, 0, "new-block requeue starts fresh");
     }
 }

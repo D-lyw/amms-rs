@@ -1433,12 +1433,10 @@ async fn ensure_storage_block_available(block: BlockId) -> Result<BlockId, AMMEr
         return Ok(block);
     };
     match http_provider.get_block_number().await {
-        Ok(head) if head < num => {
-            Err(AMMError::BlockNotAvailable {
-                requested_block: num,
-                storage_head: head,
-            })
-        }
+        Ok(head) if head < num => Err(AMMError::BlockNotAvailable {
+            requested_block: num,
+            storage_head: head,
+        }),
         _ => Ok(block),
     }
 }
@@ -1969,6 +1967,11 @@ where
         let snapshots =
             match fetch_exact_snapshots_batch(provider, contract_address, &pairs, block).await {
                 Ok(s) => s,
+                // 目标块尚未被存储 RPC 收录：不能吞成"该组全部失败"，
+                // 必须向上传播，让 maintenance 的 Resync 路径保持重试等待
+                // RPC 收录目标块（吞掉会退化成 "Resync returned empty result"
+                // 普通失败 → 指数退避后按更新的乐观头重试 → 永远追不上）。
+                Err(e @ AMMError::BlockNotAvailable { .. }) => return Err(e),
                 Err(e) => {
                     tracing::error!(
                         address = ?contract_address,
