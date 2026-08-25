@@ -1,8 +1,8 @@
 //! 说明：Pancake Infinity 目前仅部署在 BNB Chain；本套利系统主要运行在
 //! Ethereum 主网，因此该模块实现尚未进行充分的链上测试与验证。请在 BNB
 //! Chain 环境下进一步验证后再用于生产。
-use std::sync::Arc;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use alloy::eips::BlockId;
 use alloy::primitives::{aliases::I24, Address, Bytes, B256, U160, U256};

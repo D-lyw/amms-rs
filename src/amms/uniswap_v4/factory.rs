@@ -1,6 +1,6 @@
-use std::sync::Arc;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
 use alloy::eips::BlockId;

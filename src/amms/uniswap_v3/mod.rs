@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use super::{
     amm::{AutomatedMarketMaker, SyncAction, AMM},
     consts::{MIN_V3_LIQUIDITY, MPFR_T_PRECISION},
@@ -24,6 +23,7 @@ use rayon::iter::{IntoParallelRefIterator, ParallelDrainRange, ParallelIterator}
 use rug::ops::Pow;
 use rug::Float;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::{
     collections::{HashMap, HashSet},
     future::Future,

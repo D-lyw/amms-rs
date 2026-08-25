@@ -3,7 +3,6 @@
 //! 通过 `getAllPairIds` + `eth_getStorageAt` 发现链上池子。
 //! Caliber 无池子创建事件，无法通过 sync_events 增量同步。
 
-use std::sync::Arc;
 use alloy::{
     eips::BlockId,
     hex::FromHex,
@@ -13,6 +12,7 @@ use alloy::{
     rpc::types::Log,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tracing::{debug, instrument};
 
 use crate::amms::{

@@ -2583,7 +2583,8 @@ impl AerodromeSlipstreamFactory {
                                 liquidity_net: tick.1,
                                 initialized: tick.0 > 0,
                             };
-                            Arc::make_mut(&mut slipstream_pool.ticks).insert(tick_idx.as_i32(), info);
+                            Arc::make_mut(&mut slipstream_pool.ticks)
+                                .insert(tick_idx.as_i32(), info);
                         }
                     }
 

@@ -490,22 +490,12 @@ fn test_engine_quote_sell_cap_matches_onchain() {
 fn test_engine_quote_buy_rem_fee_matches_failed_tx_samples() {
     let mut pool = test_pool();
     pool.apply_l2_update(1, U256::from(13_649u64), 67_475_114, 4, 4);
-    let out = pool
-        .engine_quote(0, 1, U256::from(44_291_018u64))
-        .unwrap();
-    assert_eq!(
-        out,
-        U256::from_str_radix("324080619644034278", 10).unwrap()
-    );
+    let out = pool.engine_quote(0, 1, U256::from(44_291_018u64)).unwrap();
+    assert_eq!(out, U256::from_str_radix("324080619644034278", 10).unwrap());
 
     pool.apply_l2_update(1, U256::from(13_684u64), 67_476_139, 5, 4);
-    let out = pool
-        .engine_quote(0, 1, U256::from(122_156_425u64))
-        .unwrap();
-    assert_eq!(
-        out,
-        U256::from_str_radix("891476871940974505", 10).unwrap()
-    );
+    let out = pool.engine_quote(0, 1, U256::from(122_156_425u64)).unwrap();
+    assert_eq!(out, U256::from_str_radix("891476871940974505", 10).unwrap());
 }
 
 /// BUY 阶梯上限：线性区 = q0j（in=1e6），饱和区 min(linear, maxOut)
@@ -730,7 +720,10 @@ fn test_sync_fee_event_updates_fee_and_rederives_rates() {
     assert_eq!(pool.fee_ppm, 200);
     // rates 同步重导：fee 1000→200 → 可执行中间价上移（0→1 方向）
     let rate_new = pool.rates[pool.pair_index(0, 1)];
-    assert!(rate_new.num > rate_old.num, "rate should rise after fee cut");
+    assert!(
+        rate_new.num > rate_old.num,
+        "rate should rise after fee cut"
+    );
     assert_eq!(rate_new.den, rate_old.den);
 
     // 重复同 fee 事件 → 无动作

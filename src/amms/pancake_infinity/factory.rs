@@ -1,6 +1,6 @@
-use std::sync::Arc;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::sync::Arc;
 
 use alloy::eips::BlockId;
 use alloy::primitives::{aliases::I24, Address, B256, U160, U256};

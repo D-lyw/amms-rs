@@ -131,8 +131,8 @@ use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
 
 use alloy::primitives::{Address, B256, U256};
-use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
+use std::time::{Duration, Instant};
 
 use super::Token;
 
@@ -402,9 +402,8 @@ fn swap_back_balances() -> &'static RwLock<HashMap<Address, SwapBackBalanceState
 /// = 0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef
 /// （硬编码避免非 const 的 keccak256 调用；alloy 宏不便在此使用）
 pub const ERC20_TRANSFER_SIG: B256 = B256::new([
-    0xdd, 0xf2, 0x52, 0xad, 0x1b, 0xe2, 0xc8, 0x9b, 0x69, 0xc2, 0xb0, 0x68, 0xfc, 0x37, 0x8d,
-    0xaa, 0x95, 0x2b, 0xa7, 0xf1, 0x63, 0xc4, 0xa1, 0x16, 0x28, 0xf5, 0x5a, 0x4d, 0xf5, 0x23,
-    0xb3, 0xef,
+    0xdd, 0xf2, 0x52, 0xad, 0x1b, 0xe2, 0xc8, 0x9b, 0x69, 0xc2, 0xb0, 0x68, 0xfc, 0x37, 0x8d, 0xaa,
+    0x95, 0x2b, 0xa7, 0xf1, 0x63, 0xc4, 0xa1, 0x16, 0x28, 0xf5, 0x5a, 0x4d, 0xf5, 0x23, 0xb3, 0xef,
 ]);
 
 /// 判断税率是否需要在事件驱动下监控 swapBack 余额。
@@ -723,9 +722,15 @@ mod tests {
             swap_back_threshold: U256::from(1250u64) * U256::from(18),
         };
         // 输出侧（用户买）：扣 buy 2%
-        assert_eq!(tax.output_net(GROSS), GROSS * uint!(9800_U256) / uint!(10000_U256) + uint!(1_U256));
+        assert_eq!(
+            tax.output_net(GROSS),
+            GROSS * uint!(9800_U256) / uint!(10000_U256) + uint!(1_U256)
+        );
         // 输入侧（用户卖）：扣 sell 5%
-        assert_eq!(tax.input_net(GROSS), GROSS * uint!(9500_U256) / uint!(10000_U256) + uint!(1_U256));
+        assert_eq!(
+            tax.input_net(GROSS),
+            GROSS * uint!(9500_U256) / uint!(10000_U256) + uint!(1_U256)
+        );
         // gross-up 往返
         let buy_gross = tax.output_gross_up(NET);
         assert_eq!(tax.output_net(buy_gross), NET);
@@ -786,8 +791,7 @@ mod tests {
                 buy_fee_bps: 300,
                 sell_fee_bps: 300,
                 pairs: vec![Address::repeat_byte(0x52)],
-                swap_back_threshold: U256::from(1250u64)
-                    * U256::from(10u64).pow(U256::from(18)),
+                swap_back_threshold: U256::from(1250u64) * U256::from(10u64).pow(U256::from(18)),
             },
         );
         register_fot_token(
@@ -855,13 +859,45 @@ mod tests {
         init_swap_back_balance_snapshot(token, U256::from(1000u32), 100);
         // 快照水位 = (100, MAX, MAX)：<= 该位置的事件丢弃（快照块事件重叠 /
         // backfill-实时边界防重）
-        apply_swap_back_transfer(token, Address::repeat_byte(0x01), token, U256::from(50u32), 100, 0, 0);
-        apply_swap_back_transfer(token, Address::repeat_byte(0x01), token, U256::from(60u32), 99, 0, 0);
+        apply_swap_back_transfer(
+            token,
+            Address::repeat_byte(0x01),
+            token,
+            U256::from(50u32),
+            100,
+            0,
+            0,
+        );
+        apply_swap_back_transfer(
+            token,
+            Address::repeat_byte(0x01),
+            token,
+            U256::from(60u32),
+            99,
+            0,
+            0,
+        );
         assert_eq!(swap_back_balance(token), U256::from(1000u32));
         // (101,0,0) 应用后，完全相同位置重放被丢弃（断线重连重放同一事件）
-        apply_swap_back_transfer(token, Address::repeat_byte(0x01), token, U256::from(40u32), 101, 0, 0);
+        apply_swap_back_transfer(
+            token,
+            Address::repeat_byte(0x01),
+            token,
+            U256::from(40u32),
+            101,
+            0,
+            0,
+        );
         assert_eq!(swap_back_balance(token), U256::from(1040u32));
-        apply_swap_back_transfer(token, Address::repeat_byte(0x01), token, U256::from(40u32), 101, 0, 0);
+        apply_swap_back_transfer(
+            token,
+            Address::repeat_byte(0x01),
+            token,
+            U256::from(40u32),
+            101,
+            0,
+            0,
+        );
         assert_eq!(swap_back_balance(token), U256::from(1040u32));
     }
 
@@ -906,7 +942,15 @@ mod tests {
         );
         assert_eq!(swap_back_balance(token), U256::from(7u32));
         // 下一块事件正常应用
-        apply_swap_back_transfer(token, Address::repeat_byte(0x01), token, U256::from(3u32), 102, 0, 0);
+        apply_swap_back_transfer(
+            token,
+            Address::repeat_byte(0x01),
+            token,
+            U256::from(3u32),
+            102,
+            0,
+            0,
+        );
         assert_eq!(swap_back_balance(token), U256::from(10u32));
     }
 
@@ -997,9 +1041,25 @@ mod tests {
     fn test_swap_back_apply_uninitialized_token() {
         // 未快照 token 的事件：or_insert 0 起点累加（防御性，不应 panic）
         let token = Address::repeat_byte(0x59);
-        apply_swap_back_transfer(token, Address::repeat_byte(0x01), token, U256::from(77u32), 5, 0, 0);
+        apply_swap_back_transfer(
+            token,
+            Address::repeat_byte(0x01),
+            token,
+            U256::from(77u32),
+            5,
+            0,
+            0,
+        );
         assert_eq!(swap_back_balance(token), U256::from(77u32));
-        apply_swap_back_transfer(token, token, Address::repeat_byte(0x02), U256::from(1u32), 6, 0, 0);
+        apply_swap_back_transfer(
+            token,
+            token,
+            Address::repeat_byte(0x02),
+            U256::from(1u32),
+            6,
+            0,
+            0,
+        );
         assert_eq!(swap_back_balance(token), U256::ZERO);
     }
 }

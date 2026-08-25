@@ -786,7 +786,9 @@ impl EkuboPool {
     /// Update tick data from PositionUpdated event
     /// This handles both liquidity_gross and liquidity_net updates, plus tick_bitmap flipping
     fn update_tick_from_event(&mut self, tick: i32, liquidity_delta: i128, is_upper: bool) {
-        let info = std::sync::Arc::make_mut(&mut self.ticks).entry(tick).or_default();
+        let info = std::sync::Arc::make_mut(&mut self.ticks)
+            .entry(tick)
+            .or_default();
 
         let liquidity_gross_before = info.liquidity_gross;
 
@@ -1005,7 +1007,9 @@ impl EkuboPool {
         liquidity_delta: i128,
         upper: bool,
     ) -> Result<bool, AMMError> {
-        let info = std::sync::Arc::make_mut(&mut self.ticks).entry(tick).or_default();
+        let info = std::sync::Arc::make_mut(&mut self.ticks)
+            .entry(tick)
+            .or_default();
 
         let liquidity_gross_before = info.liquidity_gross;
 

@@ -1352,4 +1352,3 @@ pub async fn start_binaryfi_prop_sync_task<N, P>(
         }
     }
 }
-

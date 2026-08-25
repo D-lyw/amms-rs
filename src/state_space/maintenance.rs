@@ -252,6 +252,9 @@ enum PendingExecutionOutcome {
     Applied,
     SkippedStale,
     DeferredStale(u64),
+    /// 目标块超前于存储 RPC 头部，本次纠错未覆盖目标块：任务保持排队，
+    /// 以相同 required_block 立即重试，直到 RPC 收录目标块（不假装成功）。
+    RetryLater(u64),
     MissingPool,
 }
 
@@ -698,13 +701,22 @@ impl<N, P> StateSpaceManager<N, P> {
                     ));
                 }
                 let variant = local_amm.variant();
-                let mut refreshed = variant
+                let mut refreshed = match variant
                     .sync_all_pools::<N, _>(
                         vec![local_amm],
                         BlockId::from(target_block),
                         provider.clone(),
                     )
-                    .await?;
+                    .await
+                {
+                    // 目标块超前于存储 RPC 头部（flashblocks 乐观头 vs HTTP 节点
+                    // 落后）：不降级读取旧块数据，任务保持排队等待 RPC 追上后
+                    // 以目标块重读，绝不把"旧块数据 + last_synced=目标块"当作成功。
+                    Err(AMMError::BlockNotAvailable { .. }) => {
+                        return Ok(PendingExecutionOutcome::RetryLater(target_block));
+                    }
+                    res => res?,
+                };
 
                 let Some(mut synced) = refreshed.pop() else {
                     return Err(AMMError::Msg(format!(
@@ -742,6 +754,7 @@ impl<N, P> StateSpaceManager<N, P> {
         provider: &P,
         state: &Arc<RwLock<StateSpace>>,
         pending_sync_queue: &Arc<Mutex<PendingSyncQueue>>,
+        pending_sync_notify: &Notify,
         canonical_head: &Arc<AtomicU64>,
         coverage_only: bool,
         max_items: usize,
@@ -763,7 +776,15 @@ impl<N, P> StateSpaceManager<N, P> {
                 queue.claim_due_non_coverage(canonical, max_items)
             }
         };
-        Self::execute_due_tasks(provider, state, pending_sync_queue, canonical, due_tasks).await;
+        Self::execute_due_tasks(
+            provider,
+            state,
+            pending_sync_queue,
+            pending_sync_notify,
+            canonical,
+            due_tasks,
+        )
+        .await;
 
         Ok(())
     }
@@ -772,6 +793,7 @@ impl<N, P> StateSpaceManager<N, P> {
         provider: &P,
         state: &Arc<RwLock<StateSpace>>,
         pending_sync_queue: &Arc<Mutex<PendingSyncQueue>>,
+        pending_sync_notify: &Notify,
         canonical: u64,
         due_tasks: Vec<(Address, PendingSyncTask)>,
     ) where
@@ -838,6 +860,22 @@ impl<N, P> StateSpaceManager<N, P> {
                         deferred_to_block,
                     );
                 }
+                Ok(PendingExecutionOutcome::RetryLater(required_block)) => {
+                    warn!(
+                        ?address,
+                        action = ?task.action,
+                        reason = ?task.reason,
+                        required_block,
+                        "Pending sync task deferred: storage RPC head behind required block; will retry"
+                    );
+                    pending_sync_queue.lock().await.postpone(
+                        address,
+                        task.action,
+                        task.reason,
+                        required_block,
+                    );
+                    pending_sync_notify.notify_one();
+                }
                 Ok(PendingExecutionOutcome::MissingPool) => {
                     pending_sync_queue.lock().await.drop_task(address);
                 }
@@ -874,6 +912,7 @@ impl<N, P> StateSpaceManager<N, P> {
                 &provider,
                 &state,
                 &pending_sync_queue,
+                &pending_sync_notify,
                 &canonical_head,
                 false,
                 usize::MAX,

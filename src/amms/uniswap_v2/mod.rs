@@ -1407,15 +1407,15 @@ mod tests {
 
         // 输出侧同为 XLS 时（token_a → token_b）：返回按 97% 折扣（同 FlatRate）
         let in_a = U256::from(100_000u64) * U256::from(10u64).pow(U256::from(6));
-        let gross_b = pool.get_amount_out(
-            in_a,
-            U256::from(pool.reserve_0),
-            U256::from(pool.reserve_1),
-        );
+        let gross_b =
+            pool.get_amount_out(in_a, U256::from(pool.reserve_0), U256::from(pool.reserve_1));
         let out_b = pool
             .simulate_swap(pool.token_a.address, pool.token_b.address, in_a)
             .unwrap();
-        assert_eq!(out_b, gross_b - gross_b * U256::from(300u16) / U256::from(10000u16));
+        assert_eq!(
+            out_b,
+            gross_b - gross_b * U256::from(300u16) / U256::from(10000u16)
+        );
     }
 
     #[test]
@@ -1438,9 +1438,15 @@ mod tests {
         assert_eq!(amount_out, expected_out);
 
         // reserve_1（XLS）增量 = 扣税后净额（实收值）
-        assert_eq!(U256::from(pool.reserve_1), U256::from(pre_reserve_1) + net_in);
+        assert_eq!(
+            U256::from(pool.reserve_1),
+            U256::from(pre_reserve_1) + net_in
+        );
         // reserve_0（USDT）减少 = 输出 gross
-        assert_eq!(U256::from(pool.reserve_0), U256::from(pre_reserve_0) - expected_out);
+        assert_eq!(
+            U256::from(pool.reserve_0),
+            U256::from(pre_reserve_0) - expected_out
+        );
     }
 
     #[test]
@@ -1461,8 +1467,7 @@ mod tests {
             )
             .unwrap();
         // 3% 双向：名义 = ceil((raw_in-1)×10000/9700)+1 > raw_in
-        let expected_ceil = (raw_in - U256::from(1u8)) * U256::from(10000u16)
-            / U256::from(9700u16)
+        let expected_ceil = (raw_in - U256::from(1u8)) * U256::from(10000u16) / U256::from(9700u16)
             + U256::from(1u8);
         assert_eq!(amount_in, expected_ceil);
         assert!(amount_in > raw_in);

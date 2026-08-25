@@ -211,7 +211,8 @@ pub const BINARYFI_ROUTER_ADDRESS: Address = address!("0x2d651e3fe9470db52d21156
 /// block.timestamp) → forceApprove(pool, 0)` 后把剩余 tokenOut/tokenIn 退回。
 /// Base 同地址为新版（多 `weth()`/`receive()` 原生 ETH 处理）。仅供理解
 /// 入口语义与事件结构；报价公式在引擎内，见模块顶部说明。
-pub const BINARYFI_ADAPTER_ADDRESS: Address = address!("0x4d0e78ba4c116f576fbe2908c75696d9041e5f04");
+pub const BINARYFI_ADAPTER_ADDRESS: Address =
+    address!("0x4d0e78ba4c116f576fbe2908c75696d9041e5f04");
 /// 池子 Swap 事件签名
 pub const BINARYFI_SWAP_EVENT: B256 =
     b256!("cd3829a3813dc3cdd188fd3d01dcf3268c16be2fdd2dd21d0665418816e46062");
@@ -509,7 +510,13 @@ impl BinaryFiPropPool {
     /// → `ask = floor(rem × 10^(dj+2) / (big × 10^d0))`。
     /// 低小数位资产 q0j 反推误差可达数千（q0j 只有 3-4 位有效数字），
     /// 大额 probe 消除误差；反推值 ±1 内验证能复刻 big 才采用。
-    fn recover_ask_big(big_out: U256, big_in: U256, dj: u32, d0: u32, fee_ppm: u64) -> Option<U256> {
+    fn recover_ask_big(
+        big_out: U256,
+        big_in: U256,
+        dj: u32,
+        d0: u32,
+        fee_ppm: u64,
+    ) -> Option<U256> {
         if big_out.is_zero() || dj > 30 || d0 > 30 {
             return None;
         }
@@ -620,8 +627,7 @@ impl BinaryFiPropPool {
                 .filter(|&d| d <= 30)
                 .filter(|_| !ask_eff.is_zero())
                 .map(|d| {
-                    let num = U256::from(10u64)
-                        .pow(U256::from(d + 2));
+                    let num = U256::from(10u64).pow(U256::from(d + 2));
                     num / ask_eff
                 });
             if let Some(qv) = self.q0j.get_mut(asset_idx) {
@@ -868,7 +874,13 @@ impl BinaryFiPropPool {
                 .copied()
                 .flatten()
                 .filter(|q| !q.is_zero())?;
-            apply_fee_rate(Rate { num: q, den: p10(d0) }, self.fee_ppm)
+            apply_fee_rate(
+                Rate {
+                    num: q,
+                    den: p10(d0),
+                },
+                self.fee_ppm,
+            )
         } else {
             // 两段式相乘（无费）：raw_i×10^(d0-2)/10^di × q0j/10^d0
             // = raw_i×q0j / 10^(di+2)
@@ -1319,10 +1331,7 @@ impl BinaryFiPropPool {
         // （unfee_quote）依赖当前 fee 口径；fee 变更只换字段、价格无需重校准
         // （L2 存无费原始价，报价时按 fee 扣）。
         if !snap.fee.is_zero() {
-            let new_fee = snap
-                .fee
-                .min(U256::from(1_000_000u64))
-                .to::<u64>();
+            let new_fee = snap.fee.min(U256::from(1_000_000u64)).to::<u64>();
             if new_fee != self.fee_ppm {
                 tracing::debug!(
                     old_fee = self.fee_ppm,
@@ -1409,26 +1418,25 @@ impl BinaryFiPropPool {
         let d0_all = self.assets[0].decimals as u32;
         let bid_nofee: Vec<Option<U256>> = (0..n)
             .map(|j| {
-                j0_out[j]
-                    .filter(|out| !out.is_zero())
-                    .and_then(|out| {
-                        if j == 0 {
-                            return None;
-                        }
-                        let dj = self.assets[j].decimals as u32;
-                        if dj > 30 || d0_all > 30 {
-                            return None;
-                        }
-                        let in_j = U256::from(10u64).pow(U256::from(dj.saturating_sub(4)));
-                        let rem = fee_rem(in_j, self.fee_ppm);
-                        let num = out.checked_mul(U256::from(10u64).pow(U256::from(dj)))?;
-                        let den = rem.checked_mul(U256::from(10u64).pow(U256::from(d0_all.saturating_sub(2))))?;
-                        if den.is_zero() {
-                            None
-                        } else {
-                            Some(num / den)
-                        }
-                    })
+                j0_out[j].filter(|out| !out.is_zero()).and_then(|out| {
+                    if j == 0 {
+                        return None;
+                    }
+                    let dj = self.assets[j].decimals as u32;
+                    if dj > 30 || d0_all > 30 {
+                        return None;
+                    }
+                    let in_j = U256::from(10u64).pow(U256::from(dj.saturating_sub(4)));
+                    let rem = fee_rem(in_j, self.fee_ppm);
+                    let num = out.checked_mul(U256::from(10u64).pow(U256::from(dj)))?;
+                    let den = rem
+                        .checked_mul(U256::from(10u64).pow(U256::from(d0_all.saturating_sub(2))))?;
+                    if den.is_zero() {
+                        None
+                    } else {
+                        Some(num / den)
+                    }
+                })
             })
             .collect();
         for j in 1..n {
@@ -1583,9 +1591,7 @@ impl BinaryFiPropPool {
                     // raw_est = qb × 10^di / (fee_rem(big_in)×10^(d0-2))
                     // （big_in 为 100 整枚，含费输出 = fee_rem(big_in)×raw×10^(d0-2)/10^di）
                     let rem = fee_rem(big_in, self.fee_ppm);
-                    let num = qb
-                        .checked_mul(p10a(dj))
-                        .unwrap_or(U256::ZERO);
+                    let num = qb.checked_mul(p10a(dj)).unwrap_or(U256::ZERO);
                     let den = rem.checked_mul(p10a(k0)).unwrap_or(U256::ZERO);
                     if den.is_zero() {
                         Some(bid)
@@ -1784,8 +1790,9 @@ impl BinaryFiPropPool {
                     }
                     while lo < hi {
                         let mid = lo + (hi - lo) / U256::from(2);
-                        let out_mid = ladder_sell_out(p, &ladder, mid, probe_in, d0, dj, self.fee_ppm)
-                            .unwrap_or(U256::ZERO);
+                        let out_mid =
+                            ladder_sell_out(p, &ladder, mid, probe_in, d0, dj, self.fee_ppm)
+                                .unwrap_or(U256::ZERO);
                         if out_mid < qb {
                             lo = mid + U256::from(1);
                         } else {

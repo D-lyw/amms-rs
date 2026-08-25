@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::amms::amm::{AutomatedMarketMaker, SyncAction};
 use crate::amms::error::AMMError;

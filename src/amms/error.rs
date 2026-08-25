@@ -60,6 +60,8 @@ pub enum AMMError {
     TokenNotFound(alloy::primitives::Address),
     #[error("Arithmetic error (overflow/underflow)")]
     ArithmeticError,
+    #[error("requested block {requested_block} ahead of storage RPC head {storage_head}")]
+    BlockNotAvailable { requested_block: u64, storage_head: u64 },
     #[error("AMM Error: {0}")]
     Msg(String),
     #[error("Token Out Does Not Exist")]
