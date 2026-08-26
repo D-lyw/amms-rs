@@ -8,6 +8,7 @@ mod exact_out;
 mod price;
 mod quote_parity;
 mod recalculate_precision;
+mod simulate_swap_mut_d_invariant;
 mod support;
 mod sync_drift;
 mod xlayer_stableswap;

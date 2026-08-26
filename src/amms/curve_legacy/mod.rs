@@ -1120,6 +1120,9 @@ impl AutomatedMarketMaker for CurveLegacyPool {
                                 "Balance underflow in simulate_swap_mut".into(),
                             ))?;
                 }
+                // CryptoSwap：balances 已变更，重算存储 D 保持不变量与余额自洽（链上 exchange 同款），
+                // 防止后续模拟用失配 D 产生虚假价格（tricrypto2 实测可放大 ~20%）。
+                self.recalculate_crypto_state()?;
                 // 刷新 spot price 缓存（balances 已更新为 swap 后状态）
                 self.update_spot_prices();
                 Ok(amount_out)
@@ -1202,6 +1205,9 @@ impl AutomatedMarketMaker for CurveLegacyPool {
                 new_view.total_supply = new_base_supply;
                 self.base_pool_view = Some(Arc::new(new_view));
 
+                // CryptoSwap：balances 已变更，重算存储 D 保持不变量与余额自洽（链上 exchange 同款），
+                // 防止后续模拟用失配 D 产生虚假价格（tricrypto2 实测可放大 ~20%）。
+                self.recalculate_crypto_state()?;
                 // 刷新 spot price 缓存
                 self.update_spot_prices();
                 Ok(base_out)
@@ -1264,6 +1270,9 @@ impl AutomatedMarketMaker for CurveLegacyPool {
                 self.balances[lp_idx] = new_lp_balance;
                 self.balances[meta_j] = new_meta_j;
 
+                // CryptoSwap：balances 已变更，重算存储 D 保持不变量与余额自洽（链上 exchange 同款），
+                // 防止后续模拟用失配 D 产生虚假价格（tricrypto2 实测可放大 ~20%）。
+                self.recalculate_crypto_state()?;
                 // 刷新 spot price 缓存
                 self.update_spot_prices();
                 Ok(meta_out)

@@ -8,5 +8,6 @@ mod meta_pool_fork_ethereum;
 mod pool_index_ethereum;
 mod quote_parity;
 mod recalculate_precision;
+mod simulate_swap_mut_d_invariant;
 mod support;
 mod sync_drift;

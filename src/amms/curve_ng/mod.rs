@@ -1103,6 +1103,9 @@ impl AutomatedMarketMaker for CurveNGPool {
             .checked_sub(amount_out)
             .ok_or(AMMError::Msg("Balance underflow".into()))?;
 
+        // CryptoSwap（TwoCrypto/TriCrypto）：balances 已变更，重算存储 D 保持不变量与余额自洽，
+        // 防止后续模拟用失配 D 产生虚假价格（与 CurveLegacy tricrypto2 同类问题）。
+        self.recalculate_d()?;
         // 刷新 spot price 缓存（balances 已更新为 swap 后状态）
         self.update_spot_prices();
 
