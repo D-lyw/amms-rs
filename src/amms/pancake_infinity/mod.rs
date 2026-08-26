@@ -654,8 +654,10 @@ impl PancakeInfinityPool {
             ..Default::default()
         };
         let _params = U256::from_be_bytes(pool_key.parameters.0);
+        // 官方 infinity-core `CLPoolParametersHelper` 位布局：[16:40) = tickSpacing（24 bits），
+        // 即 (parameters >> 16) & 0xFFFFFF，对应字节切片 [27..30]（此前误用 [29..32]）。
         let spacing =
-            I24::from_be_bytes::<3>((&pool_key.parameters.0[29..32]).try_into().unwrap()).as_i32();
+            I24::from_be_bytes::<3>((&pool_key.parameters.0[27..30]).try_into().unwrap()).as_i32();
         pool.tick_spacing = spacing;
         pool.pool_id = alloy::primitives::keccak256(pool.pool_key.abi_encode());
         pool

@@ -753,7 +753,7 @@ impl AutomatedMarketMakerFactory for PancakeInfinityFactory {
             token_a: Token::new_with_decimals(event.currency0, 0),
             token_b: Token::new_with_decimals(event.currency1, 0),
             tick_spacing: I24::from_be_bytes::<3>(
-                (&event.parameters.0[29..32]).try_into().unwrap(),
+                (&event.parameters.0[27..30]).try_into().unwrap(),
             )
             .as_i32(),
             lp_fee: event.fee.to::<u32>(),

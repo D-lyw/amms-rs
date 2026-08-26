@@ -48,11 +48,12 @@ fn create_test_pool(
         (token_b, token_a)
     };
 
-    // Build parameters bytes32 with tick_spacing encoded
+    // Build parameters bytes32 with tick_spacing encoded per official layout
+    // (infinity-core `CLPoolParametersHelper`): bits [16:40) = tickSpacing (24 bits),
+    // i.e. parameters = tickSpacing << 16，对应字节切片 [27..30]；低 16 位为 hooks bitmap。
     let mut parameters = [0u8; 32];
-    // tick_spacing is i24, encoded in the last 3 bytes
     let tick_spacing_bytes = (tick_spacing as i32).to_be_bytes();
-    parameters[29..32].copy_from_slice(&tick_spacing_bytes[1..4]);
+    parameters[27..30].copy_from_slice(&tick_spacing_bytes[1..4]);
 
     let pool_key = PoolKey {
         currency0,
@@ -363,4 +364,48 @@ fn test_simulate_swap_exact_out_protocol_fee() {
     // 有协议费时，总费率更高，所以需要的输入更多
     // 总费率 = protocol_fee + lp_fee * (1 - protocol_fee) ≈ 0.1% + 0.3% * 0.999 ≈ 0.3997%
     assert!(exact_in_with_protocol >= exact_in_no_protocol);
+}
+
+/// 回归测试：`parameters` 位布局必须按官方 infinity-core `CLPoolParametersHelper` 解码，
+/// tickSpacing 位于 [16:40)（即 (parameters >> 16) & 0xFFFFFF，字节切片 [27..30]）。
+/// 数据来源：BSC CLPoolManager 0xa0FfB9c1CE1Fe56963B0321B32E7A0302114058b
+/// `poolIdToPoolKey` 实测返回：
+///   - fee 67 零 hooks 池   parameters=0x...00010000 → tickSpacing=1
+///   - fee 2500 带 hooks 池 parameters=0x...32008d   → tickSpacing=50（低16位=0x008d hooks bitmap）
+#[test]
+fn test_pool_key_parameters_tick_spacing_decode() {
+    let manager = Address::ZERO;
+    let mk_key = |params: [u8; 32], fee: u32| PoolKey {
+        currency0: Address::ZERO,
+        currency1: alloy::primitives::address!("0x0000000000000000000000000000000000000001"),
+        hooks: Address::ZERO,
+        poolManager: manager,
+        fee: alloy::primitives::aliases::U24::from(fee),
+        parameters: alloy::primitives::B256::from(params),
+    };
+
+    // tickSpacing=1 → parameters = 1 << 16 = 0x...00010000
+    let mut p1 = [0u8; 32];
+    p1[29] = 0x01;
+    let pool1 = PancakeInfinityPool::new(manager, mk_key(p1, 67));
+    assert_eq!(pool1.tick_spacing, 1);
+
+    // tickSpacing=50 + hooks bitmap 0x008d → parameters = 0x...32008d
+    let mut p2 = [0u8; 32];
+    p2[29] = 0x32;
+    p2[31] = 0x8d;
+    let pool2 = PancakeInfinityPool::new(manager, mk_key(p2, 2500));
+    assert_eq!(pool2.tick_spacing, 50);
+
+    // tickSpacing=10 → parameters = 10 << 16 = 0x...000a0000
+    let mut p3 = [0u8; 32];
+    p3[29] = 0x0a;
+    let pool3 = PancakeInfinityPool::new(manager, mk_key(p3, 67));
+    assert_eq!(pool3.tick_spacing, 10);
+
+    // pool_id 必须等于 keccak256(abi.encode(poolKey))（与链上 poolId 一致的前提）
+    assert_eq!(
+        pool1.pool_id,
+        alloy::primitives::keccak256(alloy::sol_types::SolValue::abi_encode(&pool1.pool_key))
+    );
 }
