@@ -1,5 +1,6 @@
 mod arbitrum_feed;
 mod base_pending_logs;
+mod bsc_logs_push;
 pub mod discovery;
 pub mod error;
 pub mod filters;
@@ -48,6 +49,7 @@ use filters::AMMFilter;
 use filters::PoolFilter;
 use futures::stream::FuturesUnordered;
 use futures::{Stream, StreamExt};
+use serde_json::{json, Value};
 use maintenance::{PendingSyncAction, PendingSyncQueue, PendingSyncReason};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Debug;
@@ -89,6 +91,14 @@ pub enum RealtimeSyncSource {
     /// - receipt 无 transactionIndex，用累计计数器推导
     XlayerFlashblocksRaw,
     ArbitrumSequencerFeed,
+    /// BSC 主网实时同步：标准 `eth_subscribe("logs")` push 订阅 + canonical 对账兜底。
+    ///
+    /// BSC 无 flashblocks 端点（0.45s 原生块的 PoSA L1），也没有 sequencer feed。
+    /// 实时通道用标准 geth `logs` 订阅推送已打包块日志；漏推由断线重连的
+    /// getLogs 补拉 + drift 状态级对账兜底（Base 同款体系）。
+    /// 要求 `StateSpaceBuilder::with_realtime_ws_endpoints(...)` 提供支持
+    /// `eth_subscribe("logs")` 的 WSS 端点。
+    BscMainnetLogsPush,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,6 +139,7 @@ pub struct StateSpaceManager<N, P> {
 
 const LOG_ADDRESS_CHUNK_SIZE: usize = 200;
 const BASE_CHAIN_ID: u64 = 8453;
+const BSC_MAINNET_CHAIN_ID: u64 = 56;
 const ARBITRUM_CHAIN_ID: u64 = 42161;
 const ETHEREUM_MAINNET_CHAIN_ID: u64 = 1;
 const XLAYER_CHAIN_ID: u64 = 196;
@@ -171,6 +182,7 @@ enum LogSource {
     XlayerFlashblock,
     ArbitrumFeedPull,
     NewHeadsPull,
+    BscLogsPush,
     Maintenance,
 }
 
@@ -505,10 +517,63 @@ impl LogQueryChunk {
     }
 }
 
+/// 将查询块序列化为 `eth_subscribe("logs"|"pendingLogs")` 的 filter JSON。
+///
+/// Base `pendingLogs` 与 BSC `logs` 订阅共用同一 filter 结构
+/// （`address` + `topics[0]` OR 列表），保证 push 订阅与 canonical
+/// getLogs 路径的覆盖完全一致。
+pub(super) fn chunk_to_subscription_filter(chunk: &LogQueryChunk) -> Value {
+    let addresses: Vec<String> = chunk
+        .addresses
+        .iter()
+        .map(|addr| format!("{addr:?}"))
+        .collect();
+
+    match &chunk.mode {
+        QueryMode::TopicFiltered(topics) => {
+            let topic0: Vec<String> = topics.iter().map(|topic| format!("{topic:?}")).collect();
+            json!({
+                "address": addresses,
+                "topics": [topic0],
+            })
+        }
+        QueryMode::AddressOnly => {
+            json!({
+                "address": addresses,
+            })
+        }
+    }
+}
+
+/// push 订阅本地预去重：多个 chunk 订阅可合法重叠（共享基础设施合约），
+/// 重连后节点也可能重复投递；在进入全局 `AppliedLogDedupCache` 前先过滤。
+#[derive(Default)]
+pub(super) struct PendingLogDedupCache {
+    seen: HashSet<AppliedLogKey>,
+    order: VecDeque<AppliedLogKey>,
+}
+
+impl PendingLogDedupCache {
+    pub(super) fn insert_if_new(&mut self, key: AppliedLogKey) -> bool {
+        if self.seen.contains(&key) {
+            return false;
+        }
+        self.seen.insert(key.clone());
+        self.order.push_back(key);
+        while self.order.len() > 300_000 {
+            if let Some(old) = self.order.pop_front() {
+                self.seen.remove(&old);
+            }
+        }
+        true
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum SelectedRealtimeSource {
     NewHeadsPull,
     BasePendingLogs,
+    BscLogsPush,
     XlayerFlashblocksPull,
     ArbitrumFeedPull,
 }
@@ -576,6 +641,8 @@ impl<N, P> StateSpaceManager<N, P> {
             && matches!(selected, SelectedRealtimeSource::BasePendingLogs))
             || (chain_id == XLAYER_CHAIN_ID
                 && matches!(selected, SelectedRealtimeSource::XlayerFlashblocksPull))
+            || (chain_id == BSC_MAINNET_CHAIN_ID
+                && matches!(selected, SelectedRealtimeSource::BscLogsPush))
         {
             let provider = self.provider.clone();
             let state = self.state.clone();
@@ -695,6 +762,7 @@ impl<N, P> StateSpaceManager<N, P> {
 
     /// Subscribes to AMM state changes through a configurable realtime source:
     /// - Base: `pendingLogs` on a Flashblocks-aware WebSocket endpoint by default.
+    /// - BSC: standard `logs` subscription on an explicit WSS endpoint (push).
     /// - Other chains: newHeads + logsBloom prefilter + per-block get_logs.
     ///
     /// For Base, the `pendingLogs` path deliberately reuses `build_query_chunks()`,
@@ -816,10 +884,12 @@ impl<N, P> StateSpaceManager<N, P> {
         let chain_id = { state.read().await.chain_id };
         let query_chunks = Self::build_query_chunks(&provider, &state, chain_id).await?;
         let selected = Self::resolve_realtime_source(chain_id, &realtime_source);
-        let base_ws_candidates = if matches!(selected, SelectedRealtimeSource::BasePendingLogs) {
+        let push_ws_candidates = if matches!(selected, SelectedRealtimeSource::BasePendingLogs)
+            || matches!(selected, SelectedRealtimeSource::BscLogsPush)
+        {
             Some(self.realtime_ws_endpoints.clone().ok_or_else(|| {
                 StateSpaceError::from(AMMError::Msg(
-                    "Base pendingLogs realtime source requires explicit websocket endpoints that support Base flashblock-related subscription methods (specifically `eth_subscribe` with `pendingLogs`). Use StateSpaceBuilder::with_realtime_ws_endpoints(vec![\"wss://...\".into(), ...]).".to_string(),
+                    "push realtime source (Base pendingLogs / BSC logs) requires explicit websocket endpoints that support `eth_subscribe` (`pendingLogs` / `logs`). Use StateSpaceBuilder::with_realtime_ws_endpoints(vec![\"wss://...\".into(), ...]).".to_string(),
                 ))
             })?)
         } else {
@@ -850,7 +920,7 @@ impl<N, P> StateSpaceManager<N, P> {
                 )))
             }
             SelectedRealtimeSource::BasePendingLogs => {
-                let ws_candidates = base_ws_candidates
+                let ws_candidates = push_ws_candidates
                     .expect("BasePendingLogs selected must prevalidate ws endpoints");
                 info!(
                     "Starting Base pendingLogs sync (chain_id={}, {} query chunks)",
@@ -858,6 +928,29 @@ impl<N, P> StateSpaceManager<N, P> {
                     query_chunks.len()
                 );
                 Ok(Box::pin(Self::subscribe_base_pending_logs_stream(
+                    provider,
+                    state,
+                    hooks,
+                    update_seq,
+                    realtime_head,
+                    canonical_head,
+                    pending_sync_queue,
+                    pending_sync_notify,
+                    applied_log_dedup,
+                    query_chunks,
+                    ws_candidates,
+                    chain_id,
+                )))
+            }
+            SelectedRealtimeSource::BscLogsPush => {
+                let ws_candidates = push_ws_candidates
+                    .expect("BscLogsPush selected must prevalidate ws endpoints");
+                info!(
+                    "Starting BSC logs push sync (chain_id={}, {} query chunks)",
+                    chain_id,
+                    query_chunks.len()
+                );
+                Ok(Box::pin(Self::subscribe_bsc_logs_push_stream(
                     provider,
                     state,
                     hooks,
@@ -929,6 +1022,8 @@ impl<N, P> StateSpaceManager<N, P> {
                     SelectedRealtimeSource::XlayerFlashblocksPull
                 } else if chain_id == ARBITRUM_CHAIN_ID || chain_id == ROBINHOOD_CHAIN_ID {
                     SelectedRealtimeSource::ArbitrumFeedPull
+                } else if chain_id == BSC_MAINNET_CHAIN_ID {
+                    SelectedRealtimeSource::BscLogsPush
                 } else {
                     SelectedRealtimeSource::NewHeadsPull
                 }
@@ -941,6 +1036,7 @@ impl<N, P> StateSpaceManager<N, P> {
                 SelectedRealtimeSource::XlayerFlashblocksPull
             }
             RealtimeSyncSource::ArbitrumSequencerFeed => SelectedRealtimeSource::ArbitrumFeedPull,
+            RealtimeSyncSource::BscMainnetLogsPush => SelectedRealtimeSource::BscLogsPush,
         }
     }
 
@@ -1708,6 +1804,7 @@ impl<N, P> StateSpaceManager<N, P> {
         match chain_id {
             ARBITRUM_CHAIN_ID => 200,
             BASE_CHAIN_ID => 100,
+            BSC_MAINNET_CHAIN_ID => 300,
             XLAYER_CHAIN_ID => 100,
             ROBINHOOD_CHAIN_ID => 100,
             ETHEREUM_MAINNET_CHAIN_ID => 50,
@@ -1986,13 +2083,13 @@ where
     /// Provide explicit WebSocket endpoints for realtime sources that require
     /// their own direct subscription connection.
     ///
-    /// This is currently required for Base `pendingLogs`, because that
-    /// subscription does not reuse the passed `Provider` transport session.
-    /// The provided endpoints must support Base flashblock-related
-    /// subscription methods, specifically `eth_subscribe` with `pendingLogs`.
+    /// Required for push-subscription realtime sources that use their own
+    /// direct WebSocket connection:
+    /// - Base `pendingLogs` (`eth_subscribe` with `pendingLogs`);
+    /// - BSC logs push (`eth_subscribe` with `logs`).
     ///
     /// It is safe for downstream applications to always call this builder
-    /// method; non-Base realtime paths currently ignore these endpoints.
+    /// method; other realtime paths currently ignore these endpoints.
     /// Empty / blank entries are ignored.
     pub fn with_realtime_ws_endpoints(self, endpoints: Vec<String>) -> StateSpaceBuilder<N, P> {
         let mut normalized = Vec::new();
@@ -3006,8 +3103,28 @@ mod tests {
         );
         assert_eq!(StateSpaceManager::<(), ()>::backfill_window_size(8453), 100);
         assert_eq!(StateSpaceManager::<(), ()>::backfill_window_size(196), 100);
+        assert_eq!(StateSpaceManager::<(), ()>::backfill_window_size(56), 300);
         assert_eq!(StateSpaceManager::<(), ()>::backfill_window_size(1), 50);
         assert_eq!(StateSpaceManager::<(), ()>::backfill_window_size(10), 50);
+    }
+
+    #[test]
+    fn bsc_realtime_source_resolves_to_logs_push() {
+        assert!(matches!(
+            StateSpaceManager::<(), ()>::resolve_realtime_source(56, &RealtimeSyncSource::Auto),
+            SelectedRealtimeSource::BscLogsPush
+        ));
+        assert!(matches!(
+            StateSpaceManager::<(), ()>::resolve_realtime_source(
+                56,
+                &RealtimeSyncSource::BscMainnetLogsPush
+            ),
+            SelectedRealtimeSource::BscLogsPush
+        ));
+        assert!(matches!(
+            StateSpaceManager::<(), ()>::resolve_realtime_source(1, &RealtimeSyncSource::Auto),
+            SelectedRealtimeSource::NewHeadsPull
+        ));
     }
 
     #[test]
