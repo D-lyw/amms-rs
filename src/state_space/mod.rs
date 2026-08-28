@@ -39,7 +39,7 @@ use alloy::eips::BlockId;
 use alloy::network::Network;
 
 use alloy::primitives::{keccak256, Address, Bloom, BloomInput, FixedBytes, B256, U256};
-use alloy::providers::Provider;
+use alloy::providers::{DynProvider, Provider, ProviderBuilder};
 use alloy::rpc::types::{eth::Log, Filter, FilterSet};
 use alloy::sol;
 use alloy::sol_types::SolEvent;
@@ -1902,6 +1902,10 @@ pub struct StateSpaceBuilder<N, P> {
     pub maintenance_interval: Option<Duration>,
     pub realtime_source: RealtimeSyncSource,
     pub realtime_ws_endpoints: Option<Vec<String>>,
+    /// 初始化（init_batch）阶段可选的独立 HTTP RPC 端点。
+    /// 配置后，state 同步的批量初始化改用 HTTP provider（多连接并发，突破 WS
+    /// 单连接吞吐限制）；实时事件订阅仍使用传入的 WS provider。不配置则保持原行为。
+    pub init_http_endpoint: Option<String>,
     /// Titan pAMM 流消费配置（M4；Ethereum 主网 + Fermi 时启用）。
     pub titan_stream_config: Option<TitanPammStreamConfig>,
     phantom: PhantomData<N>,
@@ -1935,6 +1939,7 @@ where
             maintenance_interval: None,
             realtime_source: RealtimeSyncSource::Auto,
             realtime_ws_endpoints: None,
+            init_http_endpoint: None,
             titan_stream_config: None,
             hooks: vec![],
         }
@@ -2110,6 +2115,13 @@ where
         }
     }
 
+    /// 指定初始化阶段使用的独立 HTTP RPC 端点（可选）。
+    /// 见 [`StateSpaceBuilder::init_http_endpoint`] 说明。
+    pub fn with_init_http_endpoint(mut self, url: String) -> StateSpaceBuilder<N, P> {
+        self.init_http_endpoint = Some(url);
+        self
+    }
+
     /// 配置 Titan pAMM 流消费（M4，可选）。
     ///
     /// - `None`（默认）：**自动检测**——state 中存在需要 Titan 实时流的 PropAMM 池
@@ -2277,21 +2289,50 @@ where
             }
         }
 
+        // 初始化批量读取使用独立 provider：配置了 HTTP 端点则用 HTTP（多连接并发，
+        // 突破 WS 单连接吞吐限制）；否则退回 WS provider，保持原行为。
+        let init_provider: DynProvider<N> = match &self.init_http_endpoint {
+            Some(url) => DynProvider::new(
+                ProviderBuilder::<alloy::providers::Identity, alloy::providers::Identity, N>::default()
+                    .network::<N>()
+                    .connect_http(url.parse().map_err(|e| AMMError::Msg(format!(
+                        "invalid init_http_endpoint: {e}"
+                    )))?),
+            ),
+            None => DynProvider::new(self.provider.clone()),
+        };
+
         // Sync remaining AMM variants in batches by variant
-        for (variant, remaining_amms) in amm_variants.drain() {
+        for (variant, mut remaining_amms) in amm_variants.drain() {
             info!(target: "state_space::sync", variant = ?variant, count = remaining_amms.len(), "Syncing batch");
-            let provider = self.provider.clone();
-            let synced = variant
-                .init_batch::<N, _>(remaining_amms, chain_tip, provider.clone())
-                .await?;
+            let provider = init_provider.clone();
 
-            // 仅做通用调度节流；具体批量大小/并发策略由各 AMM init_batch 内部负责。
-            sleep(Duration::from_millis(1200)).await;
+            // PancakeV3 初始化请求量巨大（spacing=1 池需全量扫 bitmap + tickdata，
+            // 726 池一次打出去会把 RPC 单连接打爆：-32603 / -32000）。
+            // 按小批初始化、批间刷新最新 block，规避连接保护；其余 variant 一次全量。
+            let batch_size = if matches!(variant, crate::amms::amm::Variant::PancakeV3Pool) {
+                10
+            } else {
+                remaining_amms.len()
+            };
 
-            for amm in synced {
-                let mut amm = amm;
-                amm.set_last_synced_block(chain_tip_u64);
-                state_space.insert_amm(amm);
+            while !remaining_amms.is_empty() {
+                let take = batch_size.min(remaining_amms.len());
+                let batch: Vec<AMM> = remaining_amms.drain(0..take).collect();
+                let batch_block = provider.get_block_number().await?;
+                let synced = variant
+                    .init_batch::<N, _>(batch, BlockId::from(batch_block), provider.clone())
+                    .await?;
+
+                // 仅做通用调度节流；具体批量大小/并发策略由各 AMM init_batch 内部负责。
+                sleep(Duration::from_millis(1200)).await;
+
+                for amm in synced {
+                    let mut amm = amm;
+                    amm.set_last_synced_block(chain_tip_u64);
+                    state_space.insert_amm(amm);
+                }
+                info!(target: "state_space::sync", variant = ?variant, batch_done = take, remaining = remaining_amms.len(), "Batch initialized");
             }
         }
 

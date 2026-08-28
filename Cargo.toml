@@ -16,7 +16,7 @@ exclude = ["target/*", ".github/*", ".gitignore", "build.rs", "contracts/*"]
 uniswap_v3_math = "0.6.2"
 
 # alloy
-alloy = { version = "1.0.25", features = ["contract", "network", "rpc", "rpc-types", "provider-ws", "rpc-types-eth", "signer-local", "reqwest-rustls-tls"] }
+alloy = { version = "1.0.25", features = ["contract", "network", "rpc", "rpc-types", "provider-ws", "reqwest", "rpc-types-eth", "signer-local", "reqwest-rustls-tls"] }
 
 # tracing
 eyre = "0.6"

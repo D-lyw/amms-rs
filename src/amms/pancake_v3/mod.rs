@@ -42,13 +42,18 @@ const PANCAKE_V3_INTER_BATCH_SLEEP_MS: u64 = 800;
 const PANCAKE_V3_META_STEP: usize = 100;
 const PANCAKE_V3_SLOT0_STEP: usize = 120;
 const PANCAKE_V3_POOLS_STEP: usize = 30;
-const PANCAKE_V3_MAX_RANGE: i32 = 200;
-const PANCAKE_V3_MAX_TICKS: usize = 40;
-const PANCAKE_V3_MAX_IN_FLIGHT: usize = 3;
+const PANCAKE_V3_MAX_RANGE: i32 = 600;
+const PANCAKE_V3_MAX_TICKS: usize = 100;
+const PANCAKE_V3_MAX_IN_FLIGHT: usize = 20;
+/// tickdata 阶段专用限流：并发 2 + 每请求后 100ms（比 bitmap 的 3 并发/20ms 更保守）。
+/// 原因：tickdata 批量请求（40 个 ticks() STATICCALL）比 bitmap 更重，且生产崩溃点
+/// 就在该阶段；先降并发加间隔观察 chainstack WS 是否仍被打挂。
+const PANCAKE_V3_TICKDATA_MAX_IN_FLIGHT: usize = 40;
+const PANCAKE_V3_TICKDATA_JOB_SLEEP_MS: u64 = 2;
 /// tick 同步单 job 完成后的限流间隔：链 RPC（chainstack BSC WS）单连接
 /// eth_call RPS 上限 200。3 并发 + 20ms → 速率封顶 ~150 req/s，留出余量
 /// （原 2ms 在低 RTT 连接上可达 150-250 req/s，持续超限触发 -32603）。
-const PANCAKE_V3_TICK_JOB_SLEEP_MS: u64 = 20;
+const PANCAKE_V3_TICK_JOB_SLEEP_MS: u64 = 2;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Info {
@@ -1683,7 +1688,7 @@ impl PancakeV3Factory {
             pool_index.insert(pool.address(), idx);
         }
 
-        let max_in_flight = PANCAKE_V3_MAX_IN_FLIGHT;
+        let max_in_flight = PANCAKE_V3_TICKDATA_MAX_IN_FLIGHT;
 
         for job in jobs {
             let provider = provider.clone();
@@ -1721,7 +1726,7 @@ impl PancakeV3Factory {
                         }
                     }
 
-                    sleep(Duration::from_millis(PANCAKE_V3_TICK_JOB_SLEEP_MS)).await;
+                    sleep(Duration::from_millis(PANCAKE_V3_TICKDATA_JOB_SLEEP_MS)).await;
                 }
             }
         }
@@ -1748,7 +1753,7 @@ impl PancakeV3Factory {
                 }
             }
 
-            sleep(Duration::from_millis(PANCAKE_V3_TICK_JOB_SLEEP_MS)).await;
+            sleep(Duration::from_millis(PANCAKE_V3_TICKDATA_JOB_SLEEP_MS)).await;
         }
         Ok(())
     }
