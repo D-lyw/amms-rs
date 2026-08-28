@@ -15,7 +15,9 @@ use alloy::{
     sol,
 };
 
-use crate::amms::consts::{MIN_V3_LIQUIDITY, MPFR_T_PRECISION, U256_1};
+use crate::amms::consts::{
+    MAX_LIQUIDITY_DISTANCE_WORDS, MAX_SIM_EMPTY_WORDS, MIN_V3_LIQUIDITY, MPFR_T_PRECISION, U256_1,
+};
 use crate::amms::Token;
 use rug::ops::Pow;
 use rug::Float;
@@ -367,6 +369,9 @@ impl AutomatedMarketMaker for UniswapV4Pool {
             liquidity: self.liquidity, // Current available liquidity in the tick range
         };
 
+        // 空洞兜底：低流动性连续跨空 word = 价格近乎免费移动 → 天文输出。
+        let mut crossed_empty_words: i32 = 0;
+
         while current_state.amount_specified_remaining != I256::ZERO
             && current_state.sqrt_price_x_96 != sqrt_price_limit_x_96
         {
@@ -389,6 +394,20 @@ impl AutomatedMarketMaker for UniswapV4Pool {
 
             // ensure that we do not overshoot the min/max tick, as the tick bitmap is not aware of these bounds
             step.tick_next = step.tick_next.clamp(MIN_TICK, MAX_TICK);
+
+            if step.initialized {
+                crossed_empty_words = 0;
+            } else {
+                crossed_empty_words += 1;
+                if crossed_empty_words > MAX_SIM_EMPTY_WORDS
+                    && current_state.liquidity < MIN_V3_LIQUIDITY
+                {
+                    return Err(AMMError::Msg(format!(
+                        "liquidity void: {} empty words with dust liquidity at tick {}",
+                        crossed_empty_words, current_state.tick
+                    )));
+                }
+            }
 
             // Get the next sqrt price from the input amount
             step.sqrt_price_next_x96 =
@@ -548,9 +567,14 @@ impl AutomatedMarketMaker for UniswapV4Pool {
 
         // Fallback: accept pools that have enough liquidity on initialized ticks
         // even if current active liquidity is zero (out-of-range / imbalanced pools).
-        self.ticks
-            .values()
-            .any(|info| info.liquidity_gross >= l_thresh)
+        // 距离约束：命中 tick 必须靠近当前价格。只有大额流动性却远在多个空 word
+        // 之外的池子是死池（BSC 0xfda09351：活跃 84 wei、真实流动性 ~19 word 外），
+        // 模拟跨空洞会产出天文输出（虚假利润）。
+        let max_dist = self.tick_spacing as i64 * 256 * MAX_LIQUIDITY_DISTANCE_WORDS as i64;
+        self.ticks.iter().any(|(&tick, info)| {
+            info.liquidity_gross >= l_thresh
+                && (tick as i64 - self.tick as i64).abs() <= max_dist
+        })
     }
 
     fn decimals(&self, token: Address) -> u8 {
@@ -756,6 +780,9 @@ impl UniswapV4Pool {
             liquidity: self.liquidity,
         };
 
+        // 空洞兜底：低流动性连续跨空 word = 价格近乎免费移动 → 天文输出。
+        let mut crossed_empty_words: i32 = 0;
+
         while current_state.amount_specified_remaining != I256::ZERO
             && current_state.sqrt_price_x_96 != sqrt_price_limit_x_96
         {
@@ -774,6 +801,20 @@ impl UniswapV4Pool {
 
             step.tick_next = tick_next.clamp(MIN_TICK, MAX_TICK);
             step.initialized = initialized;
+
+            if step.initialized {
+                crossed_empty_words = 0;
+            } else {
+                crossed_empty_words += 1;
+                if crossed_empty_words > MAX_SIM_EMPTY_WORDS
+                    && current_state.liquidity < MIN_V3_LIQUIDITY
+                {
+                    return Err(AMMError::Msg(format!(
+                        "liquidity void: {} empty words with dust liquidity at tick {}",
+                        crossed_empty_words, current_state.tick
+                    )));
+                }
+            }
 
             step.sqrt_price_next_x96 =
                 uniswap_v3_math::tick_math::get_sqrt_ratio_at_tick(step.tick_next)

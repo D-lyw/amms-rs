@@ -46,3 +46,13 @@ pub const MPFR_T_PRECISION: u32 = 70;
 // Minimum liquidity thresholds to prevent dust pool arbitrage
 pub const MIN_POOL_RESERVE: u128 = 100_000;
 pub const MIN_V3_LIQUIDITY: u128 = 100_000;
+
+// V3/V4 空洞防御：当前 tick 与可接受 liquidity tick 之间的最大 bitmap word 距离。
+// 只有大额流动性却远在多个空 word 之外的池子是"被抽干/迁移"的死池
+// （BSC 实锤：0xfda09351 活跃流动性 84 wei，真实流动性 ~19 个空 word 之外），
+// 模拟跨空洞会以近零成本移动价格、产出天文数字的虚假利润。
+pub const MAX_LIQUIDITY_DISTANCE_WORDS: i32 = 8;
+
+// 模拟步进时允许连续跨越的空 word 数（>此值且跨空洞流动性过低 → Err）。
+// 当前 word 空没关系，周围 word 有流动性即可；只有"低流动性长空洞"才判死。
+pub const MAX_SIM_EMPTY_WORDS: i32 = 2;
