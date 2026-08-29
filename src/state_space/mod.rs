@@ -1023,7 +1023,10 @@ impl<N, P> StateSpaceManager<N, P> {
                 } else if chain_id == ARBITRUM_CHAIN_ID || chain_id == ROBINHOOD_CHAIN_ID {
                     SelectedRealtimeSource::ArbitrumFeedPull
                 } else if chain_id == BSC_MAINNET_CHAIN_ID {
-                    SelectedRealtimeSource::BscLogsPush
+                    // BSC 实时同步与 Ethereum 主网一致走 NewHeadsPull：
+                    // newHeads + 整块 get_logs 按块边界应用，避免 logs-push
+                    // 同块多批推送产生的中间态幻影机会（P1 已砸/P2 未砸）。
+                    SelectedRealtimeSource::NewHeadsPull
                 } else {
                     SelectedRealtimeSource::NewHeadsPull
                 }
@@ -3150,11 +3153,12 @@ mod tests {
     }
 
     #[test]
-    fn bsc_realtime_source_resolves_to_logs_push() {
+    fn bsc_realtime_source_resolves_to_new_heads_pull() {
         assert!(matches!(
             StateSpaceManager::<(), ()>::resolve_realtime_source(56, &RealtimeSyncSource::Auto),
-            SelectedRealtimeSource::BscLogsPush
+            SelectedRealtimeSource::NewHeadsPull
         ));
+        // 显式配置仍走旧 logs-push 路径（向后兼容，生产未使用）。
         assert!(matches!(
             StateSpaceManager::<(), ()>::resolve_realtime_source(
                 56,
