@@ -13,8 +13,8 @@
 
 | 角色 | 地址 | 说明 |
 |---|---|---|
-| 池子 / quote / Swap | `0x2d651e3fe9470db52d211569a0ab7266c5180de7` | = **PAmm1010Router**（官方 Router，quote recipient 即池子自身） |
-| 引擎 | `0xeacf260a16a4e16a758fc1bd126d49d8e02f9996` | `update(...)` 交易提交带签名价格；emit Update 事件（data 为空） |
+| 池子 / quote / Swap | `0x4a8e34cfe4f643132e8de0e9752054a9ac862816` | = **PAmm1010Router**（官方 Router，quote recipient 即池子自身；2026-08-19 迁移） |
+| 引擎 | `0x6558dbe4c1bb50ed881e54105242491d03a98118` | `update(...)` 交易提交带签名价格；emit Update 事件（data 为空；2026-08-19 迁移） |
 | 金库 | `0x9b169052Ee1569Ec5bDF51DbF48D2962526cF6D9` | 持有 12 种资产（USDT0/xSOL/xETH/CRCLx/DOG/NVDAx/…） |
 | 旧默认 Router（已废弃） | `0xa1945aa291a99ea996b9c41cc645e30c1c01d190` | 仅作历史参考；生产用 poolindex 配置（= 池子地址） |
 

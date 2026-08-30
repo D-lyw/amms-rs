@@ -125,7 +125,7 @@
 //! ### PAmm1010Router（XLayer 池子 = 官方 Router，已验证源码）
 //!
 //! Router 是**薄代理**（ReentrancyGuard）：owner 可 `setTarget` 切换核心，
-//! 链上实测 `target()` = 引擎 `0xeacf260a...`；核心接口 `IPAmm1010` 的
+//! 链上实测 `target()` = 引擎 `0x6558dbe4...`（2026-08-19 迁移后新部署）；核心接口 `IPAmm1010` 的
 //! `quote/swap` 首参均为 `account`（router 转发时 = `msg.sender`），
 //! 核心 `swap` 末参为 `extraFeePpm`（router 普通 swap 传 0）。
 //!
@@ -182,6 +182,7 @@ pub const BINARYFI_CHAIN_ID: u64 = 196;
 /// 资产数量（getAssets 返回 12 个资产）
 pub const BINARYFI_ASSET_COUNT: usize = 12;
 /// XLayer 默认部署：池子合约（Swap 事件、quote 报价）。
+/// 2026-08-19 BinaryFi 已迁移：旧部署 0x2d651e3f... / 0xeacf260a... 不再被官方路径使用。
 /// 配置化部署时地址应由 poolindex/loader 经 `BinaryFiPropFactory::new` 传入，
 /// 此常量仅作为默认值与文档参考。
 /// 池子 = 官方 **PAmm1010Router**，swap 入口
@@ -191,19 +192,19 @@ pub const BINARYFI_ASSET_COUNT: usize = 12;
 /// `tokenIn` 进 vault、从 vault 发 `tokenOut`；另有带额外费率的
 /// `swapWithExtraFees`（`0x9e51844f`）与原生 ETH 入口（`0xEeee...EeE`）；
 /// 详见模块顶部“协议形态与部署对照”。
-pub const BINARYFI_POOL_ADDRESS: Address = address!("0x2d651e3fe9470db52d211569a0ab7266c5180de7");
+pub const BINARYFI_POOL_ADDRESS: Address = address!("0x4a8e34cfe4f643132e8de0e9752054a9ac862816");
 /// XLayer 默认部署：引擎合约（update 事件、价格提交）
-pub const BINARYFI_ENGINE_ADDRESS: Address = address!("0xeacf260a16a4e16a758fc1bd126d49d8e02f9996");
+pub const BINARYFI_ENGINE_ADDRESS: Address = address!("0x6558dbe4c1bb50ed881e54105242491d03a98118");
 /// XLayer 默认部署：金库合约（持有资产）
 pub const BINARYFI_VAULT_ADDRESS: Address = address!("0x9b169052Ee1569Ec5bDF51DbF48D2962526cF6D9");
 /// XLayer 默认部署：quote 的 recipient（Router）。
-/// 官方 Router 为 PAmm1010Router（= 池子地址 0x2d651e，与 poolindex 配置一致）；
+/// 官方 Router 为 PAmm1010Router（= 池子地址 0x4a8e34cf，与 poolindex 配置一致）；
 /// 该常量仅作 `Default` 兜底初值，生产路径由 loader 从 ndjson config 覆盖。
 /// 跨链对照：Base 同实现 router = `0x98537a558449bC1437C2e897d640847AF6102549`
 /// （bytecode 与 XLayer 除 WETH 常量外逐字节一致；XLayer WETH9 =
 /// `0xe538905cf8410324e03a5a23c1c177a474d59b2b`，Base WETH =
 /// `0x4200000000000000000000000000000000000006`）。
-pub const BINARYFI_ROUTER_ADDRESS: Address = address!("0x2d651e3fe9470db52d211569a0ab7266c5180de7");
+pub const BINARYFI_ROUTER_ADDRESS: Address = address!("0x4a8e34cfe4f643132e8de0e9752054a9ac862816");
 /// BinaryFiEvmAdapter（XLayer 部署，2026-08 反汇编 + 开源源码双向核验一致）：
 /// 聚合器用无状态清仓适配器 `sellBase/sellQuote(to, pool, moreInfo)`，
 /// `moreInfo = abi.encode(tokenIn, tokenOut)`，内部
