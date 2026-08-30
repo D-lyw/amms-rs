@@ -949,6 +949,54 @@ fn test_sync_enriched_update_applies_price() {
     assert_eq!(rate.den, U256::from(1_000_000_000_000u64));
 }
 
+/// AsyncUpdate 快照写回的核心安全前提：L2 日志已把价格推进到块 N 后，旧块快照
+/// （snap_block < N）写回不得回退 L2 价格（`apply_snapshot` 的 log_fresh 保鲜）。
+/// 这是"BinaryFi AsyncUpdate 放宽 last_synced_block 竞态丢弃、直接写回"的正确性
+/// 依据——快照只补事件拿不到的 quote/bid/容量/费率，价格以日志为准。
+#[test]
+fn test_apply_snapshot_does_not_regress_fresh_log_price() {
+    let mut pool = test_pool();
+    // L2 日志：asset1 价格 15005 落到块 0x400c944，price_updated_block 推进
+    pool.apply_l2_update_full(
+        1,
+        U256::from(15005u64),
+        0x400c944,
+        0,
+        0,
+        U256::ZERO,
+        U256::ZERO,
+    );
+    assert_eq!(pool.prices[1], U256::from(15005));
+    assert_eq!(pool.price_updated_block[1], 0x400c944);
+
+    // 旧块快照（snap_block < 日志块）：quote 观测给出不同 bid/q0j
+    let ok = |v: &str| QuoteResult {
+        amountOut: U256::from_str_radix(v, 10).unwrap(),
+        success: true,
+    };
+    let snap = Snapshot {
+        assets: pool.assets.iter().map(|t| t.address).collect(),
+        decimals: vec![6u8, 18u8],
+        scales: vec![U256::ZERO, U256::from(10_000u64)],
+        poolBalances: vec![U256::ZERO, U256::ZERO],
+        vaultReserves: vec![
+            U256::from(10u64).pow(U256::from(30)),
+            U256::from(10u64).pow(U256::from(30)),
+        ],
+        vaultBalances: Vec::new(),
+        quotePairs: vec![U256::from(1), U256::from(2)],
+        quotes: vec![ok("1000000000000000"), ok("14850")], // 0→1 small / 1→0 small
+        fee: U256::from(1000),
+    };
+    pool.apply_snapshot(&snap, 0x400c944 - 1);
+
+    // log_fresh：日志价格 >= 快照块 → 快照不覆盖 L2 价格/ask/q0j
+    assert_eq!(pool.prices[1], U256::from(15005), "L2 价格不得被旧快照回退");
+    assert_eq!(pool.price_updated_block[1], 0x400c944);
+    // 容量/禁用状态仍以快照 quote 观测为准（事件拿不到的权威数据）
+    assert!(!pool.buy_disabled[1]);
+}
+
 #[test]
 fn test_sync_canonical_update_marks_stale() {
     let mut pool = test_pool();

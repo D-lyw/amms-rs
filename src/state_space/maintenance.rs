@@ -183,6 +183,26 @@ fn should_skip_async_apply(
     existing_last_synced_block > snapshot_last_synced_block
 }
 
+/// AsyncUpdate 快照写回前是否因"本地已更新"竞态丢弃。
+///
+/// - `AMM::BinaryFiPropPool` 不放宽：其 AsyncUpdate 快照携带事件流无法提供的
+///   quote/bid/容量/费率（L2 update 日志只有 price/ladder/点差），而该链每块
+///   都有 MM update 交易，`last_synced_block` 恒新；若按 last_synced_block
+///   竞态丢弃，恢复通道会完全失效（快照永远被 SkippedStale 丢弃）。价格回退
+///   已由 `apply_snapshot` 内部 `price_updated_block >= snap_block 不覆盖`
+///   保鲜判断兜底，容量以链上 quote 观测为权威（与周期 re-anchor 同语义）。
+/// - 其余 AMM 保持原语义：existing 已新于快照克隆块 → 快照视为过期。
+fn should_skip_async_apply_for(
+    amm: &AMM,
+    existing_last_synced_block: u64,
+    snapshot_last_synced_block: u64,
+) -> bool {
+    if matches!(amm, AMM::BinaryFiPropPool(_)) {
+        return false;
+    }
+    should_skip_async_apply(existing_last_synced_block, snapshot_last_synced_block)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum PendingSyncAction {
     AsyncUpdate,
@@ -718,12 +738,17 @@ impl<N, P> StateSpaceManager<N, P> {
                 local_amm.set_last_synced_block(target_block);
                 let mut guard = state.write().await;
                 if let Some(existing) = guard.get(&address) {
-                    if should_skip_async_apply(
+                    if should_skip_async_apply_for(
+                        &local_amm,
                         existing.last_synced_block(),
                         snapshot_last_synced_block,
                     ) {
                         return Ok(PendingExecutionOutcome::SkippedStale);
                     }
+                    // 写回前保留 existing 已推进的 last_synced_block（set 为 max
+                    // 单调）：BinaryFi 竞态放宽后，防止快照写回把 last_synced_block
+                    // 回退到旧块，导致后续旧块日志被重新应用（重复消费容量/双计）。
+                    local_amm.set_last_synced_block(existing.last_synced_block());
                 }
                 guard.insert_amm(local_amm);
                 Ok(PendingExecutionOutcome::Applied)
@@ -2664,6 +2689,27 @@ mod tests {
         assert!(should_skip_async_apply(101, 100));
         assert!(!should_skip_async_apply(100, 100));
         assert!(!should_skip_async_apply(99, 100));
+    }
+
+    #[test]
+    fn test_binaryfi_async_update_not_skipped_by_newer_local_state() {
+        // BinaryFi：即使 existing 已新于快照克隆块，也不得竞态丢弃快照——
+        // 快照携带事件流无法提供的 quote/bid/容量/费率，丢弃会让恢复通道失效。
+        let pool = crate::amms::binaryfi_prop::BinaryFiPropPool::default();
+        let amm = AMM::BinaryFiPropPool(pool);
+        assert!(!should_skip_async_apply_for(&amm, 101, 100));
+        assert!(!should_skip_async_apply_for(&amm, 100, 100));
+        assert!(!should_skip_async_apply_for(&amm, 99, 100));
+    }
+
+    #[test]
+    fn test_non_binaryfi_async_update_keeps_stale_skip_semantics() {
+        // 非 BinaryFi（此处用 Fermi prop 池代表）：existing 新于快照克隆块 → 仍跳过，
+        // 与既有 should_skip_async_apply 语义一致，改动不影响其他 AMM。
+        let pool = crate::amms::fermi_prop::FermiPropPool::default();
+        let amm = AMM::FermiPropPool(pool);
+        assert!(should_skip_async_apply_for(&amm, 101, 100));
+        assert!(!should_skip_async_apply_for(&amm, 100, 100));
     }
 
     #[test]
