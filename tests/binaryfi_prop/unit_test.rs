@@ -127,6 +127,170 @@ fn real_update_tx() -> Vec<u8> {
     tx
 }
 
+/// 构造一条真实 legacy 批量 update 交易（`0x34f7f748`，2026-08-19 引擎升级后格式）。
+/// calldata 含 asset 1（xETH）与 asset 3（xSOL）两条记录，价格/ladder 来自
+/// 链上样本（块 69328955，tx 0xe25b47…）。
+fn real_batch_update_tx() -> Vec<u8> {
+    let mut calldata = vec![0x34, 0xf7, 0xf7, 0x48];
+    let w = |v: u64| -> [u8; 32] {
+        let mut b = [0u8; 32];
+        b[24..].copy_from_slice(&v.to_be_bytes());
+        b
+    };
+    // head 6 words：dataOffset=0xc0 / sigOffset=0x920 / timestamp / blockNumber=0x421e03b / 0 / 0xaa0
+    calldata.extend_from_slice(&w(0xc0));
+    calldata.extend_from_slice(&w(0x920));
+    calldata.extend_from_slice(&w(0x6a9435ca));
+    calldata.extend_from_slice(&w(0x421e03b));
+    calldata.extend_from_slice(&w(0));
+    calldata.extend_from_slice(&w(0xaa0));
+    calldata.extend_from_slice(&w(2)); // count = 2
+                                       // record = (asset_idx, price, askOff, bidOff, data0, data1)
+    let record = |idx: u64, price: u64, askf: u64, bidf: u64, d0hi: u16, d1hi: u16| {
+        let mut b = Vec::new();
+        b.extend_from_slice(&w(idx));
+        b.extend_from_slice(&w(price));
+        b.extend_from_slice(&w(askf));
+        b.extend_from_slice(&w(bidf));
+        let mut d0 = [0u8; 32];
+        d0[..2].copy_from_slice(&d0hi.to_be_bytes());
+        b.extend_from_slice(&d0);
+        let mut d1 = [0u8; 32];
+        d1[..2].copy_from_slice(&d1hi.to_be_bytes());
+        b.extend_from_slice(&d1);
+        b
+    };
+    // asset 1（xETH）：price=247334，d0hi=0x0327、d1hi=0x032f → raw 50/50
+    calldata.extend_from_slice(&record(1, 247334, 5, 3, 0x0327, 0x032f));
+    // asset 3（xSOL）：price=10706，d0hi=0x0035、d1hi=0x0048 → raw 3/4
+    calldata.extend_from_slice(&record(3, 10706, 2, 1, 0x0035, 0x0048));
+    // sig 区（96B 占位）
+    calldata.extend_from_slice(&[0u8; 96]);
+
+    let to: [u8; 20] = BINARYFI_ENGINE_ADDRESS.into_array();
+    rlp_list(&[
+        rlp_item(&[1]),
+        rlp_item(&[1]),
+        rlp_item(&[0x52, 0x08]),
+        rlp_item(&to),
+        rlp_item(&[]),
+        rlp_item(&calldata),
+        rlp_item(&[0x1c]),
+        rlp_item(&[1]),
+        rlp_item(&[1]),
+    ])
+}
+
+#[test]
+fn test_enrich_batch_update_log_data() {
+    let raw = real_batch_update_tx();
+    let tx_hash = keccak256(&raw);
+    let mk_log = |idx: usize| {
+        LogData::new(vec![BINARYFI_UPDATE_EVENT, asset_topic(idx)], Bytes::new()).unwrap()
+    };
+
+    // asset 3（xSOL）：price=10706，blockNumber=0x421e03b，raw 点差 4/3
+    let enriched = enrich_update_log_data(
+        &[hex::encode(&raw)],
+        Some(tx_hash),
+        &mk_log(3),
+        BINARYFI_ENGINE_ADDRESS,
+    )
+    .expect("batch enrich should succeed");
+    let data = enriched.data.as_ref();
+    assert_eq!(data.len(), 224);
+    assert_eq!(U256::from_be_slice(&data[..32]), U256::from(10706u64));
+    assert_eq!(U256::from_be_slice(&data[32..64]).to::<u64>(), 0x421e03b);
+    assert_eq!(&data[64..66], &[0x00, 0x35]); // data0 高 16 位
+    assert_eq!(&data[96..98], &[0x00, 0x48]); // data1 高 16 位
+    assert_eq!(U256::from_be_slice(&data[160..192]).to::<u64>(), 4); // ask_raw
+    assert_eq!(U256::from_be_slice(&data[192..224]).to::<u64>(), 3); // bid_raw
+    assert_eq!(enriched.topics(), &[BINARYFI_UPDATE_EVENT, asset_topic(3)]);
+
+    // asset 1（xETH）：price=247334 → raw 50/50
+    let enriched1 = enrich_update_log_data(
+        &[hex::encode(&raw)],
+        Some(tx_hash),
+        &mk_log(1),
+        BINARYFI_ENGINE_ADDRESS,
+    )
+    .expect("batch enrich asset1 should succeed");
+    let data1 = enriched1.data.as_ref();
+    assert_eq!(U256::from_be_slice(&data1[..32]), U256::from(247334u64));
+    assert_eq!(U256::from_be_slice(&data1[160..192]).to::<u64>(), 50);
+    assert_eq!(U256::from_be_slice(&data1[192..224]).to::<u64>(), 50);
+
+    // 未知资产索引 → None（保留原始日志走 L3 兜底）
+    assert!(enrich_update_log_data(
+        &[hex::encode(&raw)],
+        Some(tx_hash),
+        &mk_log(99),
+        BINARYFI_ENGINE_ADDRESS
+    )
+    .is_none());
+}
+
+/// 批量 update 记录的 L2 应用：注入值喂入 `apply_l2_update_full` 后，0→xSOL /
+/// xSOL→0（in=1e6，fee=400）报价与链上块 69328955 逐位一致
+/// （9,333,333 / 106,987），即幻影套利方向的本地价格与链上对齐。
+#[test]
+fn test_batch_update_l2_quote_matches_chain() {
+    let mut pool = BinaryFiPropPool::default();
+    pool.assets = vec![
+        Token::new_with_decimals(address!("0x779ded0c9e1022225f8e0630b35a9b54be713736"), 6),
+        Token::new_with_decimals(address!("0xe7b000003a45145decf8a28fc755ad5ec5ea025a"), 18),
+        Token::new_with_decimals(address!("0x68fa48b1c2fe52b3d776e1953e0e782b5044ce28"), 8),
+        Token::new_with_decimals(address!("0x505000008de8748dbd4422ff4687a4fc9beba15b"), 9),
+    ];
+    let n = pool.assets.len();
+    pool.prices = vec![U256::ZERO; n];
+    pool.spreads = vec![0; n];
+    pool.bid_offsets = vec![0; n];
+    pool.ask_offsets = vec![0; n];
+    pool.q0j = vec![None; n];
+    pool.sell_raw = vec![None; n];
+    pool.buy_zero_over_vault = vec![false; n];
+    pool.max_outputs = vec![None; n];
+    pool.max_inputs = vec![None; n];
+    pool.reserves = vec![U256::ZERO; n];
+    pool.rates = vec![Rate::zero(); n * n];
+    pool.price_updated_block = vec![0; n];
+    pool.sell_ladders = vec![None; n];
+    pool.buy_ladders = vec![None; n];
+    pool.ladder_reserves = vec![None; n];
+    pool.buy_ladder_remaining = vec![None; n];
+    pool.prices[0] = U256::from(BINARYFI_PRICE0_DEFAULT);
+    pool.fee_ppm = 400;
+
+    // 链上批量 tx（块 69328955）asset 3 记录：price=10706、d0hi=0x0035、
+    // d1hi=0x0048 → ask_raw=4、bid_raw=3（scale=10000 → 实际偏移 4/3）
+    let mut d0 = [0u8; 32];
+    d0[..2].copy_from_slice(&[0x00, 0x35]);
+    let mut d1 = [0u8; 32];
+    d1[..2].copy_from_slice(&[0x00, 0x48]);
+    pool.apply_l2_update_full(
+        3,
+        U256::from(10706u64),
+        0x421e03b,
+        4,
+        3,
+        U256::from_be_slice(&d0),
+        U256::from_be_slice(&d1),
+    );
+    assert_eq!(pool.ask_price(3).unwrap(), U256::from(10710u64));
+    assert_eq!(pool.bid_price(3).unwrap(), U256::from(10703u64));
+    // 链上 0→3 in=1e6（fee=400）：9,333,333
+    assert_eq!(
+        pool.engine_quote(0, 3, U256::from(1_000_000u64)).unwrap(),
+        U256::from(9_333_333u64)
+    );
+    // 链上 3→0 in=1e6：106,987（线性回退 raw=10703，fee 输入侧扣）
+    assert_eq!(
+        pool.engine_quote(3, 0, U256::from(1_000_000u64)).unwrap(),
+        U256::from(106_987u64)
+    );
+}
+
 #[test]
 fn test_enrich_update_log_data() {
     let raw = real_update_tx();

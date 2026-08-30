@@ -80,6 +80,11 @@
 //!    边缘通过 `keccak256(raw) == tx_hash` 定位交易，RLP 解码后解析
 //!    `0x024b94f6` calldata，把 `(price, blockNumber, data0..2)` 5 个 word 注入
 //!    日志 data，随后 `sync()` 直接用 price 重算所有相关 pair 的费率，零 RPC。
+//!    2026-08-19 引擎升级后 MM 改用批量 update `0x34f7f748`：一笔交易携带
+//!    N 条资产记录并发出 N 条 Update 日志（data 仍为空、topic[1]=asset_idx）；
+//!    enrich 按日志 asset_idx 从批量记录挑对应 `(price, data0, data1)` 注入，
+//!    点差偏移仍由 ladder 前 16 位解析（与单资产格式同编码，链上实测吻合；
+//!    记录内显式 askOff/bidOff 字段不参与报价）。
 //! 3. **L3 — 无 raw bytes 的 update 日志**（canonical get_logs 路径）：
 //!    把相关 pair 标记 stale 并返回 `SyncAction::AsyncUpdate`，由 StateSpace 的
 //!    pending_sync_queue 触发 `update()`：一次 `GetBinaryFiPropStateBatchRequest`
@@ -222,6 +227,13 @@ pub const BINARYFI_UPDATE_EVENT: B256 =
     b256!("af186e2e77ac28f0c051cdd1e2b3b92924e34b314650186bbc14742e373751c8");
 /// 引擎 update 函数选择器
 pub const BINARYFI_UPDATE_SELECTOR: [u8; 4] = [0x02, 0x4b, 0x94, 0xf6];
+/// 引擎批量 update 函数选择器（`0x34f7f748`，2026-08-19 引擎升级后新格式）：
+/// 一笔交易携带 N 条资产记录（6 words/条）并发出 N 条 Update 日志
+/// （日志 data 为空、topic[1] = asset_idx）。
+pub const BINARYFI_BATCH_UPDATE_SELECTOR: [u8; 4] = [0x34, 0xf7, 0xf7, 0x48];
+/// 批量 update 单条记录长度（6 words = 192B）：
+/// `(asset_idx, price, askOff, bidOff, data0=sellLadder, data1=buyLadder)`
+pub const BINARYFI_BATCH_UPDATE_RECORD_LEN: usize = 32 * 6;
 /// 引擎 setFee 函数选择器（`setFee(uint256)`，运营方调用；fee 单位 = ppm，1e6 = 100%）。
 /// 链上实证：块 0x4073356 由 0x2db200f40f47… 调用设置 fee=0xc8(200)，该块内
 /// `getFee` 从 1000 变为 200。
@@ -2658,6 +2670,75 @@ impl Default for BinaryFiPropPool {
 // Flashblocks 原始交易增强
 // ============================================================================
 
+/// 批量 update（`0x34f7f748`，2026-08-19 引擎升级后新格式）的日志增强。
+///
+/// calldata 布局：selector(4) + head 6 words + data 区。head =
+/// `[dataOffset, sigOffset, timestamp, blockNumber, _, _]`，dataOffset 为字节偏移
+/// （相对 data 区起点，即 selector 之后），指向 count word；其后是
+/// count × 6 words 记录：`(asset_idx, price, askOff, bidOff,
+/// data0=sellLadder, data1=buyLadder)`（192B/条）。
+///
+/// 引擎每笔批量交易发出 N 条 Update 日志（data 为空、topic[1] = asset_idx），
+/// 本函数按日志 asset_idx 挑对应记录，注入与单资产 update 相同的 7-word data：
+/// `(price, blockNumber, data0, data1, data2=0, askOffsetRaw, bidOffsetRaw)`。
+///
+/// ladder 编码与单资产 update 一致（前 16 位为点差偏移字段，实际偏移
+/// = (字段/16) × scale/10000）；记录中的显式 askOff/bidOff 字段**不参与报价**
+/// （链上实测 4 资产：ask = price + (data1>>240)/16 逐位吻合、显式字段不符）。
+/// 找不到对应资产记录 / 布局非法时返回 `None`（调用方保留原始日志走 L3）。
+fn enrich_batch_update_log_data(input: &[u8], log_data: &LogData) -> Option<LogData> {
+    if input.len() < 4 + 32 * 6 + 32 + BINARYFI_BATCH_UPDATE_RECORD_LEN {
+        return None;
+    }
+    let d = &input[4..];
+    let u256 = |off: usize| U256::from_be_slice(&d[off..off + 32]);
+    let data_offset = u256(0).to::<usize>();
+    // dataOffset 相对 data 区起点；count word 至少应位于 6 个 head word 之后
+    if data_offset < 32 * 6 {
+        return None;
+    }
+    let block_number = u256(3 * 32).to::<u64>();
+    let count = u256(data_offset).to::<usize>();
+    if count == 0 || count > 64 {
+        return None;
+    }
+    let rec_start = data_offset + 32;
+    let rec_end = rec_start.checked_add(count.checked_mul(BINARYFI_BATCH_UPDATE_RECORD_LEN)?)?;
+    if rec_end > d.len() {
+        return None;
+    }
+    let target = U256::from_be_bytes(log_data.topics().get(1)?.0).to::<usize>();
+    // 同资产多次出现时取最后一条（保留循环最后一次命中）
+    let mut found: Option<(U256, U256, U256)> = None;
+    for k in 0..count {
+        let r = rec_start + k * BINARYFI_BATCH_UPDATE_RECORD_LEN;
+        if u256(r).to::<usize>() == target {
+            let price = u256(r + 32);
+            let data0 = u256(r + 128);
+            let data1 = u256(r + 160);
+            found = Some((price, data0, data1));
+        }
+    }
+    let (price, data0, data1) = found?;
+    // ladder 左对齐：前 16 位为点差偏移字段（实际偏移 = (字段/16) × scale/10000）
+    let ask_offset_raw = (data1 >> U256::from(240)) / U256::from(16);
+    let bid_offset_raw = (data0 >> U256::from(240)) / U256::from(16);
+
+    let mut words = Vec::with_capacity(224);
+    for w in [
+        price,
+        U256::from(block_number),
+        data0,
+        data1,
+        U256::ZERO, // data2：批量记录无此字段，透传 0（sync 不消费）
+        ask_offset_raw,
+        bid_offset_raw,
+    ] {
+        words.extend_from_slice(&w.to_be_bytes::<32>());
+    }
+    LogData::new(log_data.topics().to_vec(), Bytes::from(words))
+}
+
 /// 从 flashblocks 的原始交易字节中定位引擎 `update` 交易并解析 calldata，
 /// 返回注入 7 个 word（price / blockNumber / data0..2 / askOffsetRaw /
 /// bidOffsetRaw）后的日志 data。其中：
@@ -2665,8 +2746,9 @@ impl Default for BinaryFiPropPool {
 ///     点差偏移字段；`askOffsetRaw = (data1 >> 240) / 16`、
 ///     `bidOffsetRaw = (data0 >> 240) / 16`（ladder 空间单位，scale 由池子应用）
 ///
-/// 找不到对应 raw bytes、RLP 解码失败或目标/选择器不匹配时返回 `None`，
-/// 调用方应保留原始日志原样。
+/// 支持旧单资产 update（`0x024b94f6`）与 2026-08-19 升级后的批量 update
+/// （`0x34f7f748`，见 `enrich_batch_update_log_data`）。找不到对应 raw bytes、
+/// RLP 解码失败或目标/选择器不匹配时返回 `None`，调用方应保留原始日志原样。
 pub fn enrich_update_log_data(
     raw_txs: &[impl AsRef<str>],
     tx_hash: Option<B256>,
@@ -2702,10 +2784,13 @@ pub fn enrich_update_log_data(
     if to? != engine_address {
         return None;
     }
-    if input.len() < BINARYFI_UPDATE_CALLDATA_LEN {
+    if input.len() < 4 {
         return None;
     }
-    if input[..4] != BINARYFI_UPDATE_SELECTOR {
+    if input[..4] == BINARYFI_BATCH_UPDATE_SELECTOR {
+        return enrich_batch_update_log_data(input, log_data);
+    }
+    if input.len() < BINARYFI_UPDATE_CALLDATA_LEN || input[..4] != BINARYFI_UPDATE_SELECTOR {
         return None;
     }
     // 布局: index / offset / blockNumber / price / a / b / data0..2(96B) /
