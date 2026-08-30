@@ -38,21 +38,25 @@ use tokio::time::{sleep, Duration};
 use tracing::info;
 use uniswap_v3_math::tick_math::{MAX_SQRT_RATIO, MAX_TICK, MIN_SQRT_RATIO, MIN_TICK};
 
-const PANCAKE_V3_INTER_BATCH_SLEEP_MS: u64 = 800;
+// 阶段间 sleep：早期 WS 单连接时代为防打挂 RPC 设置 800ms；现 init 走 HTTP
+// 多连接 + 有界并发（in-flight）控速，阶段间仅需极小间隔，50ms 足够。
+const PANCAKE_V3_INTER_BATCH_SLEEP_MS: u64 = 50;
 const PANCAKE_V3_META_STEP: usize = 100;
 const PANCAKE_V3_SLOT0_STEP: usize = 120;
 const PANCAKE_V3_POOLS_STEP: usize = 30;
+// 单 job 覆盖的 word/tick 数。batch 合约把返回结果当创建代码经 eth_call
+// 返回，受 EIP-170 24,576B 上限约束：bitmap 每 word 32B（600 → 19.2KB 安全），
+// tickdata 每 tick 96B（200 → 19,232B，留 ~22% 余量）。曾试 1200/250 触发
+// -32000 max code size exceeded。
 const PANCAKE_V3_MAX_RANGE: i32 = 600;
-const PANCAKE_V3_MAX_TICKS: usize = 100;
-const PANCAKE_V3_MAX_IN_FLIGHT: usize = 20;
-/// tickdata 阶段专用限流：并发 2 + 每请求后 100ms（比 bitmap 的 3 并发/20ms 更保守）。
-/// 原因：tickdata 批量请求（40 个 ticks() STATICCALL）比 bitmap 更重，且生产崩溃点
-/// 就在该阶段；先降并发加间隔观察 chainstack WS 是否仍被打挂。
+const PANCAKE_V3_MAX_TICKS: usize = 200;
+// HTTP 多连接下的并发上限。chainstack BSC 限 ~200 rps，RTT 300ms 量级下
+// 40 并发 ≈ 130 req/s。曾试 50 并发持续 2 分钟后触发连接超时（服务端
+// 连接数/速率保护），回调 40 保持稳定；MAX_TICKS=200 已把请求数减半。
+const PANCAKE_V3_MAX_IN_FLIGHT: usize = 40;
 const PANCAKE_V3_TICKDATA_MAX_IN_FLIGHT: usize = 40;
 const PANCAKE_V3_TICKDATA_JOB_SLEEP_MS: u64 = 2;
-/// tick 同步单 job 完成后的限流间隔：链 RPC（chainstack BSC WS）单连接
-/// eth_call RPS 上限 200。3 并发 + 20ms → 速率封顶 ~150 req/s，留出余量
-/// （原 2ms 在低 RTT 连接上可达 150-250 req/s，持续超限触发 -32603）。
+/// bitmap 单 job 完成后的限流间隔：在 in-flight 并发控速基础上做微调。
 const PANCAKE_V3_TICK_JOB_SLEEP_MS: u64 = 2;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

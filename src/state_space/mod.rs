@@ -2313,9 +2313,10 @@ where
             // PancakeV3 初始化请求量巨大（spacing=1 池需全量扫 bitmap + tickdata，
             // 726 池一次打出去会把 RPC 单连接打爆：-32603 / -32000）。
             // 按小批初始化（HTTP 多连接并发 + 批间 sleep 节流）规避连接保护；
+            // 批大小与 init_batch 内部 POOLS_STEP=30 对齐（每阶段恰 1 组），
             // 其余 variant 一次全量。
             let batch_size = if matches!(variant, crate::amms::amm::Variant::PancakeV3Pool) {
-                10
+                30
             } else {
                 remaining_amms.len()
             };
@@ -2333,8 +2334,9 @@ where
                     .init_batch::<N, _>(batch, BlockId::from(batch_block), provider.clone())
                     .await?;
 
-                // 仅做通用调度节流；具体批量大小/并发策略由各 AMM init_batch 内部负责。
-                sleep(Duration::from_millis(1200)).await;
+                // 仅做通用调度节流（HTTP 多连接 + in-flight 并发已控速，300ms 足够）；
+                // 具体批量大小/并发策略由各 AMM init_batch 内部负责。
+                sleep(Duration::from_millis(300)).await;
 
                 for amm in synced {
                     let mut amm = amm;
