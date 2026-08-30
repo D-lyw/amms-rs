@@ -2312,7 +2312,8 @@ where
 
             // PancakeV3 初始化请求量巨大（spacing=1 池需全量扫 bitmap + tickdata，
             // 726 池一次打出去会把 RPC 单连接打爆：-32603 / -32000）。
-            // 按小批初始化、批间刷新最新 block，规避连接保护；其余 variant 一次全量。
+            // 按小批初始化（HTTP 多连接并发 + 批间 sleep 节流）规避连接保护；
+            // 其余 variant 一次全量。
             let batch_size = if matches!(variant, crate::amms::amm::Variant::PancakeV3Pool) {
                 10
             } else {
@@ -2322,7 +2323,12 @@ where
             while !remaining_amms.is_empty() {
                 let take = batch_size.min(remaining_amms.len());
                 let batch: Vec<AMM> = remaining_amms.drain(0..take).collect();
-                let batch_block = provider.get_block_number().await?;
+                // 所有 init_batch 必须与 realtime_head（=chain_tip_u64）在同一块快照：
+                // 事件流初始 backfill 从 realtime_head+1 开始，若各批使用更新的
+                // batch_block，会被 backfill 重复应用已包含的块（Mint 双计 /
+                // Burn underflow → 启动期 Resync 风暴）。固定快照块后 backfill
+                // [tip+1..head] 只应用 init 期间产生的新块，无重叠无缺口。
+                let batch_block = chain_tip_u64;
                 let synced = variant
                     .init_batch::<N, _>(batch, BlockId::from(batch_block), provider.clone())
                     .await?;
