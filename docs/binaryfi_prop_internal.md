@@ -264,6 +264,28 @@ out = floor(v × 10^(dj−d0+2) / ask_j)                  // 第二段 BUY，无
 不可见 → 本地金库门控放行必然失败的交易（`transferFrom(vault)` 余额不足
 revert，见 `dex-arbitrage/docs/2026-08-19_binaryfi_shared_vault_drain_forensics.md`）。
 
+### reserves 快照重锚（2026-08-31 幻影容量事故修复）
+
+周期快照用它重锚 `vaultBalances` 校正金库漂移，但快照块 `snap_block` 取自
+canonical head，XLayer flashblock 事件流领先 canonical 1-2 块 → 快照读到的
+是**旧一截的真值**。reserves 是纯累积量（事件只 `+in/-out`、从不写真值），
+快照无条件覆盖会把抽干前余额打回事件账本已扣到的精确值（649M → 6,988），
+幻影容量持续到下一次快照（仍旧）→ 9 笔失败报价。
+
+- 其它字段（price/offset/q0j/sell_raw/max_*/buy_ladder_remaining）是"最新值"，
+  update 事件每 1-3 块写真值，快照回退 1-2 块也自回归；reserves 无此重置点。
+- 旧 guard（last_synced_block 丢弃旧快照）会让 BinaryFi 快照通道完全失效
+  （每块都有 MM update，last_synced_block 恒新），漂移无法回归。
+- 现实现：`ReservesDeltaLedger` rebase-merge（checkpoint + redo log），
+  `reserves = 快照(S) + Σ(块 > S 的 swap 事件净变化)`：S ≥ last_event_block
+  → 直接锚定；base ≤ S < last_event_block → 精确 rebase（漂移每 15s 收敛）；
+  重启首次 → replay；窗口挤出/无块号日志 → 退化 guard（不写回，绝不低于
+  旧行为）。配套：锚定后 `reserves == 0` 为"已空"（权威归零），未锚定 0
+  仍为"未知"。
+
+设计细节与长期维护注意见 `src/amms/binaryfi_prop/mod.rs` 模块顶部
+"reserves 快照写回：rebase-merge" 一节。
+
 ## 9. 链上实测验证数据（SELL）
 
 asset6 @ 探测块 67302528（price=76870、R=29.4e15）：

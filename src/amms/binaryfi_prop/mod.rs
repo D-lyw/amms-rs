@@ -91,6 +91,62 @@
 //!    静态调用批量拉取余额 + stale pair 的 `pool.quote`，从同块 `(0→j)/(j→0)`
 //!    精确恢复每资产 bid/ask（含点差），再本地推导全部费率。
 //!
+//! ## reserves 快照写回：rebase-merge（2026-08-31 事故设计抉择，长期维护必读）
+//!
+//! ### 为什么 reserves 特殊：纯累积量，无自回归
+//!
+//! `reserves` 是**纯累积量**：swap 事件只在当前值上做 `+in/−out`（见 L1），
+//! **没有任何事件会把链上真值写进来**。唯一写真值的是快照 `vaultBalances`
+//! （`vault.balanceOf`），而快照块 `snap_block` 取自 canonical head
+//! （`provider.get_block_number()`）；XLayer flashblock 事件流领先 canonical
+//! 1-2 块 → 快照读到的是**旧一截的真值**。
+//!
+//! 对比其它字段（price/offset/q0j/sell_raw/max_*/buy_ladder_remaining）：
+//! 它们都是"最新值"，由 update 事件每 1-3 块直接写入当前链上真值——即使被
+//! 快照回退 1-2 块，下一次 update 立即纠正（**自回归**）。reserves 没有这种
+//! 重置点：快照把旧值写进来后，swap 事件继续在错误基线上累积，错误持续到
+//! 下一次快照——而下次快照读的还是旧块 → 幻影容量持续复活。
+//!
+//! ### 历史（为什么不能退回旧方案）
+//!
+//! - v1.19.6 及以前：`should_skip_async_apply` 按 `last_synced_block` 丢弃
+//!   旧快照（BinaryFi 每块都有 MM update 事件，last_synced_block 恒新）→
+//!   快照通道完全失效，reserves 漂移无法回归（2026-08-19 事故：引擎 quote
+//!   606.7M 而真实金库 280.7M）。
+//! - v1.19.7：对 BinaryFi 去掉 skip、无条件应用快照；当时假设快照字段与
+//!   事件字段不相交 → 暴露 `reserves` 被旧值覆盖（2026-08-31 事故：快照把
+//!   抽干前 649M 打回事件账本已扣到的 6,988，幻影容量持续 15s、9 笔失败）。
+//! - v1.19.8（本实现）：rebase-merge，实时性（事件账本逐块精确）与收敛性
+//!   （漂移每 15s 被链上真值回正）两者兼顾。
+//!
+//! ### 解法：ReservesDeltaLedger（checkpoint + redo log）
+//!
+//! 语义 `reserves = 快照(S) + Σ(块 > S 的 swap 事件净变化)`：
+//! - 事件路径：`sync()` 每笔 swap 把 `(block, +in, −out)` 记入环形缓冲
+//!   （同块累加、乱序/重复忽略、容量 128 块挤出跟踪 `evicted_up_to`）。
+//! - 快照路径：`apply_snapshot` 调 `ledger.rebase`——
+//!   `S ≥ last_event_block` → 直接锚定（快照覆盖全部事件，清空账本）；
+//!   `base ≤ S < last_event_block` → `current + (快照 − 基底) − Σ(base, S]`，
+//!   精确把基底推进到 S（漂移每 15s 被链上真值收敛）；
+//!   重启后首次（base=0）→ 快照 + 缓冲内 > S 的事件 replay；
+//!   `S < base` 或窗口挤出/无块号日志 → 退化为 guard（保持事件账本，不写回，
+//!   绝不比旧行为差）。
+//! - 代价：每池约 24KB 内存（128 块 × 12 资产 × 16B），可忽略。
+//!
+//! ### 归零门控（配套）
+//!
+//! 锚定后 `reserves == 0` 是"已空"（权威，`vault_known` 返回 `Some(0)`，
+//! SELL 超容量归零、BUY 截断为 0）；未锚定 0 仍是"未知"（None，维持历史
+//! 兜底）。防止"账本已精确到 0 却被当未知放行"。
+//!
+//! ### 长期维护注意
+//!
+//! - 真实事件写 `reserves` 的路径**只有 `sync()` 一处**（`anchor_rate` 是
+//!   保留的测试/旧调用点）；新增写路径必须同步记入 ledger，否则 rebase 偏差。
+//! - `simulate_swap_mut` 只应作用于克隆/测试池，不得污染真实池状态。
+//! - 快照块号必须与"快照读取时对应的链上块"一致（rebase 数学依赖 S 与
+//!   `vaultBalances` 同块）；不要用 `BlockId::latest()` 的隐式块。
+//!
 //! ## 协议形态与部署对照（BinaryFiEvm，2026-08 源码级核验）
 //!
 //! BinaryFiEvm 是**单一 operator 的链上订单簿 DEX**：链下做市引擎（operator）
@@ -158,6 +214,8 @@
 
 pub mod factory;
 
+use std::collections::VecDeque;
+
 use alloy::{
     eips::BlockId,
     network::Network,
@@ -186,6 +244,10 @@ pub use types::*;
 pub const BINARYFI_CHAIN_ID: u64 = 196;
 /// 资产数量（getAssets 返回 12 个资产）
 pub const BINARYFI_ASSET_COUNT: usize = 12;
+/// `ReservesDeltaLedger` 环形缓冲容量（块数）。rebase 窗口只需覆盖 canonical
+/// 滞后 flashblock 的 1-2 块，128 是宽裕余量；被挤出时退化为 guard 语义
+/// （S ≥ last_event_block 才覆盖），不会回退事件账本。
+pub const BINARYFI_LEDGER_CAPACITY: usize = 128;
 /// XLayer 默认部署：池子合约（Swap 事件、quote 报价）。
 /// 2026-08-19 BinaryFi 已迁移：旧部署 0x2d651e3f... / 0xeacf260a... 不再被官方路径使用。
 /// 配置化部署时地址应由 poolindex/loader 经 `BinaryFiPropFactory::new` 传入，
@@ -400,6 +462,11 @@ pub struct BinaryFiPropPool {
     pub ladder_reserves: Vec<Option<U256>>,
     /// 池子各资产余额（输出截断基准）
     pub reserves: Vec<U256>,
+    /// 共享金库事件净变化账本（环形缓冲）：快照 rebase-merge 用。
+    /// 序列化跳过（`skip_serializing`），重启后 `base_block = 0`，
+    /// 首个快照走 replay 分支精确恢复，无需落盘/迁移。
+    #[serde(default, skip_serializing)]
+    pub ledger: ReservesDeltaLedger,
     /// 有向费率 num/den，index = i * N + j（对角为空）
     pub rates: Vec<Rate>,
     /// 待批量刷新 pair（index 同上）
@@ -408,6 +475,184 @@ pub struct BinaryFiPropPool {
     pub price_updated_block: Vec<u64>,
     /// price0 是否已通过 Swap 锚定标定
     pub price0_calibrated: bool,
+}
+
+/// 共享金库 `reserves` 的事件净变化账本（环形缓冲）。
+///
+/// 语义：`reserves = 快照(S) + Σ(块 > S 的 swap 事件净变化)`。事件路径逐块
+/// 记录 Δ（同块多笔累加、乱序/重复忽略）；快照路径在 `apply_snapshot` 时
+/// rebase-merge：快照块 S 落在窗口内 → 精确合并（漂移每 15s 被链上真值收敛），
+/// 落在窗口外 → 退化为「S ≥ last_event_block 才覆盖」的 guard，绝不回退
+/// 事件账本。这是 reserves 与其它"最新值"字段的本质区别——reserves 是纯
+/// 累积量，事件只在当前值上增减、从不写真值，唯一写真值的快照又滞后
+/// canonical 1-2 块；不合并则幻影容量持续复活（2026-08-31 事故根因）。
+/// 完整设计抉择（历史/为什么 guard 不够/退化语义）见模块顶部
+/// "reserves 快照写回：rebase-merge" 一节。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReservesDeltaLedger {
+    /// (块号, 每资产 Δ)，按块升序；同块多笔 swap 累加进同一条目
+    entries: VecDeque<(u64, Vec<i128>)>,
+    /// 缓冲容量（块数）
+    capacity: usize,
+    /// 最近一次成功锚定的快照块；0 = 尚未锚定（重启/冷启动）
+    base_block: u64,
+    /// 锚定时的快照 reserves（做差用；与资产数组对齐）
+    base_reserves: Vec<i128>,
+    /// 已记录 swap 事件的最高块号（单调）
+    last_event_block: u64,
+    /// 被容量挤出的事件最大块号；锚定后重置。`base_block < evicted_up_to`
+    /// 表示「基底之后的事件已部分丢失」，无法精确合并 → 退化 guard。
+    evicted_up_to: u64,
+    /// 收到过无块号日志（`log.block_number == None`），其 Δ 未入账 →
+    /// 禁止 rebase 合并（退化 guard），避免合并结果偏差。
+    incomplete: bool,
+}
+
+impl Default for ReservesDeltaLedger {
+    fn default() -> Self {
+        Self::new(BINARYFI_LEDGER_CAPACITY)
+    }
+}
+
+impl ReservesDeltaLedger {
+    pub const fn new(capacity: usize) -> Self {
+        Self {
+            entries: VecDeque::new(),
+            capacity,
+            base_block: 0,
+            base_reserves: Vec::new(),
+            last_event_block: 0,
+            evicted_up_to: 0,
+            incomplete: false,
+        }
+    }
+
+    /// 记录一笔 swap 的净变化。块号单调推进：乱序/重复事件忽略（防双计），
+    /// 同块多笔累加进同一条目。
+    pub fn record(&mut self, block: u64, i: usize, delta_i: i128, j: usize, delta_j: i128) {
+        if block < self.last_event_block {
+            return;
+        }
+        if block > self.last_event_block {
+            self.last_event_block = block;
+            self.entries.push_back((block, Vec::new()));
+            while self.entries.len() > self.capacity {
+                if let Some((popped, _)) = self.entries.pop_front() {
+                    self.evicted_up_to = self.evicted_up_to.max(popped);
+                }
+            }
+        }
+        if let Some((_, deltas)) = self.entries.back_mut() {
+            let need = i.max(j) + 1;
+            if deltas.len() < need {
+                deltas.resize(need, 0);
+            }
+            deltas[i] += delta_i;
+            deltas[j] += delta_j;
+        }
+    }
+
+    /// 是否已成功锚定过快照（锚定后 `reserves == 0` 语义为"已空"，而非未知）。
+    pub fn is_anchored(&self) -> bool {
+        self.base_block != 0
+    }
+
+    /// 标记存在未入账事件（无块号日志，`log.block_number == None`）；
+    /// 之后快照合并退化为 guard，避免合并结果偏差。
+    pub fn mark_incomplete(&mut self) {
+        self.incomplete = true;
+    }
+
+    /// 快照合并：`current = 快照(S) + Σ(块 > S 的事件净变化)`。
+    /// `current` 必须已 resize 到 `snap.len()`。分支见 [`LedgerApply`]。
+    pub fn rebase(&mut self, current: &mut [U256], snap: &[U256], snap_block: u64) -> LedgerApply {
+        let n = snap.len();
+        if n == 0 || current.len() != n {
+            return LedgerApply::SkippedStale;
+        }
+        // S 已覆盖全部已记录事件：直接锚定，无需 replay/prefix
+        if snap_block >= self.last_event_block {
+            for k in 0..n {
+                current[k] = snap[k];
+            }
+            self.entries.clear();
+            self.base_block = snap_block;
+            self.base_reserves = snap.iter().map(|v| v.to::<u128>() as i128).collect();
+            self.evicted_up_to = 0;
+            self.incomplete = false;
+            return LedgerApply::Anchored;
+        }
+        // 陈旧快照：早于当前基底，丢弃（事件账本为准）
+        if self.base_block != 0 && snap_block < self.base_block {
+            return LedgerApply::SkippedStale;
+        }
+        // 首次锚定（重启/冷启动）：快照覆盖历史，窗口内事件补上 S 之后的部分
+        if self.base_block == 0 {
+            while self
+                .entries
+                .front()
+                .map(|(blk, _)| *blk <= snap_block)
+                .unwrap_or(false)
+            {
+                self.entries.pop_front();
+            }
+            let mut replay = vec![0i128; n];
+            for (_, deltas) in self.entries.iter() {
+                for (k, d) in deltas.iter().enumerate().take(n) {
+                    replay[k] += d;
+                }
+            }
+            for k in 0..n {
+                let v = snap[k].to::<u128>() as i128 + replay[k];
+                current[k] = U256::from(v.max(0) as u128);
+            }
+            self.base_block = snap_block;
+            self.base_reserves = snap.iter().map(|v| v.to::<u128>() as i128).collect();
+            return LedgerApply::Merged;
+        }
+        // base ≤ S < last_event_block：rebase。prefix = Σ (base, S] 的事件变化，
+        // 需基底之后的事件完整在窗口内；否则退化为 guard（保持事件账本）。
+        if self.base_block < self.evicted_up_to || self.incomplete {
+            return LedgerApply::SkippedWindowMiss;
+        }
+        let mut prefix = vec![0i128; n];
+        let mut drop = 0usize;
+        for (idx, (blk, deltas)) in self.entries.iter().enumerate() {
+            if *blk > snap_block {
+                break;
+            }
+            for (k, d) in deltas.iter().enumerate().take(n) {
+                prefix[k] += d;
+            }
+            drop = idx + 1;
+        }
+        for _ in 0..drop {
+            self.entries.pop_front();
+        }
+        for k in 0..n {
+            let base_v = self.base_reserves.get(k).copied().unwrap_or(0);
+            let snap_v = snap[k].to::<u128>() as i128;
+            let cur_v = current[k].to::<u128>() as i128;
+            let v = cur_v + (snap_v - base_v) - prefix[k];
+            current[k] = U256::from(v.max(0) as u128);
+        }
+        self.base_block = snap_block;
+        self.base_reserves = snap.iter().map(|v| v.to::<u128>() as i128).collect();
+        LedgerApply::Merged
+    }
+}
+
+/// [`ReservesDeltaLedger::rebase`] 的合并结果
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LedgerApply {
+    /// S ≥ last_event_block：直接以快照锚定（清空账本）
+    Anchored,
+    /// 精确合并：`current = 快照(S) + Σ(块 > S 事件)`，基底推进到 S
+    Merged,
+    /// 陈旧快照（S < base_block）或数据不足：保持事件账本，不写回
+    SkippedStale,
+    /// base 后事件已丢失/无块号日志，无法精确合并：保持事件账本（退化 guard）
+    SkippedWindowMiss,
 }
 
 impl BinaryFiPropPool {
@@ -777,11 +1022,27 @@ impl BinaryFiPropPool {
     }
 
     /// SELL 超容量归零：i→0 输出 > USDT0 金库余额 → 0（链上实测；
-    /// 对称 buy_zero_over_vault；reserve 未知时不归零）
+    /// 对称 buy_zero_over_vault）。锚定后余额 0 = 已空（权威归零，
+    /// 抽干后不再报价）；未锚定 0 = 未知，不归零。
     fn sell_zero_over_vault(&self, v: U256) -> Option<U256> {
-        match self.reserves.get(0).copied().filter(|r| !r.is_zero()) {
+        match self.vault_known(0) {
             Some(r) if v > r => Some(U256::ZERO),
             _ => Some(v),
+        }
+    }
+
+    /// 金库余额读取：锚定后 `0` 为"已空"（权威，参与归零/截断），
+    /// 未锚定 `0` 为"未知"（None，维持历史兜底语义）。
+    fn vault_known(&self, j: usize) -> Option<U256> {
+        let r = self.reserves.get(j).copied().unwrap_or(U256::ZERO);
+        if r.is_zero() {
+            if self.ledger.is_anchored() {
+                Some(U256::ZERO)
+            } else {
+                None
+            }
+        } else {
+            Some(r)
         }
     }
 
@@ -1242,7 +1503,7 @@ impl BinaryFiPropPool {
                 .flatten()
                 .or_else(|| self.max_outputs.get(j).copied().flatten())
             {
-                Some(m) => match self.reserves.get(j).copied().filter(|r| !r.is_zero()) {
+                Some(m) => match self.vault_known(j) {
                     Some(v) => Some(m.min(v)),
                     None => Some(m),
                 },
@@ -1361,12 +1622,45 @@ impl BinaryFiPropPool {
         // （getAssetReserves）会与真实金库脱节（2026-08-19 事故：引擎 quote
         // 606.7M 而真实金库仅 280.7M），本地门控必须以真实余额为准才能挡住
         // 必然失败的交易。读取失败回退引擎内部记账，再回退 pool 余额。
-        if snap.vaultBalances.len() == n {
-            self.reserves = snap.vaultBalances.clone();
+        //
+        // 写回走 `ReservesDeltaLedger::rebase` 合并（2026-08-31 事故根因修复）：
+        // 快照块 S 取自 canonical head（滞后 flashblock 1-2 块），无条件覆盖
+        // 会把抽干前余额打回事件账本已扣到的精确值 → 幻影容量持续复活。
+        // 合并语义 `reserves = 快照(S) + Σ(块 > S 事件净变化)`：窗口内精确，
+        // 窗口外退化 guard（绝不回退事件账本）。reserves 是纯累积量，事件
+        // 只增减不写真值，这是它区别于其它"最新值"字段必须合并的根本原因。
+        let balances: Option<&[U256]> = if snap.vaultBalances.len() == n {
+            Some(&snap.vaultBalances)
         } else if snap.vaultReserves.len() == n {
-            self.reserves = snap.vaultReserves.clone();
+            Some(&snap.vaultReserves)
         } else if snap.poolBalances.len() == n {
-            self.reserves = snap.poolBalances.clone();
+            Some(&snap.poolBalances)
+        } else {
+            None
+        };
+        if let Some(balances) = balances {
+            match self.ledger.rebase(&mut self.reserves, balances, snap_block) {
+                LedgerApply::Anchored => tracing::debug!(
+                    snap_block,
+                    "binaryfi reserves anchored by snapshot (S >= last event block)"
+                ),
+                LedgerApply::Merged => tracing::debug!(
+                    snap_block,
+                    base_block = self.ledger.base_block,
+                    "binaryfi reserves rebase-merged onto snapshot"
+                ),
+                LedgerApply::SkippedStale => tracing::warn!(
+                    snap_block,
+                    base_block = self.ledger.base_block,
+                    "binaryfi reserves snapshot skipped: stale (kept event ledger)"
+                ),
+                LedgerApply::SkippedWindowMiss => tracing::warn!(
+                    snap_block,
+                    base_block = self.ledger.base_block,
+                    last_event_block = self.ledger.last_event_block,
+                    "binaryfi reserves snapshot skipped: ledger window miss (kept event ledger)"
+                ),
+            }
         }
 
         // 1) 从同块 quote 恢复每资产 bid 与 BUY 小额报价 q0j：
@@ -2114,6 +2408,18 @@ impl AutomatedMarketMaker for BinaryFiPropPool {
             // reserves、消耗 BUY 阶梯容量。2026-08-19 事故根因：跨 pair SELL
             // 抽干 USDT0 金库对本实例不可见 → 本地金库门控放行必然失败的交易。
             self.update_shared_vault(i, j, amount_in, amount_out);
+            // reserves 事件净变化入账（rebase-merge 用）：块号缺失（canonical
+            // 路径）时标记 incomplete，快照合并退化为 guard，防止合并偏差。
+            match log.block_number {
+                Some(blk) => self.ledger.record(
+                    blk,
+                    i,
+                    amount_in.to::<u128>() as i128,
+                    j,
+                    -(amount_out.to::<u128>() as i128),
+                ),
+                None => self.ledger.mark_incomplete(),
+            }
             // 费率锚定仍限本 pair（防跨 pair 污染价格）：仅当 Swap 完全落在自身
             // exposed pair 内才用成交价标定；跨 pair 只更新金库、不动价格。
             if let Some((a, b)) = self.exposed_pair {
@@ -2618,7 +2924,7 @@ impl BinaryFiPropPool {
     /// 仅当该方向的阶梯上限（maxIn/maxOut）未知时启用（见 `ladder_cap_known`），
     /// 保守近似防止超大额输入的虚假报价；已知精确上限时不叠加，避免低估。
     fn capped_out(&self, j: usize, out: U256) -> U256 {
-        match self.reserves.get(j).copied().filter(|r| !r.is_zero()) {
+        match self.vault_known(j) {
             Some(reserve) => {
                 let cap = reserve * U256::from(BINARYFI_MAX_OUTPUT_BPS) / U256::from(10_000);
                 out.min(cap)
@@ -2662,6 +2968,7 @@ impl Default for BinaryFiPropPool {
             buy_ladder_remaining: Vec::new(),
             ladder_reserves: Vec::new(),
             price0_calibrated: false,
+            ledger: ReservesDeltaLedger::default(),
         }
     }
 }
@@ -2737,6 +3044,316 @@ fn enrich_batch_update_log_data(input: &[u8], log_data: &LogData) -> Option<LogD
         words.extend_from_slice(&w.to_be_bytes::<32>());
     }
     LogData::new(log_data.topics().to_vec(), Bytes::from(words))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::amms::Token;
+
+    fn u(v: u128) -> U256 {
+        U256::from(v)
+    }
+
+    fn test_pool(n: usize) -> BinaryFiPropPool {
+        let mut pool = BinaryFiPropPool::default();
+        pool.assets = (0..n)
+            .map(|i| Token {
+                address: Address::repeat_byte(i as u8),
+                decimals: 18,
+                symbol: String::new(),
+                chain_id: BINARYFI_CHAIN_ID,
+                fot_tax: None,
+            })
+            .collect();
+        pool.reserves = vec![U256::ZERO; n];
+        pool
+    }
+
+    /// S ≥ last_event_block：直接锚定，清空账本
+    #[test]
+    fn test_ledger_anchor_fresh() {
+        let mut ledger = ReservesDeltaLedger::default();
+        let mut cur = vec![u(100), u(200)];
+        let snap = vec![u(300), u(400)];
+        assert_eq!(ledger.rebase(&mut cur, &snap, 100), LedgerApply::Anchored);
+        assert_eq!(cur, snap);
+        assert!(ledger.is_anchored());
+        // 账本已清空：再锚定仍走 Anchored
+        assert_eq!(ledger.rebase(&mut cur, &snap, 101), LedgerApply::Anchored);
+    }
+
+    /// 重启后首次锚定（base=0）：快照 + 块 > S 事件 replay
+    #[test]
+    fn test_ledger_replay_first_anchor() {
+        let mut ledger = ReservesDeltaLedger::default();
+        ledger.record(101, 0, -50, 1, 40);
+        ledger.record(102, 0, -10, 1, 8);
+        let mut cur = vec![u(1000), u(1000)]; // 旧状态，被快照覆盖
+        let snap = vec![u(500), u(600)]; // canonical 头 S=100
+        assert_eq!(ledger.rebase(&mut cur, &snap, 100), LedgerApply::Merged);
+        // snap + (块101+102 Δ) = [500-60, 600+48]
+        assert_eq!(cur, vec![u(440), u(648)]);
+        assert!(ledger.is_anchored());
+    }
+
+    /// rebase 精确性：锚定后事件推进，S 落在 (base, latest]，合并 = 手工重放
+    #[test]
+    fn test_ledger_rebase_precise() {
+        let mut ledger = ReservesDeltaLedger::default();
+        let mut cur = vec![u(500), u(600)];
+        assert_eq!(
+            ledger.rebase(&mut cur, &vec![u(500), u(600)], 100),
+            LedgerApply::Anchored
+        );
+        // 事件 101/102 应用（当前值含事件）+ 记录
+        cur[0] = u(430);
+        cur[1] = u(648);
+        ledger.record(101, 0, -60, 1, 48);
+        ledger.record(102, 0, -10, 1, 0);
+        // 快照 S=101（链上 101 块状态）→ 合并 = snap + 块102 Δ
+        assert_eq!(
+            ledger.rebase(&mut cur, &vec![u(430), u(660)], 101),
+            LedgerApply::Merged
+        );
+        assert_eq!(cur, vec![u(420), u(660)]);
+    }
+
+    /// 陈旧快照（S < base）：丢弃，事件账本保持
+    #[test]
+    fn test_ledger_stale_skip() {
+        let mut ledger = ReservesDeltaLedger::default();
+        let mut cur = vec![u(500), u(600)];
+        assert_eq!(
+            ledger.rebase(&mut cur, &vec![u(500), u(600)], 100),
+            LedgerApply::Anchored
+        );
+        cur[0] = u(490);
+        ledger.record(101, 0, -10, 1, 0);
+        assert_eq!(
+            ledger.rebase(&mut cur, &vec![u(400), u(600)], 99),
+            LedgerApply::SkippedStale
+        );
+        assert_eq!(cur, vec![u(490), u(600)]);
+    }
+
+    /// 同块多笔 swap 累加进同一条目
+    #[test]
+    fn test_ledger_same_block_accumulate() {
+        let mut ledger = ReservesDeltaLedger::default();
+        ledger.record(101, 0, -50, 1, 40);
+        ledger.record(101, 0, -10, 1, 8);
+        let mut cur = vec![u(1000), u(1000)];
+        assert_eq!(
+            ledger.rebase(&mut cur, &vec![u(500), u(600)], 100),
+            LedgerApply::Merged
+        );
+        // 同块两笔 → 单条目 [-60, 48]
+        assert_eq!(cur, vec![u(440), u(648)]);
+    }
+
+    /// 乱序/重复事件（block < last_event_block）：忽略，防双计
+    #[test]
+    fn test_ledger_out_of_order_ignore() {
+        let mut ledger = ReservesDeltaLedger::default();
+        ledger.record(102, 0, -10, 1, 8);
+        ledger.record(101, 0, -50, 1, 40); // 乱序 → 忽略
+        ledger.record(102, 0, -5, 1, 2); // 同块重复 → 累加
+        let mut cur = vec![u(1000), u(1000)];
+        assert_eq!(
+            ledger.rebase(&mut cur, &vec![u(500), u(600)], 100),
+            LedgerApply::Merged
+        );
+        assert_eq!(cur, vec![u(485), u(610)]); // 只含块102 的 [-15, +10]
+    }
+
+    /// 窗口挤出：base 后事件被容量挤出 → 退化 guard（保持事件账本）；
+    /// S 覆盖全部事件时仍可锚定
+    #[test]
+    fn test_ledger_window_miss() {
+        let mut ledger = ReservesDeltaLedger::new(2);
+        let mut cur = vec![u(1000), u(1000)];
+        assert_eq!(
+            ledger.rebase(&mut cur, &vec![u(1000), u(1000)], 100),
+            LedgerApply::Anchored
+        );
+        // 事件 101/102/103：capacity=2 → 块101 被挤出
+        for blk in [101u64, 102, 103] {
+            cur[0] = cur[0].saturating_sub(U256::from(10));
+            cur[1] = cur[1].saturating_add(U256::from(5));
+            ledger.record(blk, 0, -10, 1, 5);
+        }
+        assert_eq!(cur, vec![u(970), u(1015)]);
+        // S=102：base=100 < evicted_up_to=101 → 无法精确合并 → 退化
+        assert_eq!(
+            ledger.rebase(&mut cur, &vec![u(980), u(1010)], 102),
+            LedgerApply::SkippedWindowMiss
+        );
+        assert_eq!(cur, vec![u(970), u(1015)]); // 事件账本保持
+                                                // S=103 ≥ last_event_block=103 → 直接锚定
+        assert_eq!(
+            ledger.rebase(&mut cur, &vec![u(960), u(1030)], 103),
+            LedgerApply::Anchored
+        );
+        assert_eq!(cur, vec![u(960), u(1030)]);
+    }
+
+    /// 事件把本地余额扣到负（saturating 兜底）后 rebase 不 panic、方向正确
+    #[test]
+    fn test_ledger_saturating_clamp() {
+        let mut ledger = ReservesDeltaLedger::default();
+        let mut cur = vec![u(10), u(20)];
+        assert_eq!(
+            ledger.rebase(&mut cur, &vec![u(10), u(20)], 100),
+            LedgerApply::Anchored
+        );
+        // 事件 101：asset0 -50（本地 saturating 到 0），asset1 +5
+        cur[0] = U256::ZERO;
+        cur[1] = u(25);
+        ledger.record(101, 0, -50, 1, 5);
+        // 快照 S=100（=base）：合并 = snap + 块101 Δ，clamp 到非负
+        assert_eq!(
+            ledger.rebase(&mut cur, &vec![u(10), u(25)], 100),
+            LedgerApply::Merged
+        );
+        assert_eq!(cur, vec![U256::ZERO, u(30)]);
+    }
+
+    /// 锚定后 reserves==0 = 已空（权威），参与归零/截断；未锚定 0 = 未知
+    #[test]
+    fn test_vault_known_zero_after_anchor() {
+        let mut pool = test_pool(2);
+        pool.reserves = vec![u(0), u(100)];
+        assert_eq!(pool.vault_known(0), None); // 未锚定：未知
+        assert_eq!(pool.vault_known(1), Some(u(100)));
+        assert_eq!(pool.sell_zero_over_vault(u(5)), Some(u(5))); // 不归零
+        assert_eq!(pool.capped_out(0, u(5)), u(5)); // 不截断
+
+        let snap = vec![u(0), u(100)];
+        assert_eq!(
+            pool.ledger.rebase(&mut pool.reserves, &snap, 100),
+            LedgerApply::Anchored
+        );
+        assert_eq!(pool.vault_known(0), Some(U256::ZERO)); // 锚定后：已空
+        assert_eq!(pool.sell_zero_over_vault(u(5)), Some(U256::ZERO)); // 归零
+        assert_eq!(pool.capped_out(0, u(5)), U256::ZERO); // 截断为 0
+    }
+
+    /// 序列化跳过 ledger；重启后 ledger 空，首个快照 replay 精确恢复
+    #[test]
+    fn test_ledger_serde_roundtrip() {
+        let mut pool = test_pool(2);
+        pool.reserves = vec![u(1000), u(1000)];
+        pool.ledger.record(101, 0, -50, 1, 40);
+        let json = serde_json::to_string(&pool).unwrap();
+        assert!(!json.contains("ledger"), "ledger must not be serialized");
+        let mut p2: BinaryFiPropPool = serde_json::from_str(&json).unwrap();
+        assert!(!p2.ledger.is_anchored());
+        // 重启后新事件
+        p2.reserves = vec![u(1000), u(1000)];
+        p2.ledger.record(102, 0, -10, 1, 8);
+        // 首个快照 S=100 → replay = snap + 块102 Δ
+        assert_eq!(
+            p2.ledger
+                .rebase(&mut p2.reserves, &vec![u(500), u(600)], 100),
+            LedgerApply::Merged
+        );
+        assert_eq!(p2.reserves, vec![u(490), u(608)]);
+    }
+
+    /// 真实 XLayer 事故场景回放（2026-08-31 13:35，块 69414266-71）：
+    /// USDT0 金库起点 27,774，swap 事件累计后余额 = 6,988（= 链上 balanceOf）。
+    /// 旧实现：快照 S=69414269（vaultBalances=649,051,239，canonical 滞后）
+    /// 无条件覆盖 → 幻影 649M 持续 15s（0xc0ca1d 等 9 笔失败报价）。
+    /// 新实现：rebase-merge → 649,051,239 + 块 69414270/71 净变化 = 6,988。
+    #[test]
+    fn test_replay_real_xlayer_scenario() {
+        let mut ledger = ReservesDeltaLedger::default();
+        let mut cur = vec![u(27_774), U256::ZERO]; // 事件账本（sync 已应用）
+                                                   // 69414266: +1,048,650,414 / -1,034,838,367 / +470,458,782
+        cur[0] = cur[0].saturating_add(u(1_048_650_414));
+        ledger.record(69_414_266, 0, 1_048_650_414, 1, 0);
+        cur[0] = cur[0].saturating_sub(u(1_034_838_367));
+        ledger.record(69_414_266, 0, -1_034_838_367, 1, 0);
+        cur[0] = cur[0].saturating_add(u(470_458_782));
+        ledger.record(69_414_266, 0, 470_458_782, 1, 0);
+        // 69414267: -483,897,106
+        cur[0] = cur[0].saturating_sub(u(483_897_106));
+        ledger.record(69_414_267, 0, -483_897_106, 1, 0);
+        // 69414269: +648,649,742
+        cur[0] = cur[0].saturating_add(u(648_649_742));
+        ledger.record(69_414_269, 0, 648_649_742, 1, 0);
+        // 69414270: -648,449,350 / -590,295 / +408,888,610 / -407,889,807 / -1,003,374
+        for d in [
+            -648_449_350i128,
+            -590_295,
+            408_888_610,
+            -407_889_807,
+            -1_003_374,
+        ] {
+            if d > 0 {
+                cur[0] = cur[0].saturating_add(u(d as u128));
+            } else {
+                cur[0] = cur[0].saturating_sub(u((-d) as u128));
+            }
+            ledger.record(69_414_270, 0, d, 1, 0);
+        }
+        // 69414271: +290,727,961 / -289,903,586 / -824,410
+        for d in [290_727_961i128, -289_903_586, -824_410] {
+            if d > 0 {
+                cur[0] = cur[0].saturating_add(u(d as u128));
+            } else {
+                cur[0] = cur[0].saturating_sub(u((-d) as u128));
+            }
+            ledger.record(69_414_271, 0, d, 1, 0);
+        }
+        assert_eq!(cur[0], u(6_988)); // 事件账本精确 = 链上 balanceOf
+
+        // 场景 1（重启后首次锚定）：快照 S=69414269 = 该块链上值 649,051,239
+        let snap = vec![u(649_051_239), U256::ZERO];
+        assert_eq!(
+            ledger.rebase(&mut cur, &snap, 69_414_269),
+            LedgerApply::Merged
+        );
+        // 合并 = 快照 + 块 69414270/71 净变化 = 6,988（幻影容量消失）
+        assert_eq!(cur[0], u(6_988));
+
+        // 场景 2（rebase，S=69414270）：新快照 7,023 → 仍精确 = 6,988
+        let snap2 = vec![u(7_023), U256::ZERO];
+        assert_eq!(
+            ledger.rebase(&mut cur, &snap2, 69_414_270),
+            LedgerApply::Merged
+        );
+        assert_eq!(cur[0], u(6_988));
+    }
+
+    /// 无块号日志（canonical 路径）→ incomplete：中间块快照退化为 guard，
+    /// S ≥ last_event_block 时仍可锚定并重置
+    #[test]
+    fn test_ledger_incomplete_degrades_to_guard() {
+        let mut ledger = ReservesDeltaLedger::default();
+        let mut cur = vec![u(500), u(600)];
+        assert_eq!(
+            ledger.rebase(&mut cur, &vec![u(500), u(600)], 100),
+            LedgerApply::Anchored
+        );
+        ledger.record(102, 0, -10, 1, 5);
+        ledger.mark_incomplete();
+        cur[0] = u(490);
+        cur[1] = u(605);
+        // 中间块 S=101：无法精确合并 → 保持事件账本
+        assert_eq!(
+            ledger.rebase(&mut cur, &vec![u(480), u(610)], 101),
+            LedgerApply::SkippedWindowMiss
+        );
+        assert_eq!(cur, vec![u(490), u(605)]);
+        // S=102 ≥ last_event_block=102：直接锚定并重置 incomplete
+        assert_eq!(
+            ledger.rebase(&mut cur, &vec![u(470), u(620)], 102),
+            LedgerApply::Anchored
+        );
+        assert_eq!(cur, vec![u(470), u(620)]);
+    }
 }
 
 /// 从 flashblocks 的原始交易字节中定位引擎 `update` 交易并解析 calldata，

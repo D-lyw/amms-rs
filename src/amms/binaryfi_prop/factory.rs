@@ -22,8 +22,9 @@ use crate::amms::{
 };
 
 use super::{
-    BinaryFiPropPool, BINARYFI_DEFAULT_FEE_PPM, BINARYFI_ENGINE_ADDRESS, BINARYFI_POOL_ADDRESS,
-    BINARYFI_ROUTER_ADDRESS, BINARYFI_SWAP_EVENT, BINARYFI_UPDATE_EVENT, BINARYFI_VAULT_ADDRESS,
+    BinaryFiPropPool, ReservesDeltaLedger, BINARYFI_DEFAULT_FEE_PPM, BINARYFI_ENGINE_ADDRESS,
+    BINARYFI_POOL_ADDRESS, BINARYFI_ROUTER_ADDRESS, BINARYFI_SWAP_EVENT, BINARYFI_UPDATE_EVENT,
+    BINARYFI_VAULT_ADDRESS,
 };
 
 // ============================================================================
@@ -109,6 +110,7 @@ impl BinaryFiPropFactory {
             max_outputs: Vec::new(),
             max_inputs: Vec::new(),
             reserves: Vec::new(),
+            ledger: ReservesDeltaLedger::default(),
             rates: Vec::new(),
             stale_pairs: Vec::new(),
             price_updated_block: Vec::new(),
