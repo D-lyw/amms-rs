@@ -230,6 +230,31 @@ out = floor(v × 10^(dj−d0+2) / ask_j)                  // 第二段 BUY，无
      通道），同一 engine 的全部虚拟子池一起更新。
 - 存量状态兼容：`fee_ppm` serde 兜底 1000，旧序列化状态行为与历史一致。
 
+### 7.9.1 费率生效账户（fee_account）对齐（v1.19.9 修复）
+
+根因：批量快照与 quote 此前一律以 **router** 为 recipient（聚合器白名单
+fee≈0/50），而链上真正执行 swap 的是独立套利合约（DexArbitrageV5XLayer）。
+引擎费率是 per-account storage：运营方对某账户设 100% 费（`FeeSet(account,
+fee)`，data 为 **raw 单位**，1 ↔ 1e6 ppm；如 2026-08-31 块 69416544 对执行器
+`0x19d704f4…` 置 1）后，本地仍按 router 口径模拟出利润 → 发单 → 链上引擎以
+`AmountTooSmall` 拒绝，形成连续虚假失败交易。
+
+修复（v1.19.9）：
+- `BinaryFiPropPool` 新增 `fee_account: Option<Address>`：实际套利执行合约
+  （链配置 `chain.arbitrage.contract_address`），`fee_recipient()` =
+  fee_account 优先、缺省回退 router（离线回放/旧状态行为不变）。loader 在
+  构建 ndjson/AMM 时传入，无需新增 config 字段。
+- 批量快照 `fetch_snapshot` 的 recipient 改为 `fee_recipient()`：`getFee` 与
+  全部 `quote(recipient, …)` 一次性对齐"我们实际能拿到"的费率与含费报价；
+  fee=1e6 时 quote 归 0 → rates 归 0 → 预过滤直接放弃路径，不再产生虚假机会。
+- per-account 事件监控：新增 `BINARYFI_FEE_ACCOUNT_EVENT`（`FeeSet`，topic1 =
+  账户，data 为 raw 单位，**不能**直接当 ppm 用），命中本实例
+  `fee_recipient()` 时返回 AsyncUpdate 重拉快照；全局 `FeeUpdated`（data 直接
+  是 ppm）仍即时更新 fee_ppm 并 AsyncUpdate，由快照以 fee_recipient 口径校正
+  per-account 覆盖。
+- 事件路由：`resolve_binaryfi_targets` 新增按账户路由分支（同 engine 且
+  `fee_recipient == 事件账户` 的实例）。
+
 ## 8. 三层数据同步（事件驱动，无轮询）
 
 | 层 | 来源 | 处理 |

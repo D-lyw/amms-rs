@@ -304,6 +304,15 @@ pub const BINARYFI_FEE_SELECTOR: [u8; 4] = [0x6f, 0x7c, 0x86, 0x8b];
 /// 链上实证：`setFee` 会发该事件（topic0 = 0xc58b3024…，data = 0xc8 = 200）。
 pub const BINARYFI_FEE_EVENT: B256 =
     b256!("c58b3024a07432cfc160ea128eebc11329d444bb61bf7098f09bb6567b943c66");
+/// 引擎按账户费率事件（`FeeSet(address indexed account, uint256 fee)`，
+/// topic1 = 账户地址，data = **原始单位**，1 ↔ 1e6 ppm）。
+/// 与全局 `FeeUpdated`（0xc58b3024…，data 直接是 ppm）不同：本事件的 data
+/// **不能**直接当 ppm 用，只作为"该账户费率可能已变"的触发信号，收到后重新
+/// `getFee(fee_recipient)` 拉权威 ppm（快照路径）。
+/// 链上实证：块 69416544 运营方 `0xd01dd6d2` 将执行器
+/// `0x19d704f4…` 费率置 1（raw = 100%），该事件后 getFee 即返回 1e6。
+pub const BINARYFI_FEE_ACCOUNT_EVENT: B256 =
+    b256!("921341769c2075d1ae425396063d5ab65ff5006c4bc0bd0821e50ce51fb60123");
 /// 默认费率（ppm，1e6 = 100%）：未知/未同步时的兜底。
 /// 历史实证：锚点块 67302528 = 500、失败交易窗口 6748xxxx = 1000、
 /// 2026-08-10 16:16 UTC（块 0x4073356）起 = 200；聚合器 0xd9eccc… = 0（白名单）。
@@ -377,6 +386,19 @@ pub struct BinaryFiPropPool {
     /// quote 批量读取合约使用的 recipient（Router，随部署配置传入）
     #[serde(default)]
     pub router_address: Address,
+    /// 费率生效账户（实际套利执行合约，`chain.arbitrage.contract_address`）。
+    /// 引擎费率是 **per-account storage**：`getFee(account)` 与
+    /// `pool.quote(recipient, …)` 都按该账户扣费，快照批量合约以它为
+    /// recipient 一次带回"我们实际能拿到"的费率与含费报价。
+    /// `None` = 回退 `router_address`（历史白名单口径，仅离线回放/旧状态用）。
+    ///
+    /// 背景（v1.19.9）：此前快照/报价全部以 router（白名单 fee≈0/50）为
+    /// recipient，而链上真正执行 swap 的是独立套利合约；运营方把执行器费率
+    /// 拉高（如 100%）后本地仍按 router 口径模拟，产生虚假机会并持续失败
+    /// （链上引擎 revert `AmountTooSmall`）。ndjson 构建时由 loader 传入
+    /// 配置中的 `contract_address`，报价/费率/事件监控全部对齐该账户。
+    #[serde(default)]
+    pub fee_account: Option<Address>,
     /// 引擎按账户费率（ppm，1e6 = 100%）：报价时输入侧扣
     /// `rem = in − in×fee/1e6`。链上 `getFee(account)`（0xb88c9148）按账户返回，
     /// 除白名单（AGG=0）外普通账户统一取同一默认值（500→1000→200 随时间变，
@@ -656,8 +678,15 @@ pub enum LedgerApply {
 }
 
 impl BinaryFiPropPool {
+    /// 费率生效账户：`fee_account`（实际执行合约）优先，缺省回退 router。
+    /// 快照批量请求的 recipient、per-account 费率事件的路由都以此为准。
+    pub fn fee_recipient(&self) -> Address {
+        self.fee_account.unwrap_or(self.router_address)
+    }
+
     /// 部署分组 key（同 pool/engine/router/vault = 同一部署，共享链上状态）。
-    /// 用于 init_batch 去重与周期同步按部署刷新。
+    /// 用于 init_batch 去重与周期同步按部署刷新。`fee_account` 不参与分组：
+    /// 它来自链配置的 `contract_address`，对同链全部 BinaryFi 实例一致。
     pub fn deployment_key(&self) -> (Address, Address, Address, Address) {
         (
             self.pool_address,
@@ -2159,11 +2188,15 @@ impl BinaryFiPropPool {
 
     /// 批量拉取快照：静态调用批量合约取 quotes/decimals/余额（合约内部调用
     /// 引擎 getAssetReserves() 填金库余额）；若为空则单独调用引擎兜底。
+    ///
+    /// `fee_account` 同时作为批量合约的 recipient：`getFee(fee_account)` 与
+    /// 全部 `quote(recipient, …)` 都按该账户扣费，保证快照口径 = 链上实际
+    /// 执行口径（费率生效账户，见 [`Self::fee_recipient`]）。
     async fn fetch_snapshot<N, P>(
         provider: P,
         pool: Address,
         engine: Address,
-        router: Address,
+        fee_account: Address,
         assets: Vec<Address>,
         quote_pairs: Vec<U256>,
         big_quote_pairs: Vec<U256>,
@@ -2178,7 +2211,7 @@ impl BinaryFiPropPool {
             provider.clone(),
             pool,
             engine,
-            router,
+            fee_account,
             assets,
             quote_pairs,
             big_quote_pairs,
@@ -2333,11 +2366,30 @@ impl AutomatedMarketMaker for BinaryFiPropPool {
             BINARYFI_SWAP_EVENT,
             BINARYFI_UPDATE_EVENT,
             BINARYFI_FEE_EVENT,
+            BINARYFI_FEE_ACCOUNT_EVENT,
         ]
     }
 
     fn sync(&mut self, log: &Log) -> Result<SyncAction, AMMError> {
         let topics = log.topics();
+
+        // L0a: 引擎按账户费率事件（FeeSet(account, fee)，topic1 = 账户）。
+        // 事件 data 是**原始单位**（1 ↔ 1e6 ppm），不能直接当 ppm 用；
+        // 只作触发信号：该账户费率可能已变，返回 AsyncUpdate 重拉快照，
+        // 让批量合约以 fee_recipient 口径带回权威 getFee + 含费 quote。
+        // 仅命中本实例费率生效账户（fee_recipient），避免多账户串扰。
+        if log.address() == self.engine_address
+            && topics.len() == 2
+            && topics[0] == BINARYFI_FEE_ACCOUNT_EVENT
+            && Address::from_word(topics[1]) == self.fee_recipient()
+        {
+            tracing::debug!(
+                account = %Address::from_word(topics[1]),
+                block = log.block_number,
+                "binaryfi per-account fee event, async resync fee snapshot"
+            );
+            return Ok(SyncAction::AsyncUpdate);
+        }
 
         // L0: 引擎 FeeUpdated 事件 → 按账户费率实时更新。
         // 费率是引擎 per-account storage（getFee），报价在输入侧按 fee_ppm 扣；
@@ -2345,7 +2397,8 @@ impl AutomatedMarketMaker for BinaryFiPropPool {
         // 立即对齐链上（事件与 setFee 交易同块）。
         // 实际变更时返回 AsyncUpdate：快照观测的含费 maxOut/maxIn/大额 probe
         // 依赖旧费率（快照与事件之间费率已变），需按新费率重新探测容量锚点；
-        // 费率未变（重复事件）不触发。
+        // 费率未变（重复事件）不触发。AsyncUpdate 重拉快照时以 fee_recipient
+        // 为准（getFee(fee_recipient)），可校正本账户存在的 per-account 覆盖。
         if log.address() == self.engine_address
             && topics.len() == 1
             && topics[0] == BINARYFI_FEE_EVENT
@@ -2782,7 +2835,7 @@ impl AutomatedMarketMaker for BinaryFiPropPool {
             provider,
             self.pool_address,
             self.engine_address,
-            self.router_address,
+            self.fee_recipient(),
             vec![],
             quote_pairs,
             big_quote_pairs,
@@ -2869,7 +2922,7 @@ impl BinaryFiPropPool {
             provider,
             self.pool_address,
             self.engine_address,
-            self.router_address,
+            self.fee_recipient(),
             assets,
             quote_pairs,
             big_quote_pairs,
@@ -2943,6 +2996,7 @@ impl Default for BinaryFiPropPool {
             engine_address: BINARYFI_ENGINE_ADDRESS,
             vault_address: BINARYFI_VAULT_ADDRESS,
             router_address: BINARYFI_ROUTER_ADDRESS,
+            fee_account: None,
             fee_ppm: BINARYFI_DEFAULT_FEE_PPM,
             chain_id: BINARYFI_CHAIN_ID,
             created_block: 0,

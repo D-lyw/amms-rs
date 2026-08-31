@@ -2688,13 +2688,15 @@ impl StateSpace {
         topics: &[FixedBytes<32>],
     ) -> Option<Vec<Address>> {
         use crate::amms::binaryfi_prop::{
-            BINARYFI_FEE_EVENT, BINARYFI_SWAP_EVENT, BINARYFI_UPDATE_EVENT,
+            BINARYFI_FEE_ACCOUNT_EVENT, BINARYFI_FEE_EVENT, BINARYFI_SWAP_EVENT,
+            BINARYFI_UPDATE_EVENT,
         };
 
         let mut instances: Vec<(
             Address,
             Option<(usize, usize)>,
             Vec<Address>,
+            Address,
             Address,
             Address,
         )> = Vec::new();
@@ -2711,6 +2713,7 @@ impl StateSpace {
                     assets,
                     p.pool_address,
                     p.engine_address,
+                    p.fee_recipient(),
                 ));
             }
         }
@@ -2721,7 +2724,7 @@ impl StateSpace {
                 let token_out = Address::from_word(topics[3]);
                 let targets = instances
                     .into_iter()
-                    .filter_map(|(key, exposed, assets, pool_addr, _)| {
+                    .filter_map(|(key, exposed, assets, pool_addr, _, _)| {
                         // 只命中本部署（同一 pool 地址）的虚拟子池，避免多部署串扰
                         if pool_addr != log_address {
                             return None;
@@ -2753,7 +2756,7 @@ impl StateSpace {
                 let asset_idx = U256::from_be_bytes(topics[1].0).to::<usize>();
                 let targets = instances
                     .into_iter()
-                    .filter_map(|(key, exposed, _, _, engine_addr)| {
+                    .filter_map(|(key, exposed, _, _, engine_addr, _)| {
                         // 只命中本部署（同一 engine 地址）的虚拟子池，避免多部署串扰
                         if engine_addr != log_address {
                             return None;
@@ -2767,13 +2770,30 @@ impl StateSpace {
                 Some(targets)
             }
             // 引擎 FeeUpdated 事件（topics.len()==1，data 前 32 字节 = 新 fee ppm）：
-            // 费率是 per-account storage（共享 router/engine），同一 engine 的全部
-            // 虚拟子池一起更新，避免 setFee 后各子池 fee_ppm 不一致。
+            // 全局费率变更，同一 engine 的全部虚拟子池一起更新（AsyncUpdate
+            // 重拉快照时按各自 fee_recipient 校正 per-account 覆盖）。
             Some(topic) if *topic == BINARYFI_FEE_EVENT && has_engine_match => {
                 let targets = instances
                     .into_iter()
-                    .filter_map(|(key, _, _, _, engine_addr)| {
+                    .filter_map(|(key, _, _, _, engine_addr, _)| {
                         (engine_addr == log_address).then_some(key)
+                    })
+                    .collect();
+                Some(targets)
+            }
+            // 引擎按账户费率事件（FeeSet(account, fee)，topic1 = 账户，data = raw
+            // 单位）：费率是 per-account storage，仅费率生效账户 == 事件账户 的
+            // 实例路由（触发 AsyncUpdate 重拉该账户口径快照）。
+            Some(topic)
+                if *topic == BINARYFI_FEE_ACCOUNT_EVENT
+                    && has_engine_match
+                    && topics.len() >= 2 =>
+            {
+                let account = Address::from_word(topics[1]);
+                let targets = instances
+                    .into_iter()
+                    .filter_map(|(key, _, _, _, engine_addr, fee_recipient)| {
+                        (engine_addr == log_address && fee_recipient == account).then_some(key)
                     })
                     .collect();
                 Some(targets)

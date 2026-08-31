@@ -94,6 +94,7 @@ impl BinaryFiPropFactory {
             engine_address: self.engine_address,
             vault_address: self.vault_address,
             router_address: self.router_address,
+            fee_account: None,
             chain_id: self.chain_id,
             created_block,
             last_synced_block: 0,

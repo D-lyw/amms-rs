@@ -907,6 +907,47 @@ fn test_sync_fee_event_updates_fee_and_rederives_rates() {
 }
 
 #[test]
+fn test_sync_per_account_fee_event_triggers_async_update() {
+    let mut pool = test_pool();
+    // 未显式设置 fee_account → fee_recipient 回退 router
+    let recipient = pool.fee_recipient();
+
+    // 引擎按账户费率事件（FeeSet(account, fee)）：topic1 = 账户，data = raw 单位。
+    // 命中本实例 fee_recipient → AsyncUpdate（重拉该账户口径快照），
+    // 但不得直接用事件 data 改写 fee_ppm（raw 1 ↔ 1e6 ppm，非 ppm）。
+    let log = Log {
+        inner: AlloyLog {
+            address: BINARYFI_ENGINE_ADDRESS,
+            data: LogData::new(
+                vec![BINARYFI_FEE_ACCOUNT_EVENT, recipient.into_word()],
+                Bytes::new(),
+            )
+            .unwrap(),
+        },
+        ..Default::default()
+    };
+    let action = pool.sync(&log).expect("sync ok");
+    assert!(matches!(action, SyncAction::AsyncUpdate));
+    assert_eq!(pool.fee_ppm, BINARYFI_DEFAULT_FEE_PPM);
+
+    // 事件账户不是本实例 fee_recipient → 不进 per-account 分支（默认 Resync）
+    let other = address!("0x19d704f408a5553b11bf50a3965beda0adb6b9dc");
+    let log_other = Log {
+        inner: AlloyLog {
+            address: BINARYFI_ENGINE_ADDRESS,
+            data: LogData::new(
+                vec![BINARYFI_FEE_ACCOUNT_EVENT, other.into_word()],
+                Bytes::new(),
+            )
+            .unwrap(),
+        },
+        ..Default::default()
+    };
+    let action2 = pool.sync(&log_other).expect("sync ok");
+    assert!(matches!(action2, SyncAction::Resync));
+}
+
+#[test]
 fn test_sync_enriched_update_applies_price() {
     let mut pool = test_pool();
     // 增强后的 data = price / blockNumber / data0..2 / askOffsetRaw / bidOffsetRaw
