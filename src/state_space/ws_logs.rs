@@ -1,6 +1,6 @@
 use super::{
-    AppliedLogDedupCache, HookRegistry, LogQueryChunk, LogSource, PendingSyncQueue, StateSpace,
-    StateSpaceError, StateSpaceManager,
+    AppliedLogDedupCache, BSC_MAINNET_CHAIN_ID, HookRegistry, LogQueryChunk, LogSource,
+    PendingSyncQueue, StateSpace, StateSpaceError, StateSpaceManager,
 };
 use crate::state_space::{STREAM_IDLE_TIMEOUT, STREAM_RECONNECT_DELAY};
 use alloy::consensus::BlockHeader;
@@ -170,15 +170,24 @@ impl<N, P> StateSpaceManager<N, P> {
                             }
 
                             let received_at = Instant::now();
-                            let logs = match Self::collect_logs_for_chunks(
-                                &provider,
-                                &query_chunks,
-                                block_num,
-                                block_num,
-                                Some(&logs_bloom),
-                            )
-                            .await
-                            {
+                            let logs = match if chain_id == BSC_MAINNET_CHAIN_ID {
+                                Self::collect_logs_for_block_bsc_full(
+                                    &provider,
+                                    &query_chunks,
+                                    block_num,
+                                    Some(&logs_bloom),
+                                )
+                                .await
+                            } else {
+                                Self::collect_logs_for_chunks(
+                                    &provider,
+                                    &query_chunks,
+                                    block_num,
+                                    block_num,
+                                    Some(&logs_bloom),
+                                )
+                                .await
+                            } {
                                 Ok(logs) => logs,
                                 Err(e) => {
                                     error!("get_logs failed for block {}: {}", block_num, e);

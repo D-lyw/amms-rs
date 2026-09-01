@@ -1463,6 +1463,80 @@ impl<N, P> StateSpaceManager<N, P> {
         Ok(all_logs)
     }
 
+    /// BSC NewHeadsPull 实时路径专用：整块单查 + 本地过滤（仅 chain_id == 56）。
+    ///
+    /// 生产实测（us-east-1，两批 532 块，Chainstack WS，`--full-block` 探针）：
+    ///   整块单查  med ~14ms / p90 ~26ms / max ~240ms
+    ///   并发 chunk med ~14ms / p90 ~107ms / max ~370ms
+    ///   串行 chunk med ~78ms / p90 ~330ms
+    /// 整块单查尾部延迟显著更优、只发 1 个请求，无 chunk 表维护/并发挂起风险。
+    /// 仅 BSC 实时单块路径使用；backfill 长区间仍走 chunked（需要 address
+    /// 过滤控制数据量），其他链实时路径不变。
+    async fn collect_logs_for_block_bsc_full(
+        provider: &P,
+        chunks: &[LogQueryChunk],
+        block_num: u64,
+        bloom: Option<&Bloom>,
+    ) -> Result<Vec<Log>, StateSpaceError>
+    where
+        P: Provider<N> + Clone,
+        N: Network,
+    {
+        // 全局 bloom 预筛：与 chunked 路径「是否会查询任何 chunk」等价，
+        // 0 命中块直接跳过，避免无谓拉取整块日志。
+        if let Some(block_bloom) = bloom {
+            let any_relevant = chunks
+                .iter()
+                .any(|chunk| Self::bloom_maybe_has_relevant_logs(block_bloom, chunk));
+            if !any_relevant {
+                return Ok(vec![]);
+            }
+        }
+
+        let filter = Filter::new().from_block(block_num).to_block(block_num);
+        let logs = provider
+            .get_logs(&filter)
+            .await
+            .map_err(StateSpaceError::from)?;
+
+        Ok(Self::filter_logs_for_chunks(logs, chunks))
+    }
+
+    /// 本地过滤：语义与 chunked 服务端过滤完全一致。
+    ///
+    /// - `TopicFiltered` chunk：地址命中且 topic0 ∈ 全局 topic 联合
+    /// - `AddressOnly` chunk：仅地址命中（任意 topic，如 FoT swapBack /
+    ///   Ekubo Log0 / Caliber）
+    ///
+    /// 与 `ranged_filter`/`chunk_to_subscription_filter` 覆盖相同，保证整块
+    /// 单查送入 apply 的日志集合与原 chunked 路径一致——避免池子地址收到
+    /// 非 sync 事件日志进入 `amm.sync` 触发误 resync。
+    fn filter_logs_for_chunks(logs: Vec<Log>, chunks: &[LogQueryChunk]) -> Vec<Log> {
+        let mut topic_addresses = HashSet::new();
+        let mut topics = HashSet::new();
+        let mut address_only = HashSet::new();
+        for chunk in chunks {
+            match &chunk.mode {
+                QueryMode::TopicFiltered(t) => {
+                    topic_addresses.extend(chunk.addresses.iter().copied());
+                    topics.extend(t.iter().copied());
+                }
+                QueryMode::AddressOnly => {
+                    address_only.extend(chunk.addresses.iter().copied());
+                }
+            }
+        }
+
+        logs.into_iter()
+            .filter(|log| {
+                let addr = log.address();
+                address_only.contains(&addr)
+                    || (topic_addresses.contains(&addr)
+                        && log.topics().first().map_or(false, |t| topics.contains(t)))
+            })
+            .collect()
+    }
+
     async fn backfill_range(
         provider: &P,
         state: &Arc<RwLock<StateSpace>>,
@@ -3165,6 +3239,64 @@ mod tests {
             &bloom,
             &miss_chunk
         ));
+    }
+
+    #[test]
+    fn bsc_full_block_local_filter_matches_chunked_semantics() {
+        let pool_a = address!("1111111111111111111111111111111111111111");
+        let pool_b = address!("2222222222222222222222222222222222222222");
+        let addr_only = address!("4444444444444444444444444444444444444444");
+        let sync_topic = FixedBytes::<32>::from([0x01u8; 32]);
+        let other_topic = FixedBytes::<32>::from([0x02u8; 32]);
+
+        let chunks = vec![
+            LogQueryChunk {
+                addresses: vec![pool_a, pool_b],
+                mode: QueryMode::TopicFiltered(vec![sync_topic]),
+            },
+            LogQueryChunk {
+                addresses: vec![addr_only],
+                mode: QueryMode::AddressOnly,
+            },
+        ];
+
+        let make_log = |addr: Address, topic: FixedBytes<32>| Log {
+            inner: alloy::primitives::Log {
+                address: addr,
+                data: LogData::new(vec![topic], Bytes::new()).unwrap(),
+            },
+            block_hash: None,
+            block_number: Some(1),
+            block_timestamp: None,
+            transaction_hash: None,
+            transaction_index: Some(0),
+            log_index: Some(0),
+            removed: false,
+        };
+
+        let logs = vec![
+            make_log(pool_a, sync_topic),
+            make_log(pool_a, other_topic),
+            make_log(pool_b, sync_topic),
+            make_log(addr_only, other_topic),
+            make_log(address!("5555555555555555555555555555555555555555"), sync_topic),
+        ];
+
+        let filtered =
+            StateSpaceManager::<(), ()>::filter_logs_for_chunks(logs, &chunks);
+
+        // pool_a+other_topic 必须被过滤（topic 不在全局联合，与 chunked 语义一致）
+        assert_eq!(filtered.len(), 3);
+        assert!(filtered.iter().all(|l| {
+            l.address() == pool_a || l.address() == pool_b || l.address() == addr_only
+        }));
+        assert!(!filtered.iter().any(|l| {
+            l.address() == pool_a && l.topics().first() == Some(&other_topic)
+        }));
+        // AddressOnly 地址任意 topic 保留
+        assert!(filtered
+            .iter()
+            .any(|l| l.address() == addr_only && l.topics().first() == Some(&other_topic)));
     }
 
     #[test]
