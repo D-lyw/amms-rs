@@ -8,6 +8,8 @@ use crate::amms::caliber_prop::CaliberPropPool;
 use crate::amms::curve_legacy::factory::CurveLegacyFactory;
 use crate::amms::curve_ng::factory::CurveNGFactory;
 use crate::amms::ekubo::EkuboFactory;
+use crate::amms::elfomo_prop::factory::ElfomoFiPropFactory;
+use crate::amms::elfomo_prop::ElfomoFiPropPool;
 use crate::amms::erc_4626::ERC4626Vault;
 use crate::amms::fermi_prop::factory::FermiPropFactory;
 use crate::amms::fermi_prop::FermiPropPool;
@@ -162,6 +164,9 @@ impl Variant {
             Variant::BinaryFiPropPool => {
                 BinaryFiPropPool::init_batch::<N, _>(amms, to_block, provider).await
             }
+            Variant::ElfomoFiPropPool => {
+                ElfomoFiPropPool::init_batch::<N, _>(amms, to_block, provider).await
+            }
             Variant::FermiPropPool => {
                 FermiPropPool::init_batch::<N, _>(amms, to_block, provider).await
             }
@@ -248,6 +253,9 @@ impl Variant {
             }
             Variant::BinaryFiPropPool => {
                 BinaryFiPropPool::init_batch::<N, _>(amms, to_block, provider).await
+            }
+            Variant::ElfomoFiPropPool => {
+                ElfomoFiPropPool::init_batch::<N, _>(amms, to_block, provider).await
             }
             Variant::FermiPropPool => {
                 FermiPropPool::init_batch::<N, _>(amms, to_block, provider).await
@@ -363,7 +371,8 @@ factory!(
     AerodromeSlipstreamFactory,
     CaliberPropFactory,
     BinaryFiPropFactory,
-    FermiPropFactory
+    FermiPropFactory,
+    ElfomoFiPropFactory
 );
 
 #[derive(Default)]

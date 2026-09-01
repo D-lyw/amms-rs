@@ -113,6 +113,7 @@ where
                     AMM::CaliberPropPool(_) => 1, // Caliber propAMM uses Ladder pricing, similar to CPMM
                     AMM::BinaryFiPropPool(_) => 1, // BinaryFi propAMM uses linear pricing, similar to CPMM
                     AMM::FermiPropPool(_) => 1, // Fermi propAMM uses lane pricing, similar to CPMM
+                    AMM::ElfomoFiPropPool(_) => 1, // ElfomoFi propAMM uses orderbook ladder pricing, similar to CPMM
                 };
 
                 PoolInfo {

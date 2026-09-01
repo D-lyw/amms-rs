@@ -30,11 +30,12 @@ use crate::amms::caliber_prop::{
     decode_batch_update_parameters, decode_caliber_swap_log, extract_input_from_raw_tx,
     extract_to_from_raw_tx, CaliberBatchUpdate, CaliberSwapEvent, CALIBER_SWAP_EVENT,
 };
+use crate::amms::elfomo_prop::{ElfomoFiPropPool, ELFOMO_UPDATE_EVENT};
 use crate::state_space::{
     STREAM_IDLE_TIMEOUT, STREAM_RECONNECT_DELAY, XLAYER_FLASHBLOCKS_RAW_WS_URL,
 };
 use alloy::network::Network;
-use alloy::primitives::{Address, Bytes, FixedBytes, LogData, B256};
+use alloy::primitives::{Address, Bytes, FixedBytes, LogData, B256, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::eth::Log;
 use async_stream::stream;
@@ -334,6 +335,18 @@ pub(crate) struct CaliberTxEvent {
     pub update: CaliberBatchUpdate,
 }
 
+/// 从 flashblocks 原始交易中提取的 ElfomoFi `updatePrices` 报价更新事件。
+///
+/// `tx_index` 为块内全局索引（跨 slice 由 `XlayerTxCountTracker` 的 `tx_base`
+/// 拼接，与懒排序修正使用同一约定）；`pool` 为被调用的 Pool 地址；
+/// `seed` 为 calldata 参数高 32 位价格种子（`a`），可直接本地重算 orderbook。
+#[derive(Debug)]
+pub(crate) struct ElfomoTxEvent {
+    pub pool: Address,
+    pub seed: U256,
+    pub tx_index: u64,
+}
+
 // ─────────────────────────────────────────────
 // Log matcher (local copy — same logic as Base flashblocks)
 // ─────────────────────────────────────────────
@@ -412,6 +425,7 @@ fn extract_logs_from_xlayer_flashblock(
     matcher: &XlayerLogMatcher,
     binaryfi_engines: &HashSet<Address>,
     caliber_contracts: &HashSet<Address>,
+    elfomo_pools: &HashSet<Address>,
     dedup_cache: &mut XlayerDedupCache,
     parse_cache: &mut XlayerParseCache,
     tx_tracker: &mut XlayerTxCountTracker,
@@ -423,12 +437,14 @@ fn extract_logs_from_xlayer_flashblock(
     HashSet<Address>,
     Vec<CaliberTxEvent>,
     Vec<CaliberSwapEvent>,
+    Vec<ElfomoTxEvent>,
 ) {
     let mut out = Vec::new();
     let mut decode_fail = 0usize;
     let mut decode_failed_addresses = HashSet::new();
     let mut caliber_events = Vec::new();
     let mut caliber_swap_events = Vec::new();
+    let mut elfomo_updates = Vec::new();
 
     // 1. 获取 block_number（metadata 数值优先，base hex 备选）
     let block_number = xlayer_flashblock_block_number(fb);
@@ -441,6 +457,7 @@ fn extract_logs_from_xlayer_flashblock(
             decode_failed_addresses,
             caliber_events,
             caliber_swap_events,
+            elfomo_updates,
         );
     };
 
@@ -529,6 +546,52 @@ fn extract_logs_from_xlayer_flashblock(
         }
     }
 
+    // 2d. ElfomoFi updatePrices 原始交易主通道（本地直算，零 RPC）：
+    //     calldata 参数就是价格种子 `a = arg >> 32`（2026-09-01 链上实证，
+    //     实测 `arg ≈ (a<<32) | (ts-1)`），解析后调用方本地重算 orderbook，
+    //     不再需要重拉 getOrderbook。
+    //     receipt status 校验：仅应用链上确认成功的更新（失败/回滚不触发）。
+    if !elfomo_pools.is_empty() {
+        if let Some(diff) = fb.diff.as_ref() {
+            for (real_idx, raw_tx_hex) in diff.transactions.iter().enumerate() {
+                let raw_hex = raw_tx_hex.strip_prefix("0x").unwrap_or(raw_tx_hex);
+                let Ok(raw) = alloy::hex::decode(raw_hex) else {
+                    continue;
+                };
+                // 轻量定位 to（只跳字段、零分配），过滤非目标 Pool 交易
+                let Some(to) = extract_to_from_raw_tx(&raw) else {
+                    continue;
+                };
+                if !elfomo_pools.contains(&to) {
+                    continue;
+                }
+                let confirmed = fb
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| {
+                        m.receipts
+                            .get(&format!("{:#x}", alloy::primitives::keccak256(&raw)))
+                    })
+                    .and_then(parse_receipt_status)
+                    .unwrap_or(false);
+                if !confirmed {
+                    continue;
+                }
+                let Some(input) = extract_input_from_raw_tx(&raw) else {
+                    continue;
+                };
+                let Some(seed) = ElfomoFiPropPool::parse_update_prices_calldata(&input) else {
+                    continue;
+                };
+                elfomo_updates.push(ElfomoTxEvent {
+                    pool: to,
+                    seed,
+                    tx_index: tx_base + real_idx as u64,
+                });
+            }
+        }
+    }
+
     // 3. 获取 metadata（receipts 从这里提取）
     let Some(metadata) = fb.metadata.as_ref() else {
         return (
@@ -538,6 +601,7 @@ fn extract_logs_from_xlayer_flashblock(
             decode_failed_addresses,
             caliber_events,
             caliber_swap_events,
+            elfomo_updates,
         );
     };
 
@@ -549,6 +613,7 @@ fn extract_logs_from_xlayer_flashblock(
             decode_failed_addresses,
             caliber_events,
             caliber_swap_events,
+            elfomo_updates,
         );
     }
 
@@ -815,6 +880,17 @@ fn extract_logs_from_xlayer_flashblock(
         }
     }
 
+    // 8. ElfomoFi 更新事件去重：updatePrices 空事件与其原始交易同块共存。
+    //    raw-tx 已携带价格种子（本地直算通道），空事件不再触发 AsyncUpdate，
+    //    直接剔除，避免冗余 RPC 重拉。
+    if !elfomo_updates.is_empty() {
+        let updated_pools: HashSet<Address> = elfomo_updates.iter().map(|e| e.pool).collect();
+        out.retain(|log| {
+            !(updated_pools.contains(&log.inner.address)
+                && log.topics().first() == Some(&ELFOMO_UPDATE_EVENT))
+        });
+    }
+
     (
         out,
         Some(block_number),
@@ -822,6 +898,7 @@ fn extract_logs_from_xlayer_flashblock(
         decode_failed_addresses,
         caliber_events,
         caliber_swap_events,
+        elfomo_updates,
     )
 }
 
@@ -874,6 +951,18 @@ impl<N, P> StateSpaceManager<N, P> {
                     .values()
                     .filter_map(|amm| match amm.as_ref() {
                         AMM::CaliberPropPool(p) => Some(p.contract_address),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            // 已注册 ElfomoFi 池子的 Pool 地址（updatePrices raw-tx 兜底，按 to 过滤）
+            let elfomo_pools: HashSet<Address> = {
+                let read_guard = state.read().await;
+                read_guard
+                    .state
+                    .values()
+                    .filter_map(|amm| match amm.as_ref() {
+                        AMM::ElfomoFiPropPool(p) => Some(p.pool_address),
                         _ => None,
                     })
                     .collect()
@@ -1070,6 +1159,7 @@ impl<N, P> StateSpaceManager<N, P> {
                     }
 
                     // 6. 提取 logs + caliber 报价更新事件 + caliber swap 事件
+                    //    + elfomo updatePrices 原始交易
                     let (
                         logs,
                         block_number,
@@ -1077,12 +1167,14 @@ impl<N, P> StateSpaceManager<N, P> {
                         decode_failed_addresses,
                         caliber_events,
                         caliber_swap_events,
+                        elfomo_updates,
                     ) =
                         extract_logs_from_xlayer_flashblock(
                             &fb,
                             &matcher,
                             &binaryfi_engines,
                             &caliber_contracts,
+                            &elfomo_pools,
                             &mut dedup_cache,
                             &mut parse_cache,
                             &mut tx_tracker,
@@ -1121,8 +1213,11 @@ impl<N, P> StateSpaceManager<N, P> {
                         }
                     }
 
-                    // 8. 无日志且无 caliber 更新/swap → 跳过
-                    if logs.is_empty() && caliber_events.is_empty() && caliber_swap_events.is_empty()
+                    // 8. 无日志且无 caliber 更新/swap 且无 elfomo 更新 → 跳过
+                    if logs.is_empty()
+                        && caliber_events.is_empty()
+                        && caliber_swap_events.is_empty()
+                        && elfomo_updates.is_empty()
                     {
                         continue;
                     }
@@ -1193,6 +1288,28 @@ impl<N, P> StateSpaceManager<N, P> {
                             }
                             Err(e) => {
                                 error!("Xlayer flashblocks caliber swap apply failed: {}", e);
+                            }
+                        }
+                    }
+
+                    // 12. ElfomoFi updatePrices 原始交易 → 本地直算 orderbook
+                    //     （calldata 携带价格种子，apply_price_seed 按本地金库
+                    //     余额重算，零 RPC；同块空事件已在提取侧剔除，避免
+                    //     冗余 AsyncUpdate。仅事件无 raw-tx 时由 L1 通道回退）
+                    if !elfomo_updates.is_empty() {
+                        match Self::apply_elfomo_updates_for_block(
+                            &state,
+                            block_num,
+                            elfomo_updates,
+                            &realtime_head,
+                        )
+                        .await
+                        {
+                            Ok(affected_elfomo) => {
+                                affected.extend(affected_elfomo);
+                            }
+                            Err(e) => {
+                                error!("Xlayer flashblocks elfomo update apply failed: {}", e);
                             }
                         }
                     }
@@ -1288,9 +1405,10 @@ mod tests {
         slice0_receipts.insert(hash_raw_tx(&slice0_txs[1]), receipt(pool, topic0, 20));
         let slice0 = flashblock(payload_id, 0, block_number, slice0_txs, slice0_receipts);
 
-        let (logs0, _, _, _, _, _) = extract_logs_from_xlayer_flashblock(
+        let (logs0, _, _, _, _, _, _) = extract_logs_from_xlayer_flashblock(
             &slice0,
             &matcher,
+            &HashSet::new(),
             &HashSet::new(),
             &HashSet::new(),
             &mut dedup,
@@ -1312,9 +1430,10 @@ mod tests {
         slice1_receipts.insert(hash_raw_tx(&slice1_txs[1]), receipt(pool, topic0, 40));
         let slice1 = flashblock(payload_id, 1, block_number, slice1_txs, slice1_receipts);
 
-        let (logs1, _, _, _, _, _) = extract_logs_from_xlayer_flashblock(
+        let (logs1, _, _, _, _, _, _) = extract_logs_from_xlayer_flashblock(
             &slice1,
             &matcher,
+            &HashSet::new(),
             &HashSet::new(),
             &HashSet::new(),
             &mut dedup,
@@ -1366,11 +1485,12 @@ mod tests {
             receipts,
         );
 
-        let (logs, _, _, _, events, _swap_events) = extract_logs_from_xlayer_flashblock(
+        let (logs, _, _, _, events, _swap_events, _) = extract_logs_from_xlayer_flashblock(
             &fb,
             &matcher,
             &HashSet::new(),
             &HashSet::from([caliber_contract]),
+            &HashSet::new(),
             &mut dedup,
             &mut parse_cache,
             &mut tx_tracker,
@@ -1387,9 +1507,10 @@ mod tests {
         assert_eq!(events[0].update.deadline, 1_786_098_592);
 
         // to 不在兴趣集合 → 不产出事件
-        let (_, _, _, _, events2, _swap_events2) = extract_logs_from_xlayer_flashblock(
+        let (_, _, _, _, events2, _swap_events2, _) = extract_logs_from_xlayer_flashblock(
             &fb,
             &matcher,
+            &HashSet::new(),
             &HashSet::new(),
             &HashSet::new(),
             &mut dedup,
@@ -1427,11 +1548,12 @@ mod tests {
         );
         let fb_reverted = flashblock("0xcaliber", 0, 67329558, vec![raw_tx.clone()], reverted);
 
-        let (_, _, _, _, events, _swap_events) = extract_logs_from_xlayer_flashblock(
+        let (_, _, _, _, events, _swap_events, _) = extract_logs_from_xlayer_flashblock(
             &fb_reverted,
             &matcher,
             &HashSet::new(),
             &HashSet::from([caliber_contract]),
+            &HashSet::new(),
             &mut dedup,
             &mut parse_cache,
             &mut tx_tracker,
@@ -1444,11 +1566,12 @@ mod tests {
 
         // receipt 缺失（未确认）→ 不产出事件
         let fb_missing = flashblock("0xcaliber", 0, 67329558, vec![raw_tx.clone()], Map::new());
-        let (_, _, _, _, events, _swap_events) = extract_logs_from_xlayer_flashblock(
+        let (_, _, _, _, events, _swap_events, _) = extract_logs_from_xlayer_flashblock(
             &fb_missing,
             &matcher,
             &HashSet::new(),
             &HashSet::from([caliber_contract]),
+            &HashSet::new(),
             &mut dedup,
             &mut parse_cache,
             &mut tx_tracker,
@@ -1512,11 +1635,12 @@ mod tests {
         let mut latest_block_timestamp = None;
 
         // 提取：真实 flashblock 原始交易 → caliber 事件
-        let (_, _, _, _, events, _swap_events) = extract_logs_from_xlayer_flashblock(
+        let (_, _, _, _, events, _swap_events, _) = extract_logs_from_xlayer_flashblock(
             &fb,
             &matcher,
             &HashSet::new(),
             &HashSet::from([caliber_contract]),
+            &HashSet::new(),
             &mut dedup,
             &mut parse_cache,
             &mut tx_tracker,
@@ -1538,6 +1662,174 @@ mod tests {
 
         // 其余 4 个 pair 不在本地池子 → 静默跳过，不影响已应用状态
         assert_eq!(affected, vec![virtual_address]);
+    }
+
+    // ── RLP 编码小工具（合成 legacy raw tx，供 elfomo 提取测试用）──
+    fn rlp_len_prefix(payload: &[u8], short: u8, long: u8) -> Vec<u8> {
+        let n = payload.len();
+        if n <= 55 {
+            vec![short + n as u8]
+        } else {
+            let nb = ((64 - (n as u64).leading_zeros()) + 7) / 8; // 长度字节数
+            let mut out = vec![long + nb as u8];
+            for i in (0..nb).rev() {
+                out.push(((n as u64) >> (8 * i)) as u8);
+            }
+            out
+        }
+    }
+
+    fn rlp_item(payload: &[u8]) -> Vec<u8> {
+        let mut out = rlp_len_prefix(payload, 0x80, 0xb7);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn rlp_list(items: &[Vec<u8>]) -> Vec<u8> {
+        let payload: Vec<u8> = items.iter().flatten().copied().collect();
+        let mut out = rlp_len_prefix(&payload, 0xc0, 0xf7);
+        out.extend_from_slice(&payload);
+        out
+    }
+
+    fn rlp_u64(v: u64) -> Vec<u8> {
+        if v == 0 {
+            return vec![0x80];
+        }
+        let bytes = v.to_be_bytes();
+        let first = bytes.iter().position(|b| *b != 0).unwrap_or(7);
+        rlp_item(&bytes[first..])
+    }
+
+    fn rlp_addr(a: Address) -> Vec<u8> {
+        let mut out = vec![0x94];
+        out.extend_from_slice(a.as_slice());
+        out
+    }
+
+    /// ElfomoFi `updatePrices` raw-tx → 种子提取 → 本地直算 orderbook 端到端：
+    /// calldata 高 32 位即价格种子；同块空 data 更新事件被过滤（避免冗余
+    /// AsyncUpdate）；apply_price_seed 用本地金库余额重算整本 orderbook。
+    #[test]
+    fn xlayer_elfomo_update_extraction_to_apply_end_to_end() {
+        use crate::amms::elfomo_prop::ElfomoFiPropPool;
+        use crate::amms::Token;
+
+        let pool = address!("02dcdf4171939ac0fe28e48e8758649311e9459a");
+        let a: U256 = U256::from(0x143c60fu64);
+        // 真实形态：arg ≈ (a<<32) | (ts-1)
+        let arg: U256 = (a << 32) | U256::from(0x6a96bd30u64);
+        let mut calldata = vec![0xae, 0x7e, 0x8d, 0x81];
+        calldata.extend_from_slice(&arg.to_be_bytes::<32>());
+
+        // 合成 legacy raw tx：to=Pool，data=updatePrices calldata
+        let fields = vec![
+            rlp_u64(0),             // nonce
+            rlp_u64(1_000_000_000), // gasPrice
+            rlp_u64(300_000),       // gasLimit
+            rlp_addr(pool),         // to
+            rlp_u64(0),             // value
+            rlp_item(&calldata),    // data
+            vec![27],               // v
+            vec![1],                // r
+            vec![1],                // s
+        ];
+        let raw_tx = rlp_list(&fields);
+
+        let mut receipts = Map::new();
+        receipts.insert(
+            hash_raw_tx(&raw_tx),
+            json!({
+                "status": "0x1",
+                "cumulativeGasUsed": "0x1",
+                "logs": [{
+                    "address": format!("{pool:#x}"),
+                    "topics": [format!("{:#x}", ELFOMO_UPDATE_EVENT)],
+                    "data": "0x"
+                }]
+            }),
+        );
+        let fb = flashblock("0xelfomo", 0, 69_452_472, vec![raw_tx], receipts);
+        let matcher = XlayerLogMatcher {
+            topic_addresses: HashSet::from([pool]),
+            topic_signatures: HashSet::from([ELFOMO_UPDATE_EVENT]),
+            address_only_addresses: HashSet::new(),
+        };
+        let mut dedup = XlayerDedupCache::new(XLAYER_DEDUP_PAYLOAD_WINDOW);
+        let mut parse_cache = XlayerParseCache::new();
+        let mut tx_tracker = XlayerTxCountTracker::new(XLAYER_TX_COUNT_WINDOW);
+        let mut latest_block_timestamp = None;
+
+        // 提取：raw-tx → ElfomoTxEvent（带种子）；同块空事件被过滤
+        let (logs, _, _, _, _, _, elfomo_events) = extract_logs_from_xlayer_flashblock(
+            &fb,
+            &matcher,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::from([pool]),
+            &mut dedup,
+            &mut parse_cache,
+            &mut tx_tracker,
+            &mut latest_block_timestamp,
+        );
+        assert_eq!(elfomo_events.len(), 1);
+        assert_eq!(elfomo_events[0].pool, pool);
+        assert_eq!(elfomo_events[0].seed, a);
+        assert_eq!(elfomo_events[0].tx_index, 0);
+        assert!(logs.is_empty(), "update 空事件应被 raw-tx 通道过滤");
+
+        // 路由 + 应用：apply_price_seed 用本地金库余额重算 orderbook（零 RPC）
+        let mut state = StateSpace::default();
+        state.insert_amm(AMM::ElfomoFiPropPool(ElfomoFiPropPool {
+            pool_address: pool,
+            token_x: address!("e7b000003a45145decf8a28fc755ad5ec5ea025a"),
+            token_y: address!("779ded0c9e1022225f8e0630b35a9b54be713736"),
+            factory_address: address!("ffffffbb2d432b8acb4c57d556c0c721a431d038"),
+            router_address: address!("f0f0f0f0fb0d738452efd03a28e8be14c76d5f73"),
+            vault_address: address!("bb1b19f138db3925883a96ff7a304277460e0c99"),
+            chain_id: 196,
+            created_block: 0,
+            last_synced_block: 0,
+            price_seed: U256::ZERO,
+            tokens: vec![
+                Token::new_with_decimals(address!("e7b000003a45145decf8a28fc755ad5ec5ea025a"), 18),
+                Token::new_with_decimals(address!("779ded0c9e1022225f8e0630b35a9b54be713736"), 6),
+            ],
+            levels: crate::amms::elfomo_prop::types::OrderbookSnapshot {
+                from_to_levels: vec![],
+                to_from_levels: vec![],
+                vault_usdt0: U256::from(19_192_415_254u64),
+                vault_xeth: U256::from(2_940_462_501_000_862_186u128),
+                price_seed: U256::ZERO,
+            },
+            consumed: Default::default(),
+        }));
+
+        let affected = state.apply_elfomo_updates(&elfomo_events, 69_452_472);
+        assert_eq!(affected, vec![pool]);
+        let pool_obj = match state.get(&pool).unwrap() {
+            AMM::ElfomoFiPropPool(p) => p,
+            _ => unreachable!(),
+        };
+        assert_eq!(pool_obj.price_seed, a);
+        assert_eq!(pool_obj.last_synced_block, 69_452_472);
+        // 与块 0x423c2b8 链上 getOrderbook 逐位一致（种子+金库余额纯函数）
+        assert_eq!(
+            pool_obj.levels.from_to_levels[0].size,
+            U256::from(600_000_000_000_000_000u128)
+        );
+        assert_eq!(
+            pool_obj.levels.from_to_levels[0].price,
+            U256::from(2_473_060_529_144_115u128)
+        );
+        assert_eq!(
+            pool_obj.levels.to_from_levels[1].size,
+            U256::from(1_740_462_501_000_862_186u128)
+        );
+        assert_eq!(
+            pool_obj.levels.to_from_levels[1].price,
+            U256::from(2_474_964_919_058_850u128)
+        );
     }
 
     /// caliber swap 事件提取：真实日志（块 67650064 tx#15 W→U）、
@@ -1575,11 +1867,12 @@ mod tests {
         let mut parse_cache = XlayerParseCache::new();
         let mut tx_tracker = XlayerTxCountTracker::new(XLAYER_TX_COUNT_WINDOW);
         let mut latest_block_timestamp = None;
-        let (_, _, _, _, _, swap_events) = extract_logs_from_xlayer_flashblock(
+        let (_, _, _, _, _, swap_events, _) = extract_logs_from_xlayer_flashblock(
             &fb,
             &matcher,
             &HashSet::new(),
             &HashSet::from([caliber_contract]),
+            &HashSet::new(),
             &mut dedup,
             &mut parse_cache,
             &mut tx_tracker,
@@ -1605,11 +1898,12 @@ mod tests {
         let mut receipts2 = Map::new();
         receipts2.insert(hash_raw_tx(&raw_tx), make_receipt("0x0"));
         let fb2 = flashblock("0xswap", 0, 67_650_064, vec![raw_tx], receipts2);
-        let (_, _, _, _, _, swap_events2) = extract_logs_from_xlayer_flashblock(
+        let (_, _, _, _, _, swap_events2, _) = extract_logs_from_xlayer_flashblock(
             &fb2,
             &matcher,
             &HashSet::new(),
             &HashSet::from([caliber_contract]),
+            &HashSet::new(),
             &mut dedup,
             &mut parse_cache,
             &mut tx_tracker,
@@ -1618,9 +1912,10 @@ mod tests {
         assert!(swap_events2.is_empty(), "回滚交易不应用");
 
         // 合约不在兴趣集合 → 不产出
-        let (_, _, _, _, _, swap_events3) = extract_logs_from_xlayer_flashblock(
+        let (_, _, _, _, _, swap_events3, _) = extract_logs_from_xlayer_flashblock(
             &fb,
             &matcher,
+            &HashSet::new(),
             &HashSet::new(),
             &HashSet::new(),
             &mut dedup,

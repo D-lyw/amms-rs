@@ -21,6 +21,7 @@ use crate::amms::balancer_v3::BalancerV3Pool;
 use crate::amms::binaryfi_prop::BinaryFiPropPool;
 use crate::amms::caliber_prop::CaliberPropPool;
 use crate::amms::curve_ng::{CurveNGFactory, ICurveNGStableSwap};
+use crate::amms::elfomo_prop::ElfomoFiPropPool;
 use crate::amms::fluid_dex::{
     DexReservesResolver, FluidDexT1, FluidLiquidity, TokenLimitData, FLUID_DEX_RESOLVER,
 };
@@ -1350,5 +1351,86 @@ pub async fn start_binaryfi_prop_sync_task<N, P>(
                 }
             }
         }
+    }
+}
+
+/// ElfomoFi propAMM 周期 orderbook 快照（最后兜底）。
+///
+/// ElfomoFi 报价更新主通道是块级实时 raw-tx：L3 flashblocks 流按 selector
+/// `0xae7e8d81` 拦截 `updatePrices` 原始交易，解析出价格种子后本地直算
+/// orderbook（零 RPC）；L1 Pool `updatePrices` 空事件仅在无 raw-tx 时回退
+/// AsyncUpdate 重拉真值。本任务只在事件流断供（flashblocks 断流/重连/漏块、
+/// matcher 未覆盖）时低频重拉整档回正 + 种子 + vault 余额，防止本地报价长期
+/// 过期。单池部署：每轮一次 `getOrderbook` + slot1 + 2 次 `balanceOf` 静态
+/// 调用，开销可忽略；失败退避上限 300s。
+pub async fn start_elfomo_prop_sync_task<N, P>(
+    state: Arc<RwLock<StateSpace>>,
+    provider: P,
+    interval: Duration,
+) where
+    N: Network,
+    P: Provider<N> + Clone + 'static,
+{
+    const MAX_RECONCILE_BACKOFF: Duration = Duration::from_secs(300);
+    let mut next_sleep = startup_delay_with_jitter(interval, "elfomo_prop");
+    loop {
+        sleep(next_sleep).await;
+
+        let mut pools: Vec<ElfomoFiPropPool> = {
+            let read_guard = state.read().await;
+            read_guard
+                .state
+                .values()
+                .filter_map(|amm| match amm.as_ref() {
+                    AMM::ElfomoFiPropPool(pool) => Some(pool.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        if pools.is_empty() {
+            next_sleep = interval;
+            continue;
+        }
+
+        let mut reconcile_failed = false;
+        // 锁外拉取快照（网络调用不持写锁），成功后统一写回
+        for pool in &mut pools {
+            match pool
+                .update_at::<N, P>(provider.clone(), BlockId::latest())
+                .await
+            {
+                Ok(()) => {}
+                Err(e) => {
+                    reconcile_failed = true;
+                    error!(
+                        address = ?pool.pool_address,
+                        error = ?e,
+                        "Failed to refresh ElfomoFi propAMM orderbook snapshot"
+                    );
+                }
+            }
+        }
+
+        let mut write_guard = state.write().await;
+        for pool in pools {
+            if let Some(existing_amm) = write_guard.get_mut_cow(&pool.address()) {
+                if let AMM::ElfomoFiPropPool(existing) = existing_amm {
+                    *existing = pool;
+                }
+            }
+        }
+        drop(write_guard);
+
+        next_sleep = if reconcile_failed {
+            let doubled = next_sleep.saturating_mul(2).min(MAX_RECONCILE_BACKOFF);
+            warn!(
+                next_sleep_secs = doubled.as_secs(),
+                "ElfomoFi reconcile backed off after failure (RPC limit / gateway overload)"
+            );
+            doubled
+        } else {
+            interval
+        };
     }
 }

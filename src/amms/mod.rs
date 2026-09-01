@@ -27,6 +27,7 @@ pub mod consts;
 pub mod curve_legacy;
 pub mod curve_ng;
 pub mod ekubo;
+pub mod elfomo_prop;
 pub mod erc_4626;
 pub mod error;
 pub mod factory;

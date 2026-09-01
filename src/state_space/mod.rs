@@ -49,8 +49,8 @@ use filters::AMMFilter;
 use filters::PoolFilter;
 use futures::stream::FuturesUnordered;
 use futures::{Stream, StreamExt};
-use serde_json::{json, Value};
 use maintenance::{PendingSyncAction, PendingSyncQueue, PendingSyncReason};
+use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Debug;
 use std::path::PathBuf;
@@ -64,7 +64,7 @@ use tokio::sync::{Mutex, Notify, RwLock};
 use crate::amms::caliber_prop::{decode_caliber_swap_log, CaliberSwapEvent, CALIBER_SWAP_EVENT};
 use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
-use xlayer_flashblocks::CaliberTxEvent;
+use xlayer_flashblocks::{CaliberTxEvent, ElfomoTxEvent};
 
 #[derive(Clone, Debug, Default)]
 pub enum RealtimeSyncSource {
@@ -943,8 +943,8 @@ impl<N, P> StateSpaceManager<N, P> {
                 )))
             }
             SelectedRealtimeSource::BscLogsPush => {
-                let ws_candidates = push_ws_candidates
-                    .expect("BscLogsPush selected must prevalidate ws endpoints");
+                let ws_candidates =
+                    push_ws_candidates.expect("BscLogsPush selected must prevalidate ws endpoints");
                 info!(
                     "Starting BSC logs push sync (chain_id={}, {} query chunks)",
                     chain_id,
@@ -1432,6 +1432,38 @@ impl<N, P> StateSpaceManager<N, P> {
         Ok(guard.apply_caliber_swaps(&swaps, block_num))
     }
 
+    /// 应用 Xlayer flashblocks 提取的 ElfomoFi `updatePrices` 原始交易
+    /// （本地直算通道，零 RPC）。
+    ///
+    /// 与 `apply_caliber_updates_for_block` 同锁同序（同一 RwLock、同一
+    /// realtime_head 推进语义）：
+    /// - 提取侧已按 receipt status 过滤回滚/未确认交易（仅成功更新到达本函数）；
+    /// - calldata 携带价格种子，`apply_price_seed` 按本地金库余额重算 orderbook；
+    /// - 同块 ElfomoTrade 日志先于本步应用（金库已递减），更新用递减后的余额
+    ///   重算，最终态与链上逐笔顺序一致（重算是 (seed, vault) 的纯函数）。
+    async fn apply_elfomo_updates_for_block(
+        state: &Arc<RwLock<StateSpace>>,
+        block_num: u64,
+        updates: Vec<ElfomoTxEvent>,
+        realtime_head: &Arc<AtomicU64>,
+    ) -> Result<Vec<Address>, StateSpaceError> {
+        let mut prev = realtime_head.load(Ordering::Relaxed);
+        while block_num > prev
+            && realtime_head
+                .compare_exchange(prev, block_num, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            prev = realtime_head.load(Ordering::Relaxed);
+        }
+
+        if updates.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut guard = state.write().await;
+        Ok(guard.apply_elfomo_updates(&updates, block_num))
+    }
+
     async fn collect_logs_for_chunks(
         provider: &P,
         chunks: &[LogQueryChunk],
@@ -1733,6 +1765,14 @@ impl<N, P> StateSpaceManager<N, P> {
                     topic_addresses.insert(p.contract_address);
                     topic_signatures.insert(CALIBER_SWAP_EVENT);
                 }
+                AMM::ElfomoFiPropPool(p) => {
+                    // ElfomoTrade 由 Router emit、updatePrices 空事件由 Pool emit，
+                    // 两者都必须注册（默认分支只注册 amm.address() = pool_address）。
+                    if has_events {
+                        topic_addresses.insert(p.pool_address);
+                        topic_addresses.insert(p.router_address);
+                    }
+                }
                 _ => {
                     if has_events {
                         topic_addresses.insert(amm.address());
@@ -1974,6 +2014,9 @@ pub struct StateSpaceBuilder<N, P> {
     /// Dedicated interval for BinaryFi propAMM full-snapshot re-anchor
     /// (cap/disabled states are not observable from events).
     pub binaryfi_sync_interval: Option<Duration>,
+    /// Dedicated interval for ElfomoFi propAMM orderbook re-anchor
+    /// (L1 updatePrices 事件断流时的最后兜底)。
+    pub elfomo_sync_interval: Option<Duration>,
     pub pending_sync_worker_interval: Duration,
     pub drift_probe_interval: Duration,
     pub maintenance_interval: Option<Duration>,
@@ -2011,6 +2054,7 @@ where
             caliber_realtime_sync: true,
             caliber_reconcile_interval: None,
             binaryfi_sync_interval: None,
+            elfomo_sync_interval: None,
             pending_sync_worker_interval: DEFAULT_PENDING_SYNC_WORKER_INTERVAL,
             drift_probe_interval: DEFAULT_DRIFT_PROBE_INTERVAL,
             maintenance_interval: None,
@@ -2151,6 +2195,18 @@ where
     pub fn with_binaryfi_sync_interval(self, interval: Duration) -> StateSpaceBuilder<N, P> {
         StateSpaceBuilder {
             binaryfi_sync_interval: Some(interval),
+            ..self
+        }
+    }
+
+    /// Set a dedicated interval for ElfomoFi propAMM orderbook re-anchor.
+    ///
+    /// L1 事件（Pool `updatePrices` 空事件）为块级实时主通道；本任务仅作
+    /// flashblocks 断流/重连/漏块时的最后兜底。未设置时回退到
+    /// `non_event_sync_interval`。
+    pub fn with_elfomo_sync_interval(self, interval: Duration) -> StateSpaceBuilder<N, P> {
+        StateSpaceBuilder {
+            elfomo_sync_interval: Some(interval),
             ..self
         }
     }
@@ -2611,6 +2667,17 @@ where
         // (maxIn/maxOut & disabled states are not observable from calldata/events)
         if let Some(interval) = self.binaryfi_sync_interval.or(non_event_interval) {
             tokio::spawn(sync_services::start_binaryfi_prop_sync_task(
+                state_space.clone(),
+                self.provider.clone(),
+                interval,
+            ));
+        }
+
+        // ElfomoFi propAMM pools: 周期 orderbook 快照（最后兜底）。
+        // 主通道是 L1 事件 + L3 flashblocks raw-tx（每块 updatePrices 实时驱动），
+        // 本任务只覆盖事件流断供场景。
+        if let Some(interval) = self.elfomo_sync_interval.or(non_event_interval) {
+            tokio::spawn(sync_services::start_elfomo_prop_sync_task(
                 state_space.clone(),
                 self.provider.clone(),
                 interval,
@@ -3132,6 +3199,38 @@ impl StateSpace {
         }
         affected_set.into_iter().collect()
     }
+
+    /// 应用 ElfomoFi `updatePrices` 原始交易（本地直算通道，零 RPC）。
+    ///
+    /// 与 `apply_caliber_updates` 同锁调用；块内按 `tx_index` 排序，按
+    /// `pool_address` 路由，命中本地池子后 `apply_price_seed` 用本地金库余额
+    /// 重算整本 orderbook（读时纯函数，逐位一致）。池子不在本地 / 块号落后
+    /// 于池子已同步块 → 静默跳过（对账兜底）。
+    fn apply_elfomo_updates(&mut self, updates: &[ElfomoTxEvent], block_num: u64) -> Vec<Address> {
+        if updates.is_empty() {
+            return vec![];
+        }
+
+        let mut sorted: Vec<&ElfomoTxEvent> = updates.iter().collect();
+        sorted.sort_by_key(|u| u.tx_index);
+
+        let mut affected_set = HashSet::new();
+        for event in sorted {
+            let Some(amm) = self.get_mut_cow(&event.pool) else {
+                continue;
+            };
+            let AMM::ElfomoFiPropPool(pool) = amm else {
+                continue;
+            };
+            // 幂等保护：与 sync() 相同语义，禁止回卷池子状态
+            if block_num < pool.last_synced_block() {
+                continue;
+            }
+            pool.apply_price_seed(event.seed, block_num);
+            affected_set.insert(event.pool);
+        }
+        affected_set.into_iter().collect()
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -3279,20 +3378,22 @@ mod tests {
             make_log(pool_a, other_topic),
             make_log(pool_b, sync_topic),
             make_log(addr_only, other_topic),
-            make_log(address!("5555555555555555555555555555555555555555"), sync_topic),
+            make_log(
+                address!("5555555555555555555555555555555555555555"),
+                sync_topic,
+            ),
         ];
 
-        let filtered =
-            StateSpaceManager::<(), ()>::filter_logs_for_chunks(logs, &chunks);
+        let filtered = StateSpaceManager::<(), ()>::filter_logs_for_chunks(logs, &chunks);
 
         // pool_a+other_topic 必须被过滤（topic 不在全局联合，与 chunked 语义一致）
         assert_eq!(filtered.len(), 3);
         assert!(filtered.iter().all(|l| {
             l.address() == pool_a || l.address() == pool_b || l.address() == addr_only
         }));
-        assert!(!filtered.iter().any(|l| {
-            l.address() == pool_a && l.topics().first() == Some(&other_topic)
-        }));
+        assert!(!filtered
+            .iter()
+            .any(|l| { l.address() == pool_a && l.topics().first() == Some(&other_topic) }));
         // AddressOnly 地址任意 topic 保留
         assert!(filtered
             .iter()
