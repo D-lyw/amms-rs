@@ -242,7 +242,8 @@ pub use types::*;
 
 /// XLayer 链 ID
 pub const BINARYFI_CHAIN_ID: u64 = 196;
-/// 资产数量（getAssets 返回 12 个资产）
+/// 历史锚点资产数量（getAssets 曾返回 12 个资产）。生产路径不再以此组网：
+/// init/快照一律以链上 getAssets() 实际数量为准，本常量仅供历史对照/测试。
 pub const BINARYFI_ASSET_COUNT: usize = 12;
 /// `ReservesDeltaLedger` 环形缓冲容量（块数）。rebase 窗口只需覆盖 canonical
 /// 滞后 flashblock 的 1-2 块，128 是宽裕余量；被挤出时退化为 guard 语义
@@ -368,9 +369,9 @@ pub fn binaryfi_virtual_address(pool: Address, token_a: Address, token_b: Addres
 ///
 /// 对外以"具体 token pair 的虚拟子池"呈现（与 UniswapV4/Caliber 一致）：
 /// StateSpace 中一个实例 = 一个可交易对；`virtual_address` 为 StateSpace key，
-/// `exposed_pair` 限定对外暴露的资产对。实例内部仍保留全 12 资产数组
-/// （numéraire 假设、全局 asset_idx、报价公式与引擎一致），未暴露资产数据
-/// 不参与任何对外计算。
+/// `exposed_pair` 限定对外暴露的资产对。实例内部保留链上 getAssets() 返回的
+/// 全量资产数组（numéraire 假设、全局 asset_idx、报价公式与引擎一致；数量
+/// 动态，如 2026-09 已扩至 20），未暴露资产数据不参与任何对外计算。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BinaryFiPropPool {
     /// 池子真实合约地址（链上批量调用 + Swap 日志匹配；不再是 StateSpace key）
@@ -2194,7 +2195,100 @@ impl BinaryFiPropPool {
     /// `fee_account` 同时作为批量合约的 recipient：`getFee(fee_account)` 与
     /// 全部 `quote(recipient, …)` 都按该账户扣费，保证快照口径 = 链上实际
     /// 执行口径（费率生效账户，见 [`Self::fee_recipient`]）。
+    ///
+    /// 批量合约把整份 Snapshot ABI 编码作为“模拟部署返回的 code”一次带回，
+    /// 受 EIP-170 部署体积上限（24576B）约束：链上资产从 12 扩到 20 后全量
+    /// 刷新（437 条 quote ≈ 46KB）会触发 `CreateContractSizeLimit`。因此按
+    /// 返回体积把请求分片为多次 deploy 调用，再在本地合并——单次调用保持
+    /// “linear → bigQuote → bigSell”段内顺序，跨片拼接后与一次请求的
+    /// `quotePairs[k] ↔ quotes[k]` 配对语义一致；assets/decimals/余额等字段
+    /// 各片同块结果一致，取首片。
     async fn fetch_snapshot<N, P>(
+        provider: P,
+        pool: Address,
+        engine: Address,
+        fee_account: Address,
+        assets: Vec<Address>,
+        quote_pairs: Vec<U256>,
+        big_quote_pairs: Vec<U256>,
+        big_sell_pairs: Vec<U256>,
+        block: BlockId,
+    ) -> Result<Snapshot, AMMError>
+    where
+        N: Network,
+        P: Provider<N> + Clone,
+    {
+        // EIP-170：创建返回的 code 上限 24576B；预算留 ~4.5KB 余量防压线波动。
+        const RETURN_BUDGET: usize = 20_000;
+        // 每个 quote 入口占用：quotePairs 32B + QuoteResult(amountOut + success) 64B
+        const ENTRY_BYTES: usize = 96;
+
+        let n = assets.len();
+        // 单次调用固定开销：9 个 head word（288B，含 fee）+ 6 个长度 n 的数组
+        // （32+32n each）+ quotePairs/quotes 各 1 个长度 word（64B）
+        let base_bytes = 288 + 6 * (32 + 32 * n) + 64;
+        let total_entries = quote_pairs.len() + big_quote_pairs.len() + big_sell_pairs.len();
+        let max_entries_per_call = RETURN_BUDGET.saturating_sub(base_bytes).max(1) / ENTRY_BYTES;
+
+        if total_entries <= max_entries_per_call {
+            return Self::fetch_snapshot_once(
+                provider,
+                pool,
+                engine,
+                fee_account,
+                assets,
+                quote_pairs,
+                big_quote_pairs,
+                big_sell_pairs,
+                block,
+            )
+            .await;
+        }
+
+        // 分片：三类列表先按原顺序压成带 kind 的扁平序列，再按单次调用可承载
+        // 的入口数切块，块内按 kind 还原回三个列表，交给批量合约执行。
+        let mut requests: Vec<(u8, U256)> = Vec::with_capacity(total_entries);
+        requests.extend(quote_pairs.into_iter().map(|p| (0u8, p)));
+        requests.extend(big_quote_pairs.into_iter().map(|p| (1u8, p)));
+        requests.extend(big_sell_pairs.into_iter().map(|p| (2u8, p)));
+
+        let mut merged: Option<Snapshot> = None;
+        for chunk in requests.chunks(max_entries_per_call) {
+            let mut chunk_q: Vec<U256> = Vec::new();
+            let mut chunk_bq: Vec<U256> = Vec::new();
+            let mut chunk_bs: Vec<U256> = Vec::new();
+            for &(kind, pair) in chunk {
+                match kind {
+                    0 => chunk_q.push(pair),
+                    1 => chunk_bq.push(pair),
+                    _ => chunk_bs.push(pair),
+                }
+            }
+            let snap = Self::fetch_snapshot_once(
+                provider.clone(),
+                pool,
+                engine,
+                fee_account,
+                assets.clone(),
+                chunk_q,
+                chunk_bq,
+                chunk_bs,
+                block,
+            )
+            .await?;
+            match &mut merged {
+                Some(acc) => {
+                    acc.quotePairs.extend(snap.quotePairs);
+                    acc.quotes.extend(snap.quotes);
+                }
+                None => merged = Some(snap),
+            }
+        }
+        Ok(merged.expect("chunked snapshot must contain at least one chunk"))
+    }
+
+    /// 单次 deploy 调用的批量快照（分片逻辑见 [`Self::fetch_snapshot`]）。
+    async fn fetch_snapshot_once<N, P>(
         provider: P,
         pool: Address,
         engine: Address,
@@ -2810,32 +2904,6 @@ impl AutomatedMarketMaker for BinaryFiPropPool {
         N: Network,
         P: Provider<N> + Clone,
     {
-        // 全量快照：assets 未知 → 传空由合约 getAssets() 获取；132 对 quote +
-        // 11 对 (0→j) 大额 quote（用于锁定 ask）
-        let mut quote_pairs = Vec::with_capacity(BINARYFI_ASSET_COUNT * BINARYFI_ASSET_COUNT);
-        for i in 0..BINARYFI_ASSET_COUNT {
-            for j in 0..BINARYFI_ASSET_COUNT {
-                if i != j {
-                    quote_pairs.push(U256::from(i * BINARYFI_ASSET_COUNT + j));
-                }
-            }
-        }
-        // 11 对 (0→j) 大额（1e10，锁定 ask + BUY maxOut）+ 11 对中额
-        // （1e9，检测非单调阶梯退化）
-        let mut big_quote_pairs = Vec::with_capacity(2 * (BINARYFI_ASSET_COUNT - 1));
-        for j in 1..BINARYFI_ASSET_COUNT {
-            big_quote_pairs.push(U256::from(BINARYFI_ASSET_COUNT * BINARYFI_ASSET_COUNT + j));
-            big_quote_pairs.push(U256::from(
-                3 * BINARYFI_ASSET_COUNT * BINARYFI_ASSET_COUNT + j,
-            ));
-        }
-        // 11 对 (j→0) 100 整枚大额报价：恢复 SELL 侧 maxIn 上限
-        let mut big_sell_pairs = Vec::with_capacity(BINARYFI_ASSET_COUNT - 1);
-        for j in 1..BINARYFI_ASSET_COUNT {
-            big_sell_pairs.push(U256::from(
-                2 * BINARYFI_ASSET_COUNT * BINARYFI_ASSET_COUNT + j,
-            ));
-        }
         // 固定到具体块号：快照 quote 与保鲜判断（日志价格 >= snap_block 不覆盖）同块一致，
         // 且避免 provider 被 fetch_snapshot 移动后再使用
         let snap_block = match block_number {
@@ -2843,12 +2911,91 @@ impl AutomatedMarketMaker for BinaryFiPropPool {
             _ => provider.get_block_number().await?,
         };
         let block = BlockId::Number(alloy::eips::BlockNumberOrTag::Number(snap_block));
+        let recipient = self.fee_recipient();
+
+        // 资产清单以链上 getAssets() 为唯一事实源，不硬编码资产数量：
+        // Stage 1 发一次零报价快照，由批量合约内 pool.getAssets() 取回链上权威
+        // 资产清单与 decimals（顺序即引擎 asset_idx）。loader/ndjson config.assets
+        // 只是拓扑提示（可能滞后于链上），初始化一律以链上为准。
+        let meta = Self::fetch_snapshot(
+            provider.clone(),
+            self.pool_address,
+            self.engine_address,
+            recipient,
+            vec![],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            block,
+        )
+        .await?;
+        let chain_assets: Vec<Token> = meta
+            .assets
+            .iter()
+            .zip(meta.decimals.iter())
+            .map(|(addr, d)| Token {
+                address: *addr,
+                decimals: *d,
+                symbol: String::new(),
+                chain_id: self.chain_id,
+                fot_tax: None,
+            })
+            .collect();
+        if chain_assets.len() < 2 {
+            return Err(AMMError::Msg(format!(
+                "binaryfi: init getAssets() returned {} assets on chain (expected >= 2)",
+                chain_assets.len()
+            )));
+        }
+        // config 注入的资产清单与链上不一致时告警（重索引后收敛）；运行时用链上。
+        if !self.assets.is_empty()
+            && (self.assets.len() != chain_assets.len()
+                || self
+                    .assets
+                    .iter()
+                    .map(|t| t.address)
+                    .ne(meta.assets.iter().copied()))
+        {
+            tracing::warn!(
+                target: "amms::binaryfi_prop",
+                pool = %self.pool_address,
+                config_assets = self.assets.len(),
+                chain_assets = chain_assets.len(),
+                "binaryfi: config assets drifted from on-chain getAssets(); using on-chain list"
+            );
+        }
+        self.assets = chain_assets;
+        let n = self.assets.len();
+
+        // Stage 2：按权威 n 组全量报价网格。pair 编码 i*n+j 必须与批量合约侧
+        // 实际资产数一致，否则 quote 会错位到其它资产对；fetch_snapshot 内部
+        // 按 EIP-170 体积预算自动分片，链上资产扩容无需改任何常量。
+        let mut quote_pairs = Vec::with_capacity(n * n);
+        for i in 0..n {
+            for j in 0..n {
+                if i != j {
+                    quote_pairs.push(U256::from(i * n + j));
+                }
+            }
+        }
+        // (0→j) 大额（锁定 ask + BUY maxOut）+ 中额（检测非单调阶梯退化）
+        let mut big_quote_pairs = Vec::with_capacity(2 * (n - 1));
+        for j in 1..n {
+            big_quote_pairs.push(U256::from(n * n + j));
+            big_quote_pairs.push(U256::from(3 * n * n + j));
+        }
+        // (j→0) 100 整枚大额报价：恢复 SELL 侧 maxIn 上限
+        let mut big_sell_pairs = Vec::with_capacity(n - 1);
+        for j in 1..n {
+            big_sell_pairs.push(U256::from(2 * n * n + j));
+        }
+
         let snap = Self::fetch_snapshot(
             provider,
             self.pool_address,
             self.engine_address,
-            self.fee_recipient(),
-            vec![],
+            recipient,
+            self.assets.iter().map(|t| t.address).collect(),
             quote_pairs,
             big_quote_pairs,
             big_sell_pairs,

@@ -3,7 +3,8 @@
 //! BinaryFi 是固定地址的单池 propAMM（无池子创建事件），因此：
 //! - `discover()` 直接返回固定池子骨架
 //! - `init_batch()` 通过 `GetBinaryFiPropStateBatchRequest` 批量读取合约
-//!   一次性完成 12 资产 decimals + 余额 + 132 对 quote 的初始化
+//!   完成链上 `getAssets()` 全部资产（数量动态，不硬编码）的 decimals +
+//!   余额 + 全量 quote 网格初始化
 
 use alloy::{
     eips::BlockId,
@@ -196,8 +197,9 @@ impl AutomatedMarketMakerFactory for BinaryFiPropFactory {
 
 /// 批量初始化 BinaryFi propAMM 池子
 ///
-/// 每个池子通过 `GetBinaryFiPropStateBatchRequest` 静态调用一次完成：
-/// 12 资产 decimals + 池子余额 + 132 对 quote 费率。
+/// 每个池子通过 `GetBinaryFiPropStateBatchRequest` 静态调用完成：
+/// 链上 `getAssets()` 全部资产（数量动态）的 decimals + 池子余额 + 全量
+/// quote 费率。同部署实例共享一次初始化，其余克隆并恢复虚拟身份。
 pub async fn init_batch<N, P>(
     amms: Vec<AMM>,
     block_number: BlockId,
