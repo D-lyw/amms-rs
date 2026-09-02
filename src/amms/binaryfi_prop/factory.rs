@@ -294,6 +294,7 @@ mod tests {
         assert_eq!(pool.router_address, BINARYFI_ROUTER_ADDRESS);
         assert_eq!(pool.created_block, 42);
         assert!(pool.assets.is_empty());
-        assert_eq!(pool.sync_events().len(), 3);
+        // v1.19.9 起新增按账户黑名单事件（BINARYFI_FEE_ACCOUNT_EVENT）
+        assert_eq!(pool.sync_events().len(), 4);
     }
 }

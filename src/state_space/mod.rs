@@ -2922,9 +2922,10 @@ impl StateSpace {
                     .collect();
                 Some(targets)
             }
-            // 引擎按账户费率事件（FeeSet(account, fee)，topic1 = 账户，data = raw
-            // 单位）：费率是 per-account storage，仅费率生效账户 == 事件账户 的
-            // 实例路由（触发 AsyncUpdate 重拉该账户口径快照）。
+            // 引擎黑名单事件（BlacklistSet(account, status)，topic1 = 账户，
+            // data = bool）：拉黑/解除拉黑都会发该事件，被拉黑账户 getFee=1e6、
+            // quote 全 0。仅费率生效账户（fee_recipient，实际执行合约）==
+            // 事件账户 的实例路由（触发 AsyncUpdate 重拉该账户口径快照）。
             Some(topic)
                 if *topic == BINARYFI_FEE_ACCOUNT_EVENT
                     && has_engine_match

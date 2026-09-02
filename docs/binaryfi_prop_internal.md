@@ -234,10 +234,13 @@ out = floor(v × 10^(dj−d0+2) / ask_j)                  // 第二段 BUY，无
 
 根因：批量快照与 quote 此前一律以 **router** 为 recipient（聚合器白名单
 fee≈0/50），而链上真正执行 swap 的是独立套利合约（DexArbitrageV5XLayer）。
-引擎费率是 per-account storage：运营方对某账户设 100% 费（`FeeSet(account,
-fee)`，data 为 **raw 单位**，1 ↔ 1e6 ppm；如 2026-08-31 块 69416544 对执行器
-`0x19d704f4…` 置 1）后，本地仍按 router 口径模拟出利润 → 发单 → 链上引擎以
-`AmountTooSmall` 拒绝，形成连续虚假失败交易。
+引擎费率/可交易性是 per-account storage：运营方调用
+`setBlacklisted(account, true)`（selector `0xd01dd6d2`）拉黑某账户（事件
+`BlacklistSet(address indexed account, bool)`，topic0 = `0x92134176…`，data
+= bool **不是** fee）后，该账户 `getFee` = 1e6（100%）且 `quote` 全 0
+（success=true）——链上实证：2026-08-31 块 69416544 运营方 0x2db200f4… 拉黑
+`0x19d704f4…`。旧版本地仍按 router 口径模拟出利润 → 发单 → 链上引擎以
+`AmountTooSmall` 拒绝，形成连续虚假失败交易（不修复会无限持续，直到重启）。
 
 修复（v1.19.9）：
 - `BinaryFiPropPool` 新增 `fee_account: Option<Address>`：实际套利执行合约
@@ -247,13 +250,27 @@ fee)`，data 为 **raw 单位**，1 ↔ 1e6 ppm；如 2026-08-31 块 69416544 �
 - 批量快照 `fetch_snapshot` 的 recipient 改为 `fee_recipient()`：`getFee` 与
   全部 `quote(recipient, …)` 一次性对齐"我们实际能拿到"的费率与含费报价；
   fee=1e6 时 quote 归 0 → rates 归 0 → 预过滤直接放弃路径，不再产生虚假机会。
-- per-account 事件监控：新增 `BINARYFI_FEE_ACCOUNT_EVENT`（`FeeSet`，topic1 =
-  账户，data 为 raw 单位，**不能**直接当 ppm 用），命中本实例
-  `fee_recipient()` 时返回 AsyncUpdate 重拉快照；全局 `FeeUpdated`（data 直接
-  是 ppm）仍即时更新 fee_ppm 并 AsyncUpdate，由快照以 fee_recipient 口径校正
-  per-account 覆盖。
+- per-account 事件监控：新增 `BINARYFI_FEE_ACCOUNT_EVENT`（`BlacklistSet`，
+  topic1 = 账户，data 为 bool，**不能**当 fee 用；拉黑/解除都会发），命中
+  本实例 `fee_recipient()` 时返回 AsyncUpdate 重拉快照；全局 `FeeUpdated`
+  （data 直接是 ppm，新引擎已不再发）仍即时更新 fee_ppm 并 AsyncUpdate，
+  由快照以 fee_recipient 口径校正 per-account 覆盖。
 - 事件路由：`resolve_binaryfi_targets` 新增按账户路由分支（同 engine 且
   `fee_recipient == 事件账户` 的实例）。
+
+### 7.9.2 黑名单快照应用防 panic（v1.19.12 修复）
+
+v1.19.9 的 fee_account 路径存在致命缺口：被拉黑账户的批量快照
+`snap.fee = 1e6`、全部 `quote` 返回 0（success=true）。`apply_snapshot`
+先写 `fee_ppm = 1e6`，随后 `unfee_quote(0, 1e6)` 计算
+`(0 + (1e6−1e6) − 1) / 0` → **除零 panic** → AsyncUpdate 任务与周期快照任务
+同时崩溃 → `fee_ppm` 永远停留在旧值（如 400）→ 本地持续用旧费率模拟出利润
+→ 虚假交易无限发送（与"被拉黑后 2 小时仍不停"的现象逐字吻合）。
+
+修复：`unfee_quote` 对 `fee ≥ 1e6` 直接返回 `None`（100% 费不可交易，无费化
+无意义）→ 上层 quote 反推全部归空 → rates 归 0 → 预过滤直接放弃路径。
+补充黑名单场景回归测试：快照 fee=1e6 + 全 0 quote 不 panic、fee_ppm=1e6、
+rates 全 0、engine_quote 输出 0。
 
 ## 8. 三层数据同步（事件驱动，无轮询）
 

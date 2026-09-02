@@ -304,13 +304,15 @@ pub const BINARYFI_FEE_SELECTOR: [u8; 4] = [0x6f, 0x7c, 0x86, 0x8b];
 /// 链上实证：`setFee` 会发该事件（topic0 = 0xc58b3024…，data = 0xc8 = 200）。
 pub const BINARYFI_FEE_EVENT: B256 =
     b256!("c58b3024a07432cfc160ea128eebc11329d444bb61bf7098f09bb6567b943c66");
-/// 引擎按账户费率事件（`FeeSet(address indexed account, uint256 fee)`，
-/// topic1 = 账户地址，data = **原始单位**，1 ↔ 1e6 ppm）。
-/// 与全局 `FeeUpdated`（0xc58b3024…，data 直接是 ppm）不同：本事件的 data
-/// **不能**直接当 ppm 用，只作为"该账户费率可能已变"的触发信号，收到后重新
-/// `getFee(fee_recipient)` 拉权威 ppm（快照路径）。
-/// 链上实证：块 69416544 运营方 `0xd01dd6d2` 将执行器
-/// `0x19d704f4…` 费率置 1（raw = 100%），该事件后 getFee 即返回 1e6。
+/// 引擎黑名单事件（`BlacklistSet(address indexed account, bool status)`，
+/// topic1 = 账户地址，data = **bool**：1 = 拉黑、0 = 解除）。
+/// 对应函数选择器 `0xd01dd6d2` = `setBlacklisted(address,bool)`（cast 4byte
+/// 实证；**不是**费率函数）。被拉黑账户 `getFee(account)` 返回 1e6（100%）且
+/// `quote(account, …)` 全部返回 0（success=true）——链上逐位实证。
+/// 本事件只作"该账户可交易性可能已变"的触发信号，收到后返回 AsyncUpdate，
+/// 重拉 `getFee(fee_recipient)` 权威口径快照；data 是 bool，**不能**当 fee 用。
+/// 链上实证：块 69416544 运营方 0x2db200f4… 调用 `setBlacklisted(0x19d704f4…,
+/// true)`，其后 getFee(0x19d704f4…) 即返回 1e6。
 pub const BINARYFI_FEE_ACCOUNT_EVENT: B256 =
     b256!("921341769c2075d1ae425396063d5ab65ff5006c4bc0bd0821e50ce51fb60123");
 /// 默认费率（ppm，1e6 = 100%）：未知/未同步时的兜底。
@@ -2324,12 +2326,21 @@ fn apply_fee_rate(rate: Rate, fee_ppm: u64) -> Option<Rate> {
 /// fee 范围（≤1000）误差 ≤ 1，由下游 ±1 反推验证吸收；fee=0 时恒等）。
 /// 仅供快照**价格反推**使用（bid/ask/q0j/raw 需无费口径与 L2 路径统一）；
 /// 容量/饱和判断与报价验证仍用原始含费 quote（比值中 fee 抵消）。
+///
+/// fee ≥ 1e6（100% 费 / 黑名单账户）：`1e6 − fee = 0`，无费化无意义且除零
+/// panic（链上实证：黑名单账户 getFee=1e6、quote 返回 0 且 success=true，
+/// 快照会以 fee=1e6 + 全 0 quote 进入此路径）→ 返回 `None`，上层 quote 反推
+/// 全部归空 → rates 归 0 → 预过滤直接放弃该池，杜绝虚假机会。
 fn unfee_quote(out: U256, fee_ppm: u64) -> Option<U256> {
     if fee_ppm == 0 {
         return Some(out);
     }
     let one = U256::from(1_000_000u64);
-    let den = one.checked_sub(U256::from(fee_ppm.min(1_000_000)))?;
+    let fee = U256::from(fee_ppm.min(1_000_000));
+    let den = one.checked_sub(fee)?;
+    if den.is_zero() {
+        return None;
+    }
     let num = out.checked_mul(one)?;
     Some((num + den - U256::from(1)) / den)
 }
@@ -2373,11 +2384,12 @@ impl AutomatedMarketMaker for BinaryFiPropPool {
     fn sync(&mut self, log: &Log) -> Result<SyncAction, AMMError> {
         let topics = log.topics();
 
-        // L0a: 引擎按账户费率事件（FeeSet(account, fee)，topic1 = 账户）。
-        // 事件 data 是**原始单位**（1 ↔ 1e6 ppm），不能直接当 ppm 用；
-        // 只作触发信号：该账户费率可能已变，返回 AsyncUpdate 重拉快照，
-        // 让批量合约以 fee_recipient 口径带回权威 getFee + 含费 quote。
-        // 仅命中本实例费率生效账户（fee_recipient），避免多账户串扰。
+        // L0a: 引擎黑名单事件（BlacklistSet(account, status)，topic1 = 账户，
+        // data = bool）。事件 data 不能当 fee 用（bool 1 恰巧 = 1e6 raw 单位，
+        // 纯属巧合）；只作触发信号：该账户可交易性可能已变，返回 AsyncUpdate
+        // 重拉快照，让批量合约以 fee_recipient 口径带回权威 getFee（拉黑账户
+        // = 1e6）+ 含费 quote（拉黑账户 = 全 0）。仅命中本实例费率生效账户
+        // （fee_recipient），避免多账户串扰。
         if log.address() == self.engine_address
             && topics.len() == 2
             && topics[0] == BINARYFI_FEE_ACCOUNT_EVENT
@@ -3122,6 +3134,23 @@ mod tests {
             .collect();
         pool.reserves = vec![U256::ZERO; n];
         pool
+    }
+
+    /// 黑名单账户快照（fee=1e6 + quote 全 0）：unfee_quote 不得除零 panic，
+    /// 返回 None 让 quote 反推全部归空（rates → 0 → 预过滤丢弃路径）。
+    #[test]
+    fn test_unfee_quote_blacklisted_fee_100pct_no_panic() {
+        // fee=1e6（100%）且链上 quote 归 0（success=true）：旧实现
+        // `(0 + (1e6−1e6) − 1) / 0` 除零 panic，AsyncUpdate/周期快照任务
+        // 崩溃 → fee_ppm 永远停旧值 → 虚假机会无限持续。
+        assert_eq!(unfee_quote(U256::ZERO, 1_000_000), None);
+        // 非零 quote 在 100% 费率下同样无解（无费化无意义）
+        assert_eq!(unfee_quote(U256::from(123u64), 1_000_000), None);
+        // 边界以下仍正常（fee=999_999 → 分母 1）
+        assert_eq!(unfee_quote(U256::from(100u64), 999_999), Some(U256::from(100_000_000u64)));
+        // 正常费率回归
+        assert_eq!(unfee_quote(U256::from(999u64), 1000), Some(U256::from(1000u64)));
+        assert_eq!(unfee_quote(U256::ZERO, 0), Some(U256::ZERO));
     }
 
     /// S ≥ last_event_block：直接锚定，清空账本

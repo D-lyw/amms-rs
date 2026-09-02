@@ -1038,6 +1038,57 @@ fn test_apply_snapshot_does_not_regress_fresh_log_price() {
     assert!(!pool.buy_disabled[1]);
 }
 
+/// 黑名单账户快照端到端回归：fee=1e6 + 全部 quote 归 0（success=true）。
+/// 旧实现在 `unfee_quote(0, 1e6)` 除零 panic → AsyncUpdate/周期快照任务崩溃 →
+/// fee_ppm 永远停在旧值 → 虚假机会无限持续（被拉黑后 2 小时仍不停）。
+/// 修复后：不 panic、fee_ppm=1e6、rates 全 0、engine_quote 输出 0 → 预过滤
+/// 直接放弃 BinaryFi 路径，不再产生虚假交易。
+#[test]
+fn test_apply_snapshot_blacklisted_fee_1e6_zeros_quotes() {
+    let mut pool = test_pool();
+    // 生产 loader 会把 fee_account 设为实际执行合约（黑名单对象）
+    pool.fee_account = Some(address!("0x7f51aae175530af69591954b4d0c958655feffc3"));
+    assert_eq!(pool.fee_recipient(), address!("0x7f51aae175530af69591954b4d0c958655feffc3"));
+
+    // 链上实证：被拉黑账户 quote 返回 0 且 success=true、getFee = 1e6
+    let ok0 = QuoteResult {
+        amountOut: U256::ZERO,
+        success: true,
+    };
+    let snap = Snapshot {
+        assets: pool.assets.iter().map(|t| t.address).collect(),
+        decimals: vec![6u8, 18u8],
+        scales: vec![U256::ZERO, U256::from(10_000u64)],
+        poolBalances: vec![U256::ZERO, U256::ZERO],
+        vaultReserves: vec![
+            U256::from(10u64).pow(U256::from(30)),
+            U256::from(10u64).pow(U256::from(30)),
+        ],
+        vaultBalances: Vec::new(),
+        quotePairs: vec![U256::from(1), U256::from(2)],
+        quotes: vec![ok0.clone(), ok0.clone()], // 0→1 / 1→0 全部归 0
+        fee: U256::from(1_000_000),
+    };
+    // 不得 panic
+    pool.apply_snapshot(&snap, 100);
+
+    assert_eq!(pool.fee_ppm, 1_000_000, "fee_ppm 必须锚定 100%");
+    assert!(pool.rates.iter().all(|r| r.is_zero()), "黑名单后 rates 必须全 0");
+    // 引擎实际走 simulate_swap：黑名单后两个方向都必须输出 0（无利润 → 无机会）
+    let (t0, t1) = (pool.assets[0].address, pool.assets[1].address);
+    assert_eq!(
+        pool.simulate_swap(t0, t1, U256::from(1_000_000u64)).unwrap(),
+        U256::ZERO
+    );
+    assert_eq!(
+        pool.simulate_swap(t1, t0, U256::from(1_000_000_000_000_000u64))
+            .unwrap(),
+        U256::ZERO
+    );
+    let (t0, t1) = (pool.assets[0].address, pool.assets[1].address);
+    assert_eq!(pool.spot_price(t0, t1).unwrap_or(1.0), 0.0);
+}
+
 #[test]
 fn test_sync_canonical_update_marks_stale() {
     let mut pool = test_pool();
