@@ -18,7 +18,7 @@ use crate::amms::aerodrome_slipstream::pool::{
 use crate::amms::amm::{AutomatedMarketMaker, AMM};
 use crate::amms::balancer_v2::BalancerV2Pool;
 use crate::amms::balancer_v3::BalancerV3Pool;
-use crate::amms::binaryfi_prop::BinaryFiPropPool;
+use crate::amms::binaryfi_prop::{BinaryFiPropPool, Snapshot};
 use crate::amms::caliber_prop::CaliberPropPool;
 use crate::amms::curve_ng::{CurveNGFactory, ICurveNGStableSwap};
 use crate::amms::elfomo_prop::ElfomoFiPropPool;
@@ -1290,7 +1290,7 @@ pub async fn start_binaryfi_prop_sync_task<N, P>(
         next_sleep = interval;
 
         // 虚拟子池化后按部署分组：每组取 seed 做一次全量快照刷新，再把刷新结果
-        // 整份克隆到同部署其余实例（恢复各自虚拟身份），避免 65 个实例各自触发
+        // 整份应用到同部署其余实例（恢复各自虚拟身份），避免 65 个实例各自触发
         // 一次链上批量读取。
         let mut groups: HashMap<(Address, Address, Address, Address), Vec<BinaryFiPropPool>> =
             HashMap::new();
@@ -1315,37 +1315,57 @@ pub async fn start_binaryfi_prop_sync_task<N, P>(
             groups.len()
         );
 
-        let mut write_guard = state.write().await;
+        // 锁外执行链上批量读取：网络调用不持写锁，避免阻塞 flashblocks 实时流
+        // 与引擎快照读锁（历史实现把 fetch_full_snapshot 放在 write_guard 作用域内，
+        // 每 15s 一次全量快照 RPC 会让整条实时管线停顿 100-500ms）。
+        // 每组一次全量快照（fetch_full_snapshot 只读、只标记 seed 本地 stale，
+        // 不改共享状态）；返回 (snap, snap_block) 供锁内分发。
+        let mut fetched: Vec<(Snapshot, u64, Vec<BinaryFiPropPool>)> = Vec::new();
         for (_, group) in groups {
             let Some(mut seed) = group.first().cloned() else {
                 continue;
             };
-            // 一次链上批量读取全量快照；分发时各实例自行 apply_snapshot，
-            // 利用实例自身的 price_updated_block 保鲜判断（日志价格 >= snap_block
-            // 不覆盖），防止快照回退更新日志价格。
-            let (snap, snap_block) = match seed.fetch_full_snapshot::<N, P>(provider.clone()).await
-            {
-                Ok(v) => v,
+            match seed.fetch_full_snapshot::<N, P>(provider.clone()).await {
+                Ok((snap, snap_block)) => {
+                    fetched.push((snap, snap_block, group));
+                }
                 Err(e) => {
                     error!(
                         address = ?seed.pool_address,
                         error = ?e,
                         "Failed to refresh BinaryFi propAMM full snapshot"
                     );
-                    continue;
                 }
-            };
+            }
+        }
+
+        if fetched.is_empty() {
+            continue;
+        }
+
+        // 短写锁临界区内整组写回（无 RPC，读者不会看到同部署半新半旧）：
+        // - 基于写回时刻的 current existing 克隆再 apply_snapshot：快照的日志保鲜
+        //   （price_updated_block >= snap_block 不覆盖）与 reserves ledger.rebase
+        //   都作用在实例自身状态上，必须保留 RPC 期间到达的实时事件，不能回退到
+        //   Phase-1 的旧克隆（否则事件从 reserves + ledger 一起丢失）；
+        // - last_synced_block 取 max 单调，防止快照把已推进的块号回卷导致旧块日志
+        //   被重新应用（与 execute_pending_task AsyncUpdate 分支同语义）；
+        // - 不做 last_synced_block 前置跳过：BinaryFi 每块都有 MM update 事件、
+        //   last_synced_block 恒新（v1.19.6 教训），快照必须无条件应用，由
+        //   apply_snapshot 内部判据保证不回退日志价格/事件余额。
+        let mut write_guard = state.write().await;
+        for (snap, snap_block, group) in fetched {
             let refreshed_pairs: Vec<usize> =
                 snap.quotePairs.iter().map(|p| p.to::<usize>()).collect();
             for pool in group {
                 let addr = pool.address();
-                // 保留实例虚拟身份 + 实例自身 price_updated_block（日志保鲜）
-                let mut refreshed = pool.clone();
-                refreshed.apply_snapshot(&snap, snap_block);
-                refreshed.set_last_synced_block(snap_block);
-                refreshed.clear_stale_pairs(&refreshed_pairs);
                 if let Some(existing_amm) = write_guard.get_mut_cow(&addr) {
                     if let AMM::BinaryFiPropPool(existing) = existing_amm {
+                        let prev_last_synced = existing.last_synced_block();
+                        let mut refreshed = (*existing).clone();
+                        refreshed.apply_snapshot(&snap, snap_block);
+                        refreshed.set_last_synced_block(prev_last_synced.max(snap_block));
+                        refreshed.clear_stale_pairs(&refreshed_pairs);
                         *existing = refreshed;
                     }
                 }
