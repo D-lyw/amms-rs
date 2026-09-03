@@ -2202,7 +2202,9 @@ impl BinaryFiPropPool {
     /// 返回体积把请求分片为多次 deploy 调用，再在本地合并——单次调用保持
     /// “linear → bigQuote → bigSell”段内顺序，跨片拼接后与一次请求的
     /// `quotePairs[k] ↔ quotes[k]` 配对语义一致；assets/decimals/余额等字段
-    /// 各片同块结果一致，取首片。
+    /// 各片同块结果一致，取首片。各分片是同一 block 的只读 eth_call，互不
+    /// 依赖：并发发起、按原片序合并（join_all 保序），跨境 RPC 的多段串行
+    /// 往返压到一段。
     async fn fetch_snapshot<N, P>(
         provider: P,
         pool: Address,
@@ -2252,30 +2254,40 @@ impl BinaryFiPropPool {
         requests.extend(big_quote_pairs.into_iter().map(|p| (1u8, p)));
         requests.extend(big_sell_pairs.into_iter().map(|p| (2u8, p)));
 
-        let mut merged: Option<Snapshot> = None;
-        for chunk in requests.chunks(max_entries_per_call) {
-            let mut chunk_q: Vec<U256> = Vec::new();
-            let mut chunk_bq: Vec<U256> = Vec::new();
-            let mut chunk_bs: Vec<U256> = Vec::new();
-            for &(kind, pair) in chunk {
-                match kind {
-                    0 => chunk_q.push(pair),
-                    1 => chunk_bq.push(pair),
-                    _ => chunk_bs.push(pair),
+        // 各片只读、同块、独立：并发发起，join_all 按输入片序返回，跨片拼接
+        // 顺序与串行版逐位一致（片段内 linear → bigQuote → bigSell 段序保留，
+        // quotePairs[k] ↔ quotes[k] 配对不变）；任一片失败整体返回 Err。
+        let chunk_futures: Vec<_> = requests
+            .chunks(max_entries_per_call)
+            .map(|chunk| {
+                let mut chunk_q: Vec<U256> = Vec::new();
+                let mut chunk_bq: Vec<U256> = Vec::new();
+                let mut chunk_bs: Vec<U256> = Vec::new();
+                for &(kind, pair) in chunk {
+                    match kind {
+                        0 => chunk_q.push(pair),
+                        1 => chunk_bq.push(pair),
+                        _ => chunk_bs.push(pair),
+                    }
                 }
-            }
-            let snap = Self::fetch_snapshot_once(
-                provider.clone(),
-                pool,
-                engine,
-                fee_account,
-                assets.clone(),
-                chunk_q,
-                chunk_bq,
-                chunk_bs,
-                block,
-            )
-            .await?;
+                Self::fetch_snapshot_once(
+                    provider.clone(),
+                    pool,
+                    engine,
+                    fee_account,
+                    assets.clone(),
+                    chunk_q,
+                    chunk_bq,
+                    chunk_bs,
+                    block,
+                )
+            })
+            .collect();
+        let chunk_results = futures::future::join_all(chunk_futures).await;
+
+        let mut merged: Option<Snapshot> = None;
+        for snap in chunk_results {
+            let snap = snap?;
             match &mut merged {
                 Some(acc) => {
                     acc.quotePairs.extend(snap.quotePairs);
