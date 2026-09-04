@@ -56,32 +56,67 @@ struct UnreadableBlockRetryState {
     next_retry_at: Instant,
 }
 
-impl UnreadableBlockRetryState {
-    fn new(block: u64) -> Self {
-        Self {
-            block,
-            retry_attempt: 0,
-            next_retry_at: Instant::now() + unreadable_retry_delay(0),
-        }
-    }
+/// 不可读块重试策略。按链配置：各链出块节奏不同，禁止跨链混用同一套重试参数。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FeedRetryPolicy {
+    /// 固定间隔重试：失败后恒定间隔再试，不倍增、不空转。
+    /// 用于 ~100ms 出块的链（如 Robinhood 4663），tip 块落地后下一次重试即命中。
+    Fixed { interval_ms: u64 },
+    /// 指数退避：base 起倍增，封顶 max。Arbitrum One（42161）等历史默认行为。
+    ExponentialBackoff { base_ms: u64, max_ms: u64 },
+}
 
-    fn bump(self) -> Self {
-        let attempt = self.retry_attempt.saturating_add(1);
-        Self {
-            block: self.block,
-            retry_attempt: attempt,
-            next_retry_at: Instant::now() + unreadable_retry_delay(attempt),
+impl FeedRetryPolicy {
+    fn delay(self, retry_attempt: u32) -> Duration {
+        match self {
+            Self::Fixed { interval_ms } => Duration::from_millis(interval_ms),
+            Self::ExponentialBackoff { base_ms, max_ms } => {
+                let shift = retry_attempt.min(5);
+                let delay_ms = base_ms.saturating_mul(1u64 << shift).min(max_ms);
+                Duration::from_millis(delay_ms)
+            }
         }
     }
 }
 
-fn unreadable_retry_delay(retry_attempt: u32) -> Duration {
-    let shift = retry_attempt.min(5);
-    let multiplier = 1u64 << shift;
-    let delay_ms = ARBITRUM_FEED_RETRY_BASE_MS
-        .saturating_mul(multiplier)
-        .min(ARBITRUM_FEED_RETRY_MAX_MS);
-    Duration::from_millis(delay_ms)
+fn feed_safety_blocks(chain_id: u64) -> u64 {
+    match chain_id {
+        // Robinhood：直接盯 feed tip（safety=0），不可读由固定 50ms 重试兜底。
+        4663 => 0,
+        // Arbitrum One 及未登记链保持历史行为（safety buffer = 1）。
+        _ => ARBITRUM_FEED_SAFETY_BLOCKS,
+    }
+}
+
+fn feed_retry_policy(chain_id: u64) -> FeedRetryPolicy {
+    match chain_id {
+        // Robinhood ~100ms/块：tip 不可读时固定 50ms 重试。
+        4663 => FeedRetryPolicy::Fixed { interval_ms: 50 },
+        // Arbitrum One（~250ms/块）沿用历史指数退避 50ms..=1000ms。
+        _ => FeedRetryPolicy::ExponentialBackoff {
+            base_ms: ARBITRUM_FEED_RETRY_BASE_MS,
+            max_ms: ARBITRUM_FEED_RETRY_MAX_MS,
+        },
+    }
+}
+
+impl UnreadableBlockRetryState {
+    fn new(block: u64, policy: FeedRetryPolicy) -> Self {
+        Self {
+            block,
+            retry_attempt: 0,
+            next_retry_at: Instant::now() + policy.delay(0),
+        }
+    }
+
+    fn bump(self, policy: FeedRetryPolicy) -> Self {
+        let attempt = self.retry_attempt.saturating_add(1);
+        Self {
+            block: self.block,
+            retry_attempt: attempt,
+            next_retry_at: Instant::now() + policy.delay(attempt),
+        }
+    }
 }
 
 fn parse_u64(value: &Value) -> Option<u64> {
@@ -163,8 +198,10 @@ impl<N, P> StateSpaceManager<N, P> {
         N: Network,
     {
         let mut updates = Vec::new();
+        let safety_blocks = feed_safety_blocks(chain_id);
+        let retry_policy = feed_retry_policy(chain_id);
         let raw_feed_head = max_seq.saturating_add(feed_l2_offset(chain_id));
-        let candidate_l2_head = raw_feed_head.saturating_sub(ARBITRUM_FEED_SAFETY_BLOCKS);
+        let candidate_l2_head = raw_feed_head.saturating_sub(safety_blocks);
 
         loop {
             let synced_head = realtime_head.load(Ordering::Relaxed);
@@ -176,7 +213,10 @@ impl<N, P> StateSpaceManager<N, P> {
 
             if let Some(state) = unreadable_block.as_ref() {
                 if state.block != next_block_to_sync {
-                    *unreadable_block = Some(UnreadableBlockRetryState::new(next_block_to_sync));
+                    *unreadable_block = Some(UnreadableBlockRetryState::new(
+                        next_block_to_sync,
+                        retry_policy,
+                    ));
                 } else if Instant::now() < state.next_retry_at {
                     break;
                 }
@@ -192,18 +232,18 @@ impl<N, P> StateSpaceManager<N, P> {
                     let state_err = StateSpaceError::from(e);
                     if Self::is_temporarily_unreadable_block_error(&state_err) {
                         let next = match unreadable_block.take() {
-                            Some(cur) if cur.block == next_block_to_sync => cur.bump(),
-                            _ => UnreadableBlockRetryState::new(next_block_to_sync),
+                            Some(cur) if cur.block == next_block_to_sync => cur.bump(retry_policy),
+                            _ => UnreadableBlockRetryState::new(next_block_to_sync, retry_policy),
                         };
                         warn!(
                             feed = feed_chain_label(chain_id),
                             unreadable_block = next.block,
                             retry_attempt = next.retry_attempt,
-                            retry_delay_ms = unreadable_retry_delay(next.retry_attempt).as_millis(),
+                            retry_delay_ms = retry_policy.delay(next.retry_attempt).as_millis(),
                             realtime_head = synced_head,
                             raw_feed_head,
                             candidate_l2_head,
-                            safety_blocks = ARBITRUM_FEED_SAFETY_BLOCKS,
+                            safety_blocks,
                             "Feed block not readable yet; scheduling retry"
                         );
                         if next.retry_attempt >= ARBITRUM_FEED_ALERT_RETRY_THRESHOLD
@@ -216,12 +256,11 @@ impl<N, P> StateSpaceManager<N, P> {
                                 feed = feed_chain_label(chain_id),
                                 unreadable_block = next.block,
                                 retry_attempt = next.retry_attempt,
-                                retry_delay_ms =
-                                    unreadable_retry_delay(next.retry_attempt).as_millis(),
+                                retry_delay_ms = retry_policy.delay(next.retry_attempt).as_millis(),
                                 realtime_head = synced_head,
                                 raw_feed_head,
                                 candidate_l2_head,
-                                safety_blocks = ARBITRUM_FEED_SAFETY_BLOCKS,
+                                safety_blocks,
                                 "ALERT: feed block repeatedly unreadable; fast-retry still failing"
                             );
                         }
@@ -290,9 +329,10 @@ impl<N, P> StateSpaceManager<N, P> {
             let feed_offset = feed_l2_offset(chain_id);
             let feed_url = feed_ws_url(chain_id);
             let feed_label = feed_chain_label(chain_id);
+            let feed_safety_blocks = feed_safety_blocks(chain_id);
             let mut max_seq = realtime_head
                 .load(Ordering::Relaxed)
-                .saturating_add(ARBITRUM_FEED_SAFETY_BLOCKS)
+                .saturating_add(feed_safety_blocks)
                 .saturating_sub(feed_offset);
             let mut last_metrics_log = Instant::now();
             let mut unreadable_block: Option<UnreadableBlockRetryState> = None;
@@ -387,13 +427,13 @@ impl<N, P> StateSpaceManager<N, P> {
                     if last_metrics_log.elapsed() >= Duration::from_secs(5) {
                         let realtime = realtime_head.load(Ordering::Relaxed);
                         let raw_feed_head = max_seq.saturating_add(feed_offset);
-                        let candidate = raw_feed_head.saturating_sub(ARBITRUM_FEED_SAFETY_BLOCKS);
+                        let candidate = raw_feed_head.saturating_sub(feed_safety_blocks);
                         info!(
                             feed = feed_label,
                             max_seq,
                             raw_feed_head,
                             candidate_l2_head = candidate,
-                            safety_blocks = ARBITRUM_FEED_SAFETY_BLOCKS,
+                            safety_blocks = feed_safety_blocks,
                             realtime_head = realtime,
                             head_lag = candidate.saturating_sub(realtime),
                             seq_duplicate_count,
@@ -492,28 +532,43 @@ mod tests {
     }
 
     #[test]
-    fn unreadable_retry_backoff_caps_at_1000ms() {
-        assert_eq!(unreadable_retry_delay(0), Duration::from_millis(50));
-        assert_eq!(unreadable_retry_delay(1), Duration::from_millis(100));
-        assert_eq!(unreadable_retry_delay(2), Duration::from_millis(200));
-        assert_eq!(unreadable_retry_delay(3), Duration::from_millis(400));
-        assert_eq!(unreadable_retry_delay(4), Duration::from_millis(800));
-        assert_eq!(unreadable_retry_delay(5), Duration::from_millis(1000));
-        assert_eq!(unreadable_retry_delay(8), Duration::from_millis(1000));
+    fn arbitrum_default_retry_backoff_caps_at_1000ms() {
+        // 42161 及未登记链保持历史指数退避 50ms..=1000ms。
+        let policy = feed_retry_policy(42161);
+        assert_eq!(policy.delay(0), Duration::from_millis(50));
+        assert_eq!(policy.delay(1), Duration::from_millis(100));
+        assert_eq!(policy.delay(2), Duration::from_millis(200));
+        assert_eq!(policy.delay(3), Duration::from_millis(400));
+        assert_eq!(policy.delay(4), Duration::from_millis(800));
+        assert_eq!(policy.delay(5), Duration::from_millis(1000));
+        assert_eq!(policy.delay(8), Duration::from_millis(1000));
+        assert_eq!(feed_safety_blocks(42161), ARBITRUM_FEED_SAFETY_BLOCKS);
+    }
+
+    #[test]
+    fn robinhood_retry_is_fixed_50ms_with_no_safety_buffer() {
+        // 4663：safety=0 直盯 tip，不可读时固定 50ms 重试（不倍增）。
+        let policy = feed_retry_policy(4663);
+        assert_eq!(policy, FeedRetryPolicy::Fixed { interval_ms: 50 });
+        assert_eq!(policy.delay(0), Duration::from_millis(50));
+        assert_eq!(policy.delay(5), Duration::from_millis(50));
+        assert_eq!(policy.delay(100), Duration::from_millis(50));
+        assert_eq!(feed_safety_blocks(4663), 0);
     }
 
     #[test]
     fn unreadable_state_keeps_same_block_and_increments_attempt() {
-        let first = UnreadableBlockRetryState::new(1234);
+        let policy = feed_retry_policy(42161);
+        let first = UnreadableBlockRetryState::new(1234, policy);
         assert_eq!(first.block, 1234);
         assert_eq!(first.retry_attempt, 0);
         assert!(first.next_retry_at > Instant::now());
 
-        let second = first.bump();
+        let second = first.bump(policy);
         assert_eq!(second.block, 1234);
         assert_eq!(second.retry_attempt, 1);
 
-        let third = second.bump();
+        let third = second.bump(policy);
         assert_eq!(third.block, 1234);
         assert_eq!(third.retry_attempt, 2);
         assert!(third.next_retry_at > Instant::now());
@@ -547,40 +602,45 @@ mod tests {
         assert_eq!(feed_ws_url(4663), ROBINHOOD_FEED_WS_URL);
         assert_eq!(feed_l2_offset(4663), 0);
         assert_eq!(feed_chain_label(4663), "robinhood");
+        assert_eq!(feed_safety_blocks(4663), 0);
+        assert_eq!(
+            feed_retry_policy(4663),
+            FeedRetryPolicy::Fixed { interval_ms: 50 }
+        );
     }
 
     #[test]
     fn robinhood_offset_zero_raw_feed_head_equals_max_seq() {
-        // Robinhood sequenceNumber == real L2 block number, offset = 0.
-        // verify that raw_feed_head == max_seq and candidate == max_seq - safety_blocks.
+        // Robinhood sequenceNumber == real L2 block number, offset = 0, safety_blocks = 0.
+        // verify that raw_feed_head == max_seq and candidate == max_seq.
         let max_seq = 100u64;
         let offset = ROBINHOOD_L2_OFFSET;
-        let safety = ARBITRUM_FEED_SAFETY_BLOCKS;
+        let safety = feed_safety_blocks(4663);
 
         let raw_feed_head = max_seq.saturating_add(offset);
         let candidate_l2_head = raw_feed_head.saturating_sub(safety);
 
         assert_eq!(raw_feed_head, 100);
-        assert_eq!(candidate_l2_head, 99);
+        assert_eq!(candidate_l2_head, 100);
     }
 
     #[test]
     fn robinhood_max_seq_initialization_skips_already_synced() {
         // Simulate subscribe_arbitrum_feed_stream's max_seq initialization
-        // for Robinhood (offset=0, safety_blocks=1).
-        // realtime_head already at block 50 → max_seq = 50 + 1 - 0 = 51.
-        // Then raw_feed_head = 51 + 0 = 51, candidate = 51 - 1 = 50.
+        // for Robinhood (offset=0, safety_blocks=0).
+        // realtime_head already at block 50 → max_seq = 50 + 0 - 0 = 50.
+        // Then raw_feed_head = 50 + 0 = 50, candidate = 50.
         // candidate <= realtime_head → drive_arbitrum_feed_progress should skip.
         let realtime_head = 50u64;
         let offset = ROBINHOOD_L2_OFFSET;
-        let safety = ARBITRUM_FEED_SAFETY_BLOCKS;
+        let safety = feed_safety_blocks(4663);
 
         let max_seq = realtime_head.saturating_add(safety).saturating_sub(offset);
         let raw_feed_head = max_seq.saturating_add(offset);
         let candidate_l2_head = raw_feed_head.saturating_sub(safety);
 
-        assert_eq!(max_seq, 51);
-        assert_eq!(raw_feed_head, 51);
+        assert_eq!(max_seq, 50);
+        assert_eq!(raw_feed_head, 50);
         assert_eq!(candidate_l2_head, 50);
         assert!(candidate_l2_head <= realtime_head);
     }
