@@ -27,6 +27,15 @@ pub(crate) const ARBITRUM_FEED_RETRY_MAX_MS: u64 = 1_000;
 const ARBITRUM_FEED_ALERT_RETRY_THRESHOLD: u32 = 8;
 const ARBITRUM_FEED_ALERT_RETRY_EVERY: u32 = 20;
 pub(crate) const ARBITRUM_FEED_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// 落后阈值：realtime_head 落后 candidate（feed 前沿）超过该块数时，
+/// drive 改用批量窗口（backfill_range 区间 get_logs）追平，而不是逐块
+/// 单次 get_logs —— 单次 RPC 固定成本 ~100ms+ 已超过 Robinhood ~100ms
+/// 出块间隔，积压/回放时逐块追赶永远追不上。
+pub(crate) const ARBITRUM_FEED_CATCHUP_BATCH_THRESHOLD: u64 = 8;
+/// 消费积压帧：回放/重连时 feed 帧到达可能远快于单帧处理节奏，
+/// 用短轮询把 socket 已就绪帧一次排空，使 max_seq 贴近真实前沿。
+const FEED_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(2);
+const MAX_FEED_DRAIN_FRAMES_PER_ROUND: u64 = 16_384;
 
 pub(crate) fn feed_ws_url(chain_id: u64) -> &'static str {
     match chain_id {
@@ -182,7 +191,7 @@ impl<N, P> StateSpaceManager<N, P> {
         provider: &P,
         state: &Arc<RwLock<StateSpace>>,
         hooks: &HookRegistry<Vec<Address>>,
-        _query_chunks: &[LogQueryChunk],
+        query_chunks: &[LogQueryChunk],
         update_seq: &Arc<AtomicU64>,
         realtime_head: &Arc<AtomicU64>,
         canonical_head: &Arc<AtomicU64>,
@@ -203,10 +212,61 @@ impl<N, P> StateSpaceManager<N, P> {
         let raw_feed_head = max_seq.saturating_add(feed_l2_offset(chain_id));
         let candidate_l2_head = raw_feed_head.saturating_sub(safety_blocks);
 
+        // 监控地址并集（chunk 间地址可重叠：共享 manager/vault/plugin 合约）。
+        // 单块逐块路径据此做服务端 eth_getLogs 地址过滤（见下方 Filter），
+        // 与 backfill/NewHeadsPull 的"服务端过滤"语义对齐；不设 topic 以
+        // 兼容 AddressOnly chunk（FoT token 等非 sync 事件），本地 apply
+        // 按原逻辑路由/容忍无关事件（与整块全量路径处理等价）。
+        let mut watched_addresses: Vec<Address> = Vec::new();
+        {
+            let mut seen = std::collections::HashSet::new();
+            for chunk in query_chunks {
+                for addr in &chunk.addresses {
+                    if seen.insert(*addr) {
+                        watched_addresses.push(*addr);
+                    }
+                }
+            }
+        }
+
         loop {
             let synced_head = realtime_head.load(Ordering::Relaxed);
             if candidate_l2_head <= synced_head {
                 break;
+            }
+
+            // 落后较多：批量窗口追赶。逐块单次 get_logs 的固定 RPC 成本
+            // （~100ms+）已超过 ~100ms 出块间隔，积压/回放时永远追不上；
+            // 区间 get_logs（backfill_range）一次请求覆盖多块，摊销成本后
+            // 每块 <1ms，可快速贴回 feed 前沿。追赶阶段只应用状态、不向下游
+            // 发出可交易信号（与 initial backfill 语义一致），避免把回放旧块
+            // 当成实时机会。
+            if candidate_l2_head - synced_head > ARBITRUM_FEED_CATCHUP_BATCH_THRESHOLD {
+                *unreadable_block = None;
+                info!(
+                    feed = feed_chain_label(chain_id),
+                    from_block = synced_head.saturating_add(1),
+                    to_block = candidate_l2_head,
+                    blocks = candidate_l2_head - synced_head,
+                    "Feed head lag exceeds threshold; batch catch-up via ranged get_logs"
+                );
+                Self::backfill_range(
+                    provider,
+                    state,
+                    hooks,
+                    query_chunks,
+                    synced_head.saturating_add(1),
+                    candidate_l2_head,
+                    realtime_head,
+                    canonical_head,
+                    pending_sync_queue,
+                    pending_sync_notify,
+                    applied_log_dedup,
+                    LogSource::ArbitrumFeedPull,
+                    chain_id,
+                )
+                .await?;
+                continue;
             }
 
             let next_block_to_sync = synced_head.saturating_add(1);
@@ -222,9 +282,12 @@ impl<N, P> StateSpaceManager<N, P> {
                 }
             }
 
-            let filter = Filter::new()
+            let mut filter = Filter::new()
                 .from_block(next_block_to_sync)
                 .to_block(next_block_to_sync);
+            if !watched_addresses.is_empty() {
+                filter = filter.address(watched_addresses.clone());
+            }
             let received_at = StdInstant::now();
             let logs = match provider.get_logs(&filter).await {
                 Ok(logs) => logs,
@@ -448,53 +511,78 @@ impl<N, P> StateSpaceManager<N, P> {
                         break;
                     }
 
-                    let next = tokio::time::timeout(ARBITRUM_FEED_POLL_INTERVAL, socket.next()).await;
-                    let maybe_message_result = match next {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
+                    // 一次性排空 socket 已就绪的积压帧（回放/断线追赶时帧到达
+                    // 可能远快于单帧处理节奏）。逐帧消费会让 max_seq 只随已消费帧
+                    // 缓慢增长、无法反映真实前沿，批量追赶也无从谈起。
+                    let mut feed_ended = false;
+                    let mut drained_frames = 0u64;
+                    let mut first_wait = ARBITRUM_FEED_POLL_INTERVAL;
+                    loop {
+                        let next = tokio::time::timeout(first_wait, socket.next()).await;
+                        first_wait = FEED_DRAIN_POLL_INTERVAL;
+                        let maybe_message_result = match next {
+                            Ok(v) => v,
+                            Err(_) => break,
+                        };
 
-                    let Some(message_result) = maybe_message_result else {
-                        warn!(feed = feed_label, "Feed stream ended");
-                        break;
-                    };
+                        let Some(message_result) = maybe_message_result else {
+                            warn!(feed = feed_label, "Feed stream ended");
+                            feed_ended = true;
+                            break;
+                        };
 
-                    let message = match message_result {
-                        Ok(v) => v,
-                        Err(e) => {
-                            warn!(feed = feed_label, "Feed stream receive error: {}", e);
+                        let message = match message_result {
+                            Ok(v) => v,
+                            Err(e) => {
+                                warn!(feed = feed_label, "Feed stream receive error: {}", e);
+                                feed_ended = true;
+                                break;
+                            }
+                        };
+                        last_feed_activity = Instant::now();
+
+                        let payload = match message {
+                            Message::Text(text) => text.to_string(),
+                            Message::Binary(bin) => {
+                                String::from_utf8_lossy(bin.as_ref()).to_string()
+                            }
+                            Message::Ping(v) => {
+                                let _ = socket.send(Message::Pong(v)).await;
+                                continue;
+                            }
+                            Message::Pong(_) => continue,
+                            Message::Close(_) => {
+                                feed_ended = true;
+                                break;
+                            }
+                            Message::Frame(_) => continue,
+                        };
+
+                        let value: Value = match serde_json::from_str(&payload) {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        };
+
+                        seq_buf.clear();
+                        extract_sequences(&value, &mut seq_buf);
+                        for seq in &seq_buf {
+                            update_seq_counters(
+                                *seq,
+                                &mut last_seen_seq,
+                                &mut max_seq,
+                                &mut seq_duplicate_count,
+                                &mut seq_non_monotonic_count,
+                            );
+                        }
+
+                        drained_frames += 1;
+                        if drained_frames >= MAX_FEED_DRAIN_FRAMES_PER_ROUND {
                             break;
                         }
-                    };
-                    last_feed_activity = Instant::now();
+                    }
 
-                    let payload = match message {
-                        Message::Text(text) => text.to_string(),
-                        Message::Binary(bin) => String::from_utf8_lossy(bin.as_ref()).to_string(),
-                        Message::Ping(v) => {
-                            let _ = socket.send(Message::Pong(v)).await;
-                            continue;
-                        }
-                        Message::Pong(_) => continue,
-                        Message::Close(_) => break,
-                        Message::Frame(_) => continue,
-                    };
-
-                    let value: Value = match serde_json::from_str(&payload) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-
-                    seq_buf.clear();
-                    extract_sequences(&value, &mut seq_buf);
-                    for seq in &seq_buf {
-                        update_seq_counters(
-                            *seq,
-                            &mut last_seen_seq,
-                            &mut max_seq,
-                            &mut seq_duplicate_count,
-                            &mut seq_non_monotonic_count,
-                        );
+                    if feed_ended {
+                        break;
                     }
                 }
 

@@ -1923,7 +1923,9 @@ impl<N, P> StateSpaceManager<N, P> {
             BASE_CHAIN_ID => 100,
             BSC_MAINNET_CHAIN_ID => 300,
             XLAYER_CHAIN_ID => 100,
-            ROBINHOOD_CHAIN_ID => 100,
+            // 实测 Chainstack WS 区间 get_logs 一次 100~5000 块均 ~150ms：
+            // 单次请求固定成本主导，窗口越大摊销越低，落后追赶越快。
+            ROBINHOOD_CHAIN_ID => 1000,
             ETHEREUM_MAINNET_CHAIN_ID => 50,
             _ => 50,
         }
