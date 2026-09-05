@@ -31,7 +31,11 @@ pub(crate) const ARBITRUM_FEED_POLL_INTERVAL: Duration = Duration::from_millis(1
 /// drive 改用批量窗口（backfill_range 区间 get_logs）追平，而不是逐块
 /// 单次 get_logs —— 单次 RPC 固定成本 ~100ms+ 已超过 Robinhood ~100ms
 /// 出块间隔，积压/回放时逐块追赶永远追不上。
-pub(crate) const ARBITRUM_FEED_CATCHUP_BATCH_THRESHOLD: u64 = 8;
+/// 8 → 2：Robinhood 出块 ~100ms、RPC 落后 feed 仅 ~1 块，逐块磨 3~8 块积压
+/// 时每块都要付一次必然失败的 get_logs + 50ms 退避，净速率追不上生产速率，
+/// 只会涨到 8 块才锯齿回补。阈值降到 2（gap>=3 即区间批量）把盲区压到 1~2 块；
+/// 区间尾部最新块仍不可读时由 backfill_range 窗口收缩处理，最新块继续逐块重试。
+pub(crate) const ARBITRUM_FEED_CATCHUP_BATCH_THRESHOLD: u64 = 2;
 /// 消费积压帧：回放/重连时 feed 帧到达可能远快于单帧处理节奏，
 /// 用短轮询把 socket 已就绪帧一次排空，使 max_seq 贴近真实前沿。
 const FEED_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(2);
