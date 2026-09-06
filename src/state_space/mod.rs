@@ -12,6 +12,7 @@ pub mod filters;
 #[allow(dead_code)]
 mod flashblocks;
 pub mod hooks;
+mod logs_push;
 mod maintenance;
 pub mod sync_services;
 pub mod titan_consumer;
@@ -99,6 +100,16 @@ pub enum RealtimeSyncSource {
     /// 要求 `StateSpaceBuilder::with_realtime_ws_endpoints(...)` 提供支持
     /// `eth_subscribe("logs")` 的 WSS 端点。
     BscMainnetLogsPush,
+    /// Robinhood 主网实时同步：标准 `eth_subscribe("logs")` push 订阅。
+    ///
+    /// Robinhood 无 flashblocks 端点，历史上实时同步与 Arbitrum 共用
+    /// `ArbitrumSequencerFeed`（官方 sequencer feed 块信号 + 逐块 getLogs）。
+    /// 生产实测第三方 RPC 的 `eth_subscribe("logs")` 推送比 newHeads+getLogs
+    /// 更早可用，且省去 RPC 可读性落后 feed ~1 块的反复重试；因此 Robinhood
+    /// 切到标准 logs 订阅。与 `BscMainnetLogsPush`（裸 WS + realtime_ws_endpoints）
+    /// 不同，本路径直接复用传入的 alloy Provider（`subscribe_logs`），
+    /// 不需要 `StateSpaceBuilder::with_realtime_ws_endpoints(...)`。
+    RobinhoodLogsPush,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -183,6 +194,7 @@ enum LogSource {
     ArbitrumFeedPull,
     NewHeadsPull,
     BscLogsPush,
+    LogsPush,
     Maintenance,
 }
 
@@ -576,6 +588,7 @@ enum SelectedRealtimeSource {
     BscLogsPush,
     XlayerFlashblocksPull,
     ArbitrumFeedPull,
+    LogsPush,
 }
 
 impl<N, P> StateSpaceManager<N, P> {
@@ -643,6 +656,8 @@ impl<N, P> StateSpaceManager<N, P> {
                 && matches!(selected, SelectedRealtimeSource::XlayerFlashblocksPull))
             || (chain_id == BSC_MAINNET_CHAIN_ID
                 && matches!(selected, SelectedRealtimeSource::BscLogsPush))
+            || (chain_id == ROBINHOOD_CHAIN_ID
+                && matches!(selected, SelectedRealtimeSource::LogsPush))
         {
             let provider = self.provider.clone();
             let state = self.state.clone();
@@ -965,6 +980,26 @@ impl<N, P> StateSpaceManager<N, P> {
                     chain_id,
                 )))
             }
+            SelectedRealtimeSource::LogsPush => {
+                info!(
+                    "Starting logs push sync (chain_id={}, {} query chunks, provider pubsub)",
+                    chain_id,
+                    query_chunks.len()
+                );
+                Ok(Box::pin(Self::subscribe_logs_push_stream(
+                    provider,
+                    state,
+                    hooks,
+                    update_seq,
+                    realtime_head,
+                    canonical_head,
+                    pending_sync_queue,
+                    pending_sync_notify,
+                    applied_log_dedup,
+                    query_chunks,
+                    chain_id,
+                )))
+            }
             SelectedRealtimeSource::XlayerFlashblocksPull => {
                 info!(
                     "Starting Xlayer flashblocks sync (chain_id={}, ws_url={}, {} query chunks)",
@@ -1020,8 +1055,13 @@ impl<N, P> StateSpaceManager<N, P> {
                     SelectedRealtimeSource::BasePendingLogs
                 } else if chain_id == XLAYER_CHAIN_ID {
                     SelectedRealtimeSource::XlayerFlashblocksPull
-                } else if chain_id == ARBITRUM_CHAIN_ID || chain_id == ROBINHOOD_CHAIN_ID {
+                } else if chain_id == ARBITRUM_CHAIN_ID {
                     SelectedRealtimeSource::ArbitrumFeedPull
+                } else if chain_id == ROBINHOOD_CHAIN_ID {
+                    // Robinhood：标准 logs 订阅推送（provider pubsub），每块
+                    // 聚合 settle 后原子应用；canonical 由 newHeads tracker
+                    // 推进（与 Base/BSC push 链一致，不依赖官方 feed）。
+                    SelectedRealtimeSource::LogsPush
                 } else if chain_id == BSC_MAINNET_CHAIN_ID {
                     // BSC 实时同步与 Ethereum 主网一致走 NewHeadsPull：
                     // newHeads + 整块 get_logs 按块边界应用，避免 logs-push
@@ -1040,6 +1080,7 @@ impl<N, P> StateSpaceManager<N, P> {
             }
             RealtimeSyncSource::ArbitrumSequencerFeed => SelectedRealtimeSource::ArbitrumFeedPull,
             RealtimeSyncSource::BscMainnetLogsPush => SelectedRealtimeSource::BscLogsPush,
+            RealtimeSyncSource::RobinhoodLogsPush => SelectedRealtimeSource::LogsPush,
         }
     }
 
@@ -3414,6 +3455,27 @@ mod tests {
         assert_eq!(StateSpaceManager::<(), ()>::backfill_window_size(56), 300);
         assert_eq!(StateSpaceManager::<(), ()>::backfill_window_size(1), 50);
         assert_eq!(StateSpaceManager::<(), ()>::backfill_window_size(10), 50);
+    }
+
+    #[test]
+    fn robinhood_realtime_source_resolves_to_logs_push() {
+        // Auto：Robinhood 从 ArbitrumFeedPull 切到 logs push（provider pubsub）。
+        assert!(matches!(
+            StateSpaceManager::<(), ()>::resolve_realtime_source(4663, &RealtimeSyncSource::Auto),
+            SelectedRealtimeSource::LogsPush
+        ));
+        // 显式配置同路径；Arbitrum 仍走 sequencer feed，不受影响。
+        assert!(matches!(
+            StateSpaceManager::<(), ()>::resolve_realtime_source(
+                4663,
+                &RealtimeSyncSource::RobinhoodLogsPush
+            ),
+            SelectedRealtimeSource::LogsPush
+        ));
+        assert!(matches!(
+            StateSpaceManager::<(), ()>::resolve_realtime_source(42161, &RealtimeSyncSource::Auto),
+            SelectedRealtimeSource::ArbitrumFeedPull
+        ));
     }
 
     #[test]
