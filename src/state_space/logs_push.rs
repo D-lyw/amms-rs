@@ -29,7 +29,8 @@ use tracing::{error, info, warn};
 // p50≈4ms / p95≈14ms 内到达，且块间严格有序无交错。因此消费侧必须做
 // **块级聚合 + settle 后原子应用**：
 // - 逐条立即 apply 会让下游看到同块中间态（P1 已砸/P2 未砸）的幻影机会；
-// - settle 10ms 覆盖 p95 推送窗口，代价远小于 100ms 块时间；
+// - settle 5ms 优先时效（100ms 块时间下仍远小于块间隔）；长尾块（>5ms
+//   才推完）由“收到更大块日志立即 flush 旧块”兜底，残余尾日志单独小批量补应用；
 // - “收到更大块日志立即 flush 旧块”作为长尾加速与兜底（实测块间 0 交错，
 //   该条件安全且不会漏块尾）。
 //
@@ -38,8 +39,9 @@ use tracing::{error, info, warn};
 // `run_silent_drift_probe_task` / maintenance coverage 对账。
 
 /// 块级聚合 settle 窗口：当前块最后一条日志到达后等待该时长，若再无同块
-/// 新日志则整块原子应用。10ms ≈ Robinhood 块内推送跨度 p95。
-const LOGS_PUSH_SETTLE_MS: Duration = Duration::from_millis(10);
+/// 新日志则整块原子应用。5ms 偏向时效（Robinhood 块内推送跨度 p95≈14ms，
+/// 长尾由新块 flush 兜底），代价是部分块尾日志走小批量补应用路径。
+const LOGS_PUSH_SETTLE_MS: Duration = Duration::from_millis(5);
 /// 连接静默兜底：超过该时长无任何日志推送视为断流，强制重建订阅（重建前
 /// getLogs 回补 gap）。Robinhood 每块几乎都有监控日志，60s 无消息=异常。
 const LOGS_PUSH_SILENT_REBUILD: Duration = STREAM_IDLE_TIMEOUT;
@@ -129,7 +131,7 @@ impl<N, P> StateSpaceManager<N, P> {
     /// - 订阅过滤集与 canonical getLogs 路径共用 `query_chunks`，覆盖一致；
     /// - 启动/重建前 `initial_backfill_results` 从 `realtime_head` 之后 getLogs 回补
     ///   （期间更新抑制，不产出下游通知）；
-    /// - 消费侧块缓冲 + 10ms settle + “新块即 flush”，整块一次原子 apply、
+    /// - 消费侧块缓冲 + 5ms settle + “新块即 flush”，整块一次原子 apply、
     ///   每块至多一次下游通知；
     /// - canonical head 不由此路径推进，由 `ensure_background_tasks` 的
     ///   newHeads tracker 独立维护（与 Base/BSC push 链一致）。
@@ -235,8 +237,8 @@ impl<N, P> StateSpaceManager<N, P> {
                 let mut last_activity = Instant::now();
 
                 loop {
-                    // settle：绝对 deadline = 当前块最后一条日志到达 + 10ms。
-                    // 同块事件密集到达时 deadline 随之顺延，末条日志后 10ms
+                    // settle：绝对 deadline = 当前块最后一条日志到达 + 5ms。
+                    // 同块事件密集到达时 deadline 随之顺延，末条日志后 5ms
                     // 必然触发——不受事件到达频率影响。
                     let settle_fut = tokio::time::sleep_until(accum.settle_deadline());
                     tokio::pin!(settle_fut);
@@ -469,8 +471,8 @@ mod tests {
         let mut acc = BlockLogAccumulator::new();
         let t0 = tokio::time::Instant::now();
         acc.feed(10, sample_log(10, 0, 0), t0);
-        // 事件密集（1ms 后同块第二条）：deadline 顺延到第二条 + 10ms，而非固定
-        // “循环起点 + 10ms”（否则密集到达会让 settle 永不触发）。
+        // 事件密集（1ms 后同块第二条）：deadline 顺延到第二条 + settle，而非固定
+        // “循环起点 + settle”（否则密集到达会让 settle 永不触发）。
         let t1 = t0 + Duration::from_millis(1);
         acc.feed(10, sample_log(10, 1, 1), t1);
         let deadline = acc.settle_deadline();
