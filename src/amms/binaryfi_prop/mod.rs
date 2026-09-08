@@ -1464,18 +1464,18 @@ impl BinaryFiPropPool {
             Some(m) => linear.min(m),
             None => linear,
         };
-        // 实时金库零门槛：**封顶后**输出超出当前金库余额 → 链上归零。
-        //  - 饱和型：min(linear, maxOut) > vault → 0（NVDAx 金库被抽干后
-        //    maxOut=1.301e18 > vault≈1.07e12，链上 quote 恒 0，本地不得继续
-        //    按快照 maxOut 报价制造幻影利润）
-        //  - 饱和型且 maxOut ≤ vault：min(linear, maxOut) 正常返回（锚点块
-        //    5 资产实测：linear > vault 但链上仍返回 maxOut）
-        // 金库未知（0）时不门控，与 capped_out 的"余额未知不截断"一致。
-        let vault = self.reserves.get(j).copied().unwrap_or(U256::ZERO);
-        if !vault.is_zero() && capped > vault {
-            U256::ZERO
-        } else {
-            capped
+                // 执行上限以真实金库为准（与 capped_out / sell_zero_over_vault 同一套
+        // vault_known 锚定语义，v1.19.8 只升级了后两者、漏掉此处）：
+        //   - 锚定且余额为 0 = 已空（权威）：任何 0→j 输出 transfer 必然失败 → 恒 0。
+        //     不能只依赖 buy_zero_over_vault（要"成功的大额 probe=0"观测才置位）；
+        //     快照 quote 失败/skip/stale 时，cap 已知的实例会把空金库当"未知"放行
+        //     → 幻影利润（2026-09-08 wAVGOx/wMRVLx/wHOODx 空壳资产事故类）。
+        //   - vault > 0：封顶后输出超金库 → 链上归零（NVDAx 金库被抽干后
+        //     maxOut > vault 时链上 quote 恒 0，本地不得继续按 maxOut 报价）。
+        //   - 未锚定 0 = 未知：不门控（历史兜底，仅启动/重锚前瞬时态）。
+        match self.vault_known(j) {
+            Some(v) if v.is_zero() || capped > v => U256::ZERO,
+            _ => capped,
         }
     }
 
@@ -3479,6 +3479,50 @@ mod tests {
         assert_eq!(pool.vault_known(0), Some(U256::ZERO)); // 锚定后：已空
         assert_eq!(pool.sell_zero_over_vault(u(5)), Some(U256::ZERO)); // 归零
         assert_eq!(pool.capped_out(0, u(5)), U256::ZERO); // 截断为 0
+    }
+
+    /// 锚定空金库 + cap 已知（buy_ladder_remaining>0）：0→j 必须归 0。
+    /// 回归：vault==0 曾按"未知"放行（08-09 buy_capped 早于 v1.19.8 锚定语义），
+    /// 空壳资产（链上 quote=0/R=0/vault=0 但 MM 每块更新价格）会因此报非 0
+    /// 幻影输出 → 链上 swap 照存储价算额、空 vault transfer 必 revert。
+    #[test]
+    fn test_buy_capped_anchored_empty_vault_returns_zero() {
+        let mk = |anchored: bool| {
+            let mut pool = test_pool(2);
+            pool.prices = vec![U256::ZERO, u(100)];
+            pool.ask_offsets = vec![0, 0];
+            pool.bid_offsets = vec![0, 0];
+            pool.spreads = vec![0, 0];
+            pool.price_updated_block = vec![0, 0];
+            pool.buy_disabled = vec![false, false];
+            pool.buy_zero_over_vault = vec![false, false];
+            pool.buy_ladder_remaining = vec![None, Some(u(500_000_000_000_000_000))];
+            pool.reserves = vec![u(1_000_000_000_000_000_000), U256::ZERO];
+            if anchored {
+                let snap = pool.reserves.clone();
+                assert_eq!(
+                    pool.ledger.rebase(&mut pool.reserves, &snap, 100),
+                    LedgerApply::Anchored
+                );
+            }
+            pool
+        };
+        let in_amt = u(1_000_000_000_000_000_000);
+        // 锚定空金库：engine_quote 与 simulate 都必须为 0（执行必失败）
+        let pool = mk(true);
+        assert_eq!(pool.vault_known(1), Some(U256::ZERO));
+        assert_eq!(pool.engine_quote(0, 1, in_amt), Some(U256::ZERO));
+        let out = pool
+            .simulate_swap(pool.assets[0].address, pool.assets[1].address, in_amt)
+            .unwrap();
+        assert_eq!(out, U256::ZERO);
+        // 未锚定 0 = 未知：保留线性兜底（不误杀 cap 未观测的正常池）
+        let pool2 = mk(false);
+        assert_eq!(pool2.vault_known(1), None);
+        let out2 = pool2
+            .simulate_swap(pool2.assets[0].address, pool2.assets[1].address, in_amt)
+            .unwrap();
+        assert!(out2 > U256::ZERO);
     }
 
     /// 序列化跳过 ledger；重启后 ledger 空，首个快照 replay 精确恢复
