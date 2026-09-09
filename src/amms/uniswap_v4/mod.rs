@@ -30,8 +30,10 @@ use uniswap_v3_math::tick_bitmap::next_initialized_tick_within_one_word;
 use uniswap_v3_math::tick_math::{MAX_SQRT_RATIO, MAX_TICK, MIN_SQRT_RATIO, MIN_TICK};
 
 pub mod factory;
+pub mod hooks;
 pub mod lense;
 pub use factory::UniswapV4Factory;
+pub use hooks::V4HookFee;
 
 // Helper structs for simulation
 #[derive(Debug, Clone, Copy)]
@@ -159,6 +161,10 @@ pub struct UniswapV4Pool {
     pub manager_address: Address,
     #[serde(default)]
     pub last_synced_block: u64,
+    /// 白名单 hook 收费建模（默认 None = 零 hook / 未装配模型的 hook 池，
+    /// 后者必须由上层过滤，不得直接参与模拟）。
+    #[serde(default)]
+    pub hook_fee: V4HookFee,
     pub token_a: Token,
     pub token_b: Token,
     pub sqrt_price: U256,
@@ -510,7 +516,10 @@ impl AutomatedMarketMaker for UniswapV4Pool {
             ));
         }
 
-        let amount_in = current_state.amount_calculated.into_raw();
+        let gross_in = current_state.amount_calculated.into_raw();
+        // 白名单 hook 收费建模：exact-output 时 PonsV2/ISP 类 hook 在用户
+        // 支付侧追加比例费用（v4-core：hook delta 落在“非指定侧”= 输入侧）。
+        let amount_in = self.hook_fee.apply_exact_out(zero_for_one, gross_in);
         Ok(amount_in)
     }
 
@@ -897,7 +906,11 @@ impl UniswapV4Pool {
             }
         }
 
-        let amount_out = (-current_state.amount_calculated).into_raw();
+        let gross_out = (-current_state.amount_calculated).into_raw();
+        // 白名单 hook 收费建模：exact-input 时 PonsV2/ISP 类 hook 从用户
+        // 毛输出中按费率扣除（v4-core：hook delta 落在“非指定侧”= 输出侧）；
+        // 池子核心状态仍按无 hook 的 core swap 演化，此处只修正用户净得。
+        let amount_out = self.hook_fee.apply_exact_in(zero_for_one, gross_out);
         Ok((current_state, amount_out))
     }
 
@@ -2635,5 +2648,207 @@ mod test {
         }
 
         Ok(())
+    }
+
+    fn test_v4_pool_with_position() -> UniswapV4Pool {
+        let manager = address!("0000000000000000000000000000000000000abc");
+        let token0 = address!("0000000000000000000000000000000000000001");
+        let token1 = address!("0000000000000000000000000000000000000002");
+        let liquidity_delta = 1_000_000_000_000_000_000i128;
+
+        let key = IPoolManager::PoolKey {
+            currency0: token0,
+            currency1: token1,
+            fee: U24::from(500u64),
+            tickSpacing: I24::try_from(1).unwrap(),
+            hooks: address!("0000000000000000000000000000000000000def"),
+        };
+
+        let mut pool = UniswapV4Pool::new(manager, key);
+        pool.token_a = Token::new_with_decimals(token0, 18);
+        pool.token_b = Token::new_with_decimals(token1, 18);
+        pool.sqrt_price = U256::from(1u128) << 96;
+        pool.tick = 0;
+        pool.liquidity = liquidity_delta as u128;
+        pool.modify_position(-100, 100, liquidity_delta).unwrap();
+        pool.token_a_price = pool.calculate_price(token0, token1).unwrap();
+        pool.token_b_price = pool.calculate_price(token1, token0).unwrap();
+        pool
+    }
+
+    #[test]
+    fn test_hook_fee_exact_in_deducts_gross_output_by_direction() {
+        let amount_in = U256::from(5_000_000_000_000u128); // 0.000005 token
+
+        // zeroForOne（卖 token_a / currency0）：费率 300 bps。
+        let plain = test_v4_pool_with_position();
+        let mut hooked = test_v4_pool_with_position();
+        hooked.hook_fee = V4HookFee::AfterSwapProportional {
+            zero_for_one_bps: vec![300],
+            one_for_zero_bps: vec![100],
+        };
+
+        let gross = plain
+            .simulate_swap(plain.token_a.address, plain.token_b.address, amount_in)
+            .unwrap();
+        let net = hooked
+            .simulate_swap(hooked.token_a.address, hooked.token_b.address, amount_in)
+            .unwrap();
+        let expected = gross - gross * U256::from(300u64) / U256::from(10_000u64);
+        assert_eq!(net, expected);
+
+        // oneForZero（卖 token_b / currency1）：费率 100 bps。
+        let gross_b = plain
+            .simulate_swap(plain.token_b.address, plain.token_a.address, amount_in)
+            .unwrap();
+        let net_b = hooked
+            .simulate_swap(hooked.token_b.address, hooked.token_a.address, amount_in)
+            .unwrap();
+        let expected_b = gross_b - gross_b * U256::from(100u64) / U256::from(10_000u64);
+        assert_eq!(net_b, expected_b);
+    }
+
+    #[test]
+    fn test_hook_fee_exact_in_zero_rate_or_none_is_identity() {
+        let amount_in = U256::from(5_000_000_000_000u128);
+        let plain = test_v4_pool_with_position();
+        let mut hooked_zero = test_v4_pool_with_position();
+        hooked_zero.hook_fee = V4HookFee::AfterSwapProportional {
+            zero_for_one_bps: vec![0],
+            one_for_zero_bps: vec![0],
+        };
+
+        let gross = plain
+            .simulate_swap(plain.token_a.address, plain.token_b.address, amount_in)
+            .unwrap();
+        let net_zero = hooked_zero
+            .simulate_swap(
+                hooked_zero.token_a.address,
+                hooked_zero.token_b.address,
+                amount_in,
+            )
+            .unwrap();
+        assert_eq!(gross, net_zero);
+    }
+
+    #[test]
+    fn test_hook_fee_exact_out_surcharges_gross_input() {
+        let amount_out = U256::from(1_000_000_000_000u128);
+        let plain = test_v4_pool_with_position();
+        let mut hooked = test_v4_pool_with_position();
+        hooked.hook_fee = V4HookFee::AfterSwapProportional {
+            zero_for_one_bps: vec![300],
+            one_for_zero_bps: vec![100],
+        };
+
+        // exact-out：base_token 为用户支付侧。
+        let gross_in = plain
+            .simulate_swap_exact_out(plain.token_a.address, plain.token_b.address, amount_out)
+            .unwrap();
+        let net_in = hooked
+            .simulate_swap_exact_out(hooked.token_a.address, hooked.token_b.address, amount_out)
+            .unwrap();
+        let expected = gross_in + gross_in * U256::from(300u64) / U256::from(10_000u64);
+        assert_eq!(net_in, expected);
+
+        let gross_in_b = plain
+            .simulate_swap_exact_out(plain.token_b.address, plain.token_a.address, amount_out)
+            .unwrap();
+        let net_in_b = hooked
+            .simulate_swap_exact_out(hooked.token_b.address, hooked.token_a.address, amount_out)
+            .unwrap();
+        let expected_b = gross_in_b + gross_in_b * U256::from(100u64) / U256::from(10_000u64);
+        assert_eq!(net_in_b, expected_b);
+    }
+
+    #[test]
+    fn test_hook_fee_does_not_change_pool_state_advance() {
+        let amount_in = U256::from(5_000_000_000_000u128);
+        let mut plain = test_v4_pool_with_position();
+        let mut hooked = test_v4_pool_with_position();
+        hooked.hook_fee = V4HookFee::AfterSwapProportional {
+            zero_for_one_bps: vec![300],
+            one_for_zero_bps: vec![100],
+        };
+
+        plain
+            .simulate_swap_mut(plain.token_a.address, plain.token_b.address, amount_in)
+            .unwrap();
+        hooked
+            .simulate_swap_mut(hooked.token_a.address, hooked.token_b.address, amount_in)
+            .unwrap();
+
+        // hook 只裁剪用户净得；池子核心状态（tick/liquidity/price）与无 hook 完全一致。
+        assert_eq!(plain.tick, hooked.tick);
+        assert_eq!(plain.sqrt_price, hooked.sqrt_price);
+        assert_eq!(plain.liquidity, hooked.liquidity);
+        assert!(
+            plain.token_a_price == hooked.token_a_price
+                || (plain.token_a_price - hooked.token_a_price).abs() < f64::EPSILON
+        );
+    }
+
+    #[test]
+    fn test_v4_hook_fee_serde_roundtrip() {
+        let fee = V4HookFee::AfterSwapProportional {
+            zero_for_one_bps: vec![300],
+            one_for_zero_bps: vec![100],
+        };
+        let json = serde_json::to_string(&fee).unwrap();
+        let back: V4HookFee = serde_json::from_str(&json).unwrap();
+        assert_eq!(fee, back);
+
+        let none_json = serde_json::to_string(&V4HookFee::None).unwrap();
+        assert_eq!(none_json, r#"{"kind":"none"}"#);
+    }
+
+    #[test]
+    fn test_pons_v2_profile_rate_is_per_pool_frozen_and_symmetric() {
+        // PonsV2MemeHook 链上语义：费率按池在 registerPool/毕业瞬间冻结，
+        // r_bps = hookFeeBps(默认100) + creatorTaxBps(创建者设定)，双向同率；
+        // exact-in 落在输出侧（净得 = gross×(10000−r)/10000），
+        // exact-out 落在输入侧（实付 = gross×(10000+r)/10000），均为单次截断。
+        let hook_fee_bps = 100u16;
+        let creator_tax_bps = 200u16;
+        let split_fee = |gross: U256| -> U256 {
+            gross * U256::from(hook_fee_bps) / U256::from(10_000u64)
+                + gross * U256::from(creator_tax_bps) / U256::from(10_000u64)
+        };
+        let fee = V4HookFee::AfterSwapProportional {
+            zero_for_one_bps: vec![hook_fee_bps, creator_tax_bps],
+            one_for_zero_bps: vec![hook_fee_bps, creator_tax_bps],
+        };
+
+        let amount_in = U256::from(12_345_678_912_345u128);
+        let plain = test_v4_pool_with_position();
+        let mut hooked = test_v4_pool_with_position();
+        hooked.hook_fee = fee;
+
+        // exact-in，两个方向费率一致。
+        let gross = plain
+            .simulate_swap(plain.token_a.address, plain.token_b.address, amount_in)
+            .unwrap();
+        let net = hooked
+            .simulate_swap(hooked.token_a.address, hooked.token_b.address, amount_in)
+            .unwrap();
+        assert_eq!(net, gross - split_fee(gross));
+
+        let gross_b = plain
+            .simulate_swap(plain.token_b.address, plain.token_a.address, amount_in)
+            .unwrap();
+        let net_b = hooked
+            .simulate_swap(hooked.token_b.address, hooked.token_a.address, amount_in)
+            .unwrap();
+        assert_eq!(net_b, gross_b - split_fee(gross_b));
+
+        // exact-out：实付 = 毛输入 + 毛输入×r/10000（单次截断），方向无关。
+        let amount_out = U256::from(9_999_999_999u128);
+        let gross_in = plain
+            .simulate_swap_exact_out(plain.token_b.address, plain.token_a.address, amount_out)
+            .unwrap();
+        let pay = hooked
+            .simulate_swap_exact_out(hooked.token_b.address, hooked.token_a.address, amount_out)
+            .unwrap();
+        assert_eq!(pay, gross_in + split_fee(gross_in));
     }
 }

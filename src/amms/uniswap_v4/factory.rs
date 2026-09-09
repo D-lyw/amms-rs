@@ -26,7 +26,7 @@ use crate::amms::uniswap_v4::lense::{
     get_tick_info_slot,
 };
 use crate::amms::uniswap_v4::IPoolManager::{IPoolManagerInstance, PoolKey};
-use crate::amms::uniswap_v4::{IPoolManager, UniswapV4Pool};
+use crate::amms::uniswap_v4::{hooks::V4HookFee, IPoolManager, UniswapV4Pool};
 use crate::amms::Token;
 use uniswap_v3_math::tick_math::{MAX_TICK, MIN_TICK};
 
@@ -809,6 +809,7 @@ impl AutomatedMarketMakerFactory for UniswapV4Factory {
                 hooks: event.hooks,
             },
             pool_id: event.id,
+            hook_fee: V4HookFee::None,
             last_synced_block: 0,
             token_a: Token::new_with_decimals(event.currency0, 0),
             token_b: Token::new_with_decimals(event.currency1, 0),
