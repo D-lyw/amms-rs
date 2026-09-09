@@ -586,14 +586,37 @@ impl CaliberPropPool {
     /// TODO(后续): 暂停类交易（`setPricingMode`/`setLocked`/`setWhitelistOnly`）
     /// 未纳入实时解析，暂停态只能由周期对账刷新（≤45s 滞后）；后续应在
     /// flashblocks 实时流中解析这些交易并实时更新 `ladder.paused`。
-    pub fn apply_batch_update(&mut self, u: &CaliberBatchUpdate, block_number: u64) {
+    /// 报价更新幂等/回补水位判定：事件 (block, tx_index) 是否新于最近一次
+    /// 已应用的 `batchUpdateParameters`（`ladder.price_update_*`）。
+    pub fn accepts_price_update(&self, block_number: u64, tx_index: u64) -> bool {
+        self.ladder.accepts_price_update(block_number, tx_index)
+    }
+
+    /// 快照落地后置报价更新水位（外部确认以块 S 落快照时调用）：S 及更早的
+    /// 更新视为已包含在快照内，之后块号 ≤ S 的实时事件一律跳过（防回卷）。
+    pub fn stamp_price_watermark(&mut self, block_number: u64) {
+        self.ladder.stamp_price_watermark(block_number);
+    }
+
+    pub fn apply_batch_update(&mut self, u: &CaliberBatchUpdate, block_number: u64, tx_index: u64) {
         if u.pair_id != self.pair_id {
+            return;
+        }
+        // 幂等 + 防回卷（2026-09-09 事故 70170894 取证）：以最近一次已应用的
+        // 报价更新 (block, tx_index) 为水位——同一更新重复到达自动跳过；
+        // 实时流漏掉的尾部更新（块号可能早于被后续 swap 推高的
+        // last_synced_block，但新于水位）允许补账。健康路径事件按序到达，
+        // 水位恒新，行为与水位引入前逐位一致。
+        if !self.ladder.accepts_price_update(block_number, tx_index) {
             return;
         }
         self.ladder.field0 = u.price;
         self.ladder.field1 = U256::from(u.flags);
         self.ladder.deadline = u.deadline;
-        self.last_synced_block = block_number;
+        self.ladder.price_update_block = block_number;
+        self.ladder.price_update_tx_index = tx_index;
+        // last_synced_block 只前进不回退（补账场景该值可能已由后续 swap 推高）
+        self.last_synced_block = self.last_synced_block.max(block_number);
         // field0/field1 是现货边际价公式的输入，实时更新后必须立即刷新
         // spot 缓存（否则下游 price filter 会用旧价格直到下一轮对账）。
         self.refresh_prices();
@@ -1223,6 +1246,12 @@ impl AutomatedMarketMaker for CaliberPropPool {
         N: Network,
         P: Provider<N> + Clone,
     {
+        // 显式块号快照：快照已包含该块及更早全部 batchUpdateParameters，
+        // 置报价更新水位，杜绝之后任何 ≤ 该块的旧事件回卷（幂等水位）。
+        let stamp_block = match &block_number {
+            BlockId::Number(alloy::eips::BlockNumberOrTag::Number(n)) => Some(*n),
+            _ => None,
+        };
         let snap = fetch_exact_snapshot(
             &provider,
             self.contract_address,
@@ -1234,6 +1263,9 @@ impl AutomatedMarketMaker for CaliberPropPool {
         .await?;
 
         self.apply_snapshot(snap);
+        if let Some(b) = stamp_block {
+            self.stamp_price_watermark(b);
+        }
 
         Ok(self)
     }
@@ -1946,6 +1978,14 @@ where
         return Ok(flags);
     }
 
+    // 显式块号快照（init/回放场景）快照已包含该块及更早的报价更新，落快照
+    // 后置水位，杜绝之后 ≤ 该块的旧事件回卷；latest 快照的落地块由存储节点
+    // 决定（可能滞后于调用方 head），不置水位（保持低水位保守语义，由实时
+    // 事件与周期对账收敛）。
+    let stamp_block = match &block {
+        BlockId::Number(alloy::eips::BlockNumberOrTag::Number(n)) => Some(*n),
+        _ => None,
+    };
     // 按合约地址分组（正常情况下全部 pool 同属一个 caliber 合约）
     let mut groups: Vec<(Address, Vec<usize>)> = Vec::new();
     for (idx, pool) in pools.iter().enumerate() {
@@ -1986,6 +2026,9 @@ where
             match snap_res {
                 Ok(snap) => {
                     pools[i].apply_snapshot(snap);
+                    if let Some(b) = stamp_block {
+                        pools[i].stamp_price_watermark(b);
+                    }
                     flags[i] = true;
                 }
                 Err(e) => {
@@ -2530,6 +2573,7 @@ mod tests {
                 deadline: now + 3600,
             },
             1,
+            0,
         );
         let revived = pool
             .simulate_swap(
@@ -2769,7 +2813,7 @@ mod tests {
             flags: 283,
             deadline: unix_now() + 3600,
         };
-        pool.apply_batch_update(&update, 12345);
+        pool.apply_batch_update(&update, 12345, 0);
 
         // 期望 = field0 * (1e6 - (x0 + field1)) / 1e15（x0=10, field1=283）
         let expected = 2_000_000_000_000f64 * (1_000_000f64 - 293f64) / 1e15;
@@ -3638,7 +3682,7 @@ mod tests {
             flags: 1155,
             deadline: 1_786_098_592,
         };
-        pool.apply_batch_update(&u, 67_329_558);
+        pool.apply_batch_update(&u, 67_329_558, 0);
         assert_eq!(pool.ladder.field0, U256::from(64_334_999_999u64));
         assert_eq!(pool.ladder.field1, U256::from(1155u64));
         assert_eq!(pool.ladder.deadline, 1_786_098_592);
@@ -3651,10 +3695,60 @@ mod tests {
             flags: 0,
             deadline: 0,
         };
-        pool.apply_batch_update(&other, 99);
+        pool.apply_batch_update(&other, 99, 0);
         assert_eq!(pool.ladder.field0, U256::from(64_334_999_999u64));
         assert_eq!(pool.ladder.field1, U256::from(1155u64));
         assert_eq!(pool.last_synced_block, 67_329_558);
+    }
+
+    #[test]
+    fn test_price_update_watermark_idempotent_and_tail_repair() {
+        // 报价更新幂等/补账语义（2026-09-09 事故 70170894 取证）：
+        // 同一事件重复到达幂等跳过、旧事件不回卷、漏更新的尾部可补账
+        // （块号早于被后续 swap 推高的 last_synced_block 但新于水位）。
+        let mut pool = test_pool_with_ladder();
+        let pair_id = pool.pair_id;
+        let upd = |price: u64| CaliberBatchUpdate {
+            pair_id,
+            price: U256::from(price),
+            flags: 283,
+            deadline: unix_now() + 3600,
+        };
+
+        // 块 100 tx3 落地 → 水位 (100,3)
+        pool.apply_batch_update(&upd(1000), 100, 3);
+        assert_eq!(pool.ladder.field0, U256::from(1000u64));
+        assert_eq!(pool.ladder.price_update_block, 100);
+        assert_eq!(pool.ladder.price_update_tx_index, 3);
+        assert_eq!(pool.last_synced_block, 100);
+
+        // 同一事件重复（实时 + 回补双通道）→ 幂等跳过
+        pool.apply_batch_update(&upd(999), 100, 3);
+        assert_eq!(pool.ladder.field0, U256::from(1000u64));
+
+        // 旧块 90（tx9 < 水位 (100,3)）→ 防回卷跳过
+        pool.apply_batch_update(&upd(500), 90, 9);
+        assert_eq!(pool.ladder.field0, U256::from(1000u64));
+
+        // 模拟后续 swap 事件把 last_synced 推到 200（> 漏更新块号 150）
+        pool.last_synced_block = 200;
+
+        // 漏掉的块 150 tx1（新于水位 (100,3)）→ 允许补账
+        pool.apply_batch_update(&upd(1500), 150, 1);
+        assert_eq!(pool.ladder.field0, U256::from(1500u64));
+        assert_eq!(pool.ladder.price_update_block, 150);
+        assert_eq!(pool.ladder.price_update_tx_index, 1);
+        // last_synced 只前进不回退
+        assert_eq!(pool.last_synced_block, 200);
+
+        // 同块 (150) 更后 tx（tx7）→ 允许（同块 EVM 序后者覆盖前者）
+        pool.apply_batch_update(&upd(1600), 150, 7);
+        assert_eq!(pool.ladder.field0, U256::from(1600u64));
+        assert_eq!(pool.ladder.price_update_tx_index, 7);
+
+        // 同块 (150) 更早 tx（tx5 < tx7）→ 防回卷跳过
+        pool.apply_batch_update(&upd(1400), 150, 5);
+        assert_eq!(pool.ladder.field0, U256::from(1600u64));
     }
 
     #[test]

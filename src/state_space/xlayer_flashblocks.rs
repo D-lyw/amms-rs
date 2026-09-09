@@ -51,7 +51,7 @@ use std::time::Instant;
 use tokio::sync::{Mutex, Notify, RwLock};
 use tokio::time::sleep;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 // ─────────────────────────────────────────────
 // Constants
@@ -513,23 +513,65 @@ fn extract_logs_from_xlayer_flashblock(
                 // 第二步：receipt status 校验——仅应用链上确认成功的更新。
                 // metadata.receipts 以 tx hash 为键，raw 交易字节的 keccak256
                 // 即为 tx hash（与懒排序修正同一约定）。
-                let confirmed = fb
+                // 可观测性（2026-09-09 事故 70170894 取证）：caliber 更新零事件、
+                // 实时流 fire-once，任何丢弃点都必须在日志中留痕，否则漏更新
+                // 无法定位。回滚（status=0x0）为合法失败低频 debug；receipt
+                // 缺失/未确认与解码失败属异常路径 warn。
+                let tx_hash = alloy::primitives::keccak256(&raw);
+                let receipt = fb
                     .metadata
                     .as_ref()
-                    .and_then(|m| {
-                        m.receipts
-                            .get(&format!("{:#x}", alloy::primitives::keccak256(&raw)))
-                    })
-                    .and_then(parse_receipt_status)
-                    .unwrap_or(false);
-                if !confirmed {
-                    continue;
+                    .and_then(|m| m.receipts.get(&format!("{tx_hash:#x}")));
+                match receipt.and_then(parse_receipt_status) {
+                    Some(true) => {}
+                    Some(false) => {
+                        debug!(
+                            payload = %fb.payload_id,
+                            index = fb.index,
+                            block = ?block_number,
+                            tx = %format!("{tx_hash:#x}"),
+                            contract = %to,
+                            "caliber batchUpdateParameters reverted on-chain (status=0x0); update skipped"
+                        );
+                        continue;
+                    }
+                    None => {
+                        // receipt 缺失/status 缺失：本帧无该交易确认结果。
+                        // 实时流实测 tx 与 receipt 同帧共现（1270/1270 零例外），
+                        // 此处触发即异常（帧异常/重连窗口），且被丢弃后没有任何
+                        // 回补通道（backfill 日志型、全量快照 ≥30s）——必须告警。
+                        warn!(
+                            payload = %fb.payload_id,
+                            index = fb.index,
+                            block = ?block_number,
+                            tx = %format!("{tx_hash:#x}"),
+                            contract = %to,
+                            "caliber batchUpdateParameters receipt missing/unconfirmed in frame; update dropped (no replay path until 30s+ snapshot)"
+                        );
+                        continue;
+                    }
                 }
                 // 第三步：命中后才取 calldata（完整 RLP 解码 + 拷贝）
                 let Some(input) = extract_input_from_raw_tx(&raw) else {
+                    warn!(
+                        payload = %fb.payload_id,
+                        index = fb.index,
+                        block = ?block_number,
+                        tx = %format!("{tx_hash:#x}"),
+                        contract = %to,
+                        "caliber batchUpdateParameters raw tx RLP decode failed; update dropped"
+                    );
                     continue;
                 };
                 let Some(updates) = decode_batch_update_parameters(&input) else {
+                    warn!(
+                        payload = %fb.payload_id,
+                        index = fb.index,
+                        block = ?block_number,
+                        tx = %format!("{tx_hash:#x}"),
+                        contract = %to,
+                        "caliber batchUpdateParameters ABI decode failed; update dropped"
+                    );
                     continue;
                 };
                 // diff.transactions 数组下标 + tx_base = 块内全局 tx_index
@@ -1090,6 +1132,9 @@ impl<N, P> StateSpaceManager<N, P> {
                     };
 
                     let Some(fb) = fb else {
+                        warn!(
+                            "Xlayer flashblocks message parse failed; frame dropped                              (caliber batchUpdateParameters in this frame, if any, is unrecoverable)"
+                        );
                         continue;
                     };
 

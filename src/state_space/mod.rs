@@ -3199,11 +3199,17 @@ impl StateSpace {
             let AMM::CaliberPropPool(pool) = amm else {
                 continue;
             };
-            // 幂等保护：与 sync() 相同语义，禁止回卷池子状态
-            if block_num < pool.last_synced_block() {
+            // 幂等/回补语义（2026-09-09 事故 70170894 取证）：事件块号落后于
+            // last_synced_block（可能被后续 swap 事件推高）时，仅当该事件
+            // 新于最近一次已应用的报价更新水位才允许补账——实时流漏掉的
+            // 尾部 batchUpdate 因此可被后续重投/回补应用；其余旧事件一律
+            // 跳过（防回卷）。池子内部水位保证同一事件重复到达幂等。
+            if block_num < pool.last_synced_block()
+                && !pool.accepts_price_update(block_num, event.tx_index)
+            {
                 continue;
             }
-            pool.apply_batch_update(&event.update, block_num);
+            pool.apply_batch_update(&event.update, block_num, event.tx_index);
             affected_set.insert(virtual_address);
         }
         affected_set.into_iter().collect()
@@ -3906,6 +3912,103 @@ mod tests {
         let stale = mk_event(pair_id, 3, 300, 30);
         let affected = state.apply_caliber_updates(&[stale], 67_329_557);
         assert!(affected.is_empty());
+    }
+
+    #[test]
+    fn caliber_updates_missed_tail_repair_and_no_regression() {
+        // 复刻 2026-09-09 事故（块 70170894 漏更新）语义：实时流漏掉块 B 的
+        // batchUpdateParameters，期间同 pair 后续 swap 事件把 last_synced_block
+        // 推到 B 之后。水位语义应允许该漏更新补账（块号 < last_synced 但
+        // (block, tx_index) 新于最近一次已应用报价更新），同时旧事件不回卷、
+        // 重复事件幂等跳过。
+        use crate::amms::caliber_prop::{CaliberBatchUpdate, CaliberPropPool, CaliberSwapEvent};
+        use crate::amms::Token;
+
+        let contract: Address = "0x154586b2479b9a11e3d4db90024dc0e26f097312"
+            .parse()
+            .unwrap();
+        let pair_id = B256::from([0x11u8; 32]);
+        let virtual_address = CaliberPropPool::virtual_address_from_pair_id(pair_id, contract);
+        let token_x = Address::from([0x01u8; 20]);
+        let token_y = Address::from([0x02u8; 20]);
+
+        let mut state = StateSpace::default();
+        state.insert_amm(AMM::CaliberPropPool(CaliberPropPool {
+            contract_address: contract,
+            pair_id,
+            virtual_address,
+            token_x,
+            token_y,
+            token_a: Token::new_with_decimals(token_x, 18),
+            token_b: Token::new_with_decimals(token_y, 6),
+            created_block: 0,
+            last_synced_block: 0,
+            reserve_a: U256::from(1_000_000),
+            reserve_b: U256::from(2_000_000),
+            ladder: Default::default(),
+            price_a_in_b: 1.0,
+            price_b_in_a: 1.0,
+        }));
+
+        let mk_update = |tx_index: u64, price: u64| CaliberTxEvent {
+            contract,
+            tx_index,
+            update: CaliberBatchUpdate {
+                pair_id,
+                price: U256::from(price),
+                flags: 1,
+                deadline: 1_786_098_592,
+            },
+        };
+        fn field0_of(state: &StateSpace, addr: Address) -> U256 {
+            match state.get(&addr).unwrap() {
+                AMM::CaliberPropPool(p) => p.ladder.field0,
+                _ => unreachable!(),
+            }
+        }
+        fn last_synced_of(state: &StateSpace, addr: Address) -> u64 {
+            match state.get(&addr).unwrap() {
+                AMM::CaliberPropPool(p) => p.last_synced_block,
+                _ => unreachable!(),
+            }
+        }
+
+        // 1) 块 100 tx3 更新落地 → 水位 (100, 3)、last_synced=100
+        let affected = state.apply_caliber_updates(&[mk_update(3, 1000)], 100);
+        assert_eq!(affected, vec![virtual_address]);
+        assert_eq!(field0_of(&state, virtual_address), U256::from(1000u64));
+        assert_eq!(last_synced_of(&state, virtual_address), 100);
+
+        // 2) 块 200 的 swap 事件把 last_synced 推到 200（> 漏更新的块号 150）
+        let swap = CaliberSwapEvent {
+            contract,
+            tx_index: 1,
+            pair_id,
+            token_in: token_x,
+            token_out: token_y,
+            amount_in: U256::from(10u64),
+            amount_out: U256::from(5u64),
+        };
+        let affected = state.apply_caliber_swaps(&[swap], 200);
+        assert_eq!(affected, vec![virtual_address]);
+        assert_eq!(last_synced_of(&state, virtual_address), 200);
+
+        // 3) 旧块 90（tx9，早于水位 (100,3)）→ 防回卷跳过
+        let affected = state.apply_caliber_updates(&[mk_update(9, 500)], 90);
+        assert!(affected.is_empty());
+        assert_eq!(field0_of(&state, virtual_address), U256::from(1000u64));
+
+        // 4) 漏更新的块 150 tx1（新于水位 (100,3)）→ 允许补账
+        let affected = state.apply_caliber_updates(&[mk_update(1, 1500)], 150);
+        assert_eq!(affected, vec![virtual_address]);
+        assert_eq!(field0_of(&state, virtual_address), U256::from(1500u64));
+        // last_synced 只前进不回退
+        assert_eq!(last_synced_of(&state, virtual_address), 200);
+
+        // 5) 同一事件重复（实时 + 回补双通道）→ 水位相等幂等跳过
+        let affected = state.apply_caliber_updates(&[mk_update(1, 1500)], 150);
+        assert!(affected.is_empty());
+        assert_eq!(field0_of(&state, virtual_address), U256::from(1500u64));
     }
 
     #[test]

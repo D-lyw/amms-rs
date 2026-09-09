@@ -445,6 +445,8 @@ impl Default for super::types::CaliberLadderState {
             deadline: 0,
             validity_window: 0,
             paused: false,
+            price_update_block: 0,
+            price_update_tx_index: 0,
         }
     }
 }

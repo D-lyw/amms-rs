@@ -89,6 +89,21 @@ pub struct CaliberLadderState {
     /// 实时更新本字段，消除暂停滞后窗口。
     #[serde(default)]
     pub paused: bool,
+    /// 最近一次已应用的 `batchUpdateParameters` 报价更新的块内定位
+    /// `(block_number, tx_index)` 水位。`field0/field1/deadline` 由快照或
+    /// 更新交易写入，本水位用于区分“已包含在快照 / 已应用”与“实时流漏掉、
+    /// 待规范链回补的尾部更新”：
+    /// - 快照在块 S 落地后水位置 (S, u64::MAX)（S 及更早的更新视为已包含，
+    ///   由 `stamp_price_watermark` 置位，仅在外部确实以块 S 落快照时调用）；
+    /// - 实时更新仅当 (block, tx_index) 严格新于水位才应用
+    ///   （`accepts_price_update`），应用后水位推进——同一更新经实时与回补
+    ///   双通道重复到达时天然幂等；
+    /// - 允许对“尾部漏更新”补账：更新块号可早于 pool 的 `last_synced_block`
+    ///   （该字段被后续 swap 事件推高），只要它新于最近一次已应用的报价更新。
+    #[serde(default)]
+    pub price_update_block: u64,
+    #[serde(default)]
+    pub price_update_tx_index: u64,
 }
 
 impl CaliberLadderState {
@@ -97,6 +112,21 @@ impl CaliberLadderState {
     /// 本地报价路径必须在每次报价时校验，避免已过期 pair 产生"幻影利润"上链回滚。
     pub fn is_unquotable(&self, now: u64) -> bool {
         self.paused || now > self.deadline.saturating_add(self.validity_window)
+    }
+
+    /// 是否应接受来自 (block, tx_index) 的 `batchUpdateParameters` 报价更新。
+    pub fn accepts_price_update(&self, block: u64, tx_index: u64) -> bool {
+        block > self.price_update_block
+            || (block == self.price_update_block && tx_index > self.price_update_tx_index)
+    }
+
+    /// 快照落地后置水位：以块 S 落地的快照已包含 S 及更早的全部报价更新，
+    /// 之后块号 ≤ S 的旧更新一律跳过（防回卷）。
+    pub fn stamp_price_watermark(&mut self, block: u64) {
+        if block >= self.price_update_block {
+            self.price_update_block = block;
+            self.price_update_tx_index = u64::MAX;
+        }
     }
 }
 
