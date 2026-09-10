@@ -810,15 +810,23 @@ impl AutomatedMarketMaker for ElfomoFiPropPool {
             let to_token = Address::from_word(B256::from_slice(&data[96..128]));
             let amount_in = U256::from_be_slice(&data[128..160]);
             let amount_out = U256::from_be_slice(&data[160..192]);
+            // 金库是成交的双向对手方（链上 10 块逐笔实证）：账户给出什么金库就
+            // 收进什么，账户收到什么金库就付出什么。
+            //   x→y：vault_xeth += amount_in, vault_usdt0 -= amount_out
+            //   y→x：vault_usdt0 += amount_in, vault_xeth -= amount_out
+            // orderbook 是 (seed, vault) 的读时纯函数：余额更新后整本自动重算。
+            // （consume_* 的结果会被 refresh_levels 按金库重建并清空，有效账本
+            //   只有 seed + 两个 vault 余额。）
             if from_token == self.token_x && to_token == self.token_y {
                 self.consume_from_to(amount_in);
+                self.levels.vault_xeth = self.levels.vault_xeth.saturating_add(amount_in);
                 self.levels.vault_usdt0 = self.levels.vault_usdt0.saturating_sub(amount_out);
-                // orderbook 是 (seed, vault) 的读时函数：金库递减后档位自动缩放
                 self.refresh_levels();
                 return Ok(SyncAction::None);
             }
             if from_token == self.token_y && to_token == self.token_x {
                 self.consume_to_from(amount_out);
+                self.levels.vault_usdt0 = self.levels.vault_usdt0.saturating_add(amount_in);
                 self.levels.vault_xeth = self.levels.vault_xeth.saturating_sub(amount_out);
                 self.refresh_levels();
                 return Ok(SyncAction::None);
@@ -932,11 +940,14 @@ impl AutomatedMarketMaker for ElfomoFiPropPool {
         if out.is_zero() {
             return Ok(out);
         }
+        // 与 sync() 同一金库账本契约：金库是对手方，双向记账。
         if token_in == self.token_x && token_out == self.token_y {
             self.consume_from_to(amount_in);
+            self.levels.vault_xeth = self.levels.vault_xeth.saturating_add(amount_in);
             self.levels.vault_usdt0 = self.levels.vault_usdt0.saturating_sub(out);
         } else if token_in == self.token_y && token_out == self.token_x {
             self.consume_to_from(out);
+            self.levels.vault_usdt0 = self.levels.vault_usdt0.saturating_add(amount_in);
             self.levels.vault_xeth = self.levels.vault_xeth.saturating_sub(out);
         }
         self.refresh_levels();
@@ -1407,9 +1418,11 @@ mod tests {
         .unwrap();
 
         assert!(matches!(pool.sync(&trade_log).unwrap(), SyncAction::None));
-        // 金库 USDT0 按成交额扣减；orderbook 是 (seed, vault) 读时函数，
-        // 事件后缓存已重建（本笔成交量小，首档仍满 0.6e18，报价不变）
+        // 金库双向记账：xETH 收进 amount_in、USDT0 付出 out；orderbook 是
+        // (seed, vault) 读时函数，事件后缓存已重建
+        //（本笔成交量小，首档仍满 0.6e18，报价不变）
         assert_eq!(pool.levels.vault_usdt0, s.vault_usdt0 - out);
+        assert_eq!(pool.levels.vault_xeth, s.vault_xeth + amount_in);
         assert_eq!(pool.levels.from_to_levels[0].size, s.from_to_levels[0].size);
         let out_again = pool
             .simulate_swap(ELFOMO_XETH_ADDRESS, ELFOMO_USDT0_ADDRESS, amount_in)
@@ -1590,7 +1603,12 @@ mod tests {
         }))
         .unwrap();
         assert!(matches!(pool.sync(&trade_log).unwrap(), SyncAction::None));
-        // 金库 xETH 按实际输出扣减；toFrom 档位随余额收缩后 s1+s2+s3 == vault
+        // 金库双向记账：USDT0 收进实际输入、xETH 按实际输出扣减；
+        // toFrom 档位随余额收缩后 s1+s2+s3 == vault
+        assert_eq!(
+            pool.levels.vault_usdt0,
+            s.vault_usdt0 + U256::from(300_000_000u64)
+        );
         assert_eq!(pool.levels.vault_xeth, s.vault_xeth - amount_out);
         let sum: U256 = pool.levels.to_from_levels.iter().map(|lv| lv.size).sum();
         assert_eq!(sum, pool.levels.vault_xeth);

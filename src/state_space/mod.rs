@@ -2860,6 +2860,33 @@ impl StateSpace {
             .collect()
     }
 
+    /// 解析 ElfomoFi `ElfomoTrade` 命中的池子地址集合。
+    ///
+    /// `ElfomoTrade` 由 Router emit，而 StateSpace 的 key 是 Pool 地址，
+    /// 通用分发链的 `direct_hit` 必然落空（历史上该事件在此被静默丢弃，
+    /// 导致 Router 侧的金库记账分支从未执行）。这里按实例 `router_address`
+    /// 反查命中池子；topic0 前置门控，非 ElfomoTrade 事件零成本返回 None。
+    fn resolve_elfomo_targets(
+        &self,
+        log_address: Address,
+        topics: &[FixedBytes<32>],
+    ) -> Option<Vec<Address>> {
+        use crate::amms::elfomo_prop::ELFOMO_TRADE_EVENT;
+
+        if topics.first() != Some(&ELFOMO_TRADE_EVENT) {
+            return None;
+        }
+        let targets: Vec<Address> = self
+            .state
+            .iter()
+            .filter_map(|(key, amm)| match amm.as_ref() {
+                AMM::ElfomoFiPropPool(p) if p.router_address == log_address => Some(*key),
+                _ => None,
+            })
+            .collect();
+        (!targets.is_empty()).then_some(targets)
+    }
+
     /// 解析 BinaryFi 事件（Swap / Update）命中的虚拟子池地址集合。
     ///
     /// 虚拟化后 StateSpace 中不再有真实地址 key：Swap 事件（topics[2]/topics[3] 为
@@ -3062,6 +3089,10 @@ impl StateSpace {
                     if self.state.contains_key(&pool_address) {
                         target_addresses.push(pool_address);
                     }
+                } else if let Some(elfomo_targets) =
+                    self.resolve_elfomo_targets(address, log.topics())
+                {
+                    target_addresses.extend(elfomo_targets);
                 } else if let Some(binaryfi_targets) =
                     self.resolve_binaryfi_targets(address, log.topics())
                 {
@@ -3576,6 +3607,101 @@ mod tests {
         assert!(state
             .resolve_algebra_plugin_event_pools(plugin, &topics)
             .is_empty());
+    }
+
+    #[test]
+    fn elfomo_trade_event_routes_from_router_to_pool() {
+        use crate::amms::elfomo_prop::{
+            ElfomoFiPropPool, ELFOMO_ROUTER_ADDRESS, ELFOMO_TRADE_EVENT, ELFOMO_UPDATE_EVENT,
+            ELFOMO_USDT0_ADDRESS, ELFOMO_XETH_ADDRESS,
+        };
+        use crate::amms::Token;
+
+        let other_router = address!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        let pool1 = address!("1111111111111111111111111111111111111111");
+        let pool2 = address!("2222222222222222222222222222222222222222");
+        let pool_other = address!("3333333333333333333333333333333333333333");
+
+        let mk = |pool: Address, router: Address| {
+            let mut p = ElfomoFiPropPool::default();
+            p.pool_address = pool;
+            p.router_address = router;
+            p.tokens = vec![
+                Token::new_with_decimals(ELFOMO_XETH_ADDRESS, 18),
+                Token::new_with_decimals(ELFOMO_USDT0_ADDRESS, 6),
+            ];
+            // 真实水位：refresh_levels 在零种子/零余额下会除零
+            p.price_seed = U256::from(0x143c60fu64);
+            p.levels.price_seed = p.price_seed;
+            p.levels.vault_usdt0 = U256::from(19_192_415_254u64);
+            p.levels.vault_xeth = U256::from(2_940_462_501_000_862_186u128);
+            p
+        };
+
+        let mut state = StateSpace::default();
+        state.insert_amm(AMM::ElfomoFiPropPool(mk(pool1, ELFOMO_ROUTER_ADDRESS)));
+        state.insert_amm(AMM::ElfomoFiPropPool(mk(pool2, ELFOMO_ROUTER_ADDRESS)));
+        state.insert_amm(AMM::ElfomoFiPropPool(mk(pool_other, other_router)));
+
+        // 解析层：ElfomoTrade（Router emit）按 router_address 反查池子
+        let topics = vec![ELFOMO_TRADE_EVENT, B256::from(U256::from(1u64))];
+        let mut routed = state
+            .resolve_elfomo_targets(ELFOMO_ROUTER_ADDRESS, &topics)
+            .expect("ElfomoTrade must route from router to its pools");
+        routed.sort_unstable();
+        assert_eq!(routed, vec![pool1, pool2]);
+        // 非 ElfomoTrade topic → 不路由
+        assert!(state
+            .resolve_elfomo_targets(ELFOMO_ROUTER_ADDRESS, &[ELFOMO_UPDATE_EVENT])
+            .is_none());
+        assert!(state
+            .resolve_elfomo_targets(ELFOMO_ROUTER_ADDRESS, &[B256::ZERO])
+            .is_none());
+
+        // 端到端：Router 日志必须真正落到池子上并双向记账金库
+        let amount_in = U256::from(300_000_000u64); // USDT0 实际输入
+        let amount_out = U256::from(100_000_000_000_000_000u128); // xETH 实际输出
+        let mut data = Vec::new();
+        for w in [
+            U256::from(0x1234u64), // executor
+            U256::from(0x5678u64), // receiver
+            ELFOMO_USDT0_ADDRESS.into_word().into(),
+            ELFOMO_XETH_ADDRESS.into_word().into(),
+            amount_in,
+            amount_out,
+        ] {
+            data.extend_from_slice(&w.to_be_bytes::<32>());
+        }
+        let trade_log: Log = serde_json::from_value(serde_json::json!({
+            "address": format!("{:#x}", ELFOMO_ROUTER_ADDRESS),
+            "topics": [
+                format!("{:#x}", ELFOMO_TRADE_EVENT),
+                format!("0x{:064x}", 1u64),
+                format!("0x{:064x}", 0u64),
+            ],
+            "data": format!("0x{}", alloy::hex::encode(&data)),
+            "blockNumber": "0x423b0c9",
+            "transactionIndex": "0x0",
+            "logIndex": "0x0",
+        }))
+        .unwrap();
+
+        let (affected, _, _) = state.sync(&[trade_log]).expect("sync must succeed");
+        assert!(
+            affected.contains(&pool1),
+            "router-emitted ElfomoTrade must reach the pool (was silently dropped)"
+        );
+        let AMM::ElfomoFiPropPool(p1) = state.get(&pool1).unwrap() else {
+            panic!("pool1 must stay ElfomoFiProp");
+        };
+        assert_eq!(
+            p1.levels.vault_usdt0,
+            U256::from(19_192_415_254u64) + amount_in
+        );
+        assert_eq!(
+            p1.levels.vault_xeth,
+            U256::from(2_940_462_501_000_862_186u128) - amount_out
+        );
     }
 
     #[test]
