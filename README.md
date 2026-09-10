@@ -6,6 +6,11 @@ Implements fully-replicated swap calculation logic for each supported protocol. 
 
 > **Attribution**: Forked and extensively extended from [darkforestry/amms-rs](https://github.com/darkforestry/amms-rs).
 
+> **先读（AI / 新同学）**：`docs/dynamic_state_sync_principles.md` —— 本库状态同步的
+> **主线设计与原则**（实时事件通道 vs 异步 RPC 快照的职责、合并语义、水位/守卫的正确用法
+> 与反模式、零事件池子的特殊性、踩坑索引）。任何涉及快照 / Resync / `last_synced_block`
+> 的改动前必读；速览见 `AGENTS.md`。
+
 ---
 
 ## Key Features
