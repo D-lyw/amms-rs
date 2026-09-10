@@ -219,6 +219,7 @@ impl DiscoverySync for CaliberPropFactory {
                     reserve_a: U256::ZERO,
                     reserve_b: U256::ZERO,
                     ladder: Default::default(),
+                    swap_ledger: Default::default(),
                     price_a_in_b: 0.0,
                     price_b_in_a: 0.0,
                 };
@@ -343,7 +344,11 @@ where
 
     // 2. 批量初始化：一次 JSON-RPC batch 读取全部储备 + Ladder + 精确报价参数
     //    （每个 pair 的固定槽位 + ladder 槽位折叠进 batch，失败 pool 保持骨架被过滤）
-    let flags = super::batch_refresh_snapshots::<N, P>(&provider, &mut pools, block_number).await?;
+    //
+    //    快照块号必须显式（rebase 合并数学的自变量）：调用方给 `latest` 等
+    //    模糊块时钉到存储节点 canonical head。
+    let snap_block = super::resolve_snapshot_block(block_number).await?;
+    let flags = super::batch_refresh_snapshots::<N, P>(&provider, &mut pools, snap_block).await?;
 
     let initialized = pools
         .into_iter()
@@ -442,6 +447,7 @@ impl Default for super::types::CaliberLadderState {
             scale: U256::ZERO,
             pos_reverse: U256::ZERO,
             pos_forward: U256::ZERO,
+            pos_block: 0,
             deadline: 0,
             validity_window: 0,
             paused: false,
@@ -478,6 +484,7 @@ impl Default for CaliberPropPool {
             reserve_a: U256::ZERO,
             reserve_b: U256::ZERO,
             ladder: Default::default(),
+            swap_ledger: Default::default(),
             price_a_in_b: 0.0,
             price_b_in_a: 0.0,
         }

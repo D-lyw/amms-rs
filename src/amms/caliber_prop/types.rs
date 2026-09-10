@@ -68,6 +68,17 @@ pub struct CaliberLadderState {
     /// `quote_forward_pos_exact` 直接使用。
     #[serde(default)]
     pub pos_forward: U256,
+    /// `cfg+7` 当前位置所属的区块号（= 最近一次写入 pos 的 swap 所在块）。
+    ///
+    /// 链上 `cfg+7` 是**块门控**的：报价时若 `cfg+7.block != 当前块`，
+    /// 合约按 pos=0（整段）计算；每次 swap 写入时若块号变化则先清零两个
+    /// 方向的位置再累加（2026-09-10 实测：块 70255494 的 low96 =
+    /// 3,848,934,873 == 当块 3 笔 `amountOut` 之和，**未包含**上一块
+    /// 70255481 的 1,406,848,718）。本地用本字段复刻该语义，
+    /// 避免 pos 跨块无限累加（旧实现 `pos_forward += amount_out` 无条件累加，
+    /// 与链上不一致）。
+    #[serde(default)]
+    pub pos_block: u64,
     /// 报价过期时间戳（完整 64 位 deadline = `(tsY << 32) | tsX`，data+0 槽
     /// bits 96..160）。`batchUpdateParameters` 更新写入时 tsY 置 0，故该路径下
     /// deadline 即更新交易的 deadline 参数；快照路径保留完整 64 位，tsY 非零时

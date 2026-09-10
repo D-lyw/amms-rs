@@ -16,6 +16,31 @@
 //! - **本地 Swap 模拟**: 用 `quote_forward_exact` / `quote_reverse_exact` 精确复刻链上
 //!   `quote()` 的 EVM uint256 运算（含 fee 扣减、pos 分段消费、储备封顶），`simulate_swap` 逐位一致。
 //!
+//! ## 状态同步契约（改动本模块前必读）
+//!
+//! 报价公式本身没有问题；出过错的全是**数据同步**。本地池子状态同时被
+//! 4 条写入路径触碰（flashblocks `apply_batch_update` / `apply_chain_swap`、
+//! 周期对账 `batch_refresh_snapshots`、maintenance Resync/AsyncUpdate），
+//! 字段的"正确落地语义"按类别分三种，**不能一律无条件赋值**：
+//!
+//! | 类别 | 字段 | 落地语义 |
+//! |---|---|---|
+//! | **A. 纯累积量** | `reserve_a/b`、`pos_forward/reverse` | 事件只在当前值上增减、从不写真值；唯一写真值的快照又滞后且串行慢取 → 交给 [`ledger::CaliberSwapLedger`] 做 `快照(S) + Σ(块 > S 事件)` rebase-merge，**绝不无条件覆盖** |
+//! | **B. 最新值** | `field0`、`field1`、`deadline` | 字段级水位保鲜：已有不早于快照块的实时更新落地（`ladder.price_update_*`）时快照不得覆盖；否则落地并把水位置到 `(snap_block, MAX)` |
+//! | **C. 快照独有** | ladder 曲线、`fee_rate`、`window`、`scale`、`validity_window`、`paused` | 实时流不可观测，直接覆盖（前提：快照块号必须**显式钉死**） |
+//!
+//! 三条铁律：
+//! 1. **快照块号必须显式**（`caliber_storage_head()`），禁止 `BlockId::latest()`——
+//!    合并数学的自变量就是它，隐式块会让"储备读到的块"与"ladder 读到的块"漂移。
+//! 2. **RPC 在锁外、落地在锁内**：写入前必须基于写锁内的 current existing 合并，
+//!    不能把 Phase-1 克隆整只覆盖（否则丢弃窗口内到达的实时事件）。
+//! 3. **新增写 `reserve_*` / `pos_*` 的路径时必须同步 `swap_ledger.record_swap`**，
+//!    否则 rebase 会引入偏差。`consumed_*` 是纯模拟状态，不进账本。
+//!
+//! 事故与取证：`docs/2026-08-08_caliber_stale_quote_report.md`、
+//! `docs/2026-08-09_caliber_flashblock_reverted_update_drift_report.md`、
+//! `docs/2026-08-11_caliber_flashblock_swap_consumption_sync_requirement.md`。
+//!
 //! ## 已知合约地址
 //!
 //! | 链 | 合约 | 状态 |
@@ -52,6 +77,7 @@
 //! - Kyber 集成: `KyberNetwork/kyberswap-dex-lib/pkg/liquidity-source/caliberprop/`
 
 pub mod factory;
+pub mod ledger;
 pub mod types;
 
 use alloy::{
@@ -74,6 +100,7 @@ use crate::amms::{
     Token,
 };
 
+use self::ledger::{to_i128, CaliberSwapLedger, LedgerApply};
 use self::types::{CaliberLadderState, LadderPoint};
 use ICaliberPropAMM::BatchUpdateParameters;
 
@@ -453,6 +480,17 @@ pub struct CaliberPropPool {
     pub reserve_b: U256,
     /// Ladder 快照 + 消费追踪
     pub ladder: CaliberLadderState,
+    /// reserves / pos 的事件净变化账本（快照 rebase-merge 用）。
+    ///
+    /// `reserve_*` / `pos_*` 是**纯累积量**：`Swap` 事件只在当前值上增减、
+    /// 从不写真值，唯一写真值的快照块又滞后 flashblock 乐观头 1~2 块且是
+    /// 串行 HTTP 拉取（窗口十几秒）。快照若无条件覆盖，就会把事件账本已推进
+    /// 的最新值打回旧值，后续事件再在错误基线上继续累积——这正是
+    /// 2026-09-10 幻影报价事故（pair `0x5dda42ef…` USDT0 储备被按
+    /// `>= 5,255.86` 报价，链上真值 `3,849.02`）的根因。
+    /// 语义与实现见 [`ledger::CaliberSwapLedger`]。
+    #[serde(default)]
+    pub swap_ledger: CaliberSwapLedger,
     /// Token A 以 Token B 计价的缓存现货价
     pub price_a_in_b: f64,
     /// Token B 以 Token A 计价的缓存现货价
@@ -640,6 +678,12 @@ impl CaliberPropPool {
         if swap.pair_id != self.pair_id {
             return;
         }
+        // 快照已锚定到块 A：块 ≤ A 的 swap 已包含在该快照内（`eth_getStorageAt`
+        // 读的是块末状态），再应用一次就是双计。快照 RPC 在锁外拉取、慢十几秒，
+        // 「快照落地」与「同块实时事件到达」并发是必经窗口，必须显式挡住。
+        if block_number <= self.swap_ledger.anchor_block() {
+            return;
+        }
         let forward = swap.token_in == self.token_x;
         // 输入侧储备增量 = "ladder 一致输入"（2026-08-11 块 67650064 取证）：
         // 输出未被限制（amount_out == quote(amount_in)）时链上按事件 amountIn
@@ -648,21 +692,35 @@ impl CaliberPropPool {
         // 部分停留在合约余额、不记入 pair 储备（tx#22：事件 amountIn=526e15，
         // 链上仅入账 87.35e15）。用 `ladder_input_for_output` 复刻。
         let input_consumed = self.ladder_input_for_output(swap, forward);
+        let in_consumed = to_i128(input_consumed);
         // 储备按 token_a/token_b 映射（虚拟池子视角，与 simulate_swap_mut
         // 同一约定）：token_in == token_a → reserve_a += input_consumed /
         // reserve_b -= out；token_in == token_b → 反之。输出侧始终按事件
-        // amountOut 全额扣减（链上 cfg+4/5 与事件输出逐位一致）。
-        // 方向（forward/reverse）只决定 pos 字段。
-        match self.get_token_index(swap.token_in) {
+        // amountOut 扣减（链上 cfg+4/5 与事件输出逐位一致），但账本必须记
+        // **实际扣减量**（`saturating_sub` 可能截断），否则 rebase 会带偏差。
+        let (d_reserve_a, d_reserve_b) = match self.get_token_index(swap.token_in) {
             0 => {
                 self.reserve_a += input_consumed;
+                let before = self.reserve_b;
                 self.reserve_b = self.reserve_b.saturating_sub(swap.amount_out);
+                (in_consumed, -to_i128(before - self.reserve_b))
             }
             1 => {
                 self.reserve_b += input_consumed;
+                let before = self.reserve_a;
                 self.reserve_a = self.reserve_a.saturating_sub(swap.amount_out);
+                (-to_i128(before - self.reserve_a), in_consumed)
             }
             _ => return, // token 不在 pair 内 → 静默忽略（fail-safe）
+        };
+        // `cfg+7` 是**块门控**的：块号变化时链上先清零两个方向再累加
+        // （2026-09-10 实测：块 70255494 的 low96 == 当块 3 笔 amountOut 之和，
+        // **未包含**上一块 70255481 的 1,406,848,718）。本地必须复刻，
+        // 否则 pos 跨块无限累加，`quote_forward_pos_exact` 输入与链上不一致。
+        if self.ladder.pos_block != block_number {
+            self.ladder.pos_forward = U256::ZERO;
+            self.ladder.pos_reverse = U256::ZERO;
+            self.ladder.pos_block = block_number;
         }
         if forward {
             // 正向 swap：low96 累计 +out，mid96 归零（链上方向切换语义）
@@ -678,6 +736,15 @@ impl CaliberPropPool {
             self.ladder.pos_reverse += swap.amount_in - fee;
             self.ladder.pos_forward = U256::ZERO;
         }
+        // 记入事件净变化账本（块内聚合、pos 记块终值）：快照 rebase-merge 靠它
+        // 把基底精确推进到快照块，同时不丢尾部事件。
+        self.swap_ledger.record_swap(
+            block_number,
+            d_reserve_a,
+            d_reserve_b,
+            self.ladder.pos_forward,
+            self.ladder.pos_reverse,
+        );
         self.last_synced_block = block_number;
     }
 
@@ -1246,26 +1313,20 @@ impl AutomatedMarketMaker for CaliberPropPool {
         N: Network,
         P: Provider<N> + Clone,
     {
-        // 显式块号快照：快照已包含该块及更早全部 batchUpdateParameters，
-        // 置报价更新水位，杜绝之后任何 ≤ 该块的旧事件回卷（幂等水位）。
-        let stamp_block = match &block_number {
-            BlockId::Number(alloy::eips::BlockNumberOrTag::Number(n)) => Some(*n),
-            _ => None,
-        };
+        // 快照块号必须显式钉死（rebase 合并数学的自变量）：调用方给
+        // `latest` 等模糊块时用存储节点 canonical head 解析。
+        let snap_block = resolve_snapshot_block(block_number).await?;
         let snap = fetch_exact_snapshot(
             &provider,
             self.contract_address,
             self.pair_id,
             self.token_x,
             self.token_y,
-            block_number,
+            BlockId::Number(snap_block.into()),
         )
         .await?;
 
-        self.apply_snapshot(snap);
-        if let Some(b) = stamp_block {
-            self.stamp_price_watermark(b);
-        }
+        self.apply_snapshot_merged(snap, snap_block);
 
         Ok(self)
     }
@@ -1275,28 +1336,98 @@ impl AutomatedMarketMaker for CaliberPropPool {
         N: Network,
         P: Provider<N> + Clone,
     {
+        // 显式快照块号（存储节点 canonical head），杜绝 `BlockId::latest()`
+        // 让"储备/ladder 各自解析块"漂移，也保证 rebase 的 S 与读取同块。
+        let snap_block = caliber_storage_head().await?;
         let snap = fetch_exact_snapshot(
             &provider,
             self.contract_address,
             self.pair_id,
             self.token_x,
             self.token_y,
-            BlockId::latest(),
+            BlockId::Number(snap_block.into()),
         )
         .await?;
 
-        self.apply_snapshot(snap);
+        self.apply_snapshot_merged(snap, snap_block);
 
         Ok(())
     }
 }
 
 impl CaliberPropPool {
-    /// 将完整精确快照应用到池子（单池 init/update 与周期批量刷新共用）。
-    fn apply_snapshot(&mut self, snap: CaliberSnapshot) {
-        self.reserve_a = snap.reserve_a;
-        self.reserve_b = snap.reserve_b;
+    /// 把块 `snap_block` 末的完整精确快照合并进池子（单池 init/update 与
+    /// 周期批量刷新共用）。
+    ///
+    /// 三类字段三种落地语义（模块头「状态同步契约」）——**不要退化为无条件赋值**：
+    ///
+    /// - **A. 纯累积量**（`reserve_a/b`、`pos_forward/reverse`）：交给
+    ///   [`CaliberSwapLedger::rebase`] 做 `快照(S) + Σ(块 > S 事件)` 合并。
+    /// - **B. "最新值"**（`field0/field1/deadline`）：字段级水位保鲜——已有
+    ///   不早于 `snap_block` 的实时更新落地时快照不碰；否则落地并置水位到
+    ///   `(snap_block, MAX)`（快照已含该块及更早的全部更新）。
+    /// - **C. 快照独有低频字段**（ladder 曲线、`fee_rate`、`window`、`scale`、
+    ///   `validity_window`、`paused`）：直接覆盖（块号已由调用方显式钉死）。
+    pub(crate) fn apply_snapshot_merged(&mut self, snap: CaliberSnapshot, snap_block: u64) {
+        // --- A. 累积量：事件账本 rebase-merge（绝不无条件覆盖） ---
+        let apply = self.swap_ledger.rebase(
+            &mut self.reserve_a,
+            &mut self.reserve_b,
+            &mut self.ladder.pos_forward,
+            &mut self.ladder.pos_reverse,
+            &mut self.ladder.pos_block,
+            snap.reserve_a,
+            snap.reserve_b,
+            snap.pos_forward,
+            snap.pos_reverse,
+            snap_block,
+        );
+        match apply {
+            LedgerApply::Anchored => tracing::debug!(
+                address = ?self.virtual_address,
+                snap_block,
+                "caliber: snapshot anchored (covers every recorded swap)"
+            ),
+            LedgerApply::Merged => tracing::debug!(
+                address = ?self.virtual_address,
+                snap_block,
+                last_event_block = self.swap_ledger.last_event_block(),
+                "caliber: snapshot rebase-merged (kept newer realtime swaps)"
+            ),
+            LedgerApply::SkippedStale => tracing::debug!(
+                address = ?self.virtual_address,
+                snap_block,
+                anchor = self.swap_ledger.anchor_block(),
+                "caliber: stale snapshot skipped (older than ledger anchor)"
+            ),
+            LedgerApply::SkippedWindowMiss => tracing::warn!(
+                address = ?self.virtual_address,
+                snap_block,
+                anchor = self.swap_ledger.anchor_block(),
+                evicted_up_to = self.swap_ledger.evicted_up_to(),
+                "caliber: snapshot merge degraded to guard (ledger window miss / out-of-order pollution); keeping event ledger, next snapshot re-anchors"
+            ),
+        }
 
+        // --- B. 报价参数："最新值"字段级水位保鲜 ---
+        let price_fresh = snap_block != 0 && self.ladder.price_update_block >= snap_block;
+        if !price_fresh {
+            self.ladder.field0 = snap.field0;
+            self.ladder.field1 = snap.field1;
+            self.ladder.deadline = snap.deadline;
+            if snap_block != 0 {
+                self.ladder.stamp_price_watermark(snap_block);
+            }
+        } else {
+            tracing::debug!(
+                address = ?self.virtual_address,
+                snap_block,
+                price_update_block = self.ladder.price_update_block,
+                "caliber: snapshot kept newer realtime price update (field0/field1/deadline)"
+            );
+        }
+
+        // --- C. 快照独有低频字段：直接覆盖 ---
         // 快照有效时刷新完整 ladder 并重置 consumed（旧值无意义）；
         // 快照因过期/暂停返回空 ladder 时保留最近一次有效 ladder + consumed，
         // 使后续实时更新（刷新 deadline）能立即恢复报价，而不是等下一轮对账。
@@ -1308,17 +1439,14 @@ impl CaliberPropPool {
             self.ladder.consumed_in_ba = U256::ZERO;
             self.ladder.consumed_out_ba = U256::ZERO;
         }
-        // 报价参数与时效性参数始终刷新（过期/暂停由报价路径在报价时判定）
-        self.ladder.field0 = snap.field0;
-        self.ladder.field1 = snap.field1;
         self.ladder.fee_rate = snap.fee_rate;
         self.ladder.window = snap.window;
         self.ladder.scale = snap.scale;
-        self.ladder.pos_reverse = snap.pos_reverse;
-        self.ladder.pos_forward = snap.pos_forward;
-        self.ladder.deadline = snap.deadline;
         self.ladder.validity_window = snap.validity_window;
         self.ladder.paused = snap.paused;
+
+        // --- D. 同步水位：单调前移，绝不回卷 ---
+        self.last_synced_block = self.last_synced_block.max(snap_block);
 
         // 重新计算现货价格
         self.refresh_prices();
@@ -1344,7 +1472,7 @@ fn b256_add(base: B256, add: u64) -> B256 {
 }
 
 /// 单 pair 的完整快照（已映射到 token_a/token_b 视角）
-struct CaliberSnapshot {
+pub(crate) struct CaliberSnapshot {
     reserve_a: U256,
     reserve_b: U256,
     /// 合约原始 ladder（token_x → token_y 方向）
@@ -1403,6 +1531,28 @@ fn caliber_storage_provider() -> Result<&'static DynProvider, AMMError> {
     Ok(CALIBER_STORAGE_PROVIDER
         .get()
         .expect("caliber storage provider just initialized"))
+}
+
+/// 存储读取通道（HTTP RPC）的 canonical head。
+///
+/// 周期对账/单池刷新用它把快照块号**显式钉死**：只有"读到的块"与
+/// [`CaliberSwapLedger::rebase`] 用的 `S` 完全一致，储备/pos 才不会被事件
+/// 账本已推进的新值打回，也不会出现"储备读块 A / ladder 读块 B"的漂移。
+pub(crate) async fn caliber_storage_head() -> Result<u64, AMMError> {
+    let provider = caliber_storage_provider()?;
+    provider
+        .get_block_number()
+        .await
+        .map_err(|e| AMMError::Msg(format!("caliber: storage head query failed: {e}")))
+}
+
+/// 把 `BlockId` 解析为显式快照块号：显式数字原样返回，
+/// `latest`/`pending` 等模糊块一律钉到存储节点 canonical head。
+async fn resolve_snapshot_block(block: BlockId) -> Result<u64, AMMError> {
+    match block {
+        BlockId::Number(alloy::eips::BlockNumberOrTag::Number(n)) => Ok(n),
+        _ => caliber_storage_head().await,
+    }
 }
 
 /// batch 回退告警只输出一次（避免每周期每 chunk 刷屏）
@@ -1956,16 +2106,51 @@ where
     Ok(out)
 }
 
+/// 纯拉取：读取同一合约下 `pairs` 在**显式块 `block`** 末的完整精确快照，
+/// 不触碰任何池子状态（网络调用，慢）。
+///
+/// 与 [`batch_refresh_snapshots`] 的分工：拉取在锁外，落地由调用方在写锁内
+/// 基于**当时的 current existing** 调 [`CaliberPropPool::apply_snapshot_merged`]
+/// 合并写回——这样 RPC 期间到达的实时事件推进的储备/pos/报价不会被丢弃。
+pub(crate) async fn fetch_snapshots_for_pairs<N, P>(
+    provider: &P,
+    contract_address: Address,
+    pairs: &[(B256, Address, Address)],
+    block: u64,
+) -> Result<Vec<Result<CaliberSnapshot, AMMError>>, AMMError>
+where
+    N: Network,
+    N::BlockResponse: BlockResponse,
+    <N::BlockResponse as BlockResponse>::Header: BlockHeader,
+    P: Provider<N> + Clone,
+{
+    fetch_exact_snapshots_batch(
+        provider,
+        contract_address,
+        pairs,
+        BlockId::Number(block.into()),
+    )
+    .await
+}
+
 /// 批量刷新一组 Caliber propAMM 池子的完整精确快照（周期对账/初始化共用）。
+///
+/// **必须传显式块号 `block`**（不再是 `BlockId`）：快照落地块就是 rebase
+/// 合并数学的自变量（`快照(S) + Σ(块 > S)`），隐式 `latest` 由节点各自时刻
+/// 解析，会让"储备/ladder 读到的块"漂移十几秒且无法与报价水位对齐。
+/// 调用方用 [`caliber_storage_head`] 或上游显式块号钉死。
 ///
 /// 按合约地址分组后调用 `fetch_exact_snapshots_batch`，把每 pool 的
 /// ~10+n 次 `eth_getStorageAt` 折叠为每 10 槽一次 JSON-RPC batch。
 /// 返回与 `pools` 对齐的成功标志：失败的 pool 保持旧状态，调用方可据此
 /// 过滤（初始化场景）或仅记录（周期对账场景）。
+///
+/// ⚠️ 本函数在**调用方传入的池子实例上就地合并**（`apply_snapshot_merged`）。
+/// 周期对账路径不要用它，见 `state_space::sync_services` 的锁内合并版本。
 pub async fn batch_refresh_snapshots<N, P>(
     provider: &P,
     pools: &mut [CaliberPropPool],
-    block: BlockId,
+    block: u64,
 ) -> Result<Vec<bool>, AMMError>
 where
     N: Network,
@@ -1978,14 +2163,7 @@ where
         return Ok(flags);
     }
 
-    // 显式块号快照（init/回放场景）快照已包含该块及更早的报价更新，落快照
-    // 后置水位，杜绝之后 ≤ 该块的旧事件回卷；latest 快照的落地块由存储节点
-    // 决定（可能滞后于调用方 head），不置水位（保持低水位保守语义，由实时
-    // 事件与周期对账收敛）。
-    let stamp_block = match &block {
-        BlockId::Number(alloy::eips::BlockNumberOrTag::Number(n)) => Some(*n),
-        _ => None,
-    };
+    let block_id = BlockId::Number(block.into());
     // 按合约地址分组（正常情况下全部 pool 同属一个 caliber 合约）
     let mut groups: Vec<(Address, Vec<usize>)> = Vec::new();
     for (idx, pool) in pools.iter().enumerate() {
@@ -2005,7 +2183,7 @@ where
             .map(|&i| (pools[i].pair_id, pools[i].token_x, pools[i].token_y))
             .collect();
         let snapshots =
-            match fetch_exact_snapshots_batch(provider, contract_address, &pairs, block).await {
+            match fetch_exact_snapshots_batch(provider, contract_address, &pairs, block_id).await {
                 Ok(s) => s,
                 // 目标块尚未被存储 RPC 收录：不能吞成"该组全部失败"，
                 // 必须向上传播，让 maintenance 的 Resync 路径保持重试等待
@@ -2025,10 +2203,8 @@ where
             let i = idxs[k];
             match snap_res {
                 Ok(snap) => {
-                    pools[i].apply_snapshot(snap);
-                    if let Some(b) = stamp_block {
-                        pools[i].stamp_price_watermark(b);
-                    }
+                    // 就地合并（A 类 rebase-merge + B 类水位保鲜 + C 类覆盖）
+                    pools[i].apply_snapshot_merged(snap, block);
                     flags[i] = true;
                 }
                 Err(e) => {
@@ -2437,6 +2613,7 @@ mod tests {
             reserve_b: U256::from(1_000),
             ladder: Default::default(),
             price_a_in_b: 1.0,
+            swap_ledger: Default::default(),
             price_b_in_a: 1.0,
         };
 
@@ -2464,6 +2641,7 @@ mod tests {
             reserve_b: U256::from(1760056227u64),
             ladder: Default::default(),
             price_a_in_b: 1.0,
+            swap_ledger: Default::default(),
             price_b_in_a: 1.0,
         };
         let ladder = vec![
@@ -2667,7 +2845,7 @@ mod tests {
             validity_window: 20,
             paused: false,
         };
-        pool.apply_snapshot(stale_snap);
+        pool.apply_snapshot_merged(stale_snap, 100);
         assert_eq!(
             pool.ladder.ladder_a_to_b.len(),
             kept_len,
@@ -2706,7 +2884,7 @@ mod tests {
             paused: false,
         };
         pool.ladder.consumed_in_ab = U256::from(777u64);
-        pool.apply_snapshot(fresh_snap);
+        pool.apply_snapshot_merged(fresh_snap, 101);
         assert_eq!(
             pool.ladder.ladder_a_to_b.len(),
             1,
@@ -2717,6 +2895,211 @@ mod tests {
             U256::ZERO,
             "consumed must reset on fresh snapshot"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // 快照合并语义回归（2026-09-10 caliber 幻影报价事故根因）
+    //
+    // 事故：pair `0x5dda42ef…` 链上 USDT0 储备 70255481~70255493 恒为
+    // 3,849.017528，本地却被按 >= 5,255.86 报价 → 幻影机会 → 上链还款不足
+    // 回滚。根因是**快照无条件覆盖累积量**，把实时 swap 事件已推进的储备/
+    // pos 打回旧值，后续事件继续在错误基线上累积。
+    // ------------------------------------------------------------------
+
+    /// 构造一个"空 ladder"快照（`ladder_input_for_output` 在空 ladder 下
+    /// 直接按 `amount_in` 全额入账，便于逐位断言储备）。
+    fn snap_empty_ladder(a: u64, b: u64, pf: u64, pr: u64) -> CaliberSnapshot {
+        CaliberSnapshot {
+            reserve_a: U256::from(a),
+            reserve_b: U256::from(b),
+            ladder: Vec::new(),
+            field0: U256::from(1_000_000u64),
+            field1: U256::ZERO,
+            fee_rate: U256::from(200u64),
+            window: U256::from(500u64),
+            scale: U256::from(1_000u64),
+            pos_reverse: U256::from(pr),
+            pos_forward: U256::from(pf),
+            deadline: u64::MAX,
+            validity_window: 20,
+            paused: false,
+        }
+    }
+
+    /// token_a → token_b 的 swap 事件（test_pool_with_ladder 的 token 序）
+    fn swap_ab(
+        contract: Address,
+        pair_id: B256,
+        amount_in: u64,
+        amount_out: u64,
+    ) -> CaliberSwapEvent {
+        CaliberSwapEvent {
+            contract,
+            tx_index: 1,
+            pair_id,
+            token_in: Address::from([1u8; 20]),
+            token_out: Address::from([2u8; 20]),
+            amount_in: U256::from(amount_in),
+            amount_out: U256::from(amount_out),
+        }
+    }
+
+    fn empty_ladder_pool() -> CaliberPropPool {
+        let mut pool = test_pool_with_ladder();
+        let contract = pool.contract_address;
+        let pair_id = pool.pair_id;
+        pool.ladder.ladder_a_to_b = Arc::new(Vec::new());
+        pool.ladder.ladder_b_to_a = Arc::new(Vec::new());
+        pool.ladder.pos_forward = U256::ZERO;
+        pool.ladder.pos_reverse = U256::ZERO;
+        pool.ladder.pos_block = 0;
+        pool.swap_ledger = Default::default();
+        pool.last_synced_block = 0;
+        let _ = (contract, pair_id);
+        pool
+    }
+
+    /// 陈旧快照（早于事件账本基底）绝不能把储备/pos 打回旧值。
+    #[test]
+    fn snapshot_does_not_rollback_reserves_when_stale() {
+        let mut pool = empty_ladder_pool();
+        let (contract, pair_id) = (pool.contract_address, pool.pair_id);
+
+        // 块 1000 末真值锚定
+        pool.apply_snapshot_merged(snap_empty_ladder(1_000_000, 1_000_000, 0, 0), 1000);
+        assert_eq!(pool.reserve_a, U256::from(1_000_000u64));
+        assert_eq!(pool.reserve_b, U256::from(1_000_000u64));
+
+        // 实时正向 swap @1001
+        pool.apply_chain_swap(&swap_ab(contract, pair_id, 1_000, 500), 1001);
+        assert_eq!(pool.reserve_a, U256::from(1_001_000u64));
+        assert_eq!(pool.reserve_b, U256::from(999_500u64));
+        assert_eq!(pool.last_synced_block, 1001);
+
+        // 陈旧快照（块 1000，值 = swap 前）→ 绝不回卷
+        pool.apply_snapshot_merged(snap_empty_ladder(1_000_000, 1_000_000, 0, 0), 1000);
+        assert_eq!(
+            pool.reserve_a,
+            U256::from(1_001_000u64),
+            "stale snapshot must not roll back reserve_a"
+        );
+        assert_eq!(
+            pool.reserve_b,
+            U256::from(999_500u64),
+            "stale snapshot must not roll back reserve_b"
+        );
+    }
+
+    /// 快照块落在 (基底, 最新事件] 之间：rebase-merge 必须 = 快照 + 更晚事件。
+    #[test]
+    fn snapshot_rebase_merge_keeps_swaps_after_snapshot_block() {
+        let mut pool = empty_ladder_pool();
+        let (contract, pair_id) = (pool.contract_address, pool.pair_id);
+
+        pool.apply_snapshot_merged(snap_empty_ladder(1_000_000, 1_000_000, 0, 0), 1000);
+        pool.apply_chain_swap(&swap_ab(contract, pair_id, 1_000, 500), 1001);
+        pool.apply_chain_swap(&swap_ab(contract, pair_id, 2_000, 700), 1002);
+
+        // 迟到的快照 S=1001（真值 = 只含 1001 那笔）
+        pool.apply_snapshot_merged(snap_empty_ladder(1_001_000, 999_500, 0, 0), 1001);
+
+        // = 快照(1001) + Δ(1002) = (1_003_000, 998_800)
+        assert_eq!(pool.reserve_a, U256::from(1_003_000u64));
+        assert_eq!(pool.reserve_b, U256::from(998_800u64));
+    }
+
+    /// 快照已覆盖同块 swap 时必须跳过重复入账（快照/实时流并发窗口）。
+    #[test]
+    fn snapshot_covers_swaps_at_or_before_snapshot_block() {
+        let mut pool = empty_ladder_pool();
+        let (contract, pair_id) = (pool.contract_address, pool.pair_id);
+
+        pool.apply_snapshot_merged(snap_empty_ladder(1_000_000, 1_000_000, 0, 0), 1000);
+        // 实时流落后：块 1000 的 swap 在快照落地之后才到达
+        pool.apply_chain_swap(&swap_ab(contract, pair_id, 1_000, 500), 1000);
+        assert_eq!(pool.reserve_a, U256::from(1_000_000u64));
+        assert_eq!(pool.reserve_b, U256::from(1_000_000u64));
+
+        // 块 1001 的 swap 仍应正常应用
+        pool.apply_chain_swap(&swap_ab(contract, pair_id, 1_000, 500), 1001);
+        assert_eq!(pool.reserve_a, U256::from(1_001_000u64));
+        assert_eq!(pool.reserve_b, U256::from(999_500u64));
+    }
+
+    /// pos（`cfg+7`）是块门控的：新块首笔先清零，绝不跨块累加。
+    #[test]
+    fn pos_does_not_accumulate_across_blocks() {
+        let mut pool = empty_ladder_pool();
+        let (contract, pair_id) = (pool.contract_address, pool.pair_id);
+
+        pool.apply_snapshot_merged(snap_empty_ladder(1_000_000, 1_000_000, 0, 0), 1000);
+        pool.apply_chain_swap(&swap_ab(contract, pair_id, 1_000, 500), 1001);
+        assert_eq!(pool.ladder.pos_forward, U256::from(500u64));
+        assert_eq!(pool.ladder.pos_block, 1001);
+
+        // 块内第二笔：累计
+        pool.apply_chain_swap(&swap_ab(contract, pair_id, 1_000, 100), 1001);
+        assert_eq!(pool.ladder.pos_forward, U256::from(600u64));
+
+        // 新块首笔：先清零再累加（链上 cfg+7 块门控语义）
+        pool.apply_chain_swap(&swap_ab(contract, pair_id, 1_000, 700), 1002);
+        assert_eq!(
+            pool.ladder.pos_forward,
+            U256::from(700u64),
+            "pos 必须在块边界清零（与链上 cfg+7 一致）"
+        );
+        assert_eq!(pool.ladder.pos_block, 1002);
+    }
+
+    /// B 类"最新值"字段级水位：不早于快照块的实时报价更新不得被快照覆盖。
+    #[test]
+    fn snapshot_does_not_clobber_newer_price_update() {
+        let mut pool = empty_ladder_pool();
+        let pair_id = pool.pair_id;
+
+        pool.apply_snapshot_merged(snap_empty_ladder(1_000_000, 1_000_000, 0, 0), 1000);
+        assert_eq!(pool.ladder.field0, U256::from(1_000_000u64));
+
+        let upd = CaliberBatchUpdate {
+            pair_id,
+            price: U256::from(42u64),
+            flags: 7,
+            deadline: 12_345,
+        };
+        pool.apply_batch_update(&upd, 1005, 3);
+        assert_eq!(pool.ladder.field0, U256::from(42u64));
+        assert_eq!(pool.ladder.deadline, 12_345);
+
+        // 更旧块的快照（1003 < 水位 1005）→ field0/deadline 保持实时值
+        pool.apply_snapshot_merged(snap_empty_ladder(1_000_000, 1_000_000, 0, 0), 1003);
+        assert_eq!(
+            pool.ladder.field0,
+            U256::from(42u64),
+            "snapshot older than realtime price update must not clobber field0"
+        );
+        assert_eq!(pool.ladder.deadline, 12_345);
+
+        // 更新块的快照（1010 > 水位）→ 快照权威，水位推进到 (1010, MAX)
+        pool.apply_snapshot_merged(snap_empty_ladder(1_000_000, 1_000_000, 0, 0), 1010);
+        assert_eq!(pool.ladder.field0, U256::from(1_000_000u64));
+        assert_eq!(pool.ladder.deadline, u64::MAX);
+        assert_eq!(pool.ladder.price_update_block, 1010);
+        assert_eq!(pool.ladder.price_update_tx_index, u64::MAX);
+    }
+
+    /// 空 ladder 过期快照：A 类字段由 rebase 锚定，但不丢实时事件。
+    #[test]
+    fn snapshot_missing_block_number_degrades_to_guard() {
+        let mut pool = empty_ladder_pool();
+        let (contract, pair_id) = (pool.contract_address, pool.pair_id);
+
+        pool.apply_snapshot_merged(snap_empty_ladder(1_000_000, 1_000_000, 0, 0), 1000);
+        pool.apply_chain_swap(&swap_ab(contract, pair_id, 1_000, 500), 1001);
+
+        // snap_block == 0（历史遗留路径）：不合并、保持事件账本
+        pool.apply_snapshot_merged(snap_empty_ladder(1, 1, 0, 0), 0);
+        assert_eq!(pool.reserve_a, U256::from(1_001_000u64));
+        assert_eq!(pool.reserve_b, U256::from(999_500u64));
     }
 
     #[test]
@@ -2735,6 +3118,7 @@ mod tests {
             reserve_b: U256::from(1_000),
             ladder: Default::default(),
             price_a_in_b: 123.0,
+            swap_ledger: Default::default(),
             price_b_in_a: 456.0,
         };
 
@@ -2766,6 +3150,7 @@ mod tests {
             reserve_b: U256::from(1760056227u64),
             ladder: Default::default(),
             price_a_in_b: 1.0,
+            swap_ledger: Default::default(),
             price_b_in_a: 1.0,
         };
         pool.ladder.ladder_a_to_b = Arc::new(vec![
@@ -2861,6 +3246,7 @@ mod tests {
             reserve_b: "141552681951730783366".parse::<U256>().unwrap(),
             ladder: Default::default(),
             price_a_in_b: 1.0,
+            swap_ledger: Default::default(),
             price_b_in_a: 1.0,
         };
         pool.ladder.ladder_a_to_b = Arc::new(vec![
@@ -3223,6 +3609,7 @@ mod tests {
             reserve_b: "151028739041011564335".parse::<U256>().unwrap(), // cfg+4 @ 块末（token_b=W）
             ladder: Default::default(),
             price_a_in_b: 0.0,
+            swap_ledger: Default::default(),
             price_b_in_a: 0.0,
         };
         pool.ladder.ladder_a_to_b = Arc::new(vec![
@@ -3303,6 +3690,7 @@ mod tests {
             reserve_b: "149040856769846885495".parse::<U256>().unwrap(), // 块起始 cfg+4
             ladder: Default::default(),
             price_a_in_b: 0.0,
+            swap_ledger: Default::default(),
             price_b_in_a: 0.0,
         };
         pool.ladder.deadline = u64::MAX;
@@ -3443,6 +3831,7 @@ mod tests {
             reserve_b: U256::ZERO,
             ladder: Default::default(),
             price_a_in_b: 0.0,
+            swap_ledger: Default::default(),
             price_b_in_a: 0.0,
         };
         pool.ladder.ladder_a_to_b = Arc::new(vec![
@@ -3672,6 +4061,7 @@ mod tests {
             reserve_b: U256::from(1_000),
             ladder: Default::default(),
             price_a_in_b: 1.0,
+            swap_ledger: Default::default(),
             price_b_in_a: 1.0,
         };
 
@@ -3768,6 +4158,7 @@ mod tests {
             reserve_b: U256::from(1_000),
             ladder: Default::default(),
             price_a_in_b: 1.0,
+            swap_ledger: Default::default(),
             price_b_in_a: 1.0,
         };
 
