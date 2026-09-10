@@ -153,6 +153,30 @@ fn elfomo_storage_provider() -> Result<&'static DynProvider, AMMError> {
         .expect("elfomo storage provider just initialized"))
 }
 
+/// 存储读取块高校验（与 `caliber_prop::ensure_storage_block_available` 同一逻辑）。
+///
+/// elfomo 的 storage 读取走硬编码 HTTP RPC（`elfomo_storage_provider`），该端点
+/// 头部可能落后于调用方传入的块高（如 maintenance Resync / coverage 传入的
+/// canonical 头），直接查询会触发 `-32019 block is out of range`。超前块**不降级
+/// 读取**，返回 `BlockNotAvailable`，由 maintenance 层把任务留在队列重试，直到
+/// HTTP 节点收录该块后再按原块读取。历史块（≤ 头部）原样保留；头部查询失败时
+/// 按原块继续（存储读取失败走既有错误重试路径）。
+async fn ensure_storage_block_available(block: BlockId) -> Result<BlockId, AMMError> {
+    let BlockId::Number(alloy::eips::BlockNumberOrTag::Number(num)) = block else {
+        return Ok(block);
+    };
+    let Ok(http_provider) = elfomo_storage_provider() else {
+        return Ok(block);
+    };
+    match http_provider.get_block_number().await {
+        Ok(head) if head < num => Err(AMMError::BlockNotAvailable {
+            requested_block: num,
+            storage_head: head,
+        }),
+        _ => Ok(block),
+    }
+}
+
 /// 价格定点基（1e24 = 0xD3C21BCECCEDA1000000，64-bit limbs 小端）
 const ONE_E24: U256 = U256::from_limbs([0x1bcecceda1000000, 0xd3c2, 0, 0]);
 
@@ -663,6 +687,10 @@ impl ElfomoFiPropPool {
         N: Network,
         P: Provider<N> + Clone,
     {
+        // 存储读取块高校验（同 caliber_prop）：超前于 HTTP 节点头部时返回
+        // `BlockNotAvailable`，由 maintenance 留队重试，不降级读取。
+        let block = ensure_storage_block_available(block).await?;
+
         use crate::amms::elfomo_prop::types::IElfomoFiFactory;
 
         let factory = IElfomoFiFactory::new(self.factory_address, provider.clone());
@@ -980,12 +1008,12 @@ impl AutomatedMarketMaker for ElfomoFiPropPool {
         N: Network,
         P: Provider<N> + Clone,
     {
-        // 固定块号，保证同一锚点内各字段一致
+        // 水位记账块号：`latest` 只在此处解析用于 `last_synced_block`，
+        // **不 pin 进链上读取**（见 `update_at` 的同名说明）。
         let snap_block = match block_number {
             BlockId::Number(alloy::eips::BlockNumberOrTag::Number(num)) => num,
             _ => provider.get_block_number().await?,
         };
-        let block = BlockId::Number(alloy::eips::BlockNumberOrTag::Number(snap_block));
 
         // 资产：pair 由实例字段 token_x/token_y 定义（Factory/部署配置传入）。
         // decimals 对已知默认 pair（xETH=18/USDT0=6）取常量，其余 token 兜底 18。
@@ -1019,7 +1047,7 @@ impl AutomatedMarketMaker for ElfomoFiPropPool {
         ];
 
         let snap = self
-            .fetch_orderbook_snapshot::<N, _>(provider, block)
+            .fetch_orderbook_snapshot::<N, _>(provider, block_number)
             .await?;
         if snap.from_to_levels.is_empty() || snap.to_from_levels.is_empty() {
             warn!(
@@ -1052,8 +1080,11 @@ impl AutomatedMarketMaker for ElfomoFiPropPool {
 impl ElfomoFiPropPool {
     /// 在指定区块拉取 orderbook + vault 快照（StateSpace update 与周期任务共用）。
     ///
-    /// 固定到具体块号：快照读取与块号一致，避免 `BlockId::latest()` 的隐式
-    /// 取数块与本地日志推进产生竞态（参照 BinaryFi `update_at`）。
+    /// 调用方传入的 `block` **原样**下发给链上读取（同 caliber `update()`）：
+    /// `latest` 由各 provider 自行解析，**不预先 pin 成具体块号**。storage 读取
+    /// 走 HTTP provider，pin 到刚产出的头块会撞 `-32019 block is out of range`
+    /// （`rpc.xlayer.tech` 对新头块的 state 有短暂不可用窗口，实测约 2%~15%）。
+    /// `snap_block` 仅在 `latest` 时解析一次，用于 `last_synced_block` 水位记账。
     pub async fn update_at<N, P>(&mut self, provider: P, block: BlockId) -> Result<(), AMMError>
     where
         N: Network,
@@ -1063,7 +1094,6 @@ impl ElfomoFiPropPool {
             BlockId::Number(alloy::eips::BlockNumberOrTag::Number(num)) => num,
             _ => provider.get_block_number().await?,
         };
-        let block = BlockId::Number(alloy::eips::BlockNumberOrTag::Number(snap_block));
         let snap = self.fetch_orderbook_snapshot(provider, block).await?;
         self.apply_orderbook_snapshot(
             snap.from_to_levels,
