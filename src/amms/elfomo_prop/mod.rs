@@ -68,12 +68,11 @@ use alloy::{
     eips::BlockId,
     network::Network,
     primitives::{address, Address, B256, U256},
-    providers::{DynProvider, Provider, ProviderBuilder},
+    providers::Provider,
     rpc::types::Log,
     sol,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::OnceLock;
 use tracing::{instrument, warn};
 
 use crate::amms::{
@@ -127,48 +126,27 @@ pub const ELFOMO_UPDATE_SELECTOR: [u8; 4] = [0xae, 0x7e, 0x8d, 0x81];
 // storage 读取专用 HTTP RPC（处理方式与 caliber_prop 一致）
 // ----------------------------------------------------------------------------
 
-/// elfomo storage 读取专用 HTTP RPC。
-///
-/// XLayer 生产 WS 网关（`wss://ws.xlayer.tech`）不开放 `eth_getStorageAt`
-/// （`-32601: rpc method is not whitelisted`），而 init / L2 周期对账 /
-/// AsyncUpdate 兜底都必须直读 Pool slot1 取价格种子（`a = slot1 >> 32`）；
-/// 因此本模块的 storage 读取统一走该 HTTP RPC（与 `caliber_prop` 同一处理
-/// 方式）。主通道（flashblocks raw-tx 本地直算）不依赖该端点。
-const ELFOMO_STORAGE_HTTP_RPC: &str = "https://rpc.xlayer.tech";
-
-/// 懒初始化的 HTTP provider（进程内复用，避免每次快照重连）。
-static ELFOMO_STORAGE_PROVIDER: OnceLock<DynProvider> = OnceLock::new();
-
-fn elfomo_storage_provider() -> Result<&'static DynProvider, AMMError> {
-    if let Some(provider) = ELFOMO_STORAGE_PROVIDER.get() {
-        return Ok(provider);
-    }
-    let url: alloy::transports::http::reqwest::Url = ELFOMO_STORAGE_HTTP_RPC
-        .parse()
-        .map_err(|e| AMMError::Msg(format!("elfomo: invalid storage rpc url: {e}")))?;
-    let provider: DynProvider = ProviderBuilder::new().connect_http(url).erased();
-    let _ = ELFOMO_STORAGE_PROVIDER.set(provider);
-    Ok(ELFOMO_STORAGE_PROVIDER
-        .get()
-        .expect("elfomo storage provider just initialized"))
-}
-
 /// 存储读取块高校验（与 `caliber_prop::ensure_storage_block_available` 同一逻辑）。
 ///
-/// elfomo 的 storage 读取走硬编码 HTTP RPC（`elfomo_storage_provider`），该端点
-/// 头部可能落后于调用方传入的块高（如 maintenance Resync / coverage 传入的
-/// canonical 头），直接查询会触发 `-32019 block is out of range`。超前块**不降级
-/// 读取**，返回 `BlockNotAvailable`，由 maintenance 层把任务留在队列重试，直到
-/// HTTP 节点收录该块后再按原块读取。历史块（≤ 头部）原样保留；头部查询失败时
-/// 按原块继续（存储读取失败走既有错误重试路径）。
-async fn ensure_storage_block_available(block: BlockId) -> Result<BlockId, AMMError> {
+/// elfomo 的 storage 读取（Pool slot1 价格种子）经 `eth_call` bulk-SLOAD 走
+/// 调用方注入的 provider（见 [`crate::amms::evm_storage`]）；该节点头部可能落后于
+/// 调用方传入的块高（如 maintenance Resync / coverage 传入的 canonical 头），
+/// 直接查询会触发 `-32019 block is out of range`。超前块**不降级读取**，返回
+/// `BlockNotAvailable`，由 maintenance 层把任务留在队列重试，直到节点收录该块后
+/// 再按原块读取。历史块（≤ 头部）原样保留；头部查询失败时按原块继续（存储读取
+/// 失败走既有错误重试路径）。
+async fn ensure_storage_block_available<N, P>(
+    provider: &P,
+    block: BlockId,
+) -> Result<BlockId, AMMError>
+where
+    N: Network,
+    P: Provider<N>,
+{
     let BlockId::Number(alloy::eips::BlockNumberOrTag::Number(num)) = block else {
         return Ok(block);
     };
-    let Ok(http_provider) = elfomo_storage_provider() else {
-        return Ok(block);
-    };
-    match http_provider.get_block_number().await {
+    match provider.get_block_number().await {
         Ok(head) if head < num => Err(AMMError::BlockNotAvailable {
             requested_block: num,
             storage_head: head,
@@ -676,8 +654,8 @@ impl ElfomoFiPropPool {
     ///
     /// 注意（链上实证）：vault 是 Gnosis Safe，**不能**在 vault 合约上调用
     /// `balanceOf`；余额必须读 `token.balanceOf(vault)`。价格种子读
-    /// Pool slot1（`a = slot1 >> 32`，走本模块 storage HTTP provider——
-    /// WS 网关不开放 `eth_getStorageAt`），供本地 `build_orderbook` 使用。
+    /// Pool slot1（`a = slot1 >> 32`，经 `eth_call` bulk-SLOAD 走调用方注入的
+    /// provider，官方 WS 网关可用），供本地 `build_orderbook` 使用。
     pub async fn fetch_orderbook_snapshot<N, P>(
         &self,
         provider: P,
@@ -689,7 +667,7 @@ impl ElfomoFiPropPool {
     {
         // 存储读取块高校验（同 caliber_prop）：超前于 HTTP 节点头部时返回
         // `BlockNotAvailable`，由 maintenance 留队重试，不降级读取。
-        let block = ensure_storage_block_available(block).await?;
+        let block = ensure_storage_block_available::<N, P>(&provider, block).await?;
 
         use crate::amms::elfomo_prop::types::IElfomoFiFactory;
 
@@ -716,12 +694,15 @@ impl ElfomoFiPropPool {
             .call()
             .await?;
 
-        // 价格种子：Pool slot1 高 32 位。storage 读取统一走本模块的 HTTP
-        // provider（WS 网关不开放 eth_getStorageAt，同 caliber_prop）。
-        let slot1: U256 = elfomo_storage_provider()?
-            .get_storage_at(self.pool_address, U256::from(1u64))
-            .block_id(block)
-            .await?;
+        // 价格种子：Pool slot1 高 32 位。经 `eth_call` bulk-SLOAD 走调用方注入的
+        // provider（官方 WS 网关不开放 eth_getStorageAt，见 `amms::evm_storage`）。
+        let slot1 = crate::amms::evm_storage::storage_slots_at::<N, P>(
+            &provider,
+            self.pool_address,
+            &[B256::from(U256::from(1u64).to_be_bytes::<32>())],
+            block,
+        )
+        .await?[0];
         let price_seed = slot1 >> 32;
 
         Ok(OrderbookSnapshot {

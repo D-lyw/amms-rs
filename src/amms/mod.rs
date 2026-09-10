@@ -30,6 +30,7 @@ pub mod ekubo;
 pub mod elfomo_prop;
 pub mod erc_4626;
 pub mod error;
+pub(crate) mod evm_storage;
 pub mod factory;
 pub mod fermi_prop;
 pub mod float;

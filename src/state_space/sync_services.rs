@@ -1162,7 +1162,8 @@ pub async fn start_pendle_sync_task<N, P>(
 ///
 /// 批量刷新：`caliber_prop::fetch_snapshots_for_pairs` 把一个合约下所有 pool 的
 /// `eth_getStorageAt`（固定槽位 + ladder 槽位）折叠进 JSON-RPC batch，
-/// 每 `STORAGE_BATCH_SIZE` 槽一次 HTTP 请求，RPC 往返从每 pool ~10+n 次降到几乎常数。
+/// 每合约一次 `eth_call` bulk-SLOAD（走调用方注入的 provider），RPC 往返从
+/// 每 pool ~10+n 次降到几乎常数。
 ///
 /// ⚠️ **拉取在锁外、合并在锁内**（2026-09-10 幻影报价事故根因）：
 /// 旧实现是「持锁克隆整池 → 锁外 RPC（十几秒）→ 写锁内整只覆盖」。RPC 窗口内
@@ -1202,14 +1203,15 @@ pub async fn start_caliber_prop_ladder_sync_task<N, P>(
 
         // 快照块号**显式钉死**（存储节点 canonical head）：它既是事件账本
         // rebase-merge 的自变量，也保证"储备与 ladder 读的是同一块"。
-        let snap_block = match crate::amms::caliber_prop::caliber_storage_head().await {
-            Ok(b) => b,
-            Err(e) => {
-                warn!(error = ?e, "Caliber reconcile: storage head query failed");
-                next_sleep = next_sleep.saturating_mul(2).min(MAX_RECONCILE_BACKOFF);
-                continue;
-            }
-        };
+        let snap_block =
+            match crate::amms::caliber_prop::caliber_storage_head::<N, P>(&provider).await {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!(error = ?e, "Caliber reconcile: storage head query failed");
+                    next_sleep = next_sleep.saturating_mul(2).min(MAX_RECONCILE_BACKOFF);
+                    continue;
+                }
+            };
 
         // Phase-1（读锁，只取元数据）：按合约地址分组收集 pair 路由三元组，
         // 不克隆池子状态（克隆整池再整只覆盖正是旧实现的错误所在）。

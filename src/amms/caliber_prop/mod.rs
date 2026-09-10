@@ -85,13 +85,13 @@ use alloy::{
     eips::BlockId,
     network::{BlockResponse, Network},
     primitives::{address, b256, keccak256, Address, B256, U256},
-    providers::{DynProvider, Provider, ProviderBuilder},
+    providers::Provider,
     rpc::types::Log,
     sol,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use tracing::instrument;
 
 use crate::amms::{
@@ -1317,7 +1317,7 @@ impl AutomatedMarketMaker for CaliberPropPool {
     {
         // 快照块号必须显式钉死（rebase 合并数学的自变量）：调用方给
         // `latest` 等模糊块时用存储节点 canonical head 解析。
-        let snap_block = resolve_snapshot_block(block_number).await?;
+        let snap_block = resolve_snapshot_block::<N, P>(&provider, block_number).await?;
         let snap = fetch_exact_snapshot(
             &provider,
             self.contract_address,
@@ -1340,7 +1340,7 @@ impl AutomatedMarketMaker for CaliberPropPool {
     {
         // 显式快照块号（存储节点 canonical head），杜绝 `BlockId::latest()`
         // 让"储备/ladder 各自解析块"漂移，也保证 rebase 的 S 与读取同块。
-        let snap_block = caliber_storage_head().await?;
+        let snap_block = caliber_storage_head::<N, P>(&provider).await?;
         let snap = fetch_exact_snapshot(
             &provider,
             self.contract_address,
@@ -1497,126 +1497,26 @@ pub(crate) struct CaliberSnapshot {
     paused: bool,
 }
 
-/// 单次 JSON-RPC batch 请求中的 `eth_getStorageAt` 数量上限。
-///
-/// 实测生产 `rpc.xlayer.tech` 的 batch 上限为 11（12 即拒绝
-/// `too many RPC calls in batch request`），取安全值 10。
-const STORAGE_BATCH_SIZE: usize = 10;
-
-/// caliber 存储读取专用 HTTP RPC。
-///
-/// XLayer 生产 WS 网关（`wss://ws.xlayer.tech`）不开放 `eth_getStorageAt`
-/// （`-32601: rpc method is not whitelisted`），而初始化/周期对账必须直读
-/// 合约 storage `cfg`/`data`/`ladder` 槽位；因此本模块的存储读取统一走
-/// 该 HTTP RPC。实时报价更新仍由 flashblocks 原始交易流驱动，不受影响。
-///
-/// ⚠️ 临时方案（2026-08-07）：为快速解决生产 WS 网关拒绝 `eth_getStorageAt`
-/// 的问题，此处硬编码了 `rpc.xlayer.tech` 公共端点。后续迭代应改为：
-/// 1. 由上层（dex-arbitrage chain 配置 `http_rpc_url`）显式传入 HTTP RPC，而不是
-///    在库内硬编码公共端点（公共端点有 rate limit，且多环境不可移植）；
-/// 2. 或改用合约自带 view 函数（`getPoolBalances(pairId)` / `quote()`，WS 上
-///    `eth_call` 可用）替代直读存储槽，从而完全摆脱对 `eth_getStorageAt` 的依赖。
-const CALIBER_STORAGE_HTTP_RPC: &str = "https://rpc.xlayer.tech";
-
-/// 懒初始化的 HTTP provider（进程内复用，避免每次对账重连）。
-static CALIBER_STORAGE_PROVIDER: OnceLock<DynProvider> = OnceLock::new();
-
-fn caliber_storage_provider() -> Result<&'static DynProvider, AMMError> {
-    if let Some(provider) = CALIBER_STORAGE_PROVIDER.get() {
-        return Ok(provider);
-    }
-    let url: alloy::transports::http::reqwest::Url = CALIBER_STORAGE_HTTP_RPC
-        .parse()
-        .map_err(|e| AMMError::Msg(format!("caliber: invalid storage rpc url: {e}")))?;
-    let provider: DynProvider = ProviderBuilder::new().connect_http(url).erased();
-    let _ = CALIBER_STORAGE_PROVIDER.set(provider);
-    Ok(CALIBER_STORAGE_PROVIDER
-        .get()
-        .expect("caliber storage provider just initialized"))
-}
-
-/// 存储读取通道（HTTP RPC）的 canonical head。
-///
-/// 周期对账/单池刷新用它把快照块号**显式钉死**：只有"读到的块"与
-/// [`CaliberSwapLedger::rebase`] 用的 `S` 完全一致，储备/pos 才不会被事件
-/// 账本已推进的新值打回，也不会出现"储备读块 A / ladder 读块 B"的漂移。
-pub(crate) async fn caliber_storage_head() -> Result<u64, AMMError> {
-    let provider = caliber_storage_provider()?;
-    provider
-        .get_block_number()
-        .await
-        .map_err(|e| AMMError::Msg(format!("caliber: storage head query failed: {e}")))
-}
-
-/// 把 `BlockId` 解析为显式快照块号：显式数字原样返回，
-/// `latest`/`pending` 等模糊块一律钉到存储节点 canonical head。
-async fn resolve_snapshot_block(block: BlockId) -> Result<u64, AMMError> {
-    match block {
-        BlockId::Number(alloy::eips::BlockNumberOrTag::Number(n)) => Ok(n),
-        _ => caliber_storage_head().await,
-    }
-}
-
-/// batch 回退告警只输出一次（避免每周期每 chunk 刷屏）
-static BATCH_FALLBACK_WARNED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-fn warn_batch_fallback(e: &AMMError) {
-    if !BATCH_FALLBACK_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        tracing::warn!(
-            error = ?e,
-            "caliber: JSON-RPC batch rejected by RPC gateway; falling back to per-slot eth_getStorageAt (logged once)"
-        );
-    } else {
-        tracing::debug!(
-            error = ?e,
-            "caliber: JSON-RPC batch failed, using per-slot fallback"
-        );
-    }
-}
-
-/// 判断错误是否属于 RPC 限流/过载类（HTTP 429 / JSON-RPC -32016 over rate limit）。
-///
-/// 限流时继续逐槽回退只会把请求量放大 ~8 倍（72+27+2 个 per-slot
-/// `eth_getStorageAt`）并进一步加剧限流，必须直接放弃本轮、等待下一轮
-/// 对账（配合对账任务的指数退避）。非限流错误（如网关拒绝 batch 的
-/// `-32601 method not whitelisted`）仍走逐槽回退兜底。
-fn is_rate_limited_err(e: &impl std::fmt::Debug) -> bool {
-    let msg = format!("{e:?}");
-    msg.contains("429") || msg.contains("rate limit") || msg.contains("-32016")
-}
-
-/// 批量存储读取的固定请求间隔（毫秒）。
-///
-/// ⚠️ 临时节流（2026-08-10）：`rpc.xlayer.tech` 公共 HTTP 端点对
-/// `eth_getStorageAt` 限流严格（`-32016 over rate limit`），初始化/周期对账的
-/// 多个 batch 在极短窗口内连发易叠加触发限流；这里在每批 HTTP 请求前固定
-/// sleep，保证请求间隔均匀（≈ 响应时间 + 200ms），摊平瞬时 RPS。
-/// 后续接入独立/高配额 HTTP 端点后可移除。
-const STORAGE_BATCH_SLEEP_MS: u64 = 200;
-
-/// 固定节流：每批批量存储 HTTP 请求前 sleep `STORAGE_BATCH_SLEEP_MS`。
-async fn throttle_storage_batch() {
-    tokio::time::sleep(std::time::Duration::from_millis(STORAGE_BATCH_SLEEP_MS)).await;
-}
-
-/// 存储读取块高校验：caliber 存储读取走硬编码 HTTP RPC
-/// （`caliber_storage_provider`），该节点头部可能落后于调用方传入的块高
-/// （如 maintenance Resync/coverage 传入的 flashblocks 乐观头），直接查询会
-/// 触发 `-32019 block is out of range`。超前块**不降级读取**，返回
-/// `BlockNotAvailable`，由 maintenance 层把 Resync 任务留在队列重试，直到
-/// HTTP 节点收录该块后再按原块读取——杜绝"用旧块数据伪装成已同步到目标块"
+/// 存储读取块高校验：storage 读经 `eth_call` 走调用方注入的 provider，若目标块
+/// 超前于该节点头部（如 maintenance Resync/coverage 传入的 flashblocks 乐观头），
+/// 直接查询会触发 `-32019 block is out of range`。超前块**不降级读取**，返回
+/// `BlockNotAvailable`，由 maintenance 层把任务留在队列重试，直到该节点收录该块
+/// 后再按原块读取——杜绝"用旧块数据伪装成已同步到目标块"
 /// （2026-08-25 68856847 事故：钳到 68856846 读旧价但标记 last_synced=68856847）。
 /// 历史块（≤ 头部）原样保留（`initial_block` 回填/回放的块语义不变）；
 /// 头部查询失败时按原块继续（存储读取失败走既有错误重试路径）。
-async fn ensure_storage_block_available(block: BlockId) -> Result<BlockId, AMMError> {
+async fn ensure_storage_block_available<N, P>(
+    provider: &P,
+    block: BlockId,
+) -> Result<BlockId, AMMError>
+where
+    N: Network,
+    P: Provider<N>,
+{
     let BlockId::Number(alloy::eips::BlockNumberOrTag::Number(num)) = block else {
         return Ok(block);
     };
-    let Ok(http_provider) = caliber_storage_provider() else {
-        return Ok(block);
-    };
-    match http_provider.get_block_number().await {
+    match provider.get_block_number().await {
         Ok(head) if head < num => Err(AMMError::BlockNotAvailable {
             requested_block: num,
             storage_head: head,
@@ -1625,96 +1525,37 @@ async fn ensure_storage_block_available(block: BlockId) -> Result<BlockId, AMMEr
     }
 }
 
-/// 通过单次 JSON-RPC batch 读取多个存储槽（一个 HTTP 请求）。
+/// 存储读取通道的 canonical head（调用方注入的 provider）。
 ///
-/// 与逐槽 `eth_getStorageAt` 完全等价（同一 `block`、同一序列化参数），
-/// 仅把 N 次 RPC 往返折叠为 1 次。所有请求必须指向同一区块。
-async fn storage_at_batch<N, P>(
-    _provider: &P,
-    reads: &[(Address, B256)],
-    block: BlockId,
-) -> Result<Vec<U256>, AMMError>
+/// 周期对账/单池刷新用它把快照块号**显式钉死**：只有"读到的块"与
+/// [`CaliberSwapLedger::rebase`] 用的 `S` 完全一致，储备/pos 才不会被事件
+/// 账本已推进的新值打回，也不会出现"储备读块 A / ladder 读块 B"的漂移。
+///
+/// 存储读取本身走 [`crate::amms::evm_storage`] 的 `eth_call` bulk-SLOAD
+/// （官方 WS 网关只放行 `eth_call`、不开放 `eth_getStorageAt`；见该模块文档），
+/// 因此这里用**同一个** provider 取头，保证"钉的块"与"读的块"同源。
+pub(crate) async fn caliber_storage_head<N, P>(provider: &P) -> Result<u64, AMMError>
 where
     N: Network,
     P: Provider<N>,
 {
-    // 存储读取统一走硬编码 HTTP RPC（WS 网关不开放 eth_getStorageAt）。
-    // 先尝试 JSON-RPC batch（一个 HTTP 请求）；若网关拒绝 batch
-    // （如 -32601 method not whitelisted、大小超限截断等），回退逐槽读取。
-    // batch 只是优化路径，逐槽是可靠基线，保证任意网关下可用。
-    let http_provider = caliber_storage_provider()?;
-    let mut batch = alloy::rpc::client::BatchRequest::new(http_provider.client());
-    let mut waiters = Vec::with_capacity(reads.len());
-    for (address, slot) in reads {
-        let key = U256::from_be_bytes(slot.0);
-        let waiter = batch
-            .add_call::<_, B256>("eth_getStorageAt", &(*address, key, block))
-            .map_err(|e| AMMError::Msg(format!("caliber: batch add_call failed: {e}")))?;
-        waiters.push(waiter);
-    }
-
-    let mut out = Vec::with_capacity(reads.len());
-    let mut batch_ok = true;
-    throttle_storage_batch().await;
-    if let Err(e) = batch.send().await {
-        batch_ok = false;
-        if is_rate_limited_err(&e) {
-            return Err(AMMError::Msg(format!(
-                "caliber: batch get_storage_at rate limited: {e}"
-            )));
-        }
-        warn_batch_fallback(&AMMError::Msg(format!("caliber: batch send failed: {e}")));
-    }
-    if batch_ok {
-        for waiter in waiters {
-            match waiter.await {
-                Ok(value) => out.push(U256::from_be_bytes(value.0)),
-                Err(e) => {
-                    batch_ok = false;
-                    if is_rate_limited_err(&e) {
-                        return Err(AMMError::Msg(format!(
-                            "caliber: batch get_storage_at rate limited: {e}"
-                        )));
-                    }
-                    warn_batch_fallback(&AMMError::Msg(format!(
-                        "caliber: batch get_storage_at failed: {e}"
-                    )));
-                    break;
-                }
-            }
-        }
-    }
-    if !batch_ok {
-        out.clear();
-        for (address, slot) in reads {
-            let key = U256::from_be_bytes(slot.0);
-            let value = http_provider
-                .get_storage_at(*address, key)
-                .block_id(block)
-                .await
-                .map_err(|e| AMMError::Msg(format!("caliber: get_storage_at failed: {e}")))?;
-            out.push(value);
-        }
-    }
-    Ok(out)
+    provider
+        .get_block_number()
+        .await
+        .map_err(|e| AMMError::Msg(format!("caliber: storage head query failed: {e}")))
 }
 
-/// 分片版 `storage_at_batch`：超过 `chunk` 个槽位时拆成多次 batch。
-async fn storage_at_batch_chunked<N, P>(
-    provider: &P,
-    reads: &[(Address, B256)],
-    block: BlockId,
-    chunk: usize,
-) -> Result<Vec<U256>, AMMError>
+/// 把 `BlockId` 解析为显式快照块号：显式数字原样返回，
+/// `latest`/`pending` 等模糊块一律钉到存储节点 canonical head。
+async fn resolve_snapshot_block<N, P>(provider: &P, block: BlockId) -> Result<u64, AMMError>
 where
     N: Network,
     P: Provider<N>,
 {
-    let mut out = Vec::with_capacity(reads.len());
-    for part in reads.chunks(chunk) {
-        out.extend(storage_at_batch(provider, part, block).await?);
+    match block {
+        BlockId::Number(alloy::eips::BlockNumberOrTag::Number(n)) => Ok(n),
+        _ => caliber_storage_head::<N, P>(provider).await,
     }
-    Ok(out)
 }
 
 /// pair 固定槽位（与 `fetch_exact_snapshot` 读取的 8 个槽一一对应）
@@ -1862,10 +1703,11 @@ fn build_snapshot_from_slots(
     })
 }
 
-/// 通过批量 `eth_getStorageAt` 读取单个 pair 的储备 + 原始 ladder + 精确报价参数。
+/// 读取单个 pair 的储备 + 原始 ladder + 精确报价参数。
 ///
 /// 存储布局见 `build_snapshot_from_slots`。10 个固定槽位（含全局 slot2/slot3）
-/// 走单次 JSON-RPC batch，ladder 槽位按需再读一批。
+/// 与 ladder 槽位都走 [`crate::amms::evm_storage`] 的 `eth_call` bulk-SLOAD
+/// （一次调用读回任意多个槽；官方 WS 网关可用）。
 async fn fetch_exact_snapshot<N, P>(
     provider: &P,
     contract_address: Address,
@@ -1880,32 +1722,27 @@ where
     <N::BlockResponse as BlockResponse>::Header: BlockHeader,
     P: Provider<N> + Clone,
 {
-    // 存储读取块高校验：超前于 HTTP 节点头部时失败返回（由 maintenance 重试），
+    // 存储读取块高校验：超前于节点头部时失败返回（由 maintenance 重试），
     // 不降级读取，避免"读旧块伪装成同步到目标块"（2026-08-25 68856847 事故）。
-    let block = ensure_storage_block_available(block).await?;
+    let block = ensure_storage_block_available::<N, P>(provider, block).await?;
 
     let cfg_base = pair_slot(pair_id, 6);
     let data_base = pair_slot(pair_id, 7);
 
-    let fixed = storage_at_batch(
+    let fixed = crate::amms::evm_storage::storage_slots_at::<N, P>(
         provider,
+        contract_address,
         &[
-            (contract_address, b256_add(cfg_base, 1)),
-            (contract_address, b256_add(cfg_base, 2)),
-            (contract_address, b256_add(cfg_base, 3)),
-            (contract_address, b256_add(cfg_base, 4)),
-            (contract_address, b256_add(cfg_base, 5)),
-            (contract_address, b256_add(cfg_base, 6)),
-            (contract_address, b256_add(cfg_base, 7)),
-            (contract_address, data_base),
-            (
-                contract_address,
-                B256::from(U256::from(2u64).to_be_bytes::<32>()),
-            ),
-            (
-                contract_address,
-                B256::from(U256::from(3u64).to_be_bytes::<32>()),
-            ),
+            b256_add(cfg_base, 1),
+            b256_add(cfg_base, 2),
+            b256_add(cfg_base, 3),
+            b256_add(cfg_base, 4),
+            b256_add(cfg_base, 5),
+            b256_add(cfg_base, 6),
+            b256_add(cfg_base, 7),
+            data_base,
+            B256::from(U256::from(2u64).to_be_bytes::<32>()),
+            B256::from(U256::from(3u64).to_be_bytes::<32>()),
         ],
         block,
     )
@@ -1949,10 +1786,16 @@ where
     if !stale {
         let ladder_base =
             keccak256((U256::from_be_bytes(cfg_base.0) + U256::from(2)).to_be_bytes::<32>());
-        let reads: Vec<(Address, B256)> = (0..n_usize)
-            .map(|i| (contract_address, b256_add(ladder_base, i as u64)))
+        let reads: Vec<B256> = (0..n_usize)
+            .map(|i| b256_add(ladder_base, i as u64))
             .collect();
-        ladder_raw = storage_at_batch(provider, &reads, block).await?;
+        ladder_raw = crate::amms::evm_storage::storage_slots_at::<N, P>(
+            provider,
+            contract_address,
+            &reads,
+            block,
+        )
+        .await?;
     }
 
     build_snapshot_from_slots(
@@ -1970,9 +1813,8 @@ where
 /// 批量读取多个 pair 的完整精确快照。
 ///
 /// 每个 pair 的固定槽位（cfg+1..+7、data+0）与全部 ladder 槽位都通过
-/// JSON-RPC batch 读取（`STORAGE_BATCH_SIZE` 个槽位一次 HTTP 请求）。
-/// 相比逐 pair 串行 `fetch_exact_snapshot`（每 pair ~10+n 次 RPC），
-/// 批量路径把 RPC 往返降到每 10 槽 1 次。
+/// [`crate::amms::evm_storage`] 的 `eth_call` bulk-SLOAD 读取（一次调用读回
+/// 数百个槽），RPC 往返从每 pool ~10+n 次降到每个合约常数次。
 ///
 /// 返回与 `pairs` 对齐的逐 pair 结果；batch 本身失败返回外层 Err，
 /// 单个 pair 校验失败（ladder 长度非法）返回内层 Err。
@@ -1992,22 +1834,17 @@ where
         return Ok(Vec::new());
     }
 
-    // 存储读取块高校验：超前于 HTTP 节点头部时失败返回（由 maintenance 重试），
+    // 存储读取块高校验：超前于节点头部时失败返回（由 maintenance 重试），
     // 不降级读取，避免"读旧块伪装成同步到目标块"（2026-08-25 68856847 事故）。
-    let block = ensure_storage_block_available(block).await?;
+    let block = ensure_storage_block_available::<N, P>(provider, block).await?;
 
     // 全局槽位（每合约一次）+ 块头（整个 batch 一次）
-    let globals = storage_at_batch(
+    let globals = crate::amms::evm_storage::storage_slots_at::<N, P>(
         provider,
+        contract_address,
         &[
-            (
-                contract_address,
-                B256::from(U256::from(2u64).to_be_bytes::<32>()),
-            ),
-            (
-                contract_address,
-                B256::from(U256::from(3u64).to_be_bytes::<32>()),
-            ),
+            B256::from(U256::from(2u64).to_be_bytes::<32>()),
+            B256::from(U256::from(3u64).to_be_bytes::<32>()),
         ],
         block,
     )
@@ -2029,20 +1866,26 @@ where
         .unwrap_or_default();
 
     // 固定槽位：每 pair 8 个（cfg+1..+7、data+0）
-    let mut fixed_reads: Vec<(Address, B256)> = Vec::with_capacity(pairs.len() * 8);
+    let mut fixed_reads: Vec<B256> = Vec::with_capacity(pairs.len() * 8);
     for (pair_id, _, _) in pairs {
         let cfg_base = pair_slot(*pair_id, 6);
         let data_base = pair_slot(*pair_id, 7);
         for i in 1..=7u64 {
-            fixed_reads.push((contract_address, b256_add(cfg_base, i)));
+            fixed_reads.push(b256_add(cfg_base, i));
         }
-        fixed_reads.push((contract_address, data_base));
+        fixed_reads.push(data_base);
     }
-    let fixed = storage_at_batch_chunked(provider, &fixed_reads, block, STORAGE_BATCH_SIZE).await?;
+    let fixed = crate::amms::evm_storage::storage_slots_at_chunked::<N, P>(
+        provider,
+        contract_address,
+        &fixed_reads,
+        block,
+    )
+    .await?;
 
     // 组装 raw + 收集需要读取的 ladder 槽位
     let mut raws: Vec<(RawPairSlots, bool)> = Vec::with_capacity(pairs.len());
-    let mut ladder_reads: Vec<(Address, B256)> = Vec::new();
+    let mut ladder_reads: Vec<B256> = Vec::new();
     for (i, (pair_id, _, _)) in pairs.iter().enumerate() {
         let base = i * 8;
         let raw = RawPairSlots {
@@ -2067,13 +1910,18 @@ where
             let ladder_base =
                 keccak256((U256::from_be_bytes(cfg_base.0) + U256::from(2)).to_be_bytes::<32>());
             for j in 0..n_usize {
-                ladder_reads.push((contract_address, b256_add(ladder_base, j as u64)));
+                ladder_reads.push(b256_add(ladder_base, j as u64));
             }
         }
     }
 
-    let ladder_vals =
-        storage_at_batch_chunked(provider, &ladder_reads, block, STORAGE_BATCH_SIZE).await?;
+    let ladder_vals = crate::amms::evm_storage::storage_slots_at_chunked::<N, P>(
+        provider,
+        contract_address,
+        &ladder_reads,
+        block,
+    )
+    .await?;
 
     // 组装逐 pair 结果
     let mut out = Vec::with_capacity(pairs.len());

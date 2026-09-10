@@ -347,7 +347,7 @@ where
     //
     //    快照块号必须显式（rebase 合并数学的自变量）：调用方给 `latest` 等
     //    模糊块时钉到存储节点 canonical head。
-    let snap_block = super::resolve_snapshot_block(block_number).await?;
+    let snap_block = super::resolve_snapshot_block::<N, P>(&provider, block_number).await?;
     let flags = super::batch_refresh_snapshots::<N, P>(&provider, &mut pools, snap_block).await?;
 
     let initialized = pools
@@ -414,21 +414,24 @@ where
 }
 
 // ============================================================================
-// eth_getStorageAt helper
+// 单槽读取 helper
 // ============================================================================
 
-/// 通过 alloy Provider 发送 `eth_getStorageAt` JSON-RPC 请求
+/// 读取单个存储槽（经 [`crate::amms::evm_storage`] 的 `eth_call` bulk-SLOAD，
+/// 官方 WS 网关可用；不依赖 `eth_getStorageAt`）。
 async fn get_storage_at<N, P>(provider: &P, address: Address, slot: B256) -> Result<B256, AMMError>
 where
     N: Network,
     P: Provider<N>,
 {
-    let slot_u256 = U256::from_be_bytes(slot.0);
-    let result: U256 = provider
-        .get_storage_at(address, slot_u256)
-        .await
-        .map_err(|e| AMMError::Msg(format!("caliber: get_storage_at failed: {e}")))?;
-    Ok(B256::from(result.to_be_bytes::<32>()))
+    let values = crate::amms::evm_storage::storage_slots_at::<N, P>(
+        provider,
+        address,
+        &[slot],
+        BlockId::latest(),
+    )
+    .await?;
+    Ok(B256::from(values[0].to_be_bytes::<32>()))
 }
 
 impl Default for super::types::CaliberLadderState {
