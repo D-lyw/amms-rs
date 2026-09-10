@@ -68,11 +68,12 @@ use alloy::{
     eips::BlockId,
     network::Network,
     primitives::{address, Address, B256, U256},
-    providers::Provider,
+    providers::{DynProvider, Provider, ProviderBuilder},
     rpc::types::Log,
     sol,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
 use tracing::{instrument, warn};
 
 use crate::amms::{
@@ -121,6 +122,36 @@ pub const ELFOMO_UPDATE_EVENT: B256 = B256::new([
 
 /// Pool `updatePrices(uint256)` selector（flashblocks raw-tx 主通道用）
 pub const ELFOMO_UPDATE_SELECTOR: [u8; 4] = [0xae, 0x7e, 0x8d, 0x81];
+
+// ----------------------------------------------------------------------------
+// storage 读取专用 HTTP RPC（处理方式与 caliber_prop 一致）
+// ----------------------------------------------------------------------------
+
+/// elfomo storage 读取专用 HTTP RPC。
+///
+/// XLayer 生产 WS 网关（`wss://ws.xlayer.tech`）不开放 `eth_getStorageAt`
+/// （`-32601: rpc method is not whitelisted`），而 init / L2 周期对账 /
+/// AsyncUpdate 兜底都必须直读 Pool slot1 取价格种子（`a = slot1 >> 32`）；
+/// 因此本模块的 storage 读取统一走该 HTTP RPC（与 `caliber_prop` 同一处理
+/// 方式）。主通道（flashblocks raw-tx 本地直算）不依赖该端点。
+const ELFOMO_STORAGE_HTTP_RPC: &str = "https://rpc.xlayer.tech";
+
+/// 懒初始化的 HTTP provider（进程内复用，避免每次快照重连）。
+static ELFOMO_STORAGE_PROVIDER: OnceLock<DynProvider> = OnceLock::new();
+
+fn elfomo_storage_provider() -> Result<&'static DynProvider, AMMError> {
+    if let Some(provider) = ELFOMO_STORAGE_PROVIDER.get() {
+        return Ok(provider);
+    }
+    let url: alloy::transports::http::reqwest::Url = ELFOMO_STORAGE_HTTP_RPC
+        .parse()
+        .map_err(|e| AMMError::Msg(format!("elfomo: invalid storage rpc url: {e}")))?;
+    let provider: DynProvider = ProviderBuilder::new().connect_http(url).erased();
+    let _ = ELFOMO_STORAGE_PROVIDER.set(provider);
+    Ok(ELFOMO_STORAGE_PROVIDER
+        .get()
+        .expect("elfomo storage provider just initialized"))
+}
 
 /// 价格定点基（1e24 = 0xD3C21BCECCEDA1000000，64-bit limbs 小端）
 const ONE_E24: U256 = U256::from_limbs([0x1bcecceda1000000, 0xd3c2, 0, 0]);
@@ -621,7 +652,8 @@ impl ElfomoFiPropPool {
     ///
     /// 注意（链上实证）：vault 是 Gnosis Safe，**不能**在 vault 合约上调用
     /// `balanceOf`；余额必须读 `token.balanceOf(vault)`。价格种子读
-    /// Pool slot1（`a = slot1 >> 32`），供本地 `build_orderbook` 使用。
+    /// Pool slot1（`a = slot1 >> 32`，走本模块 storage HTTP provider——
+    /// WS 网关不开放 `eth_getStorageAt`），供本地 `build_orderbook` 使用。
     pub async fn fetch_orderbook_snapshot<N, P>(
         &self,
         provider: P,
@@ -656,8 +688,9 @@ impl ElfomoFiPropPool {
             .call()
             .await?;
 
-        // 价格种子：Pool slot1 高 32 位
-        let slot1: U256 = provider
+        // 价格种子：Pool slot1 高 32 位。storage 读取统一走本模块的 HTTP
+        // provider（WS 网关不开放 eth_getStorageAt，同 caliber_prop）。
+        let slot1: U256 = elfomo_storage_provider()?
             .get_storage_at(self.pool_address, U256::from(1u64))
             .block_id(block)
             .await?;
