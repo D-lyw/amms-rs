@@ -1000,13 +1000,6 @@ impl AutomatedMarketMaker for ElfomoFiPropPool {
         N: Network,
         P: Provider<N> + Clone,
     {
-        // 水位记账块号：`latest` 只在此处解析用于 `last_synced_block`，
-        // **不 pin 进链上读取**（见 `update_at` 的同名说明）。
-        let snap_block = match block_number {
-            BlockId::Number(alloy::eips::BlockNumberOrTag::Number(num)) => num,
-            _ => provider.get_block_number().await?,
-        };
-
         // 资产：pair 由实例字段 token_x/token_y 定义（Factory/部署配置传入）。
         // decimals 对已知默认 pair（xETH=18/USDT0=6）取常量，其余 token 兜底 18。
         self.tokens = vec![
@@ -1038,8 +1031,9 @@ impl AutomatedMarketMaker for ElfomoFiPropPool {
             },
         ];
 
-        let snap = self
-            .fetch_orderbook_snapshot::<N, _>(provider, block_number)
+        // 读块钉死后再读：content 与水位同源（见 `fetch_snapshot_at`）
+        let (snap, snap_block) = self
+            .fetch_snapshot_at::<N, _>(provider, block_number)
             .await?;
         if snap.from_to_levels.is_empty() || snap.to_from_levels.is_empty() {
             warn!(
@@ -1070,14 +1064,19 @@ impl AutomatedMarketMaker for ElfomoFiPropPool {
 }
 
 impl ElfomoFiPropPool {
-    /// 在指定区块拉取 orderbook + vault 快照（StateSpace update 与周期任务共用）。
+    /// 拉取链上精确快照：**先把读块钉死、再读**（content 与水位同源）。
     ///
-    /// 调用方传入的 `block` **原样**下发给链上读取（同 caliber `update()`）：
-    /// `latest` 由各 provider 自行解析，**不预先 pin 成具体块号**（部分端点对
-    /// 刚产出的头块 state 有短暂不可用窗口，pin 死会撞 `-32019 block is out of
-    /// range`）。storage 读取走 `eth_call` + state-override 批量 SLOAD。
-    /// `snap_block` 仅在 `latest` 时解析一次，用于 `last_synced_block` 水位记账。
-    pub async fn update_at<N, P>(&mut self, provider: P, block: BlockId) -> Result<(), AMMError>
+    /// `BlockId::Number(n)` 直接使用 `n`；其余（`latest` 等）先解析为 provider
+    /// 当前头部块号，再以 `BlockId::Number(head)` 读取。杜绝"读的是 latest、
+    /// 水位记的是另一次 `get_block_number()`"的错位：content 覆盖块 ≠ 水位块时，
+    /// 落在该区间的成交会被水位守卫跳过 → 永久漏账。
+    /// 读块可用性由 `ensure_storage_block_available` 守卫（超前于节点头部返回
+    /// `BlockNotAvailable`，由调用方留队重试，不降级读取）。
+    pub async fn fetch_snapshot_at<N, P>(
+        &self,
+        provider: P,
+        block: BlockId,
+    ) -> Result<(OrderbookSnapshot, u64), AMMError>
     where
         N: Network,
         P: Provider<N> + Clone,
@@ -1086,7 +1085,27 @@ impl ElfomoFiPropPool {
             BlockId::Number(alloy::eips::BlockNumberOrTag::Number(num)) => num,
             _ => provider.get_block_number().await?,
         };
-        let snap = self.fetch_orderbook_snapshot(provider, block).await?;
+        let snap = self
+            .fetch_orderbook_snapshot::<N, _>(provider, BlockId::Number(snap_block.into()))
+            .await?;
+        Ok((snap, snap_block))
+    }
+
+    /// 把链上精确快照**合并**进本地池（绝不整只覆盖实时事件账本）。
+    ///
+    /// vault 是纯累积账本（与 caliber reserve 同类）：只有"本地水位 ≤ 快照读块"
+    /// 时快照才落地——此时快照内容已覆盖本地已应用的全部事件（同块及更早），
+    /// 落地是纯超集，不丢增量；本地水位更高说明已有更新的实时事件进了账本，
+    /// 覆盖会丢这段增量并把水位回退（该区间日志随后被守卫跳过 → 永久漏账），
+    /// 因此跳过，等下一轮头部追上再修。
+    ///
+    /// 落地时水位**精确**置为快照读块（不再 `max(prev)`）：gate 已保证单调，
+    /// 同时避免"水位声称已同步到本地 flashblock 头、内容却只到 RPC 头"的错位。
+    /// 返回是否落地。
+    pub fn merge_snapshot(&mut self, snap: OrderbookSnapshot, snap_block: u64) -> bool {
+        if self.last_synced_block > snap_block {
+            return false;
+        }
         self.apply_orderbook_snapshot(
             snap.from_to_levels,
             snap.to_from_levels,
@@ -1095,6 +1114,20 @@ impl ElfomoFiPropPool {
             snap.price_seed,
             snap_block,
         );
+        self.last_synced_block = snap_block;
+        true
+    }
+
+    /// 在指定区块拉取并合并 orderbook + vault 快照（StateSpace update 与周期
+    /// 任务共用）。读块钉定见 [`Self::fetch_snapshot_at`]，合并语义见
+    /// [`Self::merge_snapshot`]。
+    pub async fn update_at<N, P>(&mut self, provider: P, block: BlockId) -> Result<(), AMMError>
+    where
+        N: Network,
+        P: Provider<N> + Clone,
+    {
+        let (snap, snap_block) = self.fetch_snapshot_at::<N, _>(provider, block).await?;
+        self.merge_snapshot(snap, snap_block);
         Ok(())
     }
 }
@@ -1621,6 +1654,49 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rev, pool.levels.vault_xeth);
+    }
+
+    #[test]
+    fn test_merge_snapshot_never_rolls_back_live_ledger() {
+        // 周期对账/AsyncUpdate 的合并语义：本地水位已高于快照读块时不得落地，
+        // 否则会丢 RPC 窗口内的 ElfomoTrade 增量并把水位回退 → 永久漏账。
+        let s = snapshot();
+        let mut pool = ElfomoFiPropPool {
+            levels: s.clone(),
+            price_seed: s.price_seed,
+            last_synced_block: 1_000,
+            ..ElfomoFiPropPool::default()
+        };
+
+        // 快照读块落后于本地水位 → 跳过：内容与水位都不动
+        assert!(!pool.merge_snapshot(s.clone(), 999));
+        assert_eq!(pool.levels.vault_usdt0, s.vault_usdt0);
+        assert_eq!(pool.levels.vault_xeth, s.vault_xeth);
+        assert_eq!(pool.last_synced_block, 1_000);
+
+        // 快照读块不早于本地水位 → 落地，且水位精确等于快照读块
+        let vault_usdt0 = U256::from(7_000_000_000u64);
+        let vault_xeth = U256::from(1_500_000_000_000_000_000u128);
+        let ob = ElfomoFiPropPool::build_orderbook(s.price_seed, vault_usdt0, vault_xeth);
+        let fresh = OrderbookSnapshot {
+            from_to_levels: ob.from_to_levels,
+            to_from_levels: ob.to_from_levels,
+            vault_usdt0,
+            vault_xeth,
+            price_seed: s.price_seed,
+        };
+        assert!(pool.merge_snapshot(fresh.clone(), 1_000));
+        assert_eq!(pool.levels.vault_usdt0, vault_usdt0);
+        assert_eq!(pool.levels.vault_xeth, vault_xeth);
+        assert_eq!(pool.last_synced_block, 1_000);
+        // 落地后报价与 (seed, vault) 读时函数一致
+        let rebuilt = ElfomoFiPropPool::build_orderbook(
+            pool.price_seed,
+            pool.levels.vault_usdt0,
+            pool.levels.vault_xeth,
+        );
+        assert_eq!(rebuilt.from_to_levels, pool.levels.from_to_levels);
+        assert_eq!(rebuilt.to_from_levels, pool.levels.to_from_levels);
     }
 
     #[test]

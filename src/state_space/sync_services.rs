@@ -20,6 +20,7 @@ use crate::amms::balancer_v2::BalancerV2Pool;
 use crate::amms::balancer_v3::BalancerV3Pool;
 use crate::amms::binaryfi_prop::{BinaryFiPropPool, Snapshot};
 use crate::amms::curve_ng::{CurveNGFactory, ICurveNGStableSwap};
+use crate::amms::elfomo_prop::types::OrderbookSnapshot;
 use crate::amms::elfomo_prop::ElfomoFiPropPool;
 use crate::amms::fluid_dex::{
     DexReservesResolver, FluidDexT1, FluidLiquidity, TokenLimitData, FLUID_DEX_RESOLVER,
@@ -1480,7 +1481,7 @@ pub async fn start_elfomo_prop_sync_task<N, P>(
     loop {
         sleep(next_sleep).await;
 
-        let mut pools: Vec<ElfomoFiPropPool> = {
+        let pools: Vec<ElfomoFiPropPool> = {
             let read_guard = state.read().await;
             read_guard
                 .state
@@ -1498,13 +1499,18 @@ pub async fn start_elfomo_prop_sync_task<N, P>(
         }
 
         let mut reconcile_failed = false;
-        // 锁外拉取快照（网络调用不持写锁），成功后统一写回
-        for pool in &mut pools {
+        // 锁外拉取快照（网络调用不持写锁）→ **锁内对 current existing 合并写回**。
+        // 绝不整只替换：锁外克隆整池 + RPC + 锁内 `*existing = clone` 会丢掉
+        // RPC 窗口内落在 live 池子上的 ElfomoTrade 增量，并把水位回退到克隆时
+        // 的值（后续同区间日志被水位守卫跳过 → 永久漏账）。合并语义见
+        // `ElfomoFiPropPool::merge_snapshot`（本地水位更高时跳过，保留实时账本）。
+        let mut refreshed: Vec<(Address, OrderbookSnapshot, u64)> = Vec::with_capacity(pools.len());
+        for pool in &pools {
             match pool
-                .update_at::<N, P>(provider.clone(), BlockId::latest())
+                .fetch_snapshot_at::<N, P>(provider.clone(), BlockId::latest())
                 .await
             {
-                Ok(()) => {}
+                Ok((snap, snap_block)) => refreshed.push((pool.pool_address, snap, snap_block)),
                 Err(e) => {
                     reconcile_failed = true;
                     error!(
@@ -1517,10 +1523,10 @@ pub async fn start_elfomo_prop_sync_task<N, P>(
         }
 
         let mut write_guard = state.write().await;
-        for pool in pools {
-            if let Some(existing_amm) = write_guard.get_mut_cow(&pool.address()) {
+        for (address, snap, snap_block) in refreshed {
+            if let Some(existing_amm) = write_guard.get_mut_cow(&address) {
                 if let AMM::ElfomoFiPropPool(existing) = existing_amm {
-                    *existing = pool;
+                    existing.merge_snapshot(snap, snap_block);
                 }
             }
         }
