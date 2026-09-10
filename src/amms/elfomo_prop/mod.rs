@@ -63,6 +63,17 @@
 //!    slot1 + vault `balanceOf` 真值（仅 flashblocks 断流/未覆盖时触发）。
 //! 3. **L2 — 周期快照（最后兜底）**：`start_elfomo_prop_sync_task` 低频重拉
 //!    整档回正 + 种子 + vault `balanceOf`，覆盖断流/重连/漏块等极端场景。
+//!
+//! ### 两条通道的合并语义（改动前先读 `docs/dynamic_state_sync_principles.md` §3）
+//!
+//! - **vault 余额（累积量）**：由 `ledger::VaultDeltaLedger` 做
+//!   `current = 快照(S) + Σ_{块>S} Δ` 的 **rebase-merge**。快照永远能落地
+//!   （不再"本地水位更高就跳过"——那会把唯一纠错通道饿死），只有早于账本
+//!   **锚点块** 才丢弃。余额由账本派生，负值只告警+截断、账本保留真值。
+//! - **`price_seed`（最新值）**：字段级水位 `price_seed_block` 保鲜。
+//!   raw-tx 种子来自 flashblock 乐观头，快照读规范头，故只在
+//!   `snap_block >= price_seed_block` 时用快照种子覆盖；否则保留本地新种子
+//!   并按它重建档位（链上档位是与快照种子绑定的，不能混用）。
 
 use alloy::{
     eips::BlockId,
@@ -84,7 +95,10 @@ use crate::amms::{
 use crate::amms::elfomo_prop::types::{LevelConsumed, OrderbookLevel, OrderbookSnapshot};
 
 pub mod factory;
+pub mod ledger;
 pub mod types;
+
+use self::ledger::{VaultDeltaLedger, VaultLedgerApply};
 
 // ============================================================================
 // 常量（XLayer 实测地址，2026-09-01）
@@ -222,6 +236,13 @@ pub struct ElfomoFiPropPool {
     /// orderbook 是 `(a, vault_usdt0, vault_xeth)` 的读时纯函数，
     /// 本地报价实时重算（见 `build_orderbook`）。
     pub price_seed: U256,
+    /// 价格种子的**字段级水位**：种子上次被写入的块号。
+    ///
+    /// raw-tx 通道的种子来自 flashblock 乐观头（领先规范头 1~3 块），而快照读的是
+    /// 规范头 → 快照落地时若种子的水位更新，必须保留本地种子（否则会把已应用的
+    /// 新种子回退成旧种子，产生旧价报价窗口）。见 principles §3 规则 1。
+    #[serde(default)]
+    pub price_seed_block: u64,
     /// Factory 代理地址（getOrderbook 快照来源）
     pub factory_address: Address,
     /// Router 地址（swap 事件来源）
@@ -240,6 +261,14 @@ pub struct ElfomoFiPropPool {
     pub levels: OrderbookSnapshot,
     /// 本地档位消耗状态（L1 事件驱动，L2 快照整档回正）
     pub consumed: LevelConsumed,
+    /// vault 余额增量账本（checkpoint + redo log）。
+    ///
+    /// **活池的 `levels.vault_xeth/vault_usdt0` 由此账本派生**：事件记账、
+    /// 快照落地走 `rebase`（`快照(S) + Σ_{块 > S}`），因此"快照读数落后于
+    /// 本地事件块"不再需要跳过快照（那是会把唯一纠错通道饿死的反模式）。
+    /// `simulate_swap_mut` 只作用于深拷贝工作副本，不进账本。
+    #[serde(default)]
+    pub vault_ledger: VaultDeltaLedger,
 }
 
 impl Default for ElfomoFiPropPool {
@@ -255,9 +284,11 @@ impl Default for ElfomoFiPropPool {
             created_block: 0,
             last_synced_block: 0,
             price_seed: U256::ZERO,
+            price_seed_block: 0,
             tokens: Vec::new(),
             levels: OrderbookSnapshot::default(),
             consumed: LevelConsumed::new(0, 0),
+            vault_ledger: VaultDeltaLedger::new(),
         }
     }
 }
@@ -285,9 +316,11 @@ impl ElfomoFiPropPool {
             created_block,
             last_synced_block: 0,
             price_seed: U256::ZERO,
+            price_seed_block: 0,
             tokens: Vec::new(),
             levels: OrderbookSnapshot::default(),
             consumed: LevelConsumed::new(0, 0),
+            vault_ledger: VaultDeltaLedger::new(),
         }
     }
 
@@ -419,6 +452,52 @@ impl ElfomoFiPropPool {
         );
     }
 
+    /// 确保 vault 账本已锚定（正常路径由 `init`/快照落地完成）。
+    ///
+    /// 防御分支：若事件早于任何 abs 快照到达（如从序列化状态恢复、账本字段
+    /// 为新增 default），则以**当前本地余额**为基底锚定。
+    ///
+    /// 基底块号取 `last_synced_block`——它正是"本地余额成立到哪一块"的语义，
+    /// 也是后续 `rebase` 陈旧判据的正确标尺（取 `block - 1` 会把基底虚标得更新，
+    /// 误杀本可用的中间块快照）。块号 0（无块级语义）时才退回 `block - 1`。
+    ///
+    /// 若该基底已覆盖本笔（`block <= base_block`），`record_trade` 会拒收并在
+    /// `sync()` 留 debug 痕；漏账/多计都会在下一次快照 rebase 时对齐链上真值。
+    fn ensure_vault_ledger_anchored(&mut self, block: u64) {
+        if self.vault_ledger.is_anchored() {
+            return;
+        }
+        let base_block = if self.last_synced_block != 0 {
+            self.last_synced_block
+        } else {
+            block.saturating_sub(1)
+        };
+        self.vault_ledger
+            .anchor(base_block, self.levels.vault_xeth, self.levels.vault_usdt0);
+    }
+
+    /// 由账本派生 vault 余额（活池余额的唯一写入点）。
+    ///
+    /// 有符号视图为负 = 本地账本与链上已不一致（漏帧/重放），**必须告警**
+    /// 而不是静默截断；截断只作用于物化的 `levels.vault_*`，账本保留真值，
+    /// 下轮快照 rebase 即可回正。
+    fn sync_vault_balances_from_ledger(&mut self) {
+        let (signed_xeth, signed_usdt0) = self.vault_ledger.current_signed();
+        if signed_xeth < 0 || signed_usdt0 < 0 {
+            warn!(
+                target: "amms::elfomo_prop",
+                pool = %self.pool_address,
+                vault_xeth_signed = signed_xeth,
+                vault_usdt0_signed = signed_usdt0,
+                anchor_block = self.vault_ledger.anchor_block(),
+                "elfomofi: vault ledger went negative (local drift); clamping to 0, awaiting snapshot rebase"
+            );
+        }
+        let (vault_xeth, vault_usdt0) = self.vault_ledger.current();
+        self.levels.vault_xeth = vault_xeth;
+        self.levels.vault_usdt0 = vault_usdt0;
+    }
+
     /// 针对给定 orderbook 快照报价（纯函数；链上对拍/复用用）。
     ///
     /// 语义与 `simulate_swap` 完全一致（零 consumed、金库封顶），但使用外部
@@ -446,9 +525,25 @@ impl ElfomoFiPropPool {
     ///
     /// - 设置 `price_seed`，按**当前本地金库余额**重算整本 orderbook；
     /// - 档位随余额自动缩放（链上读时动态计算，同构）；
-    /// - 单调推进 `last_synced_block`（与 `set_last_synced_block` 同语义）。
+    /// - **水位保鲜**：仅当 `block_number >= price_seed_block` 时才写入种子并把
+    ///   水位推进到该块（规则 1：水位必须被"读"，只写不读会让旧块/重放的
+    ///   raw-tx 把新种子回退、水位却反被 stamp 到更高块号，自相矛盾并骗过
+    ///   `merge_snapshot` 的 `seed_fresh` 闸门）。同块多笔由调用方按 `tx_index`
+    ///   排序，最后一笔赢。
+    /// - 单调推进 `last_synced_block`。
     pub fn apply_price_seed(&mut self, seed: U256, block_number: u64) {
-        self.price_seed = seed;
+        if block_number >= self.price_seed_block {
+            self.price_seed = seed;
+            self.price_seed_block = block_number;
+        } else {
+            tracing::debug!(
+                target: "amms::elfomo_prop",
+                pool = %self.pool_address,
+                block_number,
+                price_seed_block = self.price_seed_block,
+                "elfomofi: stale price seed ignored"
+            );
+        }
         self.refresh_levels();
         self.last_synced_block = self.last_synced_block.max(block_number);
     }
@@ -635,6 +730,21 @@ impl ElfomoFiPropPool {
         price_seed: U256,
         block_number: u64,
     ) {
+        // 仅限 init / 空账本：更旧的块号会让账本锚点与水位回退，静默抹掉 P2 收益。
+        if block_number != 0 && block_number < self.vault_ledger.anchor_block() {
+            warn!(
+                target: "amms::elfomo_prop",
+                pool = %self.pool_address,
+                block_number,
+                anchor_block = self.vault_ledger.anchor_block(),
+                "elfomofi: stale orderbook snapshot ignored (older than ledger anchor)"
+            );
+            return;
+        }
+        // 种子同样按字段级水位保鲜（与 `apply_price_seed` / `merge_snapshot` 同形态）：
+        // 本地已有更新种子时不得回退。链上档位数组是绑定快照种子的，此时必须按
+        // 本地 (seed, 余额) 重建，不能直接采用。
+        let seed_fresh = block_number >= self.price_seed_block;
         self.levels = OrderbookSnapshot {
             from_to_levels,
             to_from_levels,
@@ -642,12 +752,29 @@ impl ElfomoFiPropPool {
             vault_xeth,
             price_seed,
         };
-        self.price_seed = price_seed;
+        if seed_fresh {
+            self.price_seed = price_seed;
+            self.price_seed_block = block_number;
+        } else {
+            warn!(
+                target: "amms::elfomo_prop",
+                pool = %self.pool_address,
+                block_number,
+                price_seed_block = self.price_seed_block,
+                "elfomofi: orderbook snapshot kept newer realtime price seed"
+            );
+        }
         self.consumed = LevelConsumed::new(
             self.levels.from_to_levels.len(),
             self.levels.to_from_levels.len(),
         );
+        if !seed_fresh {
+            self.refresh_levels();
+        }
         self.last_synced_block = self.last_synced_block.max(block_number);
+        // 链上绝对值 = 账本锚点（块末状态已含该块及更早的全部成交）。
+        self.vault_ledger
+            .anchor(block_number, vault_xeth, vault_usdt0);
     }
 
     /// 拉取 orderbook + vault 余额 + 价格种子快照（L2/init 兜底通道）。
@@ -812,25 +939,36 @@ impl AutomatedMarketMaker for ElfomoFiPropPool {
             let amount_out = U256::from_be_slice(&data[160..192]);
             // 金库是成交的双向对手方（链上 10 块逐笔实证）：账户给出什么金库就
             // 收进什么，账户收到什么金库就付出什么。
-            //   x→y：vault_xeth += amount_in, vault_usdt0 -= amount_out
-            //   y→x：vault_usdt0 += amount_in, vault_xeth -= amount_out
-            // orderbook 是 (seed, vault) 的读时纯函数：余额更新后整本自动重算。
-            // （consume_* 的结果会被 refresh_levels 按金库重建并清空，有效账本
-            //   只有 seed + 两个 vault 余额。）
-            if from_token == self.token_x && to_token == self.token_y {
-                self.consume_from_to(amount_in);
-                self.levels.vault_xeth = self.levels.vault_xeth.saturating_add(amount_in);
-                self.levels.vault_usdt0 = self.levels.vault_usdt0.saturating_sub(amount_out);
-                self.refresh_levels();
+            //   x→y：Δxeth = +amount_in, Δusdt0 = −amount_out
+            //   y→x：Δusdt0 = +amount_in, Δxeth = −amount_out
+            // 增量先入 `vault_ledger`（有符号，不静默截断），余额再由账本派生；
+            // orderbook 是 (seed, vault) 读时纯函数，余额更新后整本自动重算。
+            // `record_trade` 返回 false = 重复回放/已含在快照锚点内 → 不得重复入账。
+            let x_to_y = from_token == self.token_x && to_token == self.token_y;
+            let y_to_x = from_token == self.token_y && to_token == self.token_x;
+            if !x_to_y && !y_to_x {
+                // 非本池 pair 的成交（同一 Router 下其它 pair）：静默忽略。
                 return Ok(SyncAction::None);
             }
-            if from_token == self.token_y && to_token == self.token_x {
-                self.consume_to_from(amount_out);
-                self.levels.vault_usdt0 = self.levels.vault_usdt0.saturating_add(amount_in);
-                self.levels.vault_xeth = self.levels.vault_xeth.saturating_sub(amount_out);
-                self.refresh_levels();
+            let block = log.block_number.unwrap_or(0);
+            self.ensure_vault_ledger_anchored(block);
+            if !self
+                .vault_ledger
+                .record_trade(block, log.log_index, x_to_y, amount_in, amount_out)
+            {
+                // 两种被拒情形都留痕（不再静默）：快照锚点已含该块 / 同块同日志重放。
+                tracing::debug!(
+                    target: "amms::elfomo_prop",
+                    pool = %self.pool_address,
+                    block,
+                    log_index = ?log.log_index,
+                    anchor_block = self.vault_ledger.anchor_block(),
+                    "elfomofi: trade already covered by snapshot anchor or replayed; skipped"
+                );
                 return Ok(SyncAction::None);
             }
+            self.sync_vault_balances_from_ledger();
+            self.refresh_levels();
             return Ok(SyncAction::None);
         }
         Ok(SyncAction::None)
@@ -930,6 +1068,12 @@ impl AutomatedMarketMaker for ElfomoFiPropPool {
         Ok(U256::ZERO)
     }
 
+    /// 可变模拟：**只允许作用在深拷贝工作副本上**（引擎 pending 路径的约定，
+    /// 与 BinaryFi 一致），不可用于 `StateSpace` 里的活池。
+    ///
+    /// 原因：活池的 `levels.vault_*` 由 `vault_ledger` 派生（真实事件唯一写入点），
+    /// 这里直接改派生值不会进账本——下一次 `sync_vault_balances_from_ledger()`
+    /// 会把它静默回退。模拟结果只用于路径报价，不需要进真实账本。
     fn simulate_swap_mut(
         &mut self,
         token_in: Address,
@@ -940,7 +1084,7 @@ impl AutomatedMarketMaker for ElfomoFiPropPool {
         if out.is_zero() {
             return Ok(out);
         }
-        // 与 sync() 同一金库账本契约：金库是对手方，双向记账。
+        // 与 sync() 的金库方向契约一致（金库是对手方，双向记账）。
         if token_in == self.token_x && token_out == self.token_y {
             self.consume_from_to(amount_in);
             self.levels.vault_xeth = self.levels.vault_xeth.saturating_add(amount_in);
@@ -1091,30 +1235,100 @@ impl ElfomoFiPropPool {
         Ok((snap, snap_block))
     }
 
-    /// 把链上精确快照**合并**进本地池（绝不整只覆盖实时事件账本）。
+    /// 把链上精确快照**合并**进本地池（`快照(S) + Σ_{块 > S} 事件增量`）。
     ///
-    /// vault 是纯累积账本（与 caliber reserve 同类）：只有"本地水位 ≤ 快照读块"
-    /// 时快照才落地——此时快照内容已覆盖本地已应用的全部事件（同块及更早），
-    /// 落地是纯超集，不丢增量；本地水位更高说明已有更新的实时事件进了账本，
-    /// 覆盖会丢这段增量并把水位回退（该区间日志随后被守卫跳过 → 永久漏账），
-    /// 因此跳过，等下一轮头部追上再修。
+    /// 修复的反模式（v1.21.3 之前）：先前用**块级水位**判断"快照是否落后"
+    /// （`last_synced_block > snap_block → 丢弃`）。Elfomo 的块级水位被 flashblock
+    /// raw-tx（每块一笔 `updatePrices`）顶到乐观头，而快照读的是存储 RPC 的
+    /// 规范头——于是健康期快照几乎总被跳过；一旦事件流**部分丢帧**（fire-once、
+    /// 无缺口检测，水位仍在头部），快照永远修不进来 → vault 漂移无界累积。
     ///
-    /// 落地时水位**精确**置为快照读块（不再 `max(prev)`）：gate 已保证单调，
-    /// 同时避免"水位声称已同步到本地 flashblock 头、内容却只到 RPC 头"的错位。
+    /// 现在交给 [`VaultDeltaLedger::rebase`]：快照永远能落地（增量 rebase 而非
+    /// 覆盖），只有"快照早于当前**锚点**块"这一真正无法重建的情形才丢弃。
+    ///
     /// 返回是否落地。
     pub fn merge_snapshot(&mut self, snap: OrderbookSnapshot, snap_block: u64) -> bool {
-        if self.last_synced_block > snap_block {
-            return false;
+        let apply = self
+            .vault_ledger
+            .rebase(snap_block, snap.vault_xeth, snap.vault_usdt0);
+        match apply {
+            VaultLedgerApply::SkippedStale => {
+                tracing::debug!(
+                    target: "amms::elfomo_prop",
+                    pool = %self.pool_address,
+                    snap_block,
+                    anchor_block = self.vault_ledger.anchor_block(),
+                    "elfomofi: stale snapshot skipped (older than ledger anchor)"
+                );
+                return false;
+            }
+            VaultLedgerApply::SkippedNoBlock => {
+                warn!(
+                    target: "amms::elfomo_prop",
+                    pool = %self.pool_address,
+                    "elfomofi: snapshot without block number, keeping event ledger"
+                );
+                return false;
+            }
+            VaultLedgerApply::Anchored => tracing::debug!(
+                target: "amms::elfomo_prop",
+                pool = %self.pool_address,
+                snap_block,
+                "elfomofi: snapshot anchored (covers every recorded trade)"
+            ),
+            VaultLedgerApply::Merged => tracing::debug!(
+                target: "amms::elfomo_prop",
+                pool = %self.pool_address,
+                snap_block,
+                last_event_block = self.vault_ledger.last_event_block(),
+                "elfomofi: snapshot rebase-merged (kept newer realtime trades)"
+            ),
         }
-        self.apply_orderbook_snapshot(
-            snap.from_to_levels,
-            snap.to_from_levels,
-            snap.vault_usdt0,
-            snap.vault_xeth,
-            snap.price_seed,
-            snap_block,
-        );
-        self.last_synced_block = snap_block;
+
+        // 种子：**字段级水位**保鲜（规则 1）。raw-tx 种子来自 flashblock 乐观头，
+        // 领先快照读的规范头；快照块早于本地种子水位时必须保留本地种子，
+        // 否则会把已应用的新种子回退成旧种子 → 旧价报价窗口（幻影机会）。
+        let seed_fresh = snap_block >= self.price_seed_block;
+        if seed_fresh {
+            self.price_seed = snap.price_seed;
+            // 快照(S) 已含 S 及更早的全部种子更新 → 水位 stamp 到 S
+            self.price_seed_block = snap_block;
+        } else {
+            tracing::debug!(
+                target: "amms::elfomo_prop",
+                pool = %self.pool_address,
+                snap_block,
+                price_seed_block = self.price_seed_block,
+                "elfomofi: snapshot kept newer realtime price seed"
+            );
+        }
+
+        // 余额 = 账本派生（快照 + Σ_{>S}）。只有"快照覆盖全部已记录成交"
+        // （`Anchored`）**且**种子也采用快照值时才可直接采用链上档位——
+        // 链上档位是用快照的 (seed, 余额) 算出来的，两者任一被本地更新取代，
+        // 都必须按本地 (seed, 余额) 重建，否则档位与种子/余额互相矛盾。
+        let covered_all = apply == VaultLedgerApply::Anchored;
+        self.sync_vault_balances_from_ledger();
+        if covered_all
+            && seed_fresh
+            && !snap.from_to_levels.is_empty()
+            && !snap.to_from_levels.is_empty()
+        {
+            self.levels = OrderbookSnapshot {
+                from_to_levels: snap.from_to_levels,
+                to_from_levels: snap.to_from_levels,
+                vault_usdt0: snap.vault_usdt0,
+                vault_xeth: snap.vault_xeth,
+                price_seed: snap.price_seed,
+            };
+            self.consumed = LevelConsumed::new(
+                self.levels.from_to_levels.len(),
+                self.levels.to_from_levels.len(),
+            );
+        } else {
+            self.refresh_levels();
+        }
+        self.last_synced_block = self.last_synced_block.max(snap_block);
         true
     }
 
@@ -1657,9 +1871,9 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_snapshot_never_rolls_back_live_ledger() {
-        // 周期对账/AsyncUpdate 的合并语义：本地水位已高于快照读块时不得落地，
-        // 否则会丢 RPC 窗口内的 ElfomoTrade 增量并把水位回退 → 永久漏账。
+    fn test_merge_snapshot_rebases_newer_trades_instead_of_skipping() {
+        // 修复的反模式：先前用块级水位判断"快照是否落后"（本地水位更高就丢弃），
+        // 会把唯一的纠错通道饿死。正确语义是 `快照(S) + Σ_{块 > S} 事件增量`。
         let s = snapshot();
         let mut pool = ElfomoFiPropPool {
             levels: s.clone(),
@@ -1668,13 +1882,69 @@ mod tests {
             ..ElfomoFiPropPool::default()
         };
 
-        // 快照读块落后于本地水位 → 跳过：内容与水位都不动
-        assert!(!pool.merge_snapshot(s.clone(), 999));
-        assert_eq!(pool.levels.vault_usdt0, s.vault_usdt0);
-        assert_eq!(pool.levels.vault_xeth, s.vault_xeth);
+        // 先以块 1_000 的链上真值锚定
+        assert!(pool.merge_snapshot(s.clone(), 1_000));
         assert_eq!(pool.last_synced_block, 1_000);
 
-        // 快照读块不早于本地水位 → 落地，且水位精确等于快照读块
+        // 块 1_005 的一笔 ElfomoTrade（xETH→USDT0）：本地水位推进到 1_005
+        let amount_in = U256::from(1_000_000_000_000_000_000u128); // 1 xETH
+        let amount_out = U256::from(3_000_000_000u64); // 3000 USDT0
+        let mut data = Vec::new();
+        for w in [
+            U256::from(0x1234u64),
+            U256::from(0x5678u64),
+            U256::ZERO,
+            U256::ZERO,
+            amount_in,
+            amount_out,
+        ] {
+            data.extend_from_slice(&w.to_be_bytes::<32>());
+        }
+        data[64..96].copy_from_slice(ELFOMO_XETH_ADDRESS.into_word().as_slice());
+        data[96..128].copy_from_slice(ELFOMO_USDT0_ADDRESS.into_word().as_slice());
+        let trade_log: Log = serde_json::from_value(serde_json::json!({
+            "address": format!("{:#x}", ELFOMO_ROUTER_ADDRESS),
+            "topics": [
+                format!("{:#x}", ELFOMO_TRADE_EVENT),
+                format!("0x{:064x}", 1u64),
+                format!("0x{:064x}", 0u64),
+            ],
+            "data": format!("0x{}", alloy::hex::encode(&data)),
+            "blockNumber": format!("0x{:x}", 1_005u64),
+            "transactionIndex": "0x0",
+            "logIndex": "0x0",
+        }))
+        .unwrap();
+        assert!(matches!(pool.sync(&trade_log).unwrap(), SyncAction::None));
+        assert_eq!(pool.levels.vault_xeth, s.vault_xeth + amount_in);
+        assert_eq!(pool.levels.vault_usdt0, s.vault_usdt0 - amount_out);
+        // StateSpace 在 sync() 返回后推进块级水位（幂等守卫用）
+        pool.set_last_synced_block(1_005);
+        assert_eq!(pool.last_synced_block, 1_005);
+
+        // 快照读块 1_003 **落后于**本地水位 1_005：必须落地而不是跳过
+        // （链上真值 1_003 = s + 块内 (1_000,1_003] 的净变化，这里记 (+100,-50)）
+        let snap_xeth = s.vault_xeth + U256::from(100u64);
+        let snap_usdt0 = s.vault_usdt0 - U256::from(50u64);
+        let ob = ElfomoFiPropPool::build_orderbook(s.price_seed, snap_usdt0, snap_xeth);
+        let older = OrderbookSnapshot {
+            from_to_levels: ob.from_to_levels,
+            to_from_levels: ob.to_from_levels,
+            vault_usdt0: snap_usdt0,
+            vault_xeth: snap_xeth,
+            price_seed: s.price_seed,
+        };
+        assert!(
+            pool.merge_snapshot(older, 1_003),
+            "snapshot older than local watermark must still land via rebase"
+        );
+        // current = 快照(1_003) + Σ_{>1_003}（块 1_005 那笔）
+        assert_eq!(pool.levels.vault_xeth, snap_xeth + amount_in);
+        assert_eq!(pool.levels.vault_usdt0, snap_usdt0 - amount_out);
+        // 水位保持单调（不回退）
+        assert_eq!(pool.last_synced_block, 1_005);
+
+        // 更新的快照覆盖全部已记录事件 → 直接锚定，账本清空
         let vault_usdt0 = U256::from(7_000_000_000u64);
         let vault_xeth = U256::from(1_500_000_000_000_000_000u128);
         let ob = ElfomoFiPropPool::build_orderbook(s.price_seed, vault_usdt0, vault_xeth);
@@ -1685,10 +1955,11 @@ mod tests {
             vault_xeth,
             price_seed: s.price_seed,
         };
-        assert!(pool.merge_snapshot(fresh.clone(), 1_000));
+        assert!(pool.merge_snapshot(fresh, 1_006));
         assert_eq!(pool.levels.vault_usdt0, vault_usdt0);
         assert_eq!(pool.levels.vault_xeth, vault_xeth);
-        assert_eq!(pool.last_synced_block, 1_000);
+        assert!(pool.vault_ledger.is_empty());
+        assert_eq!(pool.last_synced_block, 1_006);
         // 落地后报价与 (seed, vault) 读时函数一致
         let rebuilt = ElfomoFiPropPool::build_orderbook(
             pool.price_seed,
@@ -1697,6 +1968,121 @@ mod tests {
         );
         assert_eq!(rebuilt.from_to_levels, pool.levels.from_to_levels);
         assert_eq!(rebuilt.to_from_levels, pool.levels.to_from_levels);
+    }
+
+    #[test]
+    fn test_apply_price_seed_ignores_stale_block() {
+        // 规则 1：水位必须被读。旧块/重放的 raw-tx 不得回退种子，也不得把水位
+        // stamp 到自相矛盾的更高块号（否则会骗过 merge_snapshot 的 seed_fresh）。
+        let s = snapshot();
+        let mut pool = ElfomoFiPropPool {
+            levels: s.clone(),
+            price_seed: s.price_seed,
+            ..ElfomoFiPropPool::default()
+        };
+        pool.apply_price_seed(U256::from(111u64), 1_010);
+        assert_eq!(pool.price_seed, U256::from(111u64));
+        assert_eq!(pool.price_seed_block, 1_010);
+
+        pool.apply_price_seed(U256::from(999u64), 1_005);
+        assert_eq!(pool.price_seed, U256::from(111u64));
+        assert_eq!(pool.price_seed_block, 1_010);
+
+        // 同块重放仍可推进（调用方按 tx_index 排序，最后一笔赢）
+        pool.apply_price_seed(U256::from(222u64), 1_010);
+        assert_eq!(pool.price_seed, U256::from(222u64));
+        assert_eq!(pool.price_seed_block, 1_010);
+
+        // 更新的块正常推进
+        pool.apply_price_seed(U256::from(333u64), 1_011);
+        assert_eq!(pool.price_seed, U256::from(333u64));
+        assert_eq!(pool.price_seed_block, 1_011);
+    }
+
+    #[test]
+    fn test_merge_snapshot_keeps_newer_realtime_price_seed() {
+        // 规则 1：种子是"最新值"字段，必须字段级水位保鲜。
+        // raw-tx 种子来自 flashblock 乐观头，快照读规范头 → 快照落地时
+        // 若本地种子更新（price_seed_block 更高），不得回退成快照的旧种子。
+        let s = snapshot();
+        let mut pool = ElfomoFiPropPool {
+            levels: s.clone(),
+            price_seed: s.price_seed,
+            ..ElfomoFiPropPool::default()
+        };
+        assert!(pool.merge_snapshot(s.clone(), 1_000));
+        assert_eq!(pool.price_seed_block, 1_000);
+
+        // 块 1_005：raw-tx 应用了新种子（乐观头，领先规范头）
+        let new_seed = s.price_seed + U256::from(12_345u64);
+        pool.apply_price_seed(new_seed, 1_005);
+        assert_eq!(pool.price_seed, new_seed);
+        assert_eq!(pool.price_seed_block, 1_005);
+
+        // 规范头快照（块 1_003）带的是**旧种子** → 必须保留本地新种子，
+        // 且档位要按本地 (新种子, 余额) 重建，不能采用快照的旧种子档位。
+        let ob = ElfomoFiPropPool::build_orderbook(s.price_seed, s.vault_usdt0, s.vault_xeth);
+        let older = OrderbookSnapshot {
+            from_to_levels: ob.from_to_levels,
+            to_from_levels: ob.to_from_levels,
+            vault_usdt0: s.vault_usdt0,
+            vault_xeth: s.vault_xeth,
+            price_seed: s.price_seed,
+        };
+        assert!(pool.merge_snapshot(older, 1_003));
+        assert_eq!(
+            pool.price_seed, new_seed,
+            "newer realtime seed must not be rolled back by a snapshot"
+        );
+        assert_eq!(pool.price_seed_block, 1_005);
+        let rebuilt = ElfomoFiPropPool::build_orderbook(
+            new_seed,
+            pool.levels.vault_usdt0,
+            pool.levels.vault_xeth,
+        );
+        assert_eq!(rebuilt.from_to_levels, pool.levels.from_to_levels);
+        assert_eq!(rebuilt.to_from_levels, pool.levels.to_from_levels);
+
+        // 快照块追上种子水位（1_006 > 1_005）→ 采用快照种子并抢占水位
+        let ob2 = ElfomoFiPropPool::build_orderbook(s.price_seed, s.vault_usdt0, s.vault_xeth);
+        let fresh = OrderbookSnapshot {
+            from_to_levels: ob2.from_to_levels,
+            to_from_levels: ob2.to_from_levels,
+            vault_usdt0: s.vault_usdt0,
+            vault_xeth: s.vault_xeth,
+            price_seed: s.price_seed,
+        };
+        assert!(pool.merge_snapshot(fresh, 1_006));
+        assert_eq!(pool.price_seed, s.price_seed);
+        assert_eq!(pool.price_seed_block, 1_006);
+    }
+
+    #[test]
+    fn test_merge_snapshot_skips_only_when_older_than_anchor() {
+        // 只有"快照早于当前账本锚点块"（无法重建 (S, base] 增量）才丢弃。
+        let s = snapshot();
+        let mut pool = ElfomoFiPropPool {
+            levels: s.clone(),
+            price_seed: s.price_seed,
+            ..ElfomoFiPropPool::default()
+        };
+        assert!(pool.merge_snapshot(s.clone(), 2_000));
+        assert_eq!(pool.vault_ledger.anchor_block(), 2_000);
+
+        let vault_usdt0 = U256::from(7_000_000_000u64);
+        let vault_xeth = U256::from(1_500_000_000_000_000_000u128);
+        let ob = ElfomoFiPropPool::build_orderbook(s.price_seed, vault_usdt0, vault_xeth);
+        let stale = OrderbookSnapshot {
+            from_to_levels: ob.from_to_levels,
+            to_from_levels: ob.to_from_levels,
+            vault_usdt0,
+            vault_xeth,
+            price_seed: s.price_seed,
+        };
+        assert!(!pool.merge_snapshot(stale, 1_999));
+        assert_eq!(pool.levels.vault_xeth, s.vault_xeth);
+        assert_eq!(pool.levels.vault_usdt0, s.vault_usdt0);
+        assert_eq!(pool.last_synced_block, 2_000);
     }
 
     #[test]

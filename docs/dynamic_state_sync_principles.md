@@ -148,6 +148,10 @@ Caliber 2026-09-10 才补齐）。
 | `7c1e9d7` v1.19.8 | reserves 被旧快照覆盖 → 幻影容量 15s、9 笔失败 | **累积量必须 rebase（规则 3）** |
 | `5144eb8` v1.19.10 | 快照 RPC 在写锁内 → 实时管线 150~515ms 停顿 | **三段式，RPC 出锁（规则 5）** |
 | `56fc14c` | caliber 尾部漏更新无法补账 | 水位改 `(block, tx_index)`，可补账 + 丢弃点留痕 |
+| `5826416` v1.21.2 | Elfomo `ElfomoTrade` 由 **Router** emit，StateSpace key 是 Pool → 通用分发链 `direct_hit` 落空、事件被**静默丢弃**；池内金库记账分支成死代码 | 协议事件若由非池地址（Router/Engine/Vault）emit，必须在分发链里显式解析到池子（`resolve_*_targets`）；**静默丢弃**要留痕 |
+| `5826416` v1.21.2 | Elfomo 金库只按单向记账（x→y 只扣 usdt0、不收 xeth） | 金库是成交的**双向**对手方：`Δin = +amount_in`、`Δout = −amount_out`，两个累积量都要记 |
+| `e155f5d` v1.21.3 | Elfomo 周期对账"锁外克隆整池 → 锁内 `*existing = clone`"，RPC 窗口内的事件增量被整只覆盖；且读块（`latest`）与水位（另一次 `get_block_number`）不同源 | 规则 5 的同一反模式；读块必须**显式钉死**（`Number(head)`）后再读，content 与水位同源 |
+| `v1.21.4` | Elfomo 用**块级水位**判断快照是否落后（`last_synced_block > snap_block → 跳过`）。Elfomo 的块级水位被 flashblock raw-tx（每块一笔 `updatePrices`）顶在乐观头，而快照读规范头 → 健康期快照几乎总被跳过；一旦事件流**部分丢帧**（fire-once、无缺口检测，水位仍在头部）就再无纠错通道，vault 漂移无界累积 | **事件不完备协议的累积量必须 rebase，不能跳过也不能覆盖**：`current = 快照(S) + Σ_{块>S} Δ`（`VaultDeltaLedger::record_trade/rebase`）。快照永远能落地，只有早于**锚点块**才丢弃；`price_seed` 另用**字段级水位** `price_seed_block` 保鲜（raw-tx 种子领先规范头，否则旧种子回退 → 旧价报价窗口） |
 | `6abd894`/`8a96aa5` v1.18.x | Resync 目标块超前存储 RPC 头被降级读旧块 | 新增 `RetryLater`，按目标块重试 |
 | `4a99931` | caliber swap 日志断流 | 断流回补 + 对账周期 60s→30s |
 | 2026-09-10 | caliber 幻影报价：pair `0x5dda42ef…` 链上 USDT0 储备 `3,849.02`，本地按 `>= 5,255.86` 报价 → 4 笔上链还款不足回滚 | 三条独立缺陷叠加：①周期对账 Phase-1 克隆整池、锁外 RPC、整只覆盖（丢弃窗口内实时事件）；②`apply_snapshot` 对累积量无条件赋值（无 rebase）；③全槽位 `BlockId::latest()`，储备与 ladder 读到的块漂移。修复：`CaliberSwapLedger` + `apply_snapshot_merged`（A 类 rebase/B 类水位保鲜/C 类覆盖）+ 快照块号显式钉死 + 对账锁内合并写回 |
@@ -178,3 +182,5 @@ Caliber 2026-09-10 才补齐）。
 | Caliber 池子 | `src/amms/caliber_prop/{mod.rs,types.rs,factory.rs}` |
 | Caliber 累积量账本 | `src/amms/caliber_prop/ledger.rs`（`CaliberSwapLedger::record_swap/rebase`、`LedgerApply`、`anchor_block`） |
 | BinaryFi 池子 | `src/amms/binaryfi_prop/`（`ReservesDeltaLedger`、`apply_l2_update_full`、`apply_snapshot`） |
+| Elfomo 池子 | `src/amms/elfomo_prop/`（`sync` L1b、`merge_snapshot`、`price_seed_block` 字段水位） |
+| Elfomo 累积量账本 | `src/amms/elfomo_prop/ledger.rs`（`VaultDeltaLedger::record_trade/rebase`、`VaultLedgerApply`、`anchor_block`；余额由账本派生） |

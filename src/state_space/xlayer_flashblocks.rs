@@ -1837,6 +1837,7 @@ mod tests {
             created_block: 0,
             last_synced_block: 0,
             price_seed: U256::ZERO,
+            price_seed_block: 0,
             tokens: vec![
                 Token::new_with_decimals(address!("e7b000003a45145decf8a28fc755ad5ec5ea025a"), 18),
                 Token::new_with_decimals(address!("779ded0c9e1022225f8e0630b35a9b54be713736"), 6),
@@ -1849,6 +1850,7 @@ mod tests {
                 price_seed: U256::ZERO,
             },
             consumed: Default::default(),
+            vault_ledger: Default::default(),
         }));
 
         let affected = state.apply_elfomo_updates(&elfomo_events, 69_452_472);
