@@ -1659,6 +1659,7 @@ mod tests {
             reserve_b: U256::from(1_000),
             ladder: Default::default(),
             price_a_in_b: 1.0,
+            swap_ledger: Default::default(),
             price_b_in_a: 1.0,
         }));
 

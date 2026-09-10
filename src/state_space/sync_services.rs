@@ -19,7 +19,6 @@ use crate::amms::amm::{AutomatedMarketMaker, AMM};
 use crate::amms::balancer_v2::BalancerV2Pool;
 use crate::amms::balancer_v3::BalancerV3Pool;
 use crate::amms::binaryfi_prop::{BinaryFiPropPool, Snapshot};
-use crate::amms::caliber_prop::CaliberPropPool;
 use crate::amms::curve_ng::{CurveNGFactory, ICurveNGStableSwap};
 use crate::amms::elfomo_prop::ElfomoFiPropPool;
 use crate::amms::fluid_dex::{
@@ -1161,9 +1160,17 @@ pub async fn start_pendle_sync_task<N, P>(
 /// 可配置）；关闭实时开关（`with_caliber_realtime_sync(false)`）时退回纯周期拉取
 /// （`caliber_ladder_sync_interval`）。
 ///
-/// 批量刷新：`caliber_prop::batch_refresh_snapshots` 把所有 pool 的
+/// 批量刷新：`caliber_prop::fetch_snapshots_for_pairs` 把一个合约下所有 pool 的
 /// `eth_getStorageAt`（固定槽位 + ladder 槽位）折叠进 JSON-RPC batch，
-/// 每 512 槽一次 HTTP 请求，RPC 往返从每 pool ~10+n 次降到几乎常数。
+/// 每 `STORAGE_BATCH_SIZE` 槽一次 HTTP 请求，RPC 往返从每 pool ~10+n 次降到几乎常数。
+///
+/// ⚠️ **拉取在锁外、合并在锁内**（2026-09-10 幻影报价事故根因）：
+/// 旧实现是「持锁克隆整池 → 锁外 RPC（十几秒）→ 写锁内整只覆盖」。RPC 窗口内
+/// 到达的实时 swap / 报价更新会被整只覆盖丢弃，`last_synced_block` 与储备一起
+/// 回卷，本地报价停在旧水位 → 幻影机会 → 上链还款不足回滚。
+/// 现在改为：读锁内只取元数据（pair 路由三元组）→ 锁外批量拉快照 →
+/// 短写锁内对**当时的 current existing** 调 `apply_snapshot_merged` 就地合并
+/// （A 类累积量走事件账本 rebase-merge、B 类报价字段水位保鲜、C 类低频字段覆盖）。
 pub async fn start_caliber_prop_ladder_sync_task<N, P>(
     state: Arc<RwLock<StateSpace>>,
     provider: P,
@@ -1193,61 +1200,136 @@ pub async fn start_caliber_prop_ladder_sync_task<N, P>(
     loop {
         sleep(next_sleep).await;
 
-        let mut target_pools: Vec<CaliberPropPool> = {
-            let read_guard = state.read().await;
-            read_guard
-                .state
-                .values()
-                .filter_map(|amm| match amm.as_ref() {
-                    AMM::CaliberPropPool(pool) => Some(pool.clone()),
-                    _ => None,
-                })
-                .collect()
+        // 快照块号**显式钉死**（存储节点 canonical head）：它既是事件账本
+        // rebase-merge 的自变量，也保证"储备与 ladder 读的是同一块"。
+        let snap_block = match crate::amms::caliber_prop::caliber_storage_head().await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(error = ?e, "Caliber reconcile: storage head query failed");
+                next_sleep = next_sleep.saturating_mul(2).min(MAX_RECONCILE_BACKOFF);
+                continue;
+            }
         };
 
-        if target_pools.is_empty() {
+        // Phase-1（读锁，只取元数据）：按合约地址分组收集 pair 路由三元组，
+        // 不克隆池子状态（克隆整池再整只覆盖正是旧实现的错误所在）。
+        let mut groups: Vec<(
+            alloy::primitives::Address,
+            Vec<(
+                alloy::primitives::Address,
+                B256,
+                alloy::primitives::Address,
+                alloy::primitives::Address,
+            )>,
+        )> = Vec::new();
+        {
+            let read_guard = state.read().await;
+            for amm in read_guard.state.values() {
+                let AMM::CaliberPropPool(pool) = amm.as_ref() else {
+                    continue;
+                };
+                let entry = (
+                    pool.virtual_address,
+                    pool.pair_id,
+                    pool.token_x,
+                    pool.token_y,
+                );
+                if let Some((_, items)) =
+                    groups.iter_mut().find(|(c, _)| *c == pool.contract_address)
+                {
+                    items.push(entry);
+                } else {
+                    groups.push((pool.contract_address, vec![entry]));
+                }
+            }
+        }
+
+        if groups.is_empty() {
             next_sleep = interval;
             continue;
         }
 
-        let mut reconcile_failed = false;
+        let pool_count: usize = groups.iter().map(|(_, items)| items.len()).sum();
         debug!(
-            "Reconciling ladder snapshots for {} Caliber propAMM pools",
-            target_pools.len()
+            pools = pool_count,
+            block = snap_block,
+            "Reconciling ladder snapshots for Caliber propAMM pools"
         );
 
-        match crate::amms::caliber_prop::batch_refresh_snapshots::<N, P>(
-            &provider,
-            &mut target_pools,
-            alloy::eips::BlockId::latest(),
-        )
-        .await
-        {
-            Ok(flags) => {
-                let failed = flags.iter().filter(|f| !**f).count();
-                if failed > 0 {
+        // Phase-2（锁外，慢）：批量拉取快照。失败按组隔离，逐 pool 结果单独处理。
+        let mut reconcile_failed = false;
+        let mut fetched: Vec<(
+            alloy::primitives::Address,
+            crate::amms::caliber_prop::CaliberSnapshot,
+        )> = Vec::with_capacity(pool_count);
+        for (contract_address, items) in groups {
+            let pairs: Vec<(B256, alloy::primitives::Address, alloy::primitives::Address)> = items
+                .iter()
+                .map(|(_, pid, tx, ty)| (*pid, *tx, *ty))
+                .collect();
+            match crate::amms::caliber_prop::fetch_snapshots_for_pairs::<N, P>(
+                &provider,
+                contract_address,
+                &pairs,
+                snap_block,
+            )
+            .await
+            {
+                Ok(snaps) => {
+                    for ((key, _, _, _), snap_res) in items.into_iter().zip(snaps) {
+                        match snap_res {
+                            Ok(snap) => fetched.push((key, snap)),
+                            Err(e) => {
+                                reconcile_failed = true;
+                                error!(
+                                    address = ?key,
+                                    block = snap_block,
+                                    error = ?e,
+                                    "Caliber reconcile: pool snapshot failed"
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
                     reconcile_failed = true;
-                    warn!("Caliber reconcile: {}/{} pools failed", failed, flags.len());
-                } else {
-                    info!(
-                        pools = target_pools.len(),
-                        "Caliber reconcile ok (flashblock realtime sync healthy)"
+                    error!(
+                        error = ?e,
+                        block = snap_block,
+                        "Caliber reconcile snapshot batch fetch failed"
                     );
                 }
             }
-            Err(e) => {
-                reconcile_failed = true;
-                error!(error = ?e, "Caliber reconcile batch snapshot failed");
+        }
+
+        // Phase-3（短写锁，无 RPC）：基于**当时的 current existing** 就地合并写回。
+        // 写锁内不做任何网络调用，读者不会看到同部署半新半旧。
+        let mut applied = 0usize;
+        {
+            let mut write_guard = state.write().await;
+            for (key, snap) in fetched {
+                let Some(existing_amm) = write_guard.get_mut_cow(&key) else {
+                    continue;
+                };
+                if let AMM::CaliberPropPool(existing) = existing_amm {
+                    existing.apply_snapshot_merged(snap, snap_block);
+                    applied += 1;
+                }
             }
         }
 
-        let mut write_guard = state.write().await;
-        for pool in target_pools {
-            if let Some(existing_amm) = write_guard.get_mut_cow(&pool.address()) {
-                if let AMM::CaliberPropPool(existing) = existing_amm {
-                    *existing = pool;
-                }
-            }
+        if reconcile_failed {
+            warn!(
+                applied,
+                pools = pool_count,
+                "Caliber reconcile partially failed"
+            );
+        } else {
+            info!(
+                pools = applied,
+                block = snap_block,
+                "Caliber reconcile ok (flashblock realtime sync healthy)"
+            );
         }
 
         // 失败退避：成功恢复基础间隔；失败翻倍（上限 300s），限流恢复后
