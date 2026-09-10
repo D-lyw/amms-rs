@@ -485,7 +485,17 @@ impl AutomatedMarketMaker for FermiPropPool {
     }
 
     fn set_last_synced_block(&mut self, block_number: u64) {
-        self.last_synced_block = block_number;
+        // 单调不回退（trait 契约见 `amms::amm`）：事件按序到达时与赋值等价，
+        // 乱序/更旧块号则不会被回卷。
+        //
+        // ⚠️ 本池的 `last_synced_block` 语义是"当前块指针"：`engine_quote` 用
+        // `trade_block == self.last_synced_block` 判定同块成交校正（见本文件
+        // `last_trade_word` 处理），因此它只能由"确实推进到该块"的路径写入。
+        // 本池 `update()` 目前是 no-op（没有刷新到某块的语义），`sync()` 也从不
+        // 返回 `AsyncUpdate`，所以 maintenance 的 AsyncUpdate 写回不会作用到它。
+        // 若将来给本池接上 AsyncUpdate 周期刷新，必须让 `update()` 自己钉住实际
+        // 读块，不能沿用 maintenance 的 canonical 兜底盖章。
+        self.last_synced_block = self.last_synced_block.max(block_number);
     }
 
     fn sync_events(&self) -> Vec<B256> {

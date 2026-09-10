@@ -57,8 +57,22 @@ pub trait AutomatedMarketMaker: Send + Sync + 'static {
         None
     }
 
+    /// 块级水位：本地状态**已一致到**的链上块号（不是“新鲜度”）。
+    ///
+    /// 消费者只用它做幂等去重、reorg/回卷保护与写回单调判断；不要用它判断
+    /// “某个字段是否新鲜”（见 `docs/dynamic_state_sync_principles.md` 规则 2）。
     fn last_synced_block(&self) -> u64;
 
+    /// 推进块级水位，**必须单调不回退**。实现一律写成：
+    ///
+    /// ```ignore
+    /// self.last_synced_block = self.last_synced_block.max(block_number);
+    /// ```
+    ///
+    /// 原因：写回路径（`state_space::maintenance` 的 AsyncUpdate / Resync、日志
+    /// 回放）会拿它与本地已推进的水位做 max 再落地。若实现是普通赋值，传入更旧
+    /// 的块号会把水位**回退**，导致后续旧块日志被重新应用（重复消费/双计），或
+    /// 让 `DeferredStale` 新鲜度守卫失效（旧快照覆盖更新的实时状态）。
     fn set_last_synced_block(&mut self, block_number: u64);
 
     /// Event signatures that indicate when the AMM should be synced

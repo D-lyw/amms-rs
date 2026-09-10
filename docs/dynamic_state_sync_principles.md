@@ -89,6 +89,11 @@ state = snapshot(S) + Σ_{块 > S} 事件净变化
 多字段写回在**同一个写锁**内整体落地，读者不能看到半新半旧；
 `last_synced_block` 写回取 `max`，只前进不回退。
 
+契约落在 `AutomatedMarketMaker::set_last_synced_block` 的 doc 上：**实现必须单调**
+（`self.last_synced_block.max(block_number)`），且写回方在**调用点自己取 max**、
+不依赖被调方。2026-09 审查修掉的三处偏差：`caliber_prop`、`curve_legacy`、
+`fermi_prop`（当时是普通赋值）。
+
 ### 规则 5 — 快照 RPC 不得在 state 写锁内执行，也不得整只覆盖
 三段式：**读锁只取元数据 → 无锁拉取（只读）→ 短写锁内基于 current existing 合并写回**。
 否则整条实时管线（flashblock apply + 引擎读锁）会被跨链 RPC 停顿（`5144eb8` 教训）。

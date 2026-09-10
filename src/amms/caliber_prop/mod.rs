@@ -1159,7 +1159,9 @@ impl AutomatedMarketMaker for CaliberPropPool {
     }
 
     fn set_last_synced_block(&mut self, block_number: u64) {
-        self.last_synced_block = block_number;
+        // 单调不回退（trait 契约见 `amms::amm`）：写回路径以 max 语义保留本地
+        // 已推进的水位，普通赋值会让更旧的块号把水位拉回去。
+        self.last_synced_block = self.last_synced_block.max(block_number);
     }
 
     fn tokens(&self) -> Vec<Address> {
@@ -2228,6 +2230,16 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 水位契约（`amms::amm`）：只前进不回退。
+    #[test]
+    fn set_last_synced_block_is_monotonic() {
+        let mut pool = test_pool_with_ladder();
+        pool.set_last_synced_block(500);
+        assert_eq!(pool.last_synced_block(), 500);
+        pool.set_last_synced_block(400);
+        assert_eq!(pool.last_synced_block(), 500, "水位不得回退到更旧的块号");
+    }
 
     #[test]
     fn test_exact_quote_vectors_pair1() {

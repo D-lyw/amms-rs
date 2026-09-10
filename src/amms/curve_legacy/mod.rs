@@ -472,7 +472,10 @@ impl AutomatedMarketMaker for CurveLegacyPool {
     }
 
     fn set_last_synced_block(&mut self, block_number: u64) {
-        self.last_synced_block = block_number;
+        // 单调不回退（trait 契约见 `amms::amm`）。本池的 update() 读 latest 但
+        // 不钉读块，水位由调用方（日志回放 / AsyncUpdate）推进；普通赋值会让
+        // 更旧的块号把水位拉回去 → 旧块日志被重新应用（重复消费/双计）。
+        self.last_synced_block = self.last_synced_block.max(block_number);
     }
 
     fn tokens(&self) -> Vec<Address> {

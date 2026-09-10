@@ -203,6 +203,26 @@ fn should_skip_async_apply_for(
     should_skip_async_apply(existing_last_synced_block, snapshot_last_synced_block)
 }
 
+/// 把 BinaryFi 快照合并进**写锁内当时的** existing 实例（绝不整只替换）。
+///
+/// - 水位 `max(prev, snap_block)`：快照落地不得回卷本地已推进的块号，否则后续旧块
+///   日志会被重新应用（重复消费容量/双计）。
+/// - `clear_stale_pairs` 只清快照实际覆盖的 pair：否则 RPC 窗口内新标记的 stale 会
+///   一直残留，之后每次 AsyncUpdate 都退化成全量重拉（RPC 放大）。
+fn merge_binaryfi_snapshot(
+    existing: &mut crate::amms::binaryfi_prop::BinaryFiPropPool,
+    snap: &crate::amms::binaryfi_prop::Snapshot,
+    snap_block: u64,
+    refreshed_pairs: &[usize],
+) {
+    let prev_last_synced = existing.last_synced_block();
+    let mut refreshed = existing.clone();
+    refreshed.apply_snapshot(snap, snap_block);
+    refreshed.clear_stale_pairs(refreshed_pairs);
+    refreshed.set_last_synced_block(prev_last_synced.max(snap_block));
+    *existing = refreshed;
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum PendingSyncAction {
     AsyncUpdate,
@@ -713,6 +733,43 @@ impl<N, P> StateSpaceManager<N, P> {
         Ok(())
     }
 
+    /// BinaryFi 的 AsyncUpdate：三段式写回（锁外 fetch → 写锁内对 current existing
+    /// 合并），与 `sync_services::start_binaryfi_prop_sync_task` 同形状。
+    ///
+    /// `probe` 只用于取发起 fetch 时的 stale 集合与 assets/decimals/fee_recipient，
+    /// **不参与写回**。
+    async fn execute_binaryfi_async_update(
+        provider: &P,
+        state: &Arc<RwLock<StateSpace>>,
+        address: Address,
+        probe: &AMM,
+    ) -> Result<PendingExecutionOutcome, AMMError>
+    where
+        P: Provider<N> + Clone,
+        N: Network,
+    {
+        let AMM::BinaryFiPropPool(probe) = probe else {
+            return Ok(PendingExecutionOutcome::MissingPool);
+        };
+        // 块号显式钉死：快照 quote、日志保鲜（price_updated_block）与 ledger rebase
+        // 的自变量必须指向同一块。
+        let snap_block = provider.get_block_number().await?;
+        let snap = probe
+            .fetch_stale_snapshot::<N, _>(provider.clone(), BlockId::from(snap_block))
+            .await?;
+        let refreshed_pairs: Vec<usize> = snap.quotePairs.iter().map(|p| p.to::<usize>()).collect();
+
+        let mut guard = state.write().await;
+        let Some(existing_amm) = guard.get_mut_cow(&address) else {
+            return Ok(PendingExecutionOutcome::MissingPool);
+        };
+        let AMM::BinaryFiPropPool(existing) = existing_amm else {
+            return Ok(PendingExecutionOutcome::MissingPool);
+        };
+        merge_binaryfi_snapshot(existing, &snap, snap_block, &refreshed_pairs);
+        Ok(PendingExecutionOutcome::Applied)
+    }
+
     async fn execute_pending_task(
         provider: &P,
         state: &Arc<RwLock<StateSpace>>,
@@ -729,13 +786,29 @@ impl<N, P> StateSpaceManager<N, P> {
                 let Some(mut local_amm) = ({ state.read().await.get(&address).cloned() }) else {
                     return Ok(PendingExecutionOutcome::MissingPool);
                 };
+                // BinaryFi 特判：必须「锁外 fetch → 写锁内对 current existing 合并」，
+                // 不能走下面的通用路径（锁外克隆整池 → RPC → 整只覆盖）——RPC 窗口内
+                // 实时流落在 live 池子上的 swap 增量不在这个克隆里，覆盖后会连同事件
+                // 账本一起丢，且水位取 max 会把这段永久跳过。周期任务
+                // （`sync_services::start_binaryfi_prop_sync_task`）已是同一形状，
+                // 这里是该反模式的最后一个入口。
+                if matches!(local_amm, AMM::BinaryFiPropPool(_)) {
+                    return Self::execute_binaryfi_async_update(
+                        provider, state, address, &local_amm,
+                    )
+                    .await;
+                }
                 let snapshot_last_synced_block = local_amm.last_synced_block();
                 // AsyncUpdate: no last_synced_block guard.
                 // RPC availability is already guaranteed by claim_due_filtered's
                 // required_block ≤ canonical_head check at pop time.
                 // On Ethereum this is always safe (canonical == realtime).
                 local_amm.update::<N, _>(provider.clone()).await?;
-                local_amm.set_last_synced_block(target_block);
+                // 刷新后水位 = max(update() 自己钉的读块, 目标 canonical)。
+                // 多数池子的 update() 读 `latest` 而不钉读块，用 canonical 作近似；
+                // caliber / binaryfi 会在 update() 内钉住真实读块（storage head /
+                // get_block_number），此处取 max 不会把它压低。
+                local_amm.set_last_synced_block(local_amm.last_synced_block().max(target_block));
                 let mut guard = state.write().await;
                 if let Some(existing) = guard.get(&address) {
                     if should_skip_async_apply_for(
@@ -745,10 +818,15 @@ impl<N, P> StateSpaceManager<N, P> {
                     ) {
                         return Ok(PendingExecutionOutcome::SkippedStale);
                     }
-                    // 写回前保留 existing 已推进的 last_synced_block（set 为 max
-                    // 单调）：BinaryFi 竞态放宽后，防止快照写回把 last_synced_block
-                    // 回退到旧块，导致后续旧块日志被重新应用（重复消费容量/双计）。
-                    local_amm.set_last_synced_block(existing.last_synced_block());
+                    // 写回前把水位对齐到 existing：**在调用点自己取 max**，不依赖
+                    // 各池 setter 的实现（契约见 `AutomatedMarketMaker::
+                    // set_last_synced_block`）。防止快照写回把水位回退到旧块 → 后续
+                    // 旧块日志被重新应用（重复消费容量/双计），或让 DeferredStale
+                    // 新鲜度守卫失效（旧快照覆盖更新的实时状态）。
+                    let keep = existing
+                        .last_synced_block()
+                        .max(local_amm.last_synced_block());
+                    local_amm.set_last_synced_block(keep);
                 }
                 guard.insert_amm(local_amm);
                 Ok(PendingExecutionOutcome::Applied)
@@ -2684,11 +2762,69 @@ mod tests {
         );
     }
 
+    /// BinaryFi AsyncUpdate 的写回语义：对 current existing 合并（不整只替换）、
+    /// 水位只前进不回退、只清快照实际覆盖的 stale pair。
+    #[test]
+    fn binaryfi_async_update_merge_keeps_watermark_and_untouched_stale() {
+        use crate::amms::binaryfi_prop::{BinaryFiPropPool, Snapshot};
+
+        let empty_snapshot = Snapshot {
+            assets: vec![],
+            decimals: vec![],
+            scales: vec![],
+            poolBalances: vec![],
+            vaultReserves: vec![],
+            vaultBalances: vec![],
+            quotePairs: vec![],
+            quotes: vec![],
+            fee: U256::ZERO,
+        };
+
+        let mut pool = BinaryFiPropPool::default();
+        pool.set_last_synced_block(100);
+        pool.stale_pairs = vec![7, 9];
+
+        // 陈旧快照（S=50 < 本地 100）：不得把水位拉回去，且只清它覆盖的 pair。
+        merge_binaryfi_snapshot(&mut pool, &empty_snapshot, 50, &[7]);
+        assert_eq!(pool.last_synced_block(), 100, "水位不得回退");
+        assert_eq!(pool.stale_pairs, vec![9], "窗口内新标记的 stale 必须保留");
+
+        // 更新的快照（S=200）：推进水位并清掉覆盖到的 pair。
+        merge_binaryfi_snapshot(&mut pool, &empty_snapshot, 200, &[9]);
+        assert_eq!(pool.last_synced_block(), 200);
+        assert!(pool.stale_pairs.is_empty());
+    }
+
     #[test]
     fn test_should_skip_async_apply_when_local_is_newer() {
         assert!(should_skip_async_apply(101, 100));
         assert!(!should_skip_async_apply(100, 100));
         assert!(!should_skip_async_apply(99, 100));
+    }
+
+    /// 水位契约（`AutomatedMarketMaker::set_last_synced_block`）：只前进不回退。
+    ///
+    /// 2026-09 审查发现 `caliber_prop` / `curve_legacy` / `fermi_prop` 三处实现
+    /// 是普通赋值，会让更旧的块号把水位拉回去；本测试覆盖当时偏差的池型，防止
+    /// 再次复制粘贴回退。
+    #[test]
+    fn set_last_synced_block_is_monotonic_across_pool_types() {
+        let mut fermi = AMM::FermiPropPool(crate::amms::fermi_prop::FermiPropPool::default());
+        let mut curve = AMM::CurveLegacyPool(crate::amms::curve_legacy::CurveLegacyPool::new(
+            address!("0x1111111111111111111111111111111111111111"),
+            crate::amms::curve_legacy::CurveLegacyPoolType::StableSwap,
+        ));
+        let mut binaryfi =
+            AMM::BinaryFiPropPool(crate::amms::binaryfi_prop::BinaryFiPropPool::default());
+
+        for amm in [&mut fermi, &mut curve, &mut binaryfi] {
+            amm.set_last_synced_block(500);
+            assert_eq!(amm.last_synced_block(), 500);
+            amm.set_last_synced_block(400);
+            assert_eq!(amm.last_synced_block(), 500, "水位不得回退到更旧的块号");
+            amm.set_last_synced_block(600);
+            assert_eq!(amm.last_synced_block(), 600);
+        }
     }
 
     #[test]

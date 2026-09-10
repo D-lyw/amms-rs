@@ -217,6 +217,7 @@ where
         reserve_a: U256::ZERO,
         reserve_b: U256::ZERO,
         ladder: Default::default(),
+        swap_ledger: Default::default(),
         price_a_in_b: 0.0,
         price_b_in_a: 0.0,
     };

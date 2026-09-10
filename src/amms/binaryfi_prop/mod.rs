@@ -3063,7 +3063,12 @@ impl BinaryFiPropPool {
     ///
     /// update_at 与 fetch_full_snapshot 共用：一次链上批量读取，避免两处重复
     /// 组装 big_quote/big_sell 请求参数。
-    async fn fetch_stale_snapshot<N, P>(
+    /// 只读：按本地 `stale_pairs` 拉一次快照，**不修改任何本地状态**。
+    ///
+    /// 供 StateSpace 的 AsyncUpdate 路径做「锁外 fetch → 写锁内对 current existing
+    /// 合并」（见 `state_space::maintenance::merge_binaryfi_snapshot`）：调用方拿
+    /// fetch 前的实例当 probe 取 stale 集合，写回作用在写锁内当时的 existing 上。
+    pub(crate) async fn fetch_stale_snapshot<N, P>(
         &self,
         provider: P,
         block: BlockId,
