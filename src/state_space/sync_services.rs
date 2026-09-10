@@ -1195,7 +1195,7 @@ pub async fn start_caliber_prop_ladder_sync_task<N, P>(
         );
     }
     // 对账失败退避上限：RPC 限流/网关过载时避免持续硬撞（间隔翻倍，
-    // 成功恢复 `interval`；配合 storage_at_batch 限流时不逐槽回退）。
+    // 成功恢复 `interval`）。
     const MAX_RECONCILE_BACKOFF: Duration = Duration::from_secs(300);
     let mut next_sleep = startup_delay_with_jitter(interval, "caliber_prop");
     loop {

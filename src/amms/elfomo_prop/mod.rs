@@ -1062,9 +1062,9 @@ impl ElfomoFiPropPool {
     /// 在指定区块拉取 orderbook + vault 快照（StateSpace update 与周期任务共用）。
     ///
     /// 调用方传入的 `block` **原样**下发给链上读取（同 caliber `update()`）：
-    /// `latest` 由各 provider 自行解析，**不预先 pin 成具体块号**。storage 读取
-    /// 走 HTTP provider，pin 到刚产出的头块会撞 `-32019 block is out of range`
-    /// （`rpc.xlayer.tech` 对新头块的 state 有短暂不可用窗口，实测约 2%~15%）。
+    /// `latest` 由各 provider 自行解析，**不预先 pin 成具体块号**（部分端点对
+    /// 刚产出的头块 state 有短暂不可用窗口，pin 死会撞 `-32019 block is out of
+    /// range`）。storage 读取走 `eth_call` + state-override 批量 SLOAD。
     /// `snap_block` 仅在 `latest` 时解析一次，用于 `last_synced_block` 水位记账。
     pub async fn update_at<N, P>(&mut self, provider: P, block: BlockId) -> Result<(), AMMError>
     where
