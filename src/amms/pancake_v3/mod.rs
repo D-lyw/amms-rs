@@ -362,8 +362,7 @@ impl AutomatedMarketMaker for PancakeV3Pool {
         // 距离约束：命中 tick 必须靠近当前价格，避免远距大额流动性（死池/空洞）误放行。
         let max_dist = self.tick_spacing as i64 * 256 * MAX_LIQUIDITY_DISTANCE_WORDS as i64;
         self.ticks.iter().any(|(&tick, info)| {
-            info.liquidity_gross >= l_thresh
-                && (tick as i64 - self.tick as i64).abs() <= max_dist
+            info.liquidity_gross >= l_thresh && (tick as i64 - self.tick as i64).abs() <= max_dist
         })
     }
 

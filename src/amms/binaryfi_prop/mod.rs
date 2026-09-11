@@ -1464,7 +1464,7 @@ impl BinaryFiPropPool {
             Some(m) => linear.min(m),
             None => linear,
         };
-                // 执行上限以真实金库为准（与 capped_out / sell_zero_over_vault 同一套
+        // 执行上限以真实金库为准（与 capped_out / sell_zero_over_vault 同一套
         // vault_known 锚定语义，v1.19.8 只升级了后两者、漏掉此处）：
         //   - 锚定且余额为 0 = 已空（权威）：任何 0→j 输出 transfer 必然失败 → 恒 0。
         //     不能只依赖 buy_zero_over_vault（要"成功的大额 probe=0"观测才置位）；
@@ -3311,9 +3311,15 @@ mod tests {
         // 非零 quote 在 100% 费率下同样无解（无费化无意义）
         assert_eq!(unfee_quote(U256::from(123u64), 1_000_000), None);
         // 边界以下仍正常（fee=999_999 → 分母 1）
-        assert_eq!(unfee_quote(U256::from(100u64), 999_999), Some(U256::from(100_000_000u64)));
+        assert_eq!(
+            unfee_quote(U256::from(100u64), 999_999),
+            Some(U256::from(100_000_000u64))
+        );
         // 正常费率回归
-        assert_eq!(unfee_quote(U256::from(999u64), 1000), Some(U256::from(1000u64)));
+        assert_eq!(
+            unfee_quote(U256::from(999u64), 1000),
+            Some(U256::from(1000u64))
+        );
         assert_eq!(unfee_quote(U256::ZERO, 0), Some(U256::ZERO));
     }
 

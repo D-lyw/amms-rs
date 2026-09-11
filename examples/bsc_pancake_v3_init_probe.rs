@@ -86,7 +86,9 @@ async fn main() -> eyre::Result<()> {
     tracing::info!(
         elapsed_secs = elapsed.as_secs_f64(),
         synced_pools = state.state.len(),
-        block = state.realtime_head.load(std::sync::atomic::Ordering::Relaxed),
+        block = state
+            .realtime_head
+            .load(std::sync::atomic::Ordering::Relaxed),
         "PancakeV3 batch init complete"
     );
 

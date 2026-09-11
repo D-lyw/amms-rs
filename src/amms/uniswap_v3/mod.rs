@@ -971,8 +971,7 @@ impl AutomatedMarketMaker for UniswapV3Pool {
             * 256
             * crate::amms::consts::MAX_LIQUIDITY_DISTANCE_WORDS as i64;
         self.ticks.iter().any(|(&tick, info)| {
-            info.liquidity_gross >= l_thresh
-                && (tick as i64 - self.tick as i64).abs() <= max_dist
+            info.liquidity_gross >= l_thresh && (tick as i64 - self.tick as i64).abs() <= max_dist
         })
     }
 

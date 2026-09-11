@@ -581,8 +581,7 @@ impl AutomatedMarketMaker for UniswapV4Pool {
         // 模拟跨空洞会产出天文输出（虚假利润）。
         let max_dist = self.tick_spacing as i64 * 256 * MAX_LIQUIDITY_DISTANCE_WORDS as i64;
         self.ticks.iter().any(|(&tick, info)| {
-            info.liquidity_gross >= l_thresh
-                && (tick as i64 - self.tick as i64).abs() <= max_dist
+            info.liquidity_gross >= l_thresh && (tick as i64 - self.tick as i64).abs() <= max_dist
         })
     }
 

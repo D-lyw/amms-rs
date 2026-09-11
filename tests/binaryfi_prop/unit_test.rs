@@ -1048,7 +1048,10 @@ fn test_apply_snapshot_blacklisted_fee_1e6_zeros_quotes() {
     let mut pool = test_pool();
     // 生产 loader 会把 fee_account 设为实际执行合约（黑名单对象）
     pool.fee_account = Some(address!("0x7f51aae175530af69591954b4d0c958655feffc3"));
-    assert_eq!(pool.fee_recipient(), address!("0x7f51aae175530af69591954b4d0c958655feffc3"));
+    assert_eq!(
+        pool.fee_recipient(),
+        address!("0x7f51aae175530af69591954b4d0c958655feffc3")
+    );
 
     // 链上实证：被拉黑账户 quote 返回 0 且 success=true、getFee = 1e6
     let ok0 = QuoteResult {
@@ -1073,11 +1076,15 @@ fn test_apply_snapshot_blacklisted_fee_1e6_zeros_quotes() {
     pool.apply_snapshot(&snap, 100);
 
     assert_eq!(pool.fee_ppm, 1_000_000, "fee_ppm 必须锚定 100%");
-    assert!(pool.rates.iter().all(|r| r.is_zero()), "黑名单后 rates 必须全 0");
+    assert!(
+        pool.rates.iter().all(|r| r.is_zero()),
+        "黑名单后 rates 必须全 0"
+    );
     // 引擎实际走 simulate_swap：黑名单后两个方向都必须输出 0（无利润 → 无机会）
     let (t0, t1) = (pool.assets[0].address, pool.assets[1].address);
     assert_eq!(
-        pool.simulate_swap(t0, t1, U256::from(1_000_000u64)).unwrap(),
+        pool.simulate_swap(t0, t1, U256::from(1_000_000u64))
+            .unwrap(),
         U256::ZERO
     );
     assert_eq!(

@@ -36,9 +36,9 @@ use amms::amms::{
     fermi_prop::{
         types::{
             fermi_engine_last_trade_slot, fermi_lane_index, fermi_registry_lane_slot,
-            fermi_virtual_address, ERC20_TRANSFER_EVENT, FERMI_ENGINE_ADDRESS,
-            FERMI_PAIR_ACTIVE_SET_EVENT, FERMI_REGISTRY_ADDRESS, FERMI_SWAPPED_EVENT,
-            FERMI_VAULT_ADDRESS, FERMI_WRAPPER_ADDRESS, IFermiEngine, IFermiERC20,
+            fermi_virtual_address, IFermiERC20, IFermiEngine, ERC20_TRANSFER_EVENT,
+            FERMI_ENGINE_ADDRESS, FERMI_PAIR_ACTIVE_SET_EVENT, FERMI_REGISTRY_ADDRESS,
+            FERMI_SWAPPED_EVENT, FERMI_VAULT_ADDRESS, FERMI_WRAPPER_ADDRESS,
         },
         FermiLane, FermiPropPool,
     },
@@ -94,9 +94,9 @@ fn drift_cases() -> Vec<DriftCase> {
                 "usdt" => usdt(),
                 "wbtc" => address!("0x2260fac5e5542a773aa44fbcfedf7c193bc2c599"),
                 "cbbtc" => address!("0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf"),
-                other => {
-                    other.parse::<Address>().expect("bad token addr in FERMI_DRIFT_PAIRS")
-                }
+                other => other
+                    .parse::<Address>()
+                    .expect("bad token addr in FERMI_DRIFT_PAIRS"),
             };
             let ta = tok(&a);
             let tb = tok(&b);
@@ -283,7 +283,11 @@ async fn check_block<P: Provider + Clone>(
             block,
             local_a,
             chain_a,
-            if local_a > chain_a { local_a - chain_a } else { chain_a - local_a }
+            if local_a > chain_a {
+                local_a - chain_a
+            } else {
+                chain_a - local_a
+            }
         );
     }
     if local_b != chain_b {
@@ -294,7 +298,11 @@ async fn check_block<P: Provider + Clone>(
             block,
             local_b,
             chain_b,
-            if local_b > chain_b { local_b - chain_b } else { chain_b - local_b }
+            if local_b > chain_b {
+                local_b - chain_b
+            } else {
+                chain_b - local_b
+            }
         );
     }
 
@@ -320,7 +328,10 @@ async fn check_block<P: Provider + Clone>(
 
     // 3. quote 对拍（pair 活跃时）
     if !pool.active {
-        println!("[{}] block={} pool inactive, skip quote parity", case.label, block);
+        println!(
+            "[{}] block={} pool inactive, skip quote parity",
+            case.label, block
+        );
         return Ok(ok);
     }
     let quote_ok = check_quote_parity(provider, case, pool, block, lane_word).await?;
@@ -363,7 +374,8 @@ pub(crate) async fn check_quote_parity<P: Provider + Clone>(
     let overrides = StateOverridesBuilder::default()
         .append(
             FERMI_REGISTRY_ADDRESS,
-            AccountOverride::default().with_state_diff([(B256::from(slot_key), B256::from(fresh_word))]),
+            AccountOverride::default()
+                .with_state_diff([(B256::from(slot_key), B256::from(fresh_word))]),
         )
         .build();
 
@@ -374,9 +386,8 @@ pub(crate) async fn check_quote_parity<P: Provider + Clone>(
     local.last_synced_block = block;
     // 同块成交校正：喂入链上 @checkpoint 的 engine last-trade 槽（正向 sub0 / 反向 sub1）
     // + 同步块号。
-    let last_trade_slot = U256::from_be_bytes(
-        fermi_engine_last_trade_slot(case.token_a, case.token_b, 0).0,
-    );
+    let last_trade_slot =
+        U256::from_be_bytes(fermi_engine_last_trade_slot(case.token_a, case.token_b, 0).0);
     match provider
         .get_storage_at(FERMI_ENGINE_ADDRESS, last_trade_slot)
         .block_id(BlockId::from(block))
@@ -385,9 +396,8 @@ pub(crate) async fn check_quote_parity<P: Provider + Clone>(
         Ok(word) => local.last_trade_word = word,
         Err(_) => local.last_trade_word = U256::ZERO,
     }
-    let last_trade_rev_slot = U256::from_be_bytes(
-        fermi_engine_last_trade_slot(case.token_a, case.token_b, 1).0,
-    );
+    let last_trade_rev_slot =
+        U256::from_be_bytes(fermi_engine_last_trade_slot(case.token_a, case.token_b, 1).0);
     match provider
         .get_storage_at(FERMI_ENGINE_ADDRESS, last_trade_rev_slot)
         .block_id(BlockId::from(block))
@@ -534,7 +544,11 @@ async fn run_sync_drift_test(
     if events.is_empty() {
         // 无事件：直接检查点对拍当前块（验证 init 状态本身与链上一致）
         let ok = check_block(&*provider, case, &pool, latest).await?;
-        assert!(ok, "[{}] checkpoint mismatch at block {}", case.label, latest);
+        assert!(
+            ok,
+            "[{}] checkpoint mismatch at block {}",
+            case.label, latest
+        );
         println!("[{}] PASSED (no events) final_block={}", case.label, latest);
         return Ok(());
     }
@@ -567,10 +581,7 @@ async fn run_sync_drift_test(
     }
 
     // 最终检查点（最后一个事件所在块）
-    let final_block = events
-        .last()
-        .and_then(|l| l.block_number)
-        .unwrap_or(latest);
+    let final_block = events.last().and_then(|l| l.block_number).unwrap_or(latest);
     let ok = check_block(&*provider, case, &pool, final_block).await?;
     assert!(
         ok,

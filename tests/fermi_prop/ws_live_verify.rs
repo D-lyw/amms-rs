@@ -45,9 +45,7 @@ use amms::{
     amms::{
         amm::AutomatedMarketMaker,
         fermi_prop::{
-            titan::apply_titan_snapshot,
-            types::fermi_registry_lane_slot,
-            FermiLane, FermiPropPool,
+            titan::apply_titan_snapshot, types::fermi_registry_lane_slot, FermiLane, FermiPropPool,
         },
     },
     state_space::titan_stream::{
@@ -103,7 +101,9 @@ fn live_cases() -> Vec<DriftCase> {
                 "usdt" => usdt(),
                 "wbtc" => wbtc(),
                 "cbbtc" => cbbtc(),
-                other => other.parse::<Address>().expect("bad token addr in FERMI_WS_VERIFY_PAIRS"),
+                other => other
+                    .parse::<Address>()
+                    .expect("bad token addr in FERMI_WS_VERIFY_PAIRS"),
             };
             cases.push(DriftCase {
                 label: Box::leak(format!("{}-{}", a, b).into_boxed_str()),
@@ -123,10 +123,7 @@ fn live_cases() -> Vec<DriftCase> {
 
 /// 从 Titan 快照提取本 pair 的 registry lane 槽位原始值（swapper/wrapper 两 venue
 /// 合并，与 `apply_titan_snapshot` 的收集逻辑一致）。
-fn snapshot_lane_word(
-    pool: &FermiPropPool,
-    snapshot: &TitanOverridesSnapshot,
-) -> Option<U256> {
+fn snapshot_lane_word(pool: &FermiPropPool, snapshot: &TitanOverridesSnapshot) -> Option<U256> {
     let slot = fermi_registry_lane_slot(pool.engine_address, pool.token_a, pool.token_b);
     for (venue, pamm) in &snapshot.per_pamm {
         if *venue != pool.swapper_address && *venue != pool.wrapper_address {
@@ -251,8 +248,16 @@ async fn checkpoint<P: Provider + Clone>(
 
     // 1. vault 余额账本对拍
     let (chain_a, chain_b) = fetch_chain_balances(provider, case, block).await?;
-    let local_a = local.vault_balances.get(&case.token_a).copied().unwrap_or_default();
-    let local_b = local.vault_balances.get(&case.token_b).copied().unwrap_or_default();
+    let local_a = local
+        .vault_balances
+        .get(&case.token_a)
+        .copied()
+        .unwrap_or_default();
+    let local_b = local
+        .vault_balances
+        .get(&case.token_b)
+        .copied()
+        .unwrap_or_default();
     if local_a != chain_a {
         res.balance_mismatches += 1;
         println!(
@@ -261,7 +266,11 @@ async fn checkpoint<P: Provider + Clone>(
             block,
             local_a,
             chain_a,
-            if local_a > chain_a { local_a - chain_a } else { chain_a - local_a },
+            if local_a > chain_a {
+                local_a - chain_a
+            } else {
+                chain_a - local_a
+            },
         );
     }
     if local_b != chain_b {
@@ -272,7 +281,11 @@ async fn checkpoint<P: Provider + Clone>(
             block,
             local_b,
             chain_b,
-            if local_b > chain_b { local_b - chain_b } else { chain_b - local_b },
+            if local_b > chain_b {
+                local_b - chain_b
+            } else {
+                chain_b - local_b
+            },
         );
     }
 
@@ -323,7 +336,8 @@ async fn test_fermi_prop_ws_live_verify() -> eyre::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
 
-    let rpc_endpoint = crate::common::rpc::provider_url().unwrap_or_else(|| PROD_RPC_URL.to_string());
+    let rpc_endpoint =
+        crate::common::rpc::provider_url().unwrap_or_else(|| PROD_RPC_URL.to_string());
     let ws_url = std::env::var("TITAN_OVERRIDES_WS_URL")
         .unwrap_or_else(|_| DEFAULT_OVERRIDES_WS_URL.to_string());
     let titan_rpc_url = std::env::var("TITAN_OVERRIDES_RPC_URL")
@@ -354,7 +368,8 @@ async fn test_fermi_prop_ws_live_verify() -> eyre::Result<()> {
         pool.set_last_synced_block(anchor);
         let pool = Arc::new(Mutex::new(pool));
         info!(
-            label = case.label, anchor,
+            label = case.label,
+            anchor,
             lane_price_e8 = { pool.lock().await.lane.fair_price_e8 },
             active = { pool.lock().await.active },
             "fermi ws live pool init"
@@ -479,7 +494,10 @@ async fn test_fermi_prop_ws_live_verify() -> eyre::Result<()> {
 
     // 6. 汇总
     println!("\n==== WS LIVE VERIFY SUMMARY ({}s) ====", secs);
-    println!("pairs: {}", cases.iter().map(|c| c.label).collect::<Vec<_>>().join(", "));
+    println!(
+        "pairs: {}",
+        cases.iter().map(|c| c.label).collect::<Vec<_>>().join(", ")
+    );
     println!(
         "snapshots={} (with Fermi lane: {}) lanes_applied={} lane_mismatches={}",
         stats.snapshots, stats.snapshots_with_lane, stats.lanes_applied, stats.lane_mismatches,

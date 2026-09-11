@@ -29,7 +29,9 @@ async fn main() -> eyre::Result<()> {
         .map(|s| s.parse().unwrap_or(60))
         .unwrap_or(60);
 
-    let provider = ProviderBuilder::new().connect_ws(WsConnect::new(wss_url.clone())).await?;
+    let provider = ProviderBuilder::new()
+        .connect_ws(WsConnect::new(wss_url.clone()))
+        .await?;
     let chain_id = provider.get_chain_id().await?;
     if chain_id != 56 {
         return Err(eyre::eyre!("expected BSC chain_id 56, got {}", chain_id));

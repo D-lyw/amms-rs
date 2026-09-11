@@ -37,8 +37,8 @@ pub mod types;
 
 pub use types::{
     fermi_engine_last_trade_slot, fermi_lane_index, fermi_max_output_slot,
-    fermi_registry_lane_slot, fermi_virtual_address, sorted_tokens, FermiCurveSegment,
-    FermiLane, FermiPairParams, IFermiERC20, IFermiEngine, IFermiRegistry, ERC20_TRANSFER_EVENT,
+    fermi_registry_lane_slot, fermi_virtual_address, sorted_tokens, FermiCurveSegment, FermiLane,
+    FermiPairParams, IFermiERC20, IFermiEngine, IFermiRegistry, ERC20_TRANSFER_EVENT,
     FERMI_CHAIN_ID, FERMI_ENGINE_ADDRESS, FERMI_PAIR_ACTIVE_SET_EVENT, FERMI_PAIR_REGISTERED_EVENT,
     FERMI_PAIR_UNREGISTERED_EVENT, FERMI_REGISTRY_ADDRESS, FERMI_SWAPPED_EVENT,
     FERMI_SWAPPER_ADDRESS, FERMI_VAULT_ADDRESS, FERMI_WRAPPER_ADDRESS,
@@ -785,9 +785,8 @@ impl AutomatedMarketMaker for FermiPropPool {
         // 6. engine 全局 last-trade 槽（同块成交校正用，见 engine_quote 注释）。
         //    正向读 sub_key=0、反向读 sub_key=1；读取失败不阻断 init
         //    （word = 0 时校正自然跳过）。
-        let last_trade_slot = U256::from_be_bytes(
-            fermi_engine_last_trade_slot(self.token_a, self.token_b, 0).0,
-        );
+        let last_trade_slot =
+            U256::from_be_bytes(fermi_engine_last_trade_slot(self.token_a, self.token_b, 0).0);
         if let Ok(word) = provider
             .get_storage_at(self.engine_address, last_trade_slot)
             .block_id(block)
@@ -795,9 +794,8 @@ impl AutomatedMarketMaker for FermiPropPool {
         {
             self.last_trade_word = word;
         }
-        let last_trade_rev_slot = U256::from_be_bytes(
-            fermi_engine_last_trade_slot(self.token_a, self.token_b, 1).0,
-        );
+        let last_trade_rev_slot =
+            U256::from_be_bytes(fermi_engine_last_trade_slot(self.token_a, self.token_b, 1).0);
         if let Ok(word) = provider
             .get_storage_at(self.engine_address, last_trade_rev_slot)
             .block_id(block)

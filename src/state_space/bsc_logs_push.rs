@@ -49,12 +49,7 @@ impl<N, P> StateSpaceManager<N, P> {
         query_chunks: Vec<LogQueryChunk>,
         ws_candidates: Vec<String>,
         chain_id: u64,
-    ) -> impl Stream<
-        Item = Result<
-            (super::RealtimeUpdateMeta, Vec<Address>),
-            StateSpaceError,
-        >,
-    > + Send
+    ) -> impl Stream<Item = Result<(super::RealtimeUpdateMeta, Vec<Address>), StateSpaceError>> + Send
     where
         P: Provider<N> + Clone + 'static,
         N: Network + 'static,

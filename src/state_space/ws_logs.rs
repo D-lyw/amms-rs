@@ -1,6 +1,6 @@
 use super::{
-    AppliedLogDedupCache, BSC_MAINNET_CHAIN_ID, HookRegistry, LogQueryChunk, LogSource,
-    PendingSyncQueue, StateSpace, StateSpaceError, StateSpaceManager,
+    AppliedLogDedupCache, HookRegistry, LogQueryChunk, LogSource, PendingSyncQueue, StateSpace,
+    StateSpaceError, StateSpaceManager, BSC_MAINNET_CHAIN_ID,
 };
 use crate::state_space::{STREAM_IDLE_TIMEOUT, STREAM_RECONNECT_DELAY};
 use alloy::consensus::BlockHeader;
