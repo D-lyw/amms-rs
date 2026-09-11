@@ -3,8 +3,9 @@
 //! 调研/逆向文档：`docs/2026-09-01_elfomo_prop_xlayer_research.md`（长期维护必读）。
 //!
 //! ElfomoFi 是 XLayer 上的 proprietary AMM（PropAMM）：链下做市引擎（MM）每块
-//! 更新 Pool 合约内 per-asset 的 3 档 orderbook（价格随 oracle/链上信号漂移，
-//! 实测存在），Router 负责报价与执行，金库（Gnosis Safe）持币背书整仓。
+//! 更新 Pool 合约内 per-asset 的 ladder orderbook（档数与宽度由该池 ladder 参数
+//! 决定，价格随 oracle/链上信号漂移），Router 负责报价与执行，金库（Gnosis Safe）
+//! 持币背书整仓。
 //! 公式全在 Pool（`0x561fa97d` 返回 packed 5-word，Factory/Router 仅透传）。
 //!
 //! ## 报价模型（固定块 `0x423c2b8` 逐位对拍锁定，双向 33 点精确命中；
@@ -19,16 +20,18 @@
 //! - **价格**：`a = slot1 >> 32`；`q = (a >> 22) & 0x3f`，
 //!   `qs = q>=32 ? q-64 : q`；`low = a & 0x3fffff`；
 //!   `base = (100000 + qs) × low`。每档 `price = slope × base`（定点 1e24）。
-//! - **from→to 档位**（size=输入量）：深度 `DEPTH1=[0.6e18,3e18,6e18,
-//!   4859537498999137814,9e19]`，斜率 `[99993,99990,99985,99975,50000]`；
-//!   `rem=vault_usdt0×1e24`，逐档 `cap=rem//price`、`s=min(DEPTH1[i],cap)`，
-//!   `rem -= ceil(s×price/1e24)×1e24`，`s<DEPTH1[i]` 即停（余量档）。
-//! - **to→from 档位**（size=输出量）：深度 `DEPTH2=[0.6e18,3e18,6e18,6e18,
-//!   12e18,60e18,0.6e18]`；`rem=vault_xeth`，逐档 `cap=rem-0.6e18`、
-//!   `s=min(DEPTH2[i],cap)`，`s<DEPTH2[i]` 即停；**尾部 0.6e18 恒显示**。
-//!   斜率按档位数：`n=1`→`[150000]`；`n=2`→`[100067,150000]`；
-//!   `n=3`→`[100007, (s₂≤1.8e18?100070:100010), 150000]`；
-//!   `n≥4`→`[100007,100010,100015,100025,100040,100050,...]` 依次 +5，尾部 150000。
+//! - **档位生成**：宽度/偏离由**本 pool 的 ladder 参数**（[`ElfomoLadderConfig`]，
+//!   `init` 时逐池从链上 `Pool.getMetadata(asset)` 读取）现算——宽度表
+//!   `PREFIX=[1U,5U,10U,10U,20U,100U]`、偏离表 `D=[7,10,15,25,40,50]`、
+//!   容量截断 + 尾档，加宽开关 `spread_level·U ≥ 本侧容量`（由金库余额决定）。
+//!   完整规则与实证见 [`ElfomoLadderConfig`] 与
+//!   `build_orderbook_with`（唯一实现，逐位对拍链上）。
+//! - **from→to 档位**（size=输入量）：容量 `(T−1)U − vault_xeth`；
+//!   `rem=vault_usdt0×1e24`，逐档 `s=min(width,rem//price)`，
+//!   `rem -= ceil(s×price/1e24)×1e24`，`s<width` 即停（余量档）。
+//! - **to→from 档位**（size=输出量）：容量 `vault_xeth`，前缀容量 `vault_xeth−U`，
+//!   尾部一档 `U`；`rem=vault_xeth`，逐档 `s=min(width,rem)`，`s<width` 即停；
+//!   **尾档恒显示**。
 //! - **撮合**：`from→to` 逐档 `out += floor(take×price/1e24)`，封顶
 //!   `min(总输出, vault USDT0)`；`to→from` 输出量逐档
 //!   `need=ceil(size×price/1e24)`，`剩余≥need` 取满档否则
@@ -43,7 +46,8 @@
 //!
 //! 报价更新机制（2026-09-01 链上实证）：MM keeper 每块向 Pool 发一笔
 //! `updatePrices(uint256)`（selector `0xae7e8d81`），Pool 同步 emit 一条空
-//! data 事件（topic `0xc5d08cbe…`）并更新 slot1。**calldata 参数就是价格种子**：
+//! data 事件（topic `0xc5d08cbe…`）并更新 slot1。**空事件零信息量、不是状态源**
+//! （仅用于提取侧的 raw-tx 去重，见下）；**calldata 参数才是价格种子**：
 //! 实测 `arg ≈ (a<<32) | (ts-1)`，`a = arg >> 32` 可直接从原始交易解析，
 //! 无需任何 RPC 即可在本地重算整本 orderbook。
 //!
@@ -58,11 +62,13 @@
 //!    `int256 specifiedAmount` 符号无关：负值=exact-out，正值=exact-in，
 //!    事件均携带实际 input/output），本地账本按事件实际金额处理即可。
 //!    关键路径完全本地。
-//! 2. **L1 — 事件通道（无 raw-tx 时的回退）**：Pool `updatePrices` 空事件
-//!    本身不含种子 → `SyncAction::AsyncUpdate` 重拉 `getOrderbook` +
-//!    slot1 + vault `balanceOf` 真值（仅 flashblocks 断流/未覆盖时触发）。
-//! 3. **L2 — 周期快照（最后兜底）**：`start_elfomo_prop_sync_task` 低频重拉
-//!    整档回正 + 种子 + vault `balanceOf`，覆盖断流/重连/漏块等极端场景。
+//! 2. **L1 — 覆盖率自证（零 RPC）**：Pool `updatePrices` 空事件已**不再订阅**
+//!    （零信息量、且与本笔 raw-tx 种子同源，见 `sync_events`）。提取通道是否
+//!    静默失效由 `observe_block` 按块边界自证：连续缺种子超阈值发一次 `error`，
+//!    不做逐块 RPC 重拉。
+//! 3. **L2 — 周期快照（唯一兜底）**：`start_elfomo_prop_sync_task`（45s）低频
+//!    重拉整档回正 + 种子 + vault `balanceOf`，覆盖断流/重连/漏块等极端场景；
+//!    AsyncUpdate/Resync 走 `execute_elfomo_snapshot_reconcile` 同形状三段式合并。
 //!
 //! ### 两条通道的合并语义（改动前先读 `docs/dynamic_state_sync_principles.md` §3）
 //!
@@ -84,7 +90,7 @@ use alloy::{
     sol,
 };
 use serde::{Deserialize, Serialize};
-use tracing::{instrument, warn};
+use tracing::{error, info, instrument, warn};
 
 use crate::amms::{
     amm::{AutomatedMarketMaker, SyncAction, AMM},
@@ -92,7 +98,7 @@ use crate::amms::{
     Token,
 };
 
-use crate::amms::elfomo_prop::types::{LevelConsumed, OrderbookLevel, OrderbookSnapshot};
+use crate::amms::elfomo_prop::types::{ElfomoLadderConfig, OrderbookLevel, OrderbookSnapshot};
 
 pub mod factory;
 pub mod ledger;
@@ -127,7 +133,8 @@ pub const ELFOMO_TRADE_EVENT: B256 = B256::new([
 ]);
 
 /// Pool emit 的 `updatePrices` 空事件 topic0（每块 1 笔，MM keeper 驱动）。
-/// data 为空，仅作"价格已漂移"的实时触发信号；真值需重拉 `getOrderbook`。
+/// **不是状态源**：仅 topic0、data 0 字节；价格种子在同笔 raw-tx calldata 里。
+/// 只保留给 flashblocks 提取侧做去重（有 raw-tx 时剔除同块该空日志）。
 pub const ELFOMO_UPDATE_EVENT: B256 = B256::new([
     0xc5, 0xd0, 0x8c, 0xbe, 0x6f, 0xd3, 0xeb, 0xc2, 0x4e, 0x5a, 0x48, 0x36, 0x16, 0xdd, 0xdb, 0xc6,
     0x3b, 0x2a, 0xff, 0x5c, 0x08, 0x2c, 0x7d, 0x69, 0x76, 0x03, 0xab, 0x52, 0x10, 0x79, 0xf8, 0x09,
@@ -176,34 +183,15 @@ const ONE_E24: U256 = U256::from_limbs([0x1bcecceda1000000, 0xd3c2, 0, 0]);
 // orderbook 生成公式常量（真实链 10 块 + anvil vault 全量扫描复验，见模块文档）
 // ----------------------------------------------------------------------------
 
-/// from→to 每档深度（xETH 输入量上限）
-const DEPTH1: [U256; 5] = [
-    U256::from_limbs([0x853a0d2313c0000, 0, 0, 0]), // 0.6e18
-    U256::from_limbs([0x29a2241af62c0000, 0, 0, 0]), // 3e18
-    U256::from_limbs([0x53444835ec580000, 0, 0, 0]), // 6e18
-    U256::from_limbs([0x43708b9bc088a616, 0, 0, 0]), // 4859537498999137814
-    U256::from_limbs([0xe1003b28d9280000, 0x4, 0, 0]), // 9e19
-];
-/// from→to 每档价格斜率（price = slope × base）
-const SLOPES_FT: [u64; 5] = [99_993, 99_990, 99_985, 99_975, 50_000];
+// 说明：orderbook 的档位宽度/偏离不是全局常量——`PREFIX`/`D` 是协议级常量，
+// 而 `unit/band_count/spread_level/spread_penalty` 是**每 pool 的链上配置**，
+// 由 `init` 逐池从 `Pool.getMetadata(asset)` 读取（见 `types::ElfomoLadderConfig`），
+// 代码里没有任何 pair 特判。生成规则见 `build_orderbook_with`。
+// ----------------------------------------------------------------------------
 
-/// to→from 每档深度（xETH 输出量上限；最后一档为恒显尾部 0.6e18）
-const DEPTH2: [U256; 7] = [
-    U256::from_limbs([0x853a0d2313c0000, 0, 0, 0]), // 0.6e18
-    U256::from_limbs([0x29a2241af62c0000, 0, 0, 0]), // 3e18
-    U256::from_limbs([0x53444835ec580000, 0, 0, 0]), // 6e18
-    U256::from_limbs([0x53444835ec580000, 0, 0, 0]), // 6e18
-    U256::from_limbs([0xa688906bd8b00000, 0, 0, 0]), // 12e18
-    U256::from_limbs([0x40aad21b3b700000, 0x3, 0, 0]), // 60e18
-    U256::from_limbs([0x853a0d2313c0000, 0, 0, 0]), // 0.6e18 尾部
-];
-/// to→from 非尾部档位斜率（n≥4 时依次 +5；n<4 另有规则见 `build_orderbook`）
-const SLOPES_TF: [u64; 7] = [
-    100_007, 100_010, 100_015, 100_025, 100_040, 100_050, 150_000,
-];
-
-/// to→from n=3 时第二档斜率切换阈值（size ≤ 此值用 100070，否则 100010）
-const TF_N3_SLOPE_THRESHOLD: U256 = U256::from_limbs([0x18fae27693b40000, 0, 0, 0]); // 1.8e18
+/// 覆盖率自证阈值：连续这么多块没有拿到 raw-tx 种子 → 说明主通道可能失效，
+/// 发一次 error 告警（零 RPC；收敛由周期对账负责，不再自动重拉）。
+pub const ELFOMO_SEED_COVERAGE_ALERT_BLOCKS: u64 = 5;
 
 /// 价格种子位域掩码（与链上 `0x561fa97d` 内部一致）
 const SEED_Q_MASK: u64 = 0x3f;
@@ -214,6 +202,13 @@ sol! {
     #[sol(rpc)]
     interface IElfomoVault {
         function balanceOf(address account) external view returns (uint256);
+    }
+
+    #[allow(missing_docs)]
+    #[sol(rpc)]
+    interface IERC20Metadata {
+        function decimals() external view returns (uint8);
+        function symbol() external view returns (string);
     }
 }
 
@@ -257,10 +252,35 @@ pub struct ElfomoFiPropPool {
     pub last_synced_block: u64,
     /// 资产列表（[xETH, USDT0]）
     pub tokens: Vec<Token>,
-    /// 订单簿快照（两侧各 3 档 + 金库余额）
+    /// 订单簿快照（两侧档位 + 金库余额 + 价格种子；档数由 ladder 决定）
     pub levels: OrderbookSnapshot,
-    /// 本地档位消耗状态（L1 事件驱动，L2 快照整档回正）
-    pub consumed: LevelConsumed,
+    /// **本 pair 的 ladder 配置**（深度/斜率表；链上是 per-asset 存储，
+    /// 本地按 pair 持有）。缺省即已知 pair 的 ladder，见 [`ElfomoLadderConfig`]。
+    #[serde(default)]
+    pub ladder: ElfomoLadderConfig,
+    /// **模型自证**：最近一次"链上档位 vs 本地 `build_orderbook` 重算"对拍是否一致。
+    ///
+    /// 链上 orderbook 是 `(seed, vault)` 的纯函数，本地同构重算；一旦对拍不一致
+    /// （协议改了参数、接入的新 pair 深度表不同），说明本地模型不再可信 → 置 false，
+    /// 报价路径直接拒绝该池，绝不输出错价；下一次对拍一致即自动恢复。
+    /// `serde(default)` 对旧状态取 true（默认信任已逐位对拍过的模型）。
+    #[serde(default = "default_model_verified")]
+    pub model_verified: bool,
+    /// 覆盖率自证：最后一次**成功应用 raw-tx 种子**的块号。
+    ///
+    /// 与 `price_seed_block` 分开：后者会被快照对账（45s）推进，会掩盖"raw-tx
+    /// 提取通道失效"这一真正要观测的事实。
+    #[serde(default)]
+    pub raw_seed_block: u64,
+    /// 覆盖率自证：块边界观测到的"已收口"块号（flashblocks `index==0` 推进）。
+    #[serde(default)]
+    pub coverage_open_block: u64,
+    /// 覆盖率自证：已收口的、无 raw-tx 种子的连续块数。
+    #[serde(default)]
+    pub blocks_since_seed: u64,
+    /// 覆盖率告警是否已发出（避免刷屏；下一个健康块收口时清零）。
+    #[serde(default)]
+    pub seed_coverage_alerted: bool,
     /// vault 余额增量账本（checkpoint + redo log）。
     ///
     /// **活池的 `levels.vault_xeth/vault_usdt0` 由此账本派生**：事件记账、
@@ -287,10 +307,20 @@ impl Default for ElfomoFiPropPool {
             price_seed_block: 0,
             tokens: Vec::new(),
             levels: OrderbookSnapshot::default(),
-            consumed: LevelConsumed::new(0, 0),
+            ladder: ElfomoLadderConfig::default(),
+            model_verified: true,
+            raw_seed_block: 0,
+            coverage_open_block: 0,
+            blocks_since_seed: 0,
+            seed_coverage_alerted: false,
             vault_ledger: VaultDeltaLedger::new(),
         }
     }
+}
+
+/// `model_verified` 的 serde 默认值（旧序列化状态无该字段时视为已验证）。
+fn default_model_verified() -> bool {
+    true
 }
 
 impl ElfomoFiPropPool {
@@ -319,7 +349,12 @@ impl ElfomoFiPropPool {
             price_seed_block: 0,
             tokens: Vec::new(),
             levels: OrderbookSnapshot::default(),
-            consumed: LevelConsumed::new(0, 0),
+            ladder: ElfomoLadderConfig::default(),
+            model_verified: true,
+            raw_seed_block: 0,
+            coverage_open_block: 0,
+            blocks_since_seed: 0,
+            seed_coverage_alerted: false,
             vault_ledger: VaultDeltaLedger::new(),
         }
     }
@@ -352,83 +387,43 @@ impl ElfomoFiPropPool {
         Some(U256::from_be_slice(&input[4..36]) >> 32)
     }
 
-    /// 按种子 `a` + 金库余额生成完整 orderbook（纯函数，与链上逐位一致）。
+    /// 按指定 pool ladder + 种子 + 金库余额生成 orderbook（纯函数，与链上逐位一致）。
     ///
-    /// 公式已用真实链 10 个块（fromTo/toFrom 全对）+ anvil vault 余额全量
-    /// 扫描复验；链上每次读取都实时用 `balanceOf(vault)` 重算，本地同构。
-    pub fn build_orderbook(seed: U256, vault_usdt0: U256, vault_xeth: U256) -> OrderbookSnapshot {
+    /// **这是 ladder 生成规则在本地唯一的实现**：`(U, T, F, spread_level, vault) → 档位表`
+    /// 的读时纯函数。规则由 2026-09-11 fork 全网格（30,240 组）逐位实证得出，见
+    /// [`ElfomoLadderConfig`]；本地一切报价路径都必须走 [`Self::local_orderbook`]。
+    ///
+    /// **注意：这套规则（含 `PREFIX_WIDTHS` / `DEVIATIONS`）是 XLayer 部署的实证**。
+    /// Base 等链是同一协议的**另一套部署变体**（`getMetadata` word 的 `f3` = 1、偏离表
+    /// 前两档不同、种子槽位不同），当前**未支持**——在那些链上模型自证会判不可信并
+    /// fail-closed（不报价）。扩展步骤见 [`ElfomoLadderConfig`] 顶部的多链说明。
+    pub fn build_orderbook_with(
+        ladder: &ElfomoLadderConfig,
+        seed: U256,
+        vault_usdt0: U256,
+        vault_xeth: U256,
+    ) -> OrderbookSnapshot {
+        let empty = || OrderbookSnapshot {
+            from_to_levels: Vec::new(),
+            to_from_levels: Vec::new(),
+            vault_usdt0,
+            vault_xeth,
+            price_seed: seed,
+        };
+
         // q 取位 22..27、low 取位 0..21，只需种子低 27 位
         let low_bits = (seed & U256::from(0x7ff_ffffu64)).to::<u64>();
         let q = (low_bits >> 22) & SEED_Q_MASK;
         let qs = if q >= 32 { q as i64 - 64 } else { q as i64 };
         let low = low_bits & SEED_LOW_MASK;
         let base = U256::from((100_000i64 + qs) as u64) * U256::from(low);
-
-        // from→to（xETH→USDT0，size = 输入量）
-        let mut from_to_levels = Vec::with_capacity(SLOPES_FT.len());
-        let mut rem = vault_usdt0 * ONE_E24;
-        for (i, slope) in SLOPES_FT.iter().enumerate() {
-            let price = U256::from(*slope) * base;
-            let cap = rem / price;
-            if cap.is_zero() {
-                break;
-            }
-            let depth = DEPTH1[i];
-            let size = cap.min(depth);
-            from_to_levels.push(OrderbookLevel::new(size, price));
-            rem -= Self::ceil_div(size * price, ONE_E24) * ONE_E24;
-            if size < depth {
-                break;
-            }
+        if !ladder.is_valid() || base.is_zero() {
+            // ladder 缺失（未 init / 配置错误）→ 不给任何档位，模型自证判不可信
+            return empty();
         }
 
-        // to→from（USDT0→xETH，size = 输出量）
-        let mut sizes: Vec<U256> = Vec::with_capacity(DEPTH2.len());
-        let mut rem = vault_xeth;
-        let tail = DEPTH2[6];
-        for (i, depth) in DEPTH2[..6].iter().enumerate() {
-            let cap = rem.saturating_sub(tail);
-            if cap.is_zero() {
-                break;
-            }
-            let size = cap.min(*depth);
-            sizes.push(size);
-            rem -= size;
-            if size < *depth {
-                break;
-            }
-        }
-        sizes.push(rem.min(tail));
-        let n = sizes.len();
-        let mut to_from_levels = Vec::with_capacity(n);
-        for (i, size) in sizes.into_iter().enumerate() {
-            let slope = if n == 1 {
-                150_000
-            } else if n == 2 {
-                if i == 0 {
-                    100_067
-                } else {
-                    150_000
-                }
-            } else if n == 3 {
-                if i == 0 {
-                    100_007
-                } else if i == 1 {
-                    if size <= TF_N3_SLOPE_THRESHOLD {
-                        100_070
-                    } else {
-                        100_010
-                    }
-                } else {
-                    150_000
-                }
-            } else if i == n - 1 {
-                150_000
-            } else {
-                SLOPES_TF[i]
-            };
-            to_from_levels.push(OrderbookLevel::new(size, U256::from(slope) * base));
-        }
+        let from_to_levels = Self::build_from_to_levels(ladder, base, vault_usdt0, vault_xeth);
+        let to_from_levels = Self::build_to_from_levels(ladder, base, vault_xeth);
 
         OrderbookSnapshot {
             from_to_levels,
@@ -439,16 +434,177 @@ impl ElfomoFiPropPool {
         }
     }
 
+    /// 前缀宽度表逐档截断到容量 `cap`（不足一整档时给残余档）。
+    fn prefix_widths(cap: U256, unit: U256) -> Vec<U256> {
+        let mut out = Vec::with_capacity(ElfomoLadderConfig::PREFIX_WIDTHS.len());
+        let mut cumulative = U256::ZERO;
+        for w in ElfomoLadderConfig::PREFIX_WIDTHS {
+            let width = U256::from(w) * unit;
+            if cumulative.saturating_add(width) <= cap {
+                out.push(width);
+                cumulative += width;
+            } else {
+                if cap > cumulative {
+                    out.push(cap - cumulative);
+                }
+                break;
+            }
+        }
+        out
+    }
+
+    /// 第 `i` 档偏离量：`D[i]`，整梯加宽时再加 `F`。
+    ///
+    /// 实测规则（2026-09-11 全网格实证）：加宽时 **`i >= 1` 的所有档位 +`F`**；
+    /// 前缀只有 1 档时该档（`i == 0`）同样 +`F`（唯一档位等价于末档）。
+    fn prefix_deviation(i: usize, prefix_len: usize, penalty: u64, widened: bool) -> u64 {
+        let mut dev = ElfomoLadderConfig::DEVIATIONS.get(i).copied().unwrap_or(0);
+        if widened && (i >= 1 || prefix_len == 1) {
+            dev += penalty;
+        }
+        dev
+    }
+
+    /// 单侧是否进入"加宽"档：**由金库余额决定，不是静态配置**。
+    ///
+    /// 实测（全网格 bit-exact）：`from→to` 侧容量 `cap = (T−1)·U − vault_xeth`、
+    /// `to→from` 侧容量即 `vault_xeth`；当 `spread_level · U >= 容量` 时该侧所有档位加宽
+    /// `F`。真实池 `T=30, spread_level=5, U=0.6e18`：`vault_xeth ≈ 3.68U` 时 `to→from`
+    /// 已加宽、`from→to` 未加宽——静态判据（旧 `spread_level >= T−1`）在此会算错价格。
+    fn side_widened(spread_level: u16, unit: U256, capacity: U256) -> bool {
+        U256::from(spread_level) * unit >= capacity
+    }
+
+    /// from→to 侧：maker 补库存方向，容量受 `vault_xeth` 约束、输出受 `vault_usdt0` 约束。
+    ///
+    /// 前缀容量 `cap = (T−1)·U − vault_xeth`：
+    /// - `cap > 0`：按 `PREFIX` 逐档截断到 `cap`，尾部再补一档 `5T·U`；逐档以剩余
+    ///   `vault_usdt0` 预算封顶（`size = min(rem/price, width)`），消耗按
+    ///   `ceil(size·price / 1e24)` 扣减；
+    /// - `cap == 0`（含 `vault_xeth >= (T−1)·U`）：链上只给**一档**残余档
+    ///   `min(T·U − vault_xeth, 预算)`，价恒为尾档价（`5T·U` 那一档的斜率），超出
+    ///   `T·U` 则完全不给档位。
+    fn build_from_to_levels(
+        ladder: &ElfomoLadderConfig,
+        base: U256,
+        vault_usdt0: U256,
+        vault_xeth: U256,
+    ) -> Vec<OrderbookLevel> {
+        let unit = ladder.unit;
+        let band_count = U256::from(ladder.band_count);
+        let penalty = u64::from(ladder.spread_penalty);
+        let total = band_count * unit; // T·U
+        let full = total - unit; // (T−1)·U
+        let tail_price = U256::from(ElfomoLadderConfig::FT_TAIL_SLOPE) * base;
+        let mut rem = vault_usdt0.saturating_mul(ONE_E24);
+        let mut levels = Vec::new();
+
+        let cap = full.saturating_sub(vault_xeth);
+        if cap.is_zero() {
+            // 库存已达/超过目标上限：只有一档 `T·U − vault_xeth` 的尾档价残余档。
+            let width = total.saturating_sub(vault_xeth);
+            if width.is_zero() || tail_price.is_zero() {
+                return levels;
+            }
+            let size = (rem / tail_price).min(width);
+            if !size.is_zero() {
+                levels.push(OrderbookLevel::new(size, tail_price));
+            }
+            return levels;
+        }
+
+        let widened = Self::side_widened(ladder.spread_level, unit, cap);
+        let prefix = Self::prefix_widths(cap, unit);
+        let mut widths = prefix.clone();
+        widths.push(U256::from(5u64) * band_count * unit);
+
+        for (i, width) in widths.iter().enumerate() {
+            let slope = if i < prefix.len() {
+                ElfomoLadderConfig::SLOPE_BASE
+                    - Self::prefix_deviation(i, prefix.len(), penalty, widened)
+            } else {
+                ElfomoLadderConfig::FT_TAIL_SLOPE
+            };
+            let price = U256::from(slope) * base;
+            if price.is_zero() {
+                break;
+            }
+            let budget_cap = rem / price;
+            let size = budget_cap.min(*width);
+            if size.is_zero() {
+                break;
+            }
+            levels.push(OrderbookLevel::new(size, price));
+            rem = rem.saturating_sub(Self::ceil_div(size * price, ONE_E24).saturating_mul(ONE_E24));
+            if size < *width {
+                break;
+            }
+        }
+        levels
+    }
+
+    /// to→from 侧：maker 减库存方向，容量受 `vault_xeth` 约束。
+    ///
+    /// 前缀容量 `vault_xeth − U`（不足一档时给残余档，`vault_xeth < U` 时前缀为空），
+    /// 尾部再补一档 `U`；逐档以剩余 `vault_xeth` 封顶。`vault_xeth` 为 0 时不给档位。
+    fn build_to_from_levels(
+        ladder: &ElfomoLadderConfig,
+        base: U256,
+        vault_xeth: U256,
+    ) -> Vec<OrderbookLevel> {
+        let unit = ladder.unit;
+        let penalty = u64::from(ladder.spread_penalty);
+        let mut rem = vault_xeth;
+        let mut levels = Vec::new();
+        if rem.is_zero() {
+            return levels;
+        }
+
+        let widened = Self::side_widened(ladder.spread_level, unit, vault_xeth);
+        let prefix = Self::prefix_widths(vault_xeth.saturating_sub(unit), unit);
+        let mut widths = prefix.clone();
+        widths.push(unit);
+
+        for (i, width) in widths.iter().enumerate() {
+            let slope = if i < prefix.len() {
+                ElfomoLadderConfig::SLOPE_BASE
+                    + Self::prefix_deviation(i, prefix.len(), penalty, widened)
+            } else {
+                ElfomoLadderConfig::TF_TAIL_SLOPE
+            };
+            let price = U256::from(slope) * base;
+            if price.is_zero() {
+                break;
+            }
+            let size = rem.min(*width);
+            if size.is_zero() {
+                break;
+            }
+            levels.push(OrderbookLevel::new(size, price));
+            rem -= size;
+            if size < *width {
+                break;
+            }
+        }
+        levels
+    }
+
+    /// 用**本池 ladder** + 当前种子 + 金库余额重算 orderbook（读时重算模型）。
+    fn local_orderbook(
+        &self,
+        seed: U256,
+        vault_usdt0: U256,
+        vault_xeth: U256,
+    ) -> OrderbookSnapshot {
+        Self::build_orderbook_with(&self.ladder, seed, vault_usdt0, vault_xeth)
+    }
+
     /// 用当前种子 + 金库余额重建 orderbook 缓存（读时重算模型下的缓存刷新）。
     fn refresh_levels(&mut self) {
-        self.levels = Self::build_orderbook(
+        self.levels = self.local_orderbook(
             self.price_seed,
             self.levels.vault_usdt0,
             self.levels.vault_xeth,
-        );
-        self.consumed = LevelConsumed::new(
-            self.levels.from_to_levels.len(),
-            self.levels.to_from_levels.len(),
         );
     }
 
@@ -498,10 +654,120 @@ impl ElfomoFiPropPool {
         self.levels.vault_usdt0 = vault_usdt0;
     }
 
+    /// 模型未通过链上对拍时拒绝报价（宁可不出价，也不出错价）。
+    fn ensure_model_verified(&self) -> Result<(), AMMError> {
+        if self.model_verified {
+            return Ok(());
+        }
+        Err(AMMError::Msg(format!(
+            "elfomofi: local orderbook model not verified against chain for pool {}; quotes disabled",
+            self.pool_address
+        )))
+    }
+
+    /// 模型自证：把链上返回的档位与本地 `build_orderbook` 的**逐位**重算结果对拍。
+    ///
+    /// 两者不一致 = 本地模型已与链上脱节（协议改参数 / 新 pair 深度表不同 /
+    /// 公式逆向有误），此时任何本地报价都不可信 → `model_verified=false`，
+    /// 报价路径拒绝该池；下一次对拍一致会自动恢复（周期对账 45s 一次）。
+    #[allow(clippy::too_many_arguments)]
+    fn verify_model_against_chain(
+        &mut self,
+        chain_from_to: &[OrderbookLevel],
+        chain_to_from: &[OrderbookLevel],
+        seed: U256,
+        vault_usdt0: U256,
+        vault_xeth: U256,
+        source: &str,
+        block: u64,
+    ) -> bool {
+        let local = Self::build_orderbook_with(&self.ladder, seed, vault_usdt0, vault_xeth);
+        let matched =
+            local.from_to_levels == chain_from_to && local.to_from_levels == chain_to_from;
+        if matched {
+            if !self.model_verified {
+                info!(
+                    target: "amms::elfomo_prop",
+                    pool = %self.pool_address, source, block,
+                    "elfomofi: local orderbook model re-verified against chain; quotes re-enabled"
+                );
+                self.model_verified = true;
+            }
+        } else {
+            if self.model_verified {
+                error!(
+                    target: "amms::elfomo_prop",
+                    pool = %self.pool_address, source, block,
+                    chain_from_to = chain_from_to.len(),
+                    chain_to_from = chain_to_from.len(),
+                    local_from_to = local.from_to_levels.len(),
+                    local_to_from = local.to_from_levels.len(),
+                    "elfomofi: local orderbook model MISMATCH vs chain — quotes disabled \
+                     until re-verified (new pair with an un-reversed depth table?)"
+                );
+            }
+            self.model_verified = false;
+        }
+        matched
+    }
+
+    /// 覆盖率自证：**块边界**观测（flashblocks `index == 0` 时由应用层驱动）。
+    ///
+    /// 为什么按块收口而不是按 slice：一个 XLayer 块会被拆成多个 flashblock
+    /// payload 先后到达，携带种子的 `updatePrices` 交易可能落在任意 slice 上，
+    /// 所以在 slice 粒度判定"本块没种子"会误报。这里在观察到块 B 时结算
+    /// `coverage_open_block`（即上一块）的覆盖情况：
+    /// - 上一块有 raw-tx 种子（`raw_seed_block >= open`）→ 计数器清零、告警位复位；
+    /// - 没有 → 计 1 块缺失；中间被整段跳过的块（流重连）按缺失计（保守）。
+    ///
+    /// 零 RPC：只依赖本地块号与 [`Self::raw_seed_block`]。
+    pub fn observe_block(&mut self, block: u64) {
+        if block <= self.coverage_open_block {
+            return;
+        }
+        let open = self.coverage_open_block;
+        if open != 0 {
+            let skipped_between = block.saturating_sub(open + 1);
+            let had_seed = self.raw_seed_block >= open;
+            let mut missing = skipped_between;
+            if !had_seed {
+                missing += 1;
+            }
+            if missing > 0 {
+                self.blocks_since_seed = self.blocks_since_seed.saturating_add(missing);
+                if self.blocks_since_seed >= ELFOMO_SEED_COVERAGE_ALERT_BLOCKS
+                    && !self.seed_coverage_alerted
+                {
+                    self.seed_coverage_alerted = true;
+                    error!(
+                        target: "amms::elfomo_prop",
+                        pool = %self.pool_address,
+                        block,
+                        blocks_since_seed = self.blocks_since_seed,
+                        last_raw_seed_block = self.raw_seed_block,
+                        "elfomofi: raw-tx price seed missing for {} consecutive blocks — \
+                         flashblocks extraction likely broken (quotes drift with the stale seed; \
+                         the 45s reconcile only repairs vault balances, not the price)",
+                        self.blocks_since_seed
+                    );
+                }
+            } else {
+                self.blocks_since_seed = 0;
+                self.seed_coverage_alerted = false;
+            }
+        }
+        self.coverage_open_block = block;
+    }
+
+    /// 本池的种子覆盖状态（观测用）：`(最后一次 raw-tx 种子的块号, 连续缺失块数)`。
+    pub fn seed_coverage(&self) -> (u64, u64) {
+        (self.raw_seed_block, self.blocks_since_seed)
+    }
+
     /// 针对给定 orderbook 快照报价（纯函数；链上对拍/复用用）。
     ///
-    /// 语义与 `simulate_swap` 完全一致（零 consumed、金库封顶），但使用外部
-    /// 传入的 orderbook —— 用于"父块金库余额 + raw-tx 种子"这类跨状态对拍。
+    /// 语义与 `simulate_swap` 完全一致（金库封顶），但使用外部传入的
+    /// orderbook —— 用于"父块金库余额 + raw-tx 种子"这类跨状态对拍。
     pub fn simulate_swap_for_orderbook(
         ob: &OrderbookSnapshot,
         token_x: Address,
@@ -511,11 +777,9 @@ impl ElfomoFiPropPool {
         amount_in: U256,
     ) -> U256 {
         if token_in == token_x && token_out == token_y {
-            let zero = vec![U256::ZERO; ob.from_to_levels.len()];
-            Self::quote_fwd_exact(&ob.from_to_levels, &zero, amount_in, ob.vault_usdt0)
+            Self::quote_fwd_exact(&ob.from_to_levels, amount_in, ob.vault_usdt0)
         } else if token_in == token_y && token_out == token_x {
-            let zero = vec![U256::ZERO; ob.to_from_levels.len()];
-            Self::quote_rev_exact(&ob.to_from_levels, &zero, amount_in, ob.vault_xeth)
+            Self::quote_rev_exact(&ob.to_from_levels, amount_in, ob.vault_xeth)
         } else {
             U256::ZERO
         }
@@ -535,6 +799,9 @@ impl ElfomoFiPropPool {
         if block_number >= self.price_seed_block {
             self.price_seed = seed;
             self.price_seed_block = block_number;
+            // 覆盖率自证：记录"raw-tx 通道本块有货"（收口判定在块边界做，
+            // 因为同块多个 flashblock slice 都可能携带种子）。
+            self.raw_seed_block = self.raw_seed_block.max(block_number);
         } else {
             tracing::debug!(
                 target: "amms::elfomo_prop",
@@ -550,23 +817,14 @@ impl ElfomoFiPropPool {
 
     /// 正向 exact-in：from→to（size = 输入量），`out += floor(take×price/1e24)`，
     /// 封顶 `min(总输出, vault_usdt0)`。
-    fn quote_fwd_exact(
-        levels: &[OrderbookLevel],
-        consumed: &[U256],
-        amount_in: U256,
-        vault_usdt0: U256,
-    ) -> U256 {
+    fn quote_fwd_exact(levels: &[OrderbookLevel], amount_in: U256, vault_usdt0: U256) -> U256 {
         let mut out = U256::ZERO;
         let mut rem = amount_in;
-        for (lv, c) in levels.iter().zip(consumed.iter()) {
+        for lv in levels.iter() {
             if rem.is_zero() {
                 break;
             }
-            let remaining = lv.size.saturating_sub(*c);
-            if remaining.is_zero() {
-                continue;
-            }
-            let take = rem.min(remaining);
+            let take = rem.min(lv.size);
             out += take * lv.price / ONE_E24;
             rem -= take;
         }
@@ -576,25 +834,19 @@ impl ElfomoFiPropPool {
     /// 反向 exact-in：to→from（size = 输出量），
     /// `need = ceil(size×price/1e24)`；`剩余≥need` 时 `out+=size`，
     /// 否则 `out += floor(剩余×1e24/price)`；封顶 `min(out, vault_xeth)`。
-    fn quote_rev_exact(
-        levels: &[OrderbookLevel],
-        consumed: &[U256],
-        amount_in: U256,
-        vault_xeth: U256,
-    ) -> U256 {
+    fn quote_rev_exact(levels: &[OrderbookLevel], amount_in: U256, vault_xeth: U256) -> U256 {
         let mut out = U256::ZERO;
         let mut rem = amount_in;
-        for (lv, c) in levels.iter().zip(consumed.iter()) {
+        for lv in levels.iter() {
             if rem.is_zero() {
                 break;
             }
-            let remaining = lv.size.saturating_sub(*c);
-            if remaining.is_zero() {
+            if lv.size.is_zero() {
                 continue;
             }
-            let need = Self::ceil_div(remaining * lv.price, ONE_E24);
+            let need = Self::ceil_div(lv.size * lv.price, ONE_E24);
             if rem >= need {
-                out += remaining;
+                out += lv.size;
                 rem -= need;
             } else {
                 out += rem * ONE_E24 / lv.price;
@@ -607,17 +859,11 @@ impl ElfomoFiPropPool {
     /// 正向 exact-out：容量 = `min(Σ floor(remaining×price/1e24), vault_usdt0)`；
     /// `to > 容量 → 0`；逐档 `rem ≥ 档输出` 取满整档，否则
     /// `in += ceil(rem×1e24/price)`。
-    fn quote_fwd_exact_out(
-        levels: &[OrderbookLevel],
-        consumed: &[U256],
-        amount_out: U256,
-        vault_usdt0: U256,
-    ) -> U256 {
+    fn quote_fwd_exact_out(levels: &[OrderbookLevel], amount_out: U256, vault_usdt0: U256) -> U256 {
         let mut level_out = Vec::with_capacity(levels.len());
         let mut cap = U256::ZERO;
-        for (lv, c) in levels.iter().zip(consumed.iter()) {
-            let remaining = lv.size.saturating_sub(*c);
-            let o = remaining * lv.price / ONE_E24;
+        for lv in levels.iter() {
+            let o = lv.size * lv.price / ONE_E24;
             level_out.push(o);
             cap += o;
         }
@@ -627,16 +873,15 @@ impl ElfomoFiPropPool {
         }
         let mut amount_in = U256::ZERO;
         let mut rem = amount_out;
-        for ((lv, c), o) in levels.iter().zip(consumed.iter()).zip(level_out.iter()) {
+        for (lv, o) in levels.iter().zip(level_out.iter()) {
             if rem.is_zero() {
                 break;
             }
-            let remaining = lv.size.saturating_sub(*c);
-            if remaining.is_zero() {
+            if lv.size.is_zero() {
                 continue;
             }
             if rem >= *o {
-                amount_in += remaining;
+                amount_in += lv.size;
                 rem -= *o;
             } else {
                 amount_in += Self::ceil_div(rem * ONE_E24, lv.price);
@@ -648,28 +893,22 @@ impl ElfomoFiPropPool {
 
     /// 反向 exact-out：`to > vault_xeth → 0`；逐档 `rem ≥ 档 size` 取满
     /// （`in += ceil(size×price/1e24)`），否则 `in += ceil(rem×price/1e24)`。
-    fn quote_rev_exact_out(
-        levels: &[OrderbookLevel],
-        consumed: &[U256],
-        amount_out: U256,
-        vault_xeth: U256,
-    ) -> U256 {
+    fn quote_rev_exact_out(levels: &[OrderbookLevel], amount_out: U256, vault_xeth: U256) -> U256 {
         if amount_out > vault_xeth {
             return U256::ZERO;
         }
         let mut amount_in = U256::ZERO;
         let mut rem = amount_out;
-        for (lv, c) in levels.iter().zip(consumed.iter()) {
+        for lv in levels.iter() {
             if rem.is_zero() {
                 break;
             }
-            let remaining = lv.size.saturating_sub(*c);
-            if remaining.is_zero() {
+            if lv.size.is_zero() {
                 continue;
             }
-            if rem >= remaining {
-                amount_in += Self::ceil_div(remaining * lv.price, ONE_E24);
-                rem -= remaining;
+            if rem >= lv.size {
+                amount_in += Self::ceil_div(lv.size * lv.price, ONE_E24);
+                rem -= lv.size;
             } else {
                 amount_in += Self::ceil_div(rem * lv.price, ONE_E24);
                 break;
@@ -679,48 +918,10 @@ impl ElfomoFiPropPool {
     }
 
     // ------------------------------------------------------------------------
-    // L1：档位消耗（ElfomoTrade 事件驱动）
+    // L2：整档回正（快照/init 通道；无"本地档位消耗"这一层状态）
     // ------------------------------------------------------------------------
 
-    /// 按输入量消耗 from→to 档位
-    fn consume_from_to(&mut self, amount_in: U256) {
-        let mut rem = amount_in;
-        for (lv, c) in self
-            .levels
-            .from_to_levels
-            .iter()
-            .zip(self.consumed.from_to.iter_mut())
-        {
-            if rem.is_zero() {
-                break;
-            }
-            let remaining = lv.size.saturating_sub(*c);
-            let take = rem.min(remaining);
-            *c += take;
-            rem -= take;
-        }
-    }
-
-    /// 按输出量消耗 to→from 档位
-    fn consume_to_from(&mut self, amount_out: U256) {
-        let mut rem = amount_out;
-        for (lv, c) in self
-            .levels
-            .to_from_levels
-            .iter()
-            .zip(self.consumed.to_from.iter_mut())
-        {
-            if rem.is_zero() {
-                break;
-            }
-            let remaining = lv.size.saturating_sub(*c);
-            let take = rem.min(remaining);
-            *c += take;
-            rem -= take;
-        }
-    }
-
-    /// 应用订单簿快照（L2/init 整档回正 + 金库余额 + 价格种子）
+    /// 应用订单簿快照（init / 快照通道：整档回正 + 金库余额 + 价格种子）。
     pub fn apply_orderbook_snapshot(
         &mut self,
         from_to_levels: Vec<OrderbookLevel>,
@@ -745,6 +946,17 @@ impl ElfomoFiPropPool {
         // 本地已有更新种子时不得回退。链上档位数组是绑定快照种子的，此时必须按
         // 本地 (seed, 余额) 重建，不能直接采用。
         let seed_fresh = block_number >= self.price_seed_block;
+        // 模型自证：链上档位 vs 本地 `build_orderbook` 逐位对拍（不一致则拒绝报价）。
+        // 放在赋值之前，借用的是入参而不是 `self.levels`（无需克隆）。
+        self.verify_model_against_chain(
+            &from_to_levels,
+            &to_from_levels,
+            price_seed,
+            vault_usdt0,
+            vault_xeth,
+            "init/orderbook-snapshot",
+            block_number,
+        );
         self.levels = OrderbookSnapshot {
             from_to_levels,
             to_from_levels,
@@ -764,10 +976,6 @@ impl ElfomoFiPropPool {
                 "elfomofi: orderbook snapshot kept newer realtime price seed"
             );
         }
-        self.consumed = LevelConsumed::new(
-            self.levels.from_to_levels.len(),
-            self.levels.to_from_levels.len(),
-        );
         if !seed_fresh {
             self.refresh_levels();
         }
@@ -846,6 +1054,65 @@ impl ElfomoFiPropPool {
             price_seed,
         })
     }
+
+    /// 逐池从链上 `Pool.getMetadata(asset)` 读取该 pair 的 ladder 参数。
+    ///
+    /// 这是"per-pool 自动获取"的实装：`init` 时按 `[token_x, token_y]` 顺序读 11 字段
+    /// 配置并解码成 [`ElfomoLadderConfig`]——**没有任何 pair 特判/地址常量**，接入新 pair
+    /// 自动获得自己的参数。
+    ///
+    /// 两链实测的差异：XLayer 对非 base asset 返回**全零**，Base 的 pool 对非 base asset
+    /// 直接 **revert**。因此这里对每个 asset 单独容错（失败/非法就试下一个），不能把
+    /// 第一个 asset 的错误当成整体失败——否则 `token_x` 恰是 quote 的 pair 会整个 init 失败。
+    ///
+    /// 都读不到 → `Ok(None)`，后续本地报价为空、模型自证判不可信（fail-closed），不 panic。
+    pub async fn fetch_ladder<N, P>(
+        &self,
+        provider: P,
+        block: BlockId,
+    ) -> Result<Option<ElfomoLadderConfig>, AMMError>
+    where
+        N: Network,
+        P: Provider<N> + Clone,
+    {
+        use crate::amms::elfomo_prop::types::IElfomoFiPool;
+
+        let pool = IElfomoFiPool::new(self.pool_address, provider);
+        for asset in [self.token_x, self.token_y] {
+            let md = match pool.getMetadata(asset).block(block).call().await {
+                Ok(md) => md,
+                Err(e) => {
+                    // 该 asset 无配置（部分部署对 quote asset 直接 revert）：换下一个
+                    tracing::debug!(
+                        target: "amms::elfomo_prop",
+                        pool = %self.pool_address,
+                        %asset,
+                        error = %e,
+                        "elfomofi: getMetadata(asset) unavailable, trying next asset"
+                    );
+                    continue;
+                }
+            };
+            let fields = [
+                U256::from(md.field0),
+                U256::from(md.decimals),
+                U256::from(md.field2),
+                U256::from(md.field3),
+                U256::from(md.field4),
+                U256::from(md.unit),
+                U256::from(md.band_count),
+                U256::from(md.spread_level),
+                U256::from(md.spread_penalty),
+                U256::from_be_slice(md.field9.as_slice()),
+                md.field10,
+            ];
+            let ladder = ElfomoLadderConfig::from_metadata(&fields);
+            if ladder.is_valid() {
+                return Ok(Some(ladder));
+            }
+        }
+        Ok(None)
+    }
 }
 
 // ============================================================================
@@ -905,25 +1172,24 @@ impl AutomatedMarketMaker for ElfomoFiPropPool {
         self.last_synced_block = self.last_synced_block.max(block_number);
     }
 
+    /// 事件通道**只注册 `ElfomoTrade`**（真状态源：金库余额增量）。
+    ///
+    /// Pool `updatePrices` 的空事件（`ELFOMO_UPDATE_EVENT`：仅 topic0、data 0 字节）
+    /// 不作为状态源——它零信息量，且与价格种子出自**同一笔交易**（种子在 calldata
+    /// 里），既不可能独立兜底，又会把每块一次的全量 RPC 重拉常态化。价格更新的
+    /// 实时唯一来源是 flashblocks 原始交易 calldata（零 RPC）；主通道是否失效由
+    /// `observe_block` 的覆盖率自证暴露，收敛交给周期对账（45s）。
     fn sync_events(&self) -> Vec<B256> {
-        vec![ELFOMO_TRADE_EVENT, ELFOMO_UPDATE_EVENT]
+        vec![ELFOMO_TRADE_EVENT]
     }
 
     fn sync(&mut self, log: &Log) -> Result<SyncAction, AMMError> {
         let topics = log.topics();
 
-        // L1a: Pool 每块 updatePrices 空事件（MM keeper 驱动）。
-        // calldata 只含时间戳、价格由 Pool 内部按 slot1 种子动态计算，
-        // 无法从事件/交易解析 → 返回 AsyncUpdate 重拉 getOrderbook 真值。
-        // 每块 1 次，块级实时（非定时轮询）。
-        if log.address() == self.pool_address
-            && topics.len() == 1
-            && topics[0] == ELFOMO_UPDATE_EVENT
-        {
-            return Ok(SyncAction::AsyncUpdate);
-        }
-
-        // L1b: Router ElfomoTrade 事件 → 本地档位消耗 + 金库余额递减
+        // Router ElfomoTrade 事件 → 金库余额增量（orderbook 随余额自动重算）。
+        //
+        // 注意：Pool 的 updatePrices 空事件**不再订阅**（`sync_events` 已剔除），
+        // 它零信息量且与种子同源，价格由 raw-tx calldata 直算。
         if log.address() == self.router_address
             && topics.len() >= 1
             && topics[0] == ELFOMO_TRADE_EVENT
@@ -950,7 +1216,16 @@ impl AutomatedMarketMaker for ElfomoFiPropPool {
                 // 非本池 pair 的成交（同一 Router 下其它 pair）：静默忽略。
                 return Ok(SyncAction::None);
             }
-            let block = log.block_number.unwrap_or(0);
+            // 缺块号时绝不能按 0 记账：账本锚点会拒收 `block <= anchor` 的增量 →
+            // 金库余额被静默漏记（幻影报价）。走 Resync 用链上绝对值兜住。
+            let Some(block) = log.block_number else {
+                warn!(
+                    target: "amms::elfomo_prop",
+                    pool = %self.pool_address,
+                    "elfomofi: ElfomoTrade without block number; requesting resync"
+                );
+                return Ok(SyncAction::Resync);
+            };
             self.ensure_vault_ledger_anchored(block);
             if !self
                 .vault_ledger
@@ -988,6 +1263,7 @@ impl AutomatedMarketMaker for ElfomoFiPropPool {
         if base_token == quote_token {
             return Ok(0.0);
         }
+        self.ensure_model_verified()?;
         // 用首档边际价：xETH→USDT0 边际 = price/1e12（USDT0/xETH）；
         // USDT0→xETH 边际 = price/1e12（USDT0/xETH），取倒数得 xETH/USDT0。
         let (level, is_fwd) = if base_token == self.token_x {
@@ -1001,10 +1277,12 @@ impl AutomatedMarketMaker for ElfomoFiPropPool {
         if lv.price.is_zero() {
             return Ok(0.0);
         }
-        // price/1e24 × 1e6（USDT0 6dp）后，1 个 xETH（1e18 raw）的输出 =
-        // price × 1e6 / 1e24 = price / 1e18（USDT0 raw）→ /1e6 = price/1e24 USDT0。
-        // 即边际价（USDT0/xETH）= price / 1e12（price 定点含 1e12 缩放）。
-        let per_xeth_usdt0 = u256_to_f64(&lv.price) / 1e12;
+        // 链上 `out_raw = size_raw × price / 1e24`，所以
+        //   rate = out_human / in_human
+        //        = (out_raw/10^dec_y) / (size_raw/10^dec_x)
+        //        = price / 10^(24 + dec_y − dec_x)
+        // （xETH 18dp / USDT0 6dp → 10^12，与链上实证一致）。
+        let per_xeth_usdt0 = u256_to_f64(&lv.price) / 10f64.powi(self.price_scale_exp());
         Ok(if is_fwd {
             per_xeth_usdt0
         } else {
@@ -1013,6 +1291,9 @@ impl AutomatedMarketMaker for ElfomoFiPropPool {
     }
 
     fn has_sufficient_liquidity(&self) -> bool {
+        if !self.model_verified {
+            return false;
+        }
         !self.levels.from_to_levels.is_empty()
             && !self.levels.to_from_levels.is_empty()
             && (!self.levels.vault_usdt0.is_zero() || !self.levels.vault_xeth.is_zero())
@@ -1022,7 +1303,7 @@ impl AutomatedMarketMaker for ElfomoFiPropPool {
         self.token_index(token)
             .and_then(|i| self.tokens.get(i))
             .map(|t| t.decimals)
-            .unwrap_or(0)
+            .unwrap_or_else(|| default_decimals_for(token))
     }
 
     fn simulate_swap(
@@ -1040,27 +1321,24 @@ impl AutomatedMarketMaker for ElfomoFiPropPool {
         if token_in == token_out || amount_in.is_zero() {
             return Ok(U256::ZERO);
         }
+        self.ensure_model_verified()?;
         // orderbook 是 (seed, vault) 的读时纯函数：与链上每次读取实时
         // `balanceOf(vault)` 重算同构，本地不缓存档位递减。
-        let ob = Self::build_orderbook(
+        let ob = self.local_orderbook(
             self.price_seed,
             self.levels.vault_usdt0,
             self.levels.vault_xeth,
         );
-        let zero = vec![U256::ZERO; ob.from_to_levels.len()];
         if token_in == self.token_x && token_out == self.token_y {
             return Ok(Self::quote_fwd_exact(
                 &ob.from_to_levels,
-                &zero,
                 amount_in,
                 ob.vault_usdt0,
             ));
         }
-        let zero = vec![U256::ZERO; ob.to_from_levels.len()];
         if token_in == self.token_y && token_out == self.token_x {
             return Ok(Self::quote_rev_exact(
                 &ob.to_from_levels,
-                &zero,
                 amount_in,
                 ob.vault_xeth,
             ));
@@ -1086,11 +1364,9 @@ impl AutomatedMarketMaker for ElfomoFiPropPool {
         }
         // 与 sync() 的金库方向契约一致（金库是对手方，双向记账）。
         if token_in == self.token_x && token_out == self.token_y {
-            self.consume_from_to(amount_in);
             self.levels.vault_xeth = self.levels.vault_xeth.saturating_add(amount_in);
             self.levels.vault_usdt0 = self.levels.vault_usdt0.saturating_sub(out);
         } else if token_in == self.token_y && token_out == self.token_x {
-            self.consume_to_from(out);
             self.levels.vault_usdt0 = self.levels.vault_usdt0.saturating_add(amount_in);
             self.levels.vault_xeth = self.levels.vault_xeth.saturating_sub(out);
         }
@@ -1113,25 +1389,22 @@ impl AutomatedMarketMaker for ElfomoFiPropPool {
         if token_in == token_out || amount_out.is_zero() {
             return Err(AMMError::Msg("elfomofi: invalid exact out".to_string()));
         }
-        let ob = Self::build_orderbook(
+        self.ensure_model_verified()?;
+        let ob = self.local_orderbook(
             self.price_seed,
             self.levels.vault_usdt0,
             self.levels.vault_xeth,
         );
-        let zero = vec![U256::ZERO; ob.from_to_levels.len()];
         if token_in == self.token_x && token_out == self.token_y {
             return Ok(Self::quote_fwd_exact_out(
                 &ob.from_to_levels,
-                &zero,
                 amount_out,
                 ob.vault_usdt0,
             ));
         }
-        let zero = vec![U256::ZERO; ob.to_from_levels.len()];
         if token_in == self.token_y && token_out == self.token_x {
             return Ok(Self::quote_rev_exact_out(
                 &ob.to_from_levels,
-                &zero,
                 amount_out,
                 ob.vault_xeth,
             ));
@@ -1145,35 +1418,75 @@ impl AutomatedMarketMaker for ElfomoFiPropPool {
         P: Provider<N> + Clone,
     {
         // 资产：pair 由实例字段 token_x/token_y 定义（Factory/部署配置传入）。
-        // decimals 对已知默认 pair（xETH=18/USDT0=6）取常量，其余 token 兜底 18。
+        // decimals **走链上 `IERC20Metadata::decimals()`**（不再硬编码已知 pair）：
+        // price 定点换算与 `calculate_price` 的缩放都依赖真实精度，硬编码在接入新的
+        // pair（不同 decimals）时会静默算错。RPC 失败时回退已知 pair 常量，不让一次
+        // 瞬时失败把 init 整个打挂。
+        let dec_x = Self::fetch_token_decimals::<N, _>(&provider, self.token_x)
+            .await
+            .unwrap_or_else(|| default_decimals_for(self.token_x));
+        let dec_y = Self::fetch_token_decimals::<N, _>(&provider, self.token_y)
+            .await
+            .unwrap_or_else(|| default_decimals_for(self.token_y));
+        let sym_x = Self::fetch_token_symbol::<N, _>(&provider, self.token_x)
+            .await
+            .unwrap_or_else(|| default_symbol_for(self.token_x));
+        let sym_y = Self::fetch_token_symbol::<N, _>(&provider, self.token_y)
+            .await
+            .unwrap_or_else(|| default_symbol_for(self.token_y));
         self.tokens = vec![
             Token {
                 address: self.token_x,
-                decimals: 18,
-                symbol: if self.token_x == ELFOMO_XETH_ADDRESS {
-                    "xETH".to_string()
-                } else {
-                    "TOKEN0".to_string()
-                },
+                decimals: dec_x,
+                symbol: sym_x,
                 chain_id: self.chain_id,
                 fot_tax: None,
             },
             Token {
                 address: self.token_y,
-                decimals: if self.token_y == ELFOMO_USDT0_ADDRESS {
-                    6
-                } else {
-                    18
-                },
-                symbol: if self.token_y == ELFOMO_USDT0_ADDRESS {
-                    "USDT0".to_string()
-                } else {
-                    "TOKEN1".to_string()
-                },
+                decimals: dec_y,
+                symbol: sym_y,
                 chain_id: self.chain_id,
                 fot_tax: None,
             },
         ];
+
+        // **逐池从链上取 ladder**：读 `Pool.getMetadata(token_x)`，解码出该 pair 的
+        // `(U, T, spread_level, spread_penalty)`。不做任何 pair 特判——新增 pair 自动
+        // 获得自己的参数。读取失败 → 保持缺省（invalid ladder）；本地报价为空，
+        // 模型自证随后判不可信（fail-closed），并留一条可检索的告警。
+        match self
+            .fetch_ladder::<N, _>(provider.clone(), block_number)
+            .await
+        {
+            Ok(Some(ladder)) => self.ladder = ladder,
+            Ok(None) => warn!(
+                target: "amms::elfomo_prop",
+                pool = %self.pool_address,
+                token_x = %self.token_x,
+                token_y = %self.token_y,
+                "elfomofi: pool getMetadata returned no ladder for this pair; \
+                 quotes will be disabled until a valid ladder is available"
+            ),
+            Err(e) => warn!(
+                target: "amms::elfomo_prop",
+                pool = %self.pool_address,
+                error = %e,
+                "elfomofi: failed to fetch ladder metadata from pool; quotes may be disabled"
+            ),
+        }
+
+        // ladder 自检：拿到参数后必须 `U > 0 && T > 0`。不满足则模型自证判不可信。
+        if !self.ladder.is_valid() {
+            warn!(
+                target: "amms::elfomo_prop",
+                pool = %self.pool_address,
+                token_x = %self.token_x,
+                token_y = %self.token_y,
+                "elfomofi: invalid ladder config for this pair; quotes will be disabled \
+                 until a valid ladder + chain model match is provided"
+            );
+        }
 
         // 读块钉死后再读：content 与水位同源（见 `fetch_snapshot_at`）
         let (snap, snap_block) = self
@@ -1208,6 +1521,38 @@ impl AutomatedMarketMaker for ElfomoFiPropPool {
 }
 
 impl ElfomoFiPropPool {
+    /// price 定点 → 人类可读边际价的缩放指数：`24 + dec_y − dec_x`。
+    fn price_scale_exp(&self) -> i32 {
+        24 + self.decimals(self.token_y) as i32 - self.decimals(self.token_x) as i32
+    }
+
+    /// 链上读 `decimals()`；失败返回 None（调用方回退已知常量）。
+    async fn fetch_token_decimals<N, P>(provider: &P, token: Address) -> Option<u8>
+    where
+        N: Network,
+        P: Provider<N> + Clone,
+    {
+        IERC20Metadata::new(token, provider.clone())
+            .decimals()
+            .call()
+            .await
+            .ok()
+    }
+
+    /// 链上读 `symbol()`（展示用元数据，不参与报价）；失败返回 None。
+    async fn fetch_token_symbol<N, P>(provider: &P, token: Address) -> Option<String>
+    where
+        N: Network,
+        P: Provider<N> + Clone,
+    {
+        IERC20Metadata::new(token, provider.clone())
+            .symbol()
+            .call()
+            .await
+            .ok()
+            .filter(|s| !s.is_empty())
+    }
+
     /// 拉取链上精确快照：**先把读块钉死、再读**（content 与水位同源）。
     ///
     /// `BlockId::Number(n)` 直接使用 `n`；其余（`latest` 等）先解析为 provider
@@ -1308,6 +1653,17 @@ impl ElfomoFiPropPool {
         // 链上档位是用快照的 (seed, 余额) 算出来的，两者任一被本地更新取代，
         // 都必须按本地 (seed, 余额) 重建，否则档位与种子/余额互相矛盾。
         let covered_all = apply == VaultLedgerApply::Anchored;
+        // 模型自证：链上档位是快照 (seed, 余额) 的纯函数，与本地重算逐位对拍。
+        // 不一致 → `model_verified=false`，报价路径拒绝该池（不给错价）。
+        self.verify_model_against_chain(
+            &snap.from_to_levels,
+            &snap.to_from_levels,
+            snap.price_seed,
+            snap.vault_usdt0,
+            snap.vault_xeth,
+            "snapshot-reconcile",
+            snap_block,
+        );
         self.sync_vault_balances_from_ledger();
         if covered_all
             && seed_fresh
@@ -1321,10 +1677,6 @@ impl ElfomoFiPropPool {
                 vault_xeth: snap.vault_xeth,
                 price_seed: snap.price_seed,
             };
-            self.consumed = LevelConsumed::new(
-                self.levels.from_to_levels.len(),
-                self.levels.to_from_levels.len(),
-            );
         } else {
             self.refresh_levels();
         }
@@ -1346,6 +1698,26 @@ impl ElfomoFiPropPool {
     }
 }
 
+/// 已知 token 的 decimals 兜底（链上读取失败时用；未知 token 按 18 处理）。
+fn default_decimals_for(token: Address) -> u8 {
+    if token == ELFOMO_USDT0_ADDRESS {
+        6
+    } else {
+        18
+    }
+}
+
+/// 已知 token 的 symbol 兜底（链上 `symbol()` 读取失败时用）。
+fn default_symbol_for(token: Address) -> String {
+    if token == ELFOMO_XETH_ADDRESS {
+        "xETH".to_string()
+    } else if token == ELFOMO_USDT0_ADDRESS {
+        "USDT0".to_string()
+    } else {
+        "TOKEN".to_string()
+    }
+}
+
 /// f64 转换辅助（用于 spot price）
 fn u256_to_f64(v: &U256) -> f64 {
     // U256 → f64：拆高 128 位
@@ -1360,6 +1732,30 @@ fn u256_to_f64(v: &U256) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// XLayer xETH/USDT0 的链上 ladder 参数（`getMetadata(0xe7b0…025a)` 实测 fixture）。
+    ///
+    /// 仅测试用：生产代码在 `init` 阶段**逐池从链上读取**，不依赖此常量。
+    fn xlayer_ladder() -> ElfomoLadderConfig {
+        ElfomoLadderConfig::from_metadata(&[
+            U256::ZERO,
+            U256::from(18u64),
+            U256::from(2u64),
+            U256::ZERO,
+            U256::ZERO,
+            U256::from(600_000_000_000_000_000u128),
+            U256::from(30u64),
+            U256::from(5u64),
+            U256::from(60u64),
+            U256::ZERO,
+            U256::ZERO,
+        ])
+    }
+
+    /// fork 对拍 helper：用 xLayer ladder 走本地读时重算。
+    fn build_orderbook(seed: U256, vault_usdt0: U256, vault_xeth: U256) -> OrderbookSnapshot {
+        ElfomoFiPropPool::build_orderbook_with(&xlayer_ladder(), seed, vault_usdt0, vault_xeth)
+    }
 
     fn lev(size: u128, price: u128) -> OrderbookLevel {
         OrderbookLevel::new(U256::from(size), U256::from(price))
@@ -1389,7 +1785,6 @@ mod tests {
     #[test]
     fn test_quote_fwd_exact() {
         let s = snapshot();
-        let consumed = vec![U256::ZERO; 3];
         // 链上对拍点（块 0x423c2b8，xETH→USDT0）
         let cases: &[(u128, u128)] = &[
             (1, 0),
@@ -1406,7 +1801,6 @@ mod tests {
         for (inp, want) in cases {
             let got = ElfomoFiPropPool::quote_fwd_exact(
                 &s.from_to_levels,
-                &consumed,
                 U256::from(*inp),
                 s.vault_usdt0,
             );
@@ -1417,7 +1811,6 @@ mod tests {
     #[test]
     fn test_quote_rev_exact() {
         let s = snapshot();
-        let consumed = vec![U256::ZERO; 3];
         // 链上对拍点（块 0x423c2b8，USDT0→xETH）
         let cases: &[(u128, u128)] = &[
             (1, 404_300_662),
@@ -1434,7 +1827,6 @@ mod tests {
         for (inp, want) in cases {
             let got = ElfomoFiPropPool::quote_rev_exact(
                 &s.to_from_levels,
-                &consumed,
                 U256::from(*inp),
                 s.vault_xeth,
             );
@@ -1445,7 +1837,6 @@ mod tests {
     #[test]
     fn test_quote_fwd_exact_out() {
         let s = snapshot();
-        let consumed = vec![U256::ZERO; 3];
         let cases: &[(u128, u128)] = &[
             (1, 404_357_269),
             (1_483_836_317, 600_000_000_000_000_000),
@@ -1461,7 +1852,6 @@ mod tests {
         for (to, want) in cases {
             let got = ElfomoFiPropPool::quote_fwd_exact_out(
                 &s.from_to_levels,
-                &consumed,
                 U256::from(*to),
                 s.vault_usdt0,
             );
@@ -1472,7 +1862,6 @@ mod tests {
     #[test]
     fn test_quote_rev_exact_out() {
         let s = snapshot();
-        let consumed = vec![U256::ZERO; 3];
         let cases: &[(u128, u128)] = &[
             (1, 1),
             (100_000_000_000_000_000, 247_340_679),
@@ -1486,7 +1875,6 @@ mod tests {
         for (to, want) in cases {
             let got = ElfomoFiPropPool::quote_rev_exact_out(
                 &s.to_from_levels,
-                &consumed,
                 U256::from(*to),
                 s.vault_xeth,
             );
@@ -1495,9 +1883,10 @@ mod tests {
     }
 
     #[test]
-    fn test_consume_then_quote() {
+    fn test_swap_then_quote_derived_from_vault() {
+        // orderbook 是 (seed, vault) 的读时纯函数：swap 只改金库余额，
+        // 下一次 quote 自动按新余额重建，不存在"本地档位消耗"这一层状态。
         let s = snapshot();
-        let consumed = LevelConsumed::new(3, 3);
         let tokens = vec![
             Token {
                 address: ELFOMO_XETH_ADDRESS,
@@ -1517,8 +1906,8 @@ mod tests {
         let mut pool = ElfomoFiPropPool {
             tokens,
             levels: s.clone(),
-            consumed: consumed.clone(),
             price_seed: U256::from(0x143c60fu64),
+            ladder: xlayer_ladder(),
             ..ElfomoFiPropPool::default()
         };
         // 模拟一笔第一档内的小额 swap（输入 0.1215e18 < 档 1 容量 0.6e18）
@@ -1528,8 +1917,7 @@ mod tests {
             .unwrap();
         assert!(out > U256::ZERO);
         let vault_before = pool.levels.vault_usdt0;
-        // 事件同步（ElfomoTrade）：消耗档位 + 金库递减
-        pool.consume_from_to(amount_in);
+        // 事件同步（ElfomoTrade）只改金库余额（双向记账）
         pool.levels.vault_usdt0 = pool.levels.vault_usdt0 - out;
         // 同档内价格线性，同输入输出不变；金库余额已扣减
         let out2 = pool
@@ -1549,7 +1937,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sync_update_event_returns_async_update() {
+    fn test_pool_update_event_is_ignored() {
         let mut pool = ElfomoFiPropPool::default();
         pool.tokens = vec![
             Token {
@@ -1569,7 +1957,9 @@ mod tests {
         ];
         pool.levels = snapshot();
 
-        // Pool updatePrices 空事件（每块 1 笔）→ AsyncUpdate（重拉 getOrderbook 真值）
+        // Pool updatePrices 空事件（仅 topic0、data 0 字节、零信息量）：
+        // 不再作为状态源（sync_events 也不再订阅），必须被忽略——它的价格信息
+        // 与 raw-tx calldata 同源，重拉没有任何独立价值，只会把全量 RPC 常态化。
         let update_log: Log = serde_json::from_value(serde_json::json!({
             "address": format!("{:#x}", ELFOMO_POOL_ADDRESS),
             "topics": [format!("{:#x}", ELFOMO_UPDATE_EVENT)],
@@ -1579,10 +1969,9 @@ mod tests {
             "logIndex": "0x0",
         }))
         .unwrap();
-        assert!(matches!(
-            pool.sync(&update_log).unwrap(),
-            SyncAction::AsyncUpdate
-        ));
+        assert!(matches!(pool.sync(&update_log).unwrap(), SyncAction::None));
+        // 订阅表里只剩 ElfomoTrade
+        assert_eq!(pool.sync_events(), vec![ELFOMO_TRADE_EVENT]);
 
         // 无关事件不触发
         let unrelated: Log = serde_json::from_value(serde_json::json!({
@@ -1598,7 +1987,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sync_trade_event_consumes_levels() {
+    fn test_sync_trade_event_updates_vault_and_recomputes_orderbook() {
         let s = snapshot();
         let tokens = vec![
             Token {
@@ -1619,17 +2008,12 @@ mod tests {
         let mut pool = ElfomoFiPropPool {
             tokens,
             levels: s.clone(),
-            consumed: LevelConsumed::new(3, 3),
             price_seed: U256::from(0x143c60fu64),
+            ladder: xlayer_ladder(),
             ..ElfomoFiPropPool::default()
         };
         let amount_in = U256::from(121_513_229_231_558_820u128);
-        let out = ElfomoFiPropPool::quote_fwd_exact(
-            &s.from_to_levels,
-            &pool.consumed.from_to,
-            amount_in,
-            s.vault_usdt0,
-        );
+        let out = ElfomoFiPropPool::quote_fwd_exact(&s.from_to_levels, amount_in, s.vault_usdt0);
         assert!(out > U256::ZERO);
 
         // Router emit 的 ElfomoTrade：data = [executor, receiver, from, to, in, out]
@@ -1680,7 +2064,7 @@ mod tests {
     #[test]
     fn test_build_orderbook_matches_chain_block() {
         // 块 0x423c2b8（seed=0x143c60f，vault 实测）逐位对拍
-        let ob = ElfomoFiPropPool::build_orderbook(
+        let ob = build_orderbook(
             U256::from(0x143c60fu64),
             U256::from(19_192_415_254u64),
             U256::from(2_940_462_501_000_862_186u128),
@@ -1692,7 +2076,7 @@ mod tests {
     #[test]
     fn test_build_orderbook_reproduces_small_vault_levels() {
         // 金库 USDT0 低于首档容量阈值时，首档 size 随余额收缩（读时重算语义）
-        let ob = ElfomoFiPropPool::build_orderbook(
+        let ob = build_orderbook(
             U256::from(0x143c60fu64),
             U256::from(1_000_000_000u64),
             U256::from(2_940_462_501_000_862_186u128),
@@ -1750,9 +2134,9 @@ mod tests {
         let mut pool = ElfomoFiPropPool {
             tokens,
             levels: snapshot(),
-            consumed: LevelConsumed::new(3, 3),
             price_seed: U256::from(0x143c60fu64),
             last_synced_block: 1,
+            ladder: xlayer_ladder(),
             ..ElfomoFiPropPool::default()
         };
         let vault_usdt0 = pool.levels.vault_usdt0;
@@ -1767,9 +2151,12 @@ mod tests {
             pool.levels.from_to_levels[0].price,
             snapshot().from_to_levels[0].price
         );
-        // 旧块号不回退
-        pool.apply_price_seed(new_seed, 50);
+        // 旧块号不回退：种子与字段级水位都不得被旧块回退
+        pool.apply_price_seed(U256::from(0xdeadbeefu64), 50);
         assert_eq!(pool.last_synced_block, 100);
+        assert_eq!(pool.price_seed, new_seed);
+        assert_eq!(pool.price_seed_block, 100);
+        assert_eq!(pool.raw_seed_block, 100);
     }
 
     #[test]
@@ -1780,18 +2167,13 @@ mod tests {
         // 本地重算 orderbook → 报价精确等于事件 toAmount=300147468。
         // 这是「raw-tx 种子 + 本地金库 → 读时重算」模型的链上端到端回归锚点。
         let seed = U256::from(0x143c4e5u64);
-        let ob = ElfomoFiPropPool::build_orderbook(
+        let ob = build_orderbook(
             seed,
             U256::from(19_492_562_722u64),
             U256::from(2_818_949_271_769_303_366u128),
         );
         let amount_in = U256::from(121_513_229_231_558_820u128);
-        let got = ElfomoFiPropPool::quote_fwd_exact(
-            &ob.from_to_levels,
-            &vec![U256::ZERO; ob.from_to_levels.len()],
-            amount_in,
-            ob.vault_usdt0,
-        );
+        let got = ElfomoFiPropPool::quote_fwd_exact(&ob.from_to_levels, amount_in, ob.vault_usdt0);
         assert_eq!(got, U256::from(300_147_468u64));
     }
 
@@ -1817,8 +2199,8 @@ mod tests {
         let mut pool = ElfomoFiPropPool {
             tokens,
             levels: s.clone(),
-            consumed: LevelConsumed::new(3, 3),
             price_seed: U256::from(0x143c60fu64),
+            ladder: xlayer_ladder(),
             ..ElfomoFiPropPool::default()
         };
         // 反向成交：USDT0→xETH，事件 toAmount 即 xETH 实际输出
@@ -1879,6 +2261,7 @@ mod tests {
             levels: s.clone(),
             price_seed: s.price_seed,
             last_synced_block: 1_000,
+            ladder: xlayer_ladder(),
             ..ElfomoFiPropPool::default()
         };
 
@@ -1926,7 +2309,7 @@ mod tests {
         // （链上真值 1_003 = s + 块内 (1_000,1_003] 的净变化，这里记 (+100,-50)）
         let snap_xeth = s.vault_xeth + U256::from(100u64);
         let snap_usdt0 = s.vault_usdt0 - U256::from(50u64);
-        let ob = ElfomoFiPropPool::build_orderbook(s.price_seed, snap_usdt0, snap_xeth);
+        let ob = build_orderbook(s.price_seed, snap_usdt0, snap_xeth);
         let older = OrderbookSnapshot {
             from_to_levels: ob.from_to_levels,
             to_from_levels: ob.to_from_levels,
@@ -1947,7 +2330,7 @@ mod tests {
         // 更新的快照覆盖全部已记录事件 → 直接锚定，账本清空
         let vault_usdt0 = U256::from(7_000_000_000u64);
         let vault_xeth = U256::from(1_500_000_000_000_000_000u128);
-        let ob = ElfomoFiPropPool::build_orderbook(s.price_seed, vault_usdt0, vault_xeth);
+        let ob = build_orderbook(s.price_seed, vault_usdt0, vault_xeth);
         let fresh = OrderbookSnapshot {
             from_to_levels: ob.from_to_levels,
             to_from_levels: ob.to_from_levels,
@@ -1961,7 +2344,7 @@ mod tests {
         assert!(pool.vault_ledger.is_empty());
         assert_eq!(pool.last_synced_block, 1_006);
         // 落地后报价与 (seed, vault) 读时函数一致
-        let rebuilt = ElfomoFiPropPool::build_orderbook(
+        let rebuilt = build_orderbook(
             pool.price_seed,
             pool.levels.vault_usdt0,
             pool.levels.vault_xeth,
@@ -1978,6 +2361,7 @@ mod tests {
         let mut pool = ElfomoFiPropPool {
             levels: s.clone(),
             price_seed: s.price_seed,
+            ladder: xlayer_ladder(),
             ..ElfomoFiPropPool::default()
         };
         pool.apply_price_seed(U256::from(111u64), 1_010);
@@ -2008,6 +2392,7 @@ mod tests {
         let mut pool = ElfomoFiPropPool {
             levels: s.clone(),
             price_seed: s.price_seed,
+            ladder: xlayer_ladder(),
             ..ElfomoFiPropPool::default()
         };
         assert!(pool.merge_snapshot(s.clone(), 1_000));
@@ -2021,7 +2406,7 @@ mod tests {
 
         // 规范头快照（块 1_003）带的是**旧种子** → 必须保留本地新种子，
         // 且档位要按本地 (新种子, 余额) 重建，不能采用快照的旧种子档位。
-        let ob = ElfomoFiPropPool::build_orderbook(s.price_seed, s.vault_usdt0, s.vault_xeth);
+        let ob = build_orderbook(s.price_seed, s.vault_usdt0, s.vault_xeth);
         let older = OrderbookSnapshot {
             from_to_levels: ob.from_to_levels,
             to_from_levels: ob.to_from_levels,
@@ -2035,16 +2420,12 @@ mod tests {
             "newer realtime seed must not be rolled back by a snapshot"
         );
         assert_eq!(pool.price_seed_block, 1_005);
-        let rebuilt = ElfomoFiPropPool::build_orderbook(
-            new_seed,
-            pool.levels.vault_usdt0,
-            pool.levels.vault_xeth,
-        );
+        let rebuilt = build_orderbook(new_seed, pool.levels.vault_usdt0, pool.levels.vault_xeth);
         assert_eq!(rebuilt.from_to_levels, pool.levels.from_to_levels);
         assert_eq!(rebuilt.to_from_levels, pool.levels.to_from_levels);
 
         // 快照块追上种子水位（1_006 > 1_005）→ 采用快照种子并抢占水位
-        let ob2 = ElfomoFiPropPool::build_orderbook(s.price_seed, s.vault_usdt0, s.vault_xeth);
+        let ob2 = build_orderbook(s.price_seed, s.vault_usdt0, s.vault_xeth);
         let fresh = OrderbookSnapshot {
             from_to_levels: ob2.from_to_levels,
             to_from_levels: ob2.to_from_levels,
@@ -2064,6 +2445,7 @@ mod tests {
         let mut pool = ElfomoFiPropPool {
             levels: s.clone(),
             price_seed: s.price_seed,
+            ladder: xlayer_ladder(),
             ..ElfomoFiPropPool::default()
         };
         assert!(pool.merge_snapshot(s.clone(), 2_000));
@@ -2071,7 +2453,7 @@ mod tests {
 
         let vault_usdt0 = U256::from(7_000_000_000u64);
         let vault_xeth = U256::from(1_500_000_000_000_000_000u128);
-        let ob = ElfomoFiPropPool::build_orderbook(s.price_seed, vault_usdt0, vault_xeth);
+        let ob = build_orderbook(s.price_seed, vault_usdt0, vault_xeth);
         let stale = OrderbookSnapshot {
             from_to_levels: ob.from_to_levels,
             to_from_levels: ob.to_from_levels,
@@ -2106,11 +2488,11 @@ mod tests {
                 },
             ],
             levels: snapshot(),
-            consumed: LevelConsumed::new(3, 3),
             price_seed: U256::from(0x143c60fu64),
+            ladder: xlayer_ladder(),
             ..ElfomoFiPropPool::default()
         };
-        let ob_small = ElfomoFiPropPool::build_orderbook(
+        let ob_small = build_orderbook(
             U256::from(0x143c60fu64),
             U256::from(1_000_000_000u64),
             U256::from(2_940_462_501_000_862_186u128),
@@ -2129,7 +2511,6 @@ mod tests {
             out,
             ElfomoFiPropPool::quote_fwd_exact(
                 &ob_small.from_to_levels,
-                &vec![U256::ZERO; 1],
                 U256::from(600_000_000_000_000_000u128),
                 ob_small.vault_usdt0,
             )
@@ -2143,5 +2524,312 @@ mod tests {
             )
             .unwrap();
         assert!(amount_in > U256::ZERO);
+    }
+
+    fn xeth_usdt0_tokens() -> Vec<Token> {
+        vec![
+            Token {
+                address: ELFOMO_XETH_ADDRESS,
+                decimals: 18,
+                symbol: "xETH".to_string(),
+                chain_id: ELFOMO_CHAIN_ID,
+                fot_tax: None,
+            },
+            Token {
+                address: ELFOMO_USDT0_ADDRESS,
+                decimals: 6,
+                symbol: "USDT0".to_string(),
+                chain_id: ELFOMO_CHAIN_ID,
+                fot_tax: None,
+            },
+        ]
+    }
+
+    fn pool_with_snapshot() -> ElfomoFiPropPool {
+        ElfomoFiPropPool {
+            token_x: ELFOMO_XETH_ADDRESS,
+            token_y: ELFOMO_USDT0_ADDRESS,
+            tokens: xeth_usdt0_tokens(),
+            levels: snapshot(),
+            price_seed: U256::from(0x143c60fu64),
+            ladder: xlayer_ladder(),
+            ..ElfomoFiPropPool::default()
+        }
+    }
+
+    #[test]
+    fn test_chain_fixture_is_bit_identical_to_local_model() {
+        // 关键前提：`verify_model_against_chain` 用逐位相等判定模型是否可信。
+        // 若链上 fixture 与本地重算有一 wei 偏差，生产环境 init/对账会把模型
+        // 误判为失效、报价被整体禁用。这里把该前提钉死。
+        let s = snapshot();
+        let rebuilt = build_orderbook(s.price_seed, s.vault_usdt0, s.vault_xeth);
+        assert_eq!(rebuilt.from_to_levels, s.from_to_levels);
+        assert_eq!(rebuilt.to_from_levels, s.to_from_levels);
+    }
+
+    /// 全网格 bit-exact 回归：链上 `getOrderbook` vs 本地模型（不依赖 RPC）。
+    ///
+    /// fixture 由 anvil fork XLayer + `eth_call` (`stateDiff` override) 生成，覆盖
+    /// `band_count ∈ {6,10,30,200} × spread_penalty ∈ {0,60} × spread_level ∈ {0,1,5,29,30}
+    /// × vault_xeth ∈ {0.5U, 2.94U, 5U, 5.1U, 10.1U, 29.5U, 30.1U}` 及若干真实池状态，
+    /// 每行都记录链上原始档位（size/price 十进制、全精度）。任何 ladder 规则改动都必须
+    /// 让本用例保持全绿——它是"本地模拟 == 链上结果"最直接的证据。
+    #[test]
+    fn test_chain_ladder_grid_bit_exact() {
+        #[derive(serde::Deserialize)]
+        struct Row {
+            t: u16,
+            f: u8,
+            sl: u16,
+            vx: String,
+            vu: String,
+            seed: String,
+            ft: Vec<(String, String)>,
+            tf: Vec<(String, String)>,
+        }
+        let rows: Vec<Row> = serde_json::from_str(include_str!("fixtures/ladder_grid.json"))
+            .expect("fixture JSON 解析失败");
+        assert!(rows.len() >= 250, "fixture 被裁剪？只有 {} 行", rows.len());
+
+        let parse = |s: &str| U256::from_str_radix(s, 10).expect("U256 解析失败");
+        let mut bad = Vec::new();
+        for (idx, r) in rows.iter().enumerate() {
+            let ladder = ElfomoLadderConfig {
+                unit: U256::from(600_000_000_000_000_000u128),
+                band_count: r.t,
+                spread_level: r.sl,
+                spread_penalty: r.f,
+            };
+            let ob = ElfomoFiPropPool::build_orderbook_with(
+                &ladder,
+                parse(&r.seed),
+                parse(&r.vu),
+                parse(&r.vx),
+            );
+            let levels = |v: &[OrderbookLevel]| -> Vec<(String, String)> {
+                v.iter()
+                    .map(|l| (l.size.to_string(), l.price.to_string()))
+                    .collect()
+            };
+            if levels(&ob.from_to_levels) != r.ft || levels(&ob.to_from_levels) != r.tf {
+                bad.push(format!(
+                    "#{idx} T={} F={} SL={} vx={} vu={} seed={}\n  chain ft={:?}\n  local ft={:?}\n                       chain tf={:?}\n  local tf={:?}",
+                    r.t,
+                    r.f,
+                    r.sl,
+                    r.vx,
+                    r.vu,
+                    r.seed,
+                    r.ft,
+                    levels(&ob.from_to_levels),
+                    r.tf,
+                    levels(&ob.to_from_levels),
+                ));
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "{} / {} 组 orderbook 与链上不一致：\n{}",
+            bad.len(),
+            rows.len(),
+            bad.join("\n")
+        );
+    }
+
+    #[test]
+    fn test_model_mismatch_disables_quotes_until_reverified() {
+        let s = snapshot();
+        let mut pool = pool_with_snapshot();
+        let ok = build_orderbook(s.price_seed, s.vault_usdt0, s.vault_xeth);
+        let amount_in = U256::from(1_000_000_000_000u64);
+
+        // 链上档位 == 本地重算 → 模型可信，报价可用
+        assert!(pool.verify_model_against_chain(
+            &ok.from_to_levels,
+            &ok.to_from_levels,
+            s.price_seed,
+            s.vault_usdt0,
+            s.vault_xeth,
+            "test",
+            100,
+        ));
+        assert!(pool.model_verified);
+        assert!(pool.has_sufficient_liquidity());
+        assert!(pool
+            .simulate_swap(ELFOMO_XETH_ADDRESS, ELFOMO_USDT0_ADDRESS, amount_in)
+            .is_ok());
+        assert!(pool
+            .calculate_price(ELFOMO_XETH_ADDRESS, ELFOMO_USDT0_ADDRESS)
+            .is_ok());
+
+        // 链上档位与本地重算不一致（协议改参数 / 公式逆向有误）→ 拒绝报价
+        let bogus = vec![lev(1, 1)];
+        assert!(!pool.verify_model_against_chain(
+            &bogus,
+            &bogus,
+            s.price_seed,
+            s.vault_usdt0,
+            s.vault_xeth,
+            "test",
+            100,
+        ));
+        assert!(!pool.model_verified);
+        assert!(!pool.has_sufficient_liquidity());
+        assert!(pool
+            .simulate_swap(ELFOMO_XETH_ADDRESS, ELFOMO_USDT0_ADDRESS, amount_in)
+            .is_err());
+        assert!(pool
+            .simulate_swap_exact_out(ELFOMO_XETH_ADDRESS, ELFOMO_USDT0_ADDRESS, U256::from(1u64))
+            .is_err());
+        assert!(pool
+            .calculate_price(ELFOMO_XETH_ADDRESS, ELFOMO_USDT0_ADDRESS)
+            .is_err());
+
+        // 下一次对拍一致 → 自动恢复（45s 对账会做这件事）
+        assert!(pool.verify_model_against_chain(
+            &ok.from_to_levels,
+            &ok.to_from_levels,
+            s.price_seed,
+            s.vault_usdt0,
+            s.vault_xeth,
+            "test",
+            101,
+        ));
+        assert!(pool.model_verified);
+        assert!(pool
+            .simulate_swap(ELFOMO_XETH_ADDRESS, ELFOMO_USDT0_ADDRESS, amount_in)
+            .is_ok());
+    }
+
+    #[test]
+    fn test_ladder_is_per_pool_and_fail_closed() {
+        let s = snapshot();
+        // 缺省 ladder 与静态已知 pair 版逐位一致（回归保护）
+        let mut pool = pool_with_snapshot();
+        assert_eq!(
+            pool.local_orderbook(s.price_seed, s.vault_usdt0, s.vault_xeth),
+            build_orderbook(s.price_seed, s.vault_usdt0, s.vault_xeth)
+        );
+
+        // 换一个 pool 的 ladder（U 不同）→ 本地 orderbook 必须随之改变，
+        // 且与"本池链上档位"对拍必然不一致 → 拒绝报价（fail-closed）
+        let mut other = xlayer_ladder();
+        other.unit = U256::from(1_200_000_000_000_000_000u128);
+        pool.ladder = other;
+        let ob = pool.local_orderbook(s.price_seed, s.vault_usdt0, s.vault_xeth);
+        assert_ne!(ob.from_to_levels[0].size, s.from_to_levels[0].size);
+        assert!(!pool.verify_model_against_chain(
+            &s.from_to_levels,
+            &s.to_from_levels,
+            s.price_seed,
+            s.vault_usdt0,
+            s.vault_xeth,
+            "test",
+            100,
+        ));
+        assert!(!pool.model_verified);
+        assert!(pool
+            .simulate_swap(
+                ELFOMO_XETH_ADDRESS,
+                ELFOMO_USDT0_ADDRESS,
+                U256::from(1_000_000_000_000u64)
+            )
+            .is_err());
+
+        // 配置缺失（缺省/未 init 的 ladder）不 panic，只是判不可信
+        pool.ladder = ElfomoLadderConfig::default();
+        assert!(!pool.ladder.is_valid());
+        let empty = pool.local_orderbook(s.price_seed, s.vault_usdt0, s.vault_xeth);
+        assert!(empty.from_to_levels.is_empty() && empty.to_from_levels.is_empty());
+        assert!(pool
+            .simulate_swap(
+                ELFOMO_XETH_ADDRESS,
+                ELFOMO_USDT0_ADDRESS,
+                U256::from(1_000_000_000_000u64)
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn test_trade_without_block_number_requests_resync() {
+        // 缺块号不能按 0 记账（账本锚点会拒收 → 金库增量静默漏记）→ 走 Resync
+        let mut pool = pool_with_snapshot();
+        let mut data = Vec::new();
+        for w in [
+            U256::from(0x1234u64),
+            U256::from(0x5678u64),
+            ELFOMO_XETH_ADDRESS.into_word().into(),
+            ELFOMO_USDT0_ADDRESS.into_word().into(),
+            U256::from(1_000_000_000u64),
+            U256::from(2_000_000_000u64),
+        ] {
+            data.extend_from_slice(&w.to_be_bytes::<32>());
+        }
+        let log: Log = serde_json::from_value(serde_json::json!({
+            "address": format!("{:#x}", ELFOMO_ROUTER_ADDRESS),
+            "topics": [
+                format!("{:#x}", ELFOMO_TRADE_EVENT),
+                format!("0x{:064x}", 1u64),
+            ],
+            "data": format!("0x{}", alloy::hex::encode(&data)),
+            "blockNumber": null,
+            "transactionIndex": "0x0",
+            "logIndex": "0x0",
+        }))
+        .unwrap();
+        assert!(matches!(pool.sync(&log).unwrap(), SyncAction::Resync));
+        // 金库余额不得被改动
+        assert_eq!(pool.levels.vault_usdt0, snapshot().vault_usdt0);
+        assert_eq!(pool.levels.vault_xeth, snapshot().vault_xeth);
+    }
+
+    #[test]
+    fn test_seed_coverage_counts_blocks_and_resets_on_recovery() {
+        let mut pool = ElfomoFiPropPool::default();
+        pool.observe_block(1_000);
+        assert_eq!(pool.blocks_since_seed, 0);
+
+        // 1001..=1006 收口 1000..=1005：全部没有 raw-tx 种子
+        for block in 1_001..=1_006 {
+            pool.observe_block(block);
+        }
+        assert_eq!(pool.blocks_since_seed, 6);
+        assert!(
+            pool.seed_coverage_alerted,
+            "达到阈值必须置告警位（只报一次）"
+        );
+        let (last_seed, missing) = pool.seed_coverage();
+        assert_eq!((last_seed, missing), (0, 6));
+
+        // 继续缺失：计数继续累计，但告警不重复触发（标志位保持）
+        pool.observe_block(1_007);
+        assert_eq!(pool.blocks_since_seed, 7);
+        assert!(pool.seed_coverage_alerted);
+
+        // raw-tx 通道恢复：块 1007 拿到种子 → 下一个块边界收口时清零复位
+        pool.apply_price_seed(U256::from(0x143c60fu64), 1_007);
+        assert_eq!(pool.seed_coverage(), (1_007, 7));
+        pool.observe_block(1_008);
+        assert_eq!(pool.blocks_since_seed, 0);
+        assert!(!pool.seed_coverage_alerted);
+
+        // 块 1008 又断了 → 收口时计 1；同一块号重复观测（同块多 slice）不重复计
+        pool.observe_block(1_009);
+        assert_eq!(pool.blocks_since_seed, 1);
+        pool.observe_block(1_009);
+        assert_eq!(pool.blocks_since_seed, 1);
+        assert_eq!(pool.coverage_open_block, 1_009);
+    }
+
+    #[test]
+    fn test_seed_coverage_treats_missed_blocks_as_missing() {
+        // 流重连导致整段块没被观测到：中间块按缺失计（保守，宁可多报一次）
+        let mut pool = ElfomoFiPropPool::default();
+        pool.observe_block(2_000);
+        pool.observe_block(2_005);
+        // (2000, 2005) 内 2000..2004 共 5 块缺失
+        assert_eq!(pool.blocks_since_seed, 5);
+        assert!(pool.seed_coverage_alerted);
     }
 }

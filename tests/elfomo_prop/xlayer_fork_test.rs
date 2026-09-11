@@ -41,11 +41,40 @@ use alloy::{
 use amms::amms::{
     amm::AutomatedMarketMaker,
     elfomo_prop::{
-        types::IElfomoFiFactory, ElfomoFiPropPool, ELFOMO_FACTORY_ADDRESS, ELFOMO_POOL_ADDRESS,
-        ELFOMO_ROUTER_ADDRESS, ELFOMO_USDT0_ADDRESS, ELFOMO_VAULT_ADDRESS, ELFOMO_XETH_ADDRESS,
+        types::{ElfomoLadderConfig, IElfomoFiFactory},
+        ElfomoFiPropPool, ELFOMO_FACTORY_ADDRESS, ELFOMO_POOL_ADDRESS, ELFOMO_ROUTER_ADDRESS,
+        ELFOMO_USDT0_ADDRESS, ELFOMO_VAULT_ADDRESS, ELFOMO_XETH_ADDRESS,
     },
 };
 use eyre::Result;
+
+/// XLayer xETH/USDT0 的链上 ladder 参数（`getMetadata(0xe7b0…025a)` 实测 fixture）。
+///
+/// 生产代码在 `init` 阶段逐池从链上读取；测试这里用固定 fixture 走**同一套**
+/// 读时重算逻辑（`build_orderbook_with`），确保公式本身被逐位验证。
+fn xlayer_ladder() -> ElfomoLadderConfig {
+    ElfomoLadderConfig::from_metadata(&[
+        U256::ZERO,
+        U256::from(18u64),
+        U256::from(2u64),
+        U256::ZERO,
+        U256::ZERO,
+        U256::from(600_000_000_000_000_000u128),
+        U256::from(30u64),
+        U256::from(5u64),
+        U256::from(60u64),
+        U256::ZERO,
+        U256::ZERO,
+    ])
+}
+
+fn build_orderbook(
+    seed: U256,
+    vault_usdt0: U256,
+    vault_xeth: U256,
+) -> amms::amms::elfomo_prop::types::OrderbookSnapshot {
+    ElfomoFiPropPool::build_orderbook_with(&xlayer_ladder(), seed, vault_usdt0, vault_xeth)
+}
 
 // ============================================================
 // Constants
@@ -57,11 +86,8 @@ const ELFOMO_TEST_BLOCK: u64 = 69_452_472;
 /// orderbook 公式多块扫描（固定历史块 + 运行时取最近块）
 const ELFOMO_ORDERBOOK_BLOCKS: &[u64] = &[
     69_452_472, // 锚点（xETH vault ≈ 2.94e18，n=3）
-    69_450_000,
-    69_440_000,
-    69_400_000, // xETH vault ≈ 0.61e18，toFrom n=1 退化档
-    69_300_000,
-    69_200_000,
+    69_450_000, 69_440_000, 69_400_000, // xETH vault ≈ 0.61e18，toFrom n=1 退化档
+    69_300_000, 69_200_000,
 ];
 /// 真实套利交易所在块（tx 0x3a608dfe…，ElfomoFi 段 xETH→USDT0）
 const ELFOMO_ARB_BLOCK: u64 = 69_447_881;
@@ -142,7 +168,10 @@ async fn connect_xlayer_provider() -> Result<Option<(Arc<impl Provider>, u64)>> 
     let provider = Arc::new(ProviderBuilder::new().connect_http(rpc_url.parse()?));
     let chain_id = provider.get_chain_id().await?;
     if chain_id != XLAYER_CHAIN_ID {
-        println!("SKIP: expected XLayer chain_id {}, got {}", XLAYER_CHAIN_ID, chain_id);
+        println!(
+            "SKIP: expected XLayer chain_id {}, got {}",
+            XLAYER_CHAIN_ID, chain_id
+        );
         return Ok(None);
     }
     Ok(Some((provider, chain_id)))
@@ -241,7 +270,10 @@ async fn fetch_update_prices_seed<P: Provider + Clone>(
     let pool_lower = format!("{:x}", ELFOMO_POOL_ADDRESS);
     for tx in txs {
         let to = tx.get("to").and_then(|t| t.as_str()).unwrap_or("");
-        if !to.trim_start_matches("0x").eq_ignore_ascii_case(&pool_lower) {
+        if !to
+            .trim_start_matches("0x")
+            .eq_ignore_ascii_case(&pool_lower)
+        {
             continue;
         }
         let input = tx.get("input").and_then(|t| t.as_str()).unwrap_or("");
@@ -282,12 +314,22 @@ async fn test_elfomo_prop_fork_orderbook_quote_replication() -> Result<()> {
     assert_eq!(local.levels.from_to_levels.len(), cft.len());
     assert_eq!(local.levels.to_from_levels.len(), ctf.len());
     assert_eq!(
-        local.levels.from_to_levels.iter().map(|lv| (lv.size, lv.price)).collect::<Vec<_>>(),
+        local
+            .levels
+            .from_to_levels
+            .iter()
+            .map(|lv| (lv.size, lv.price))
+            .collect::<Vec<_>>(),
         cft,
         "init fromTo 与链上不一致"
     );
     assert_eq!(
-        local.levels.to_from_levels.iter().map(|lv| (lv.size, lv.price)).collect::<Vec<_>>(),
+        local
+            .levels
+            .to_from_levels
+            .iter()
+            .map(|lv| (lv.size, lv.price))
+            .collect::<Vec<_>>(),
         ctf,
         "init toFrom 与链上不一致"
     );
@@ -307,7 +349,7 @@ async fn test_elfomo_prop_fork_orderbook_quote_replication() -> Result<()> {
         let bid = BlockId::Number(BlockNumberOrTag::Number(bn));
         let (vu, vx) = chain_vault_balances(provider.clone(), bid).await?;
         let seed = chain_price_seed(provider.clone(), bid).await?;
-        let local_ob = ElfomoFiPropPool::build_orderbook(seed, vu, vx);
+        let local_ob = build_orderbook(seed, vu, vx);
         let (cft, ctf) = chain_orderbook(provider.clone(), bid).await?;
         total_ob += 1;
         let lft: Vec<(U256, U256)> = local_ob
@@ -442,7 +484,9 @@ async fn test_elfomo_prop_fork_orderbook_quote_replication() -> Result<()> {
         if sim == chain {
             ok_eo += 1;
         } else {
-            eo_mismatches.push(format!("  xETH->USDT0 exact-out={out}: sim={sim} chain={chain}"));
+            eo_mismatches.push(format!(
+                "  xETH->USDT0 exact-out={out}: sim={sim} chain={chain}"
+            ));
         }
     }
     for out in &rev_exact_outs {
@@ -457,7 +501,9 @@ async fn test_elfomo_prop_fork_orderbook_quote_replication() -> Result<()> {
         if sim == chain {
             ok_eo += 1;
         } else {
-            eo_mismatches.push(format!("  USDT0->xETH exact-out={out}: sim={sim} chain={chain}"));
+            eo_mismatches.push(format!(
+                "  USDT0->xETH exact-out={out}: sim={sim} chain={chain}"
+            ));
         }
     }
     assert!(
@@ -475,14 +521,18 @@ async fn test_elfomo_prop_fork_orderbook_quote_replication() -> Result<()> {
     let parsed_seed = fetch_update_prices_seed(provider.clone(), ELFOMO_ARB_BLOCK)
         .await?
         .ok_or_else(|| eyre::eyre!("arb block updatePrices 交易未找到"))?;
-    assert_eq!(parsed_seed, U256::from(ELFOMO_ARB_SEED), "updatePrices calldata 种子解析失败");
+    assert_eq!(
+        parsed_seed,
+        U256::from(ELFOMO_ARB_SEED),
+        "updatePrices calldata 种子解析失败"
+    );
     // 交易执行时刻状态 = 父块金库余额 + 本块种子
     let (vu, vx) = chain_vault_balances(
         provider.clone(),
         BlockId::Number(BlockNumberOrTag::Number(ELFOMO_ARB_BLOCK - 1)),
     )
     .await?;
-    let ob = ElfomoFiPropPool::build_orderbook(parsed_seed, vu, vx);
+    let ob = build_orderbook(parsed_seed, vu, vx);
     let sim = ElfomoFiPropPool::simulate_swap_for_orderbook(
         &ob,
         ELFOMO_XETH_ADDRESS,
@@ -491,7 +541,11 @@ async fn test_elfomo_prop_fork_orderbook_quote_replication() -> Result<()> {
         ELFOMO_USDT0_ADDRESS,
         U256::from(ELFOMO_ARB_IN),
     );
-    assert_eq!(sim, U256::from(ELFOMO_ARB_OUT), "本地账本重算（父块金库+本块种子）必须等于链上成交额");
+    assert_eq!(
+        sim,
+        U256::from(ELFOMO_ARB_OUT),
+        "本地账本重算（父块金库+本块种子）必须等于链上成交额"
+    );
     // 块后状态：链上 getAmountOut 视图在交易所在块存在 1 wei 的视图层取整
     // 差异（`Router.getAmountOut` 视图路径，仅出现在交易执行后的那个块，
     // 116 块扫描仅此 1 块出现；swap 执行路径无此差异）。因此这里只要求
@@ -509,7 +563,7 @@ async fn test_elfomo_prop_fork_orderbook_quote_replication() -> Result<()> {
         BlockId::Number(BlockNumberOrTag::Number(ELFOMO_ARB_BLOCK)),
     )
     .await?;
-    let ob_post = ElfomoFiPropPool::build_orderbook(parsed_seed, vu_post, vx_post);
+    let ob_post = build_orderbook(parsed_seed, vu_post, vx_post);
     let sim_post = ElfomoFiPropPool::simulate_swap_for_orderbook(
         &ob_post,
         ELFOMO_XETH_ADDRESS,
@@ -522,7 +576,11 @@ async fn test_elfomo_prop_fork_orderbook_quote_replication() -> Result<()> {
         "Phase 4: arb in={ELFOMO_ARB_IN} sim(pre-tx state)={sim} tx_out={ELFOMO_ARB_OUT} \
          chain_getAmountOut(post-tx)={chain_out} sim(post-tx state)={sim_post}"
     );
-    let diff = if sim_post >= chain_out { sim_post - chain_out } else { chain_out - sim_post };
+    let diff = if sim_post >= chain_out {
+        sim_post - chain_out
+    } else {
+        chain_out - sim_post
+    };
     assert!(
         diff <= U256::from(1u64),
         "块后状态本地重算与链上 getAmountOut 偏差超过 1 wei: sim={sim_post} chain={chain_out}"

@@ -185,6 +185,13 @@ const DEFAULT_DRIFT_PROBE_INTERVAL: Duration = Duration::from_secs(120);
 /// 批量刷新）与陈旧报价窗口；正常时 flashblocks 实时交易流保证新鲜度，
 /// 对账仅作低频兜底。后续应改为配置化独立 HTTP RPC 端点后恢复更细粒度。
 const DEFAULT_CALIBER_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
+/// ElfomoFi 周期对账默认间隔（45s，用户指定）。
+///
+/// Elfomo 的 vault 余额只能靠 `ElfomoTrade` 增量累积，一旦事件流漏帧就需要一次
+/// 链上绝对值来 rebase（`快照(S) + Σ_{>S}`）。实时主通道是 flashblocks raw-tx
+/// （价格种子）+ Router `ElfomoTrade`（金库增量），本任务只作低频纠错兜底：
+/// 45s 兼顾 RPC 限流与漂移窗口上界；显式 `with_elfomo_sync_interval` 优先。
+const DEFAULT_ELFOMO_RECONCILE_INTERVAL: Duration = Duration::from_secs(45);
 
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1807,10 +1814,13 @@ impl<N, P> StateSpaceManager<N, P> {
                     topic_signatures.insert(CALIBER_SWAP_EVENT);
                 }
                 AMM::ElfomoFiPropPool(p) => {
-                    // ElfomoTrade 由 Router emit、updatePrices 空事件由 Pool emit，
-                    // 两者都必须注册（默认分支只注册 amm.address() = pool_address）。
+                    // **只注册 Router**：唯一的日志状态源是 `ElfomoTrade`
+                    // （金库余额增量）。Pool `updatePrices` 空事件零信息量、且与
+                    // raw-tx calldata 里的价格种子同源，已从 `sync_events` 剔除，
+                    // 不能再把 pool_address 注册进来（否则 get_logs 回填/直连订阅
+                    // 又会把那条无意义的事件拉回来，历史上的 `SkippedStale`
+                    // 刷屏即源于此）。价格种子走 flashblocks raw-tx 通道。
                     if has_events {
-                        topic_addresses.insert(p.pool_address);
                         topic_addresses.insert(p.router_address);
                     }
                 }
@@ -2244,9 +2254,9 @@ where
 
     /// Set a dedicated interval for ElfomoFi propAMM orderbook re-anchor.
     ///
-    /// L1 事件（Pool `updatePrices` 空事件）为块级实时主通道；本任务仅作
-    /// flashblocks 断流/重连/漏块时的最后兜底。未设置时回退到
-    /// `non_event_sync_interval`。
+    /// 实时主通道是 flashblocks raw-tx（价格种子）+ Router `ElfomoTrade`
+    /// （金库增量）；本任务仅作断流/重连/漏块时的最后兜底，未显式设置时
+    /// 取 [`DEFAULT_ELFOMO_RECONCILE_INTERVAL`]（45s）。
     pub fn with_elfomo_sync_interval(self, interval: Duration) -> StateSpaceBuilder<N, P> {
         StateSpaceBuilder {
             elfomo_sync_interval: Some(interval),
@@ -2716,10 +2726,13 @@ where
             ));
         }
 
-        // ElfomoFi propAMM pools: 周期 orderbook 快照（最后兜底）。
-        // 主通道是 L1 事件 + L3 flashblocks raw-tx（每块 updatePrices 实时驱动），
-        // 本任务只覆盖事件流断供场景。
-        if let Some(interval) = self.elfomo_sync_interval.or(non_event_interval) {
+        // ElfomoFi propAMM pools: 周期 orderbook 快照（最后兜底，默认 45s）。
+        // 主通道是 flashblocks raw-tx（价格种子）+ Router ElfomoTrade（金库增量），
+        // 本任务只覆盖事件流断供/漏帧场景（vault rebase-merge，见 merge_snapshot）。
+        if let Some(interval) = self
+            .elfomo_sync_interval
+            .or(Some(DEFAULT_ELFOMO_RECONCILE_INTERVAL))
+        {
             tokio::spawn(sync_services::start_elfomo_prop_sync_task(
                 state_space.clone(),
                 self.provider.clone(),
@@ -2866,25 +2879,57 @@ impl StateSpace {
     /// 通用分发链的 `direct_hit` 必然落空（历史上该事件在此被静默丢弃，
     /// 导致 Router 侧的金库记账分支从未执行）。这里按实例 `router_address`
     /// 反查命中池子；topic0 前置门控，非 ElfomoTrade 事件零成本返回 None。
+    ///
+    /// **按 pair 判别**：同一个 Router 下会挂多个 pair（不同 Pool 地址），
+    /// 仅凭 router 会把 A 池的成交发给 B 池（B 池的 `sync()` 内层 pair 守卫
+    /// 会丢弃它，但多了一次无效的 Router 反查与写锁竞争）。这里用与 `sync()`
+    /// 相同的事件布局解出 `fromToken/toToken` 先做方向判别；data 短于预期
+    /// （解析失败）时退回"router 全命中"——宁可多路由一次，也不能丢金库增量。
     fn resolve_elfomo_targets(
         &self,
         log_address: Address,
         topics: &[FixedBytes<32>],
+        data: &[u8],
     ) -> Option<Vec<Address>> {
         use crate::amms::elfomo_prop::ELFOMO_TRADE_EVENT;
 
         if topics.first() != Some(&ELFOMO_TRADE_EVENT) {
             return None;
         }
+        // data = [executor, receiver, fromToken, toToken, fromAmount, toAmount]
+        let pair = (data.len() >= 128).then(|| {
+            (
+                Address::from_word(B256::from_slice(&data[64..96])),
+                Address::from_word(B256::from_slice(&data[96..128])),
+            )
+        });
+
+        let mut has_router_match = false;
         let targets: Vec<Address> = self
             .state
             .iter()
-            .filter_map(|(key, amm)| match amm.as_ref() {
-                AMM::ElfomoFiPropPool(p) if p.router_address == log_address => Some(*key),
-                _ => None,
+            .filter_map(|(key, amm)| {
+                let AMM::ElfomoFiPropPool(p) = amm.as_ref() else {
+                    return None;
+                };
+                if p.router_address != log_address {
+                    return None;
+                }
+                has_router_match = true;
+                if let Some((from_token, to_token)) = pair {
+                    let x_to_y = from_token == p.token_x && to_token == p.token_y;
+                    let y_to_x = from_token == p.token_y && to_token == p.token_x;
+                    if !x_to_y && !y_to_x {
+                        // 非本池 pair 的成交：不该发给它（同 router 的其它 pair）
+                        return None;
+                    }
+                }
+                Some(*key)
             })
             .collect();
-        (!targets.is_empty()).then_some(targets)
+        // 命中已知 Router（即使本笔没有匹配的 pair）就终结分发链，
+        // 避免落到通用分支把 `topics[1]` 当成 pool_id 做无意义查询。
+        has_router_match.then_some(targets)
     }
 
     /// 解析 BinaryFi 事件（Swap / Update）命中的虚拟子池地址集合。
@@ -3090,7 +3135,7 @@ impl StateSpace {
                         target_addresses.push(pool_address);
                     }
                 } else if let Some(elfomo_targets) =
-                    self.resolve_elfomo_targets(address, log.topics())
+                    self.resolve_elfomo_targets(address, log.topics(), log.data().data.as_ref())
                 {
                     target_addresses.extend(elfomo_targets);
                 } else if let Some(binaryfi_targets) =
@@ -3311,6 +3356,26 @@ impl StateSpace {
             affected_set.insert(event.pool);
         }
         affected_set.into_iter().collect()
+    }
+
+    /// Elfomo 种子覆盖率自证：**块边界**调用（flashblocks `index == 0`），零 RPC。
+    ///
+    /// 每个已注册的 Elfomo 池各自收口上一块：上一块没有 raw-tx 种子就累计缺失块数，
+    /// 连续达到阈值由池内发一次 `error`（见 `ElfomoFiPropPool::observe_block`）。
+    /// 这是"提取通道静默失效"的唯一自证信号——失效时 `elfomo_updates` 为空，
+    /// 上层会直接跳过该 payload，没有任何其他路径能察觉价格种子已经断供。
+    pub(super) fn observe_elfomo_seed_coverage(&mut self, block: u64) {
+        let pools: Vec<Address> = self
+            .state
+            .iter()
+            .filter(|(_, amm)| matches!(amm.as_ref(), AMM::ElfomoFiPropPool(_)))
+            .map(|(addr, _)| *addr)
+            .collect();
+        for addr in pools {
+            if let Some(AMM::ElfomoFiPropPool(pool)) = self.get_mut_cow(&addr) {
+                pool.observe_block(block);
+            }
+        }
     }
 }
 
@@ -3626,6 +3691,8 @@ mod tests {
             let mut p = ElfomoFiPropPool::default();
             p.pool_address = pool;
             p.router_address = router;
+            p.token_x = ELFOMO_XETH_ADDRESS;
+            p.token_y = ELFOMO_USDT0_ADDRESS;
             p.tokens = vec![
                 Token::new_with_decimals(ELFOMO_XETH_ADDRESS, 18),
                 Token::new_with_decimals(ELFOMO_USDT0_ADDRESS, 6),
@@ -3643,19 +3710,57 @@ mod tests {
         state.insert_amm(AMM::ElfomoFiPropPool(mk(pool2, ELFOMO_ROUTER_ADDRESS)));
         state.insert_amm(AMM::ElfomoFiPropPool(mk(pool_other, other_router)));
 
-        // 解析层：ElfomoTrade（Router emit）按 router_address 反查池子
+        // 解析层：ElfomoTrade（Router emit）按 router_address + pair 反查池子
         let topics = vec![ELFOMO_TRADE_EVENT, B256::from(U256::from(1u64))];
+        let trade_data = |from: Address, to: Address| {
+            let mut d = Vec::with_capacity(6 * 32);
+            for w in [
+                U256::from(0x1234u64),
+                U256::from(0x5678u64),
+                from.into_word().into(),
+                to.into_word().into(),
+                U256::from(1u64),
+                U256::from(1u64),
+            ] {
+                d.extend_from_slice(&w.to_be_bytes::<32>());
+            }
+            d
+        };
+        let x_to_y = trade_data(ELFOMO_XETH_ADDRESS, ELFOMO_USDT0_ADDRESS);
         let mut routed = state
-            .resolve_elfomo_targets(ELFOMO_ROUTER_ADDRESS, &topics)
+            .resolve_elfomo_targets(ELFOMO_ROUTER_ADDRESS, &topics, &x_to_y)
             .expect("ElfomoTrade must route from router to its pools");
         routed.sort_unstable();
         assert_eq!(routed, vec![pool1, pool2]);
+        // 同一 Router 下的其它 pair：不发给本 pair 的池子（返回空，不进通用分支）
+        let other_pair = trade_data(
+            ELFOMO_XETH_ADDRESS,
+            address!("9999999999999999999999999999999999999999"),
+        );
+        assert_eq!(
+            state
+                .resolve_elfomo_targets(ELFOMO_ROUTER_ADDRESS, &topics, &other_pair)
+                .expect("known router must terminate the dispatch chain"),
+            Vec::<Address>::new()
+        );
+        // 另一个已注册 Router：只命中挂在它下面的池子
+        assert_eq!(
+            state
+                .resolve_elfomo_targets(other_router, &topics, &x_to_y)
+                .expect("registered router must route its own pool"),
+            vec![pool_other]
+        );
+        // 完全未知的 Router：不路由（交给链上其余分发分支）
+        let unknown_router = address!("cccccccccccccccccccccccccccccccccccccccc");
+        assert!(state
+            .resolve_elfomo_targets(unknown_router, &topics, &x_to_y)
+            .is_none());
         // 非 ElfomoTrade topic → 不路由
         assert!(state
-            .resolve_elfomo_targets(ELFOMO_ROUTER_ADDRESS, &[ELFOMO_UPDATE_EVENT])
+            .resolve_elfomo_targets(ELFOMO_ROUTER_ADDRESS, &[ELFOMO_UPDATE_EVENT], &x_to_y)
             .is_none());
         assert!(state
-            .resolve_elfomo_targets(ELFOMO_ROUTER_ADDRESS, &[B256::ZERO])
+            .resolve_elfomo_targets(ELFOMO_ROUTER_ADDRESS, &[B256::ZERO], &[])
             .is_none());
 
         // 端到端：Router 日志必须真正落到池子上并双向记账金库

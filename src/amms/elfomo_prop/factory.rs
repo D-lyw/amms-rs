@@ -97,7 +97,13 @@ impl ElfomoFiPropFactory {
 
     /// XLayer 默认部署便捷构造（地址见模块常量）
     pub fn new_default(chain_id: u64, creation_block: u64) -> Self {
-        Self::new(vec![ElfomoPairConfig::new_default()], ELFOMO_FACTORY_ADDRESS, ELFOMO_ROUTER_ADDRESS, chain_id, creation_block)
+        Self::new(
+            vec![ElfomoPairConfig::new_default()],
+            ELFOMO_FACTORY_ADDRESS,
+            ELFOMO_ROUTER_ADDRESS,
+            chain_id,
+            creation_block,
+        )
     }
 
     /// 为所有配置 pair 构建池子骨架（资产/档位在 init 时填充）。
@@ -110,6 +116,7 @@ impl ElfomoFiPropFactory {
         };
         cfgs.into_iter()
             .map(|cfg| {
+                // ladder 不在这里设定：`init` 阶段逐池从链上 `getMetadata` 读取
                 ElfomoFiPropPool::skeleton(
                     cfg.pool_address,
                     cfg.token_x,
@@ -245,10 +252,29 @@ mod tests {
         assert_eq!(factory.pairs.len(), 1);
         assert_eq!(factory.pairs[0].pool_address, ELFOMO_POOL_ADDRESS);
         assert_eq!(factory.pairs[0].vault_address, ELFOMO_VAULT_ADDRESS);
-        assert_eq!(factory.pairs[0].token_x, crate::amms::elfomo_prop::ELFOMO_XETH_ADDRESS);
-        assert_eq!(factory.pairs[0].token_y, crate::amms::elfomo_prop::ELFOMO_USDT0_ADDRESS);
+        assert_eq!(
+            factory.pairs[0].token_x,
+            crate::amms::elfomo_prop::ELFOMO_XETH_ADDRESS
+        );
+        assert_eq!(
+            factory.pairs[0].token_y,
+            crate::amms::elfomo_prop::ELFOMO_USDT0_ADDRESS
+        );
         assert!(factory.pool_creation_event().is_zero());
-        assert_eq!(factory.pool_events().len(), 2);
+        // 只订阅 ElfomoTrade（金库增量）；updatePrices 空事件零信息量，不再作状态源
+        assert_eq!(factory.pool_events().len(), 1);
+    }
+
+    #[test]
+    fn test_factory_ladder_is_fetched_at_init_not_registered() {
+        use crate::amms::elfomo_prop::types::ElfomoLadderConfig;
+
+        // ladder 不再是"上游登记"，而是 `init` 时逐池从链上 `getMetadata` 读取；
+        // 骨架阶段保持缺省（invalid）→ 未 init 前不报价（fail-closed）。
+        let factory = ElfomoFiPropFactory::new_default(ELFOMO_CHAIN_ID, 1);
+        let pools = factory.skeletons(1);
+        assert_eq!(pools[0].ladder, ElfomoLadderConfig::default());
+        assert!(!pools[0].ladder.is_valid());
     }
 
     #[test]
@@ -263,6 +289,6 @@ mod tests {
         assert_eq!(pool.created_block, 42);
         assert!(pool.tokens.is_empty());
         assert!(pool.levels.from_to_levels.is_empty());
-        assert_eq!(pool.sync_events().len(), 2);
+        assert_eq!(pool.sync_events().len(), 1);
     }
 }

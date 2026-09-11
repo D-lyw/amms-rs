@@ -1461,12 +1461,12 @@ pub async fn start_binaryfi_prop_sync_task<N, P>(
 
 /// ElfomoFi propAMM 周期 orderbook 快照（最后兜底）。
 ///
-/// ElfomoFi 报价更新主通道是块级实时 raw-tx：L3 flashblocks 流按 selector
+/// ElfomoFi 报价更新主通道是块级实时 raw-tx：flashblocks 流按 selector
 /// `0xae7e8d81` 拦截 `updatePrices` 原始交易，解析出价格种子后本地直算
-/// orderbook（零 RPC）；L1 Pool `updatePrices` 空事件仅在无 raw-tx 时回退
-/// AsyncUpdate 重拉真值。本任务只在事件流断供（flashblocks 断流/重连/漏块、
-/// matcher 未覆盖）时低频重拉整档回正 + 种子 + vault 余额，防止本地报价长期
-/// 过期。单池部署：每轮一次 `getOrderbook` + slot1 + 2 次 `balanceOf` 静态
+/// orderbook（零 RPC）；Pool `updatePrices` 空事件已不再订阅（零信息量），
+/// 提取通道失效由覆盖率自证暴露。本任务作为**唯一兜底**，在事件流断供
+/// （flashblocks 断流/重连/漏块、matcher 未覆盖）时低频重拉整档回正 + 种子 +
+/// vault 余额，防止本地报价长期过期。单池部署：每轮一次 `getOrderbook` + slot1 + 2 次 `balanceOf` 静态
 /// 调用，开销可忽略；失败退避上限 300s。
 pub async fn start_elfomo_prop_sync_task<N, P>(
     state: Arc<RwLock<StateSpace>>,

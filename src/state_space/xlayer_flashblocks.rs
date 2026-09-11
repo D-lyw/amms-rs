@@ -923,8 +923,10 @@ fn extract_logs_from_xlayer_flashblock(
     }
 
     // 8. ElfomoFi 更新事件去重：updatePrices 空事件与其原始交易同块共存。
-    //    raw-tx 已携带价格种子（本地直算通道），空事件不再触发 AsyncUpdate，
-    //    直接剔除，避免冗余 RPC 重拉。
+    //    价格种子走 raw-tx 直算通道（上面的 2d），空事件零信息量、已从
+    //    `sync_events` 剔除（query chunks 也只注册 Router），正常路径根本不会
+    //    出现在 `out` 里；这里保留一道防御，避免历史 matcher/旧镜像把它带进来
+    //    再触发一次无意义的重拉。
     if !elfomo_updates.is_empty() {
         let updated_pools: HashSet<Address> = elfomo_updates.iter().map(|e| e.pool).collect();
         out.retain(|log| {
@@ -1009,6 +1011,9 @@ impl<N, P> StateSpaceManager<N, P> {
                     })
                     .collect()
             };
+            // Elfomo 覆盖率自证：按**块号跃迁**收口（同一块的多个 slice 只收口一次），
+            // 不依赖 slice `index` 语义（重连后可能从中途 slice 开始）。
+            let mut elfomo_coverage_block: u64 = 0;
             let mut dedup_cache = XlayerDedupCache::new(XLAYER_DEDUP_PAYLOAD_WINDOW);
             let mut parse_cache = XlayerParseCache::new();
             let mut tx_tracker = XlayerTxCountTracker::new(XLAYER_TX_COUNT_WINDOW);
@@ -1228,6 +1233,18 @@ impl<N, P> StateSpaceManager<N, P> {
 
                     let block_num =
                         block_number.unwrap_or_else(|| realtime_head.load(Ordering::Relaxed));
+
+                    // 6b. Elfomo 种子覆盖率自证：块号跃迁时零 RPC 收口上一块。
+                    //     必须放在第 8 步 `continue` 之前——提取通道失效的块恰恰是
+                    //     "无日志/无 raw-tx"的块，会在第 8 步被整块跳过，否则这条
+                    //     唯一的自证信号永远不会触发。
+                    if !elfomo_pools.is_empty() && block_num > elfomo_coverage_block {
+                        elfomo_coverage_block = block_num;
+                        state
+                            .write()
+                            .await
+                            .observe_elfomo_seed_coverage(block_num);
+                    }
 
                     // 7. 处理解析失败
                     if decode_fail_count > 0 {
@@ -1849,8 +1866,21 @@ mod tests {
                 vault_xeth: U256::from(2_940_462_501_000_862_186u128),
                 price_seed: U256::ZERO,
             },
-            consumed: Default::default(),
             vault_ledger: Default::default(),
+            ladder: crate::amms::elfomo_prop::types::ElfomoLadderConfig::from_metadata(&[
+                U256::ZERO,
+                U256::from(18u64),
+                U256::from(2u64),
+                U256::ZERO,
+                U256::ZERO,
+                U256::from(600_000_000_000_000_000u128),
+                U256::from(30u64),
+                U256::from(5u64),
+                U256::from(60u64),
+                U256::ZERO,
+                U256::ZERO,
+            ]),
+            ..ElfomoFiPropPool::default()
         }));
 
         let affected = state.apply_elfomo_updates(&elfomo_events, 69_452_472);

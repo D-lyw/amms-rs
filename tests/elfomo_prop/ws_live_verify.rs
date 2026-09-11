@@ -28,14 +28,40 @@ use alloy::{
     providers::{Provider, ProviderBuilder},
     sol,
 };
-use amms::amms::{
-    elfomo_prop::{
-        types::IElfomoFiFactory, ElfomoFiPropPool, ELFOMO_FACTORY_ADDRESS, ELFOMO_POOL_ADDRESS,
-        ELFOMO_ROUTER_ADDRESS, ELFOMO_USDT0_ADDRESS, ELFOMO_VAULT_ADDRESS, ELFOMO_XETH_ADDRESS,
-        ELFOMO_UPDATE_SELECTOR,
-    },
+use amms::amms::elfomo_prop::{
+    types::{ElfomoLadderConfig, IElfomoFiFactory},
+    ElfomoFiPropPool, ELFOMO_FACTORY_ADDRESS, ELFOMO_POOL_ADDRESS, ELFOMO_ROUTER_ADDRESS,
+    ELFOMO_UPDATE_SELECTOR, ELFOMO_USDT0_ADDRESS, ELFOMO_VAULT_ADDRESS, ELFOMO_XETH_ADDRESS,
 };
 use eyre::Result;
+
+/// XLayer xETH/USDT0 的链上 ladder 参数（`getMetadata(0xe7b0…025a)` 实测 fixture）。
+///
+/// 生产代码在 `init` 阶段逐池从链上读取；测试这里用固定 fixture 走**同一套**
+/// 读时重算逻辑（`build_orderbook_with`），确保公式本身被逐位验证。
+fn xlayer_ladder() -> ElfomoLadderConfig {
+    ElfomoLadderConfig::from_metadata(&[
+        U256::ZERO,
+        U256::from(18u64),
+        U256::from(2u64),
+        U256::ZERO,
+        U256::ZERO,
+        U256::from(600_000_000_000_000_000u128),
+        U256::from(30u64),
+        U256::from(5u64),
+        U256::from(60u64),
+        U256::ZERO,
+        U256::ZERO,
+    ])
+}
+
+fn build_orderbook(
+    seed: U256,
+    vault_usdt0: U256,
+    vault_xeth: U256,
+) -> amms::amms::elfomo_prop::types::OrderbookSnapshot {
+    ElfomoFiPropPool::build_orderbook_with(&xlayer_ladder(), seed, vault_usdt0, vault_xeth)
+}
 use futures::StreamExt;
 use serde::Deserialize;
 use std::env;
@@ -115,7 +141,7 @@ where
             x.balanceOf(ELFOMO_VAULT_ADDRESS).block(bid).call().await?,
         )
     };
-    let local_ob = ElfomoFiPropPool::build_orderbook(pc.seed, vu, vx);
+    let local_ob = build_orderbook(pc.seed, vu, vx);
     let factory = IElfomoFiFactory::new(ELFOMO_FACTORY_ADDRESS, provider.clone());
     let cob = factory
         .getOrderbook(ELFOMO_XETH_ADDRESS, ELFOMO_USDT0_ADDRESS)
