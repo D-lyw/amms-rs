@@ -236,10 +236,37 @@ IElfomoFiPool.getMetadata(address asset)
 设 `U=unit`、`T=band_count`、`SL=spread_level`、`F=spread_penalty`，两侧共用：
 
 ```text
-PREFIX = [1U, 5U, 10U, 10U, 20U, 100U]      // 前缀宽度表（逐档截断到容量）
-D      = [7, 10, 15, 25, 40, 50]            // 逐档偏离（1e-5），dev_i = D[i]
+PREFIX = profile.widths      // 前缀宽度表（逐档截断到容量）
+D      = profile.deviations  // 逐档偏离（1e-5），dev_i = D[i]
 尾档斜率：from→to = 50000，to→from = 150000；普通档斜率 100000 ∓ dev_i
 ```
+
+**`PREFIX`/`D` 不是协议常量，而是池子的动态存储**（2026-09-11 二次实证）：
+
+- 位置：`mapping(uint256 => uint256)` @ slot0，key = 本 pair 在
+  `Pool.getSupportedPairs()` 中的下标（XLayer 单 pair = 0）→
+  槽位 `keccak256(pad32(key)‖pad32(0))` = `0xad3228b6…5fb5`。
+- 一条 word 的打包布局（分块实测解码 + 逐字段置位验证）：
+
+  ```text
+  byte31          = n（档数，本例 6）
+  byte30          = widths[0]
+  deviations[k]   = u16 little-endian @ byte (28 − 4k)   k = 0..n-1
+  widths[k+1]     = u16 little-endian @ byte (26 − 4k)   k = 0..n-2
+  ```
+
+- 实测样本：
+  - 块 `70352699` 及更早：`0x…00320064002800140019000a000f000a000a00050007000106`
+    → `widths=[1,5,10,10,20,100]`、`deviations=[7,10,15,25,40,50]`（= 首轮逆向的快照）；
+  - 块 `70352700` 起：`0x…003c0064002d00140023000a0019000a00140005000f000106`
+    → `deviations=[15,20,25,35,45,60]`，宽度表不变。
+- 改写来源：keeper 发 `0xd4ff31bd(uint256[] keys, uint256[] words)` 到 Pool
+  （`keys[i]` = pair 下标，`words[i]` = 新 word）；**该交易同样只 emit 那条空事件**
+  `0xc5d08cbe…`，信息全在 calldata。
+
+因此 profile 与 `price_seed` 完全同构：`init` 逐池从链上读取（key 由
+`getSupportedPairs()` 现算），运行期由 raw-tx `0xd4ff31bd`（零 RPC）+ 周期快照
+（字段级水位 `profile_block`）持续保鲜；**代码里没有任何写死的宽度/偏离表**。
 
 - **from→to**：容量 `C = (T−1)·U − vault_xeth`
   - `C > 0`：前缀按 `PREFIX` 逐档截断到 `C`（不足一档给残余档），尾部再补一档 `5T·U`；
@@ -253,10 +280,10 @@ D      = [7, 10, 15, 25, 40, 50]            // 逐档偏离（1e-5），dev_i = 
   `vault_usdt0` 与档宽共同封顶。
 
 **接入新 pair 的步骤（零代码改动）**：部署配置里加
-`ElfomoPairConfig{token_x, token_y, pool_address, vault_address}` 即可；ladder 由
-`init` 自动从该 pool 的 `getMetadata` 读取。若协议改了 `PREFIX`/`D` 等**协议级常量**
-（目前对所有实测配置一致），模型自证会在 init/对账时逐位对拍失败 →
-`model_verified=false` → 拒绝报价（fail-closed，不输出错价）。
+`ElfomoPairConfig{token_x, token_y, pool_address, vault_address}` 即可；ladder（含
+profile word）由 `init` 自动从该 pool 的 `getSupportedPairs()` + `getMetadata` +
+slot0 读取。keeper 改表由 raw-tx/快照实时同步；模型自证用**快照自带的 profile**
+对拍（不能用可能已更新的本地 profile，否则会假阴性误停报价）。
 
 ##### 多链核查（2026-09-11 实测：Base / BSC）
 

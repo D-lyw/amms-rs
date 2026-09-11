@@ -21,9 +21,11 @@
 //!   `qs = q>=32 ? q-64 : q`；`low = a & 0x3fffff`；
 //!   `base = (100000 + qs) × low`。每档 `price = slope × base`（定点 1e24）。
 //! - **档位生成**：宽度/偏离由**本 pool 的 ladder 参数**（[`ElfomoLadderConfig`]，
-//!   `init` 时逐池从链上 `Pool.getMetadata(asset)` 读取）现算——宽度表
-//!   `PREFIX=[1U,5U,10U,10U,20U,100U]`、偏离表 `D=[7,10,15,25,40,50]`、
-//!   容量截断 + 尾档，加宽开关 `spread_level·U ≥ 本侧容量`（由金库余额决定）。
+//!   `init` 时逐池从链上读取）现算——静态参数 `U/T/spread_*` 来自
+//!   `Pool.getMetadata(asset)`；宽度表/偏离表来自 slot0 `mapping(pairIdx => word)`
+//!   的 **profile word**（**动态存储，不是常量**，keeper 会用 `0xd4ff31bd` 改写，
+//!   布局见 [`ElfomoBandProfile`]）。再加容量截断 + 尾档，加宽开关
+//!   `spread_level·U ≥ 本侧容量`（由金库余额决定）。
 //!   完整规则与实证见 [`ElfomoLadderConfig`] 与
 //!   `build_orderbook_with`（唯一实现，逐位对拍链上）。
 //! - **from→to 档位**（size=输入量）：容量 `(T−1)U − vault_xeth`；
@@ -52,9 +54,11 @@
 //! 无需任何 RPC 即可在本地重算整本 orderbook。
 //!
 //! 1. **L3 — flashblocks 原始交易流（主通道，零 RPC）**：
-//!    `xlayer_flashblocks` 流按 selector `0xae7e8d81` 拦截发往 Pool 的
-//!    `updatePrices` 交易，解析出种子 `a` → `apply_price_seed` 本地重算
-//!    orderbook；同块该交易 emit 的空事件被过滤（避免重复 AsyncUpdate）。
+//!    `xlayer_flashblocks` 流拦截发往 Pool 的两类 calldata（信息都不在事件里）：
+//!    `updatePrices(uint256)`（`0xae7e8d81`）→ 种子 `a` → `apply_price_seed`；
+//!    keeper 逐档 profile 改写 `0xd4ff31bd(uint256[] keys,uint256[] words)` →
+//!    `apply_band_profile`（按 pair 下标过滤）。两者都本地重算 orderbook；
+//!    同块这些交易 emit 的空事件被过滤（避免重复 AsyncUpdate）。
 //!    `ElfomoTrade`（Router emit，topic `0xbe65a3f1…e2528`，data =
 //!    [executor, receiver, fromToken, toToken, fromAmount, toAmount]）
 //!    驱动金库余额递减（orderbook 随余额自动重算）。事件里的
@@ -80,6 +84,9 @@
 //!   raw-tx 种子来自 flashblock 乐观头，快照读规范头，故只在
 //!   `snap_block >= price_seed_block` 时用快照种子覆盖；否则保留本地新种子
 //!   并按它重建档位（链上档位是与快照种子绑定的，不能混用）。
+//! - **profile word（最新值）**：同形态的字段级水位 `profile_block`（keeper 的
+//!   `0xd4ff31bd` 也会改它）；模型自证**用快照自带的 profile** 重建对拍，
+//!   避免"本地 profile 已更新、快照落后"时的假阴性误停报价。
 
 use alloy::{
     eips::BlockId,
@@ -98,7 +105,9 @@ use crate::amms::{
     Token,
 };
 
-use crate::amms::elfomo_prop::types::{ElfomoLadderConfig, OrderbookLevel, OrderbookSnapshot};
+use crate::amms::elfomo_prop::types::{
+    ElfomoBandProfile, ElfomoLadderConfig, OrderbookLevel, OrderbookSnapshot,
+};
 
 pub mod factory;
 pub mod ledger;
@@ -142,6 +151,19 @@ pub const ELFOMO_UPDATE_EVENT: B256 = B256::new([
 
 /// Pool `updatePrices(uint256)` selector（flashblocks raw-tx 主通道用）
 pub const ELFOMO_UPDATE_SELECTOR: [u8; 4] = [0xae, 0x7e, 0x8d, 0x81];
+
+/// keeper 逐档 profile 改写 selector：`0xd4ff31bd(uint256[] keys, uint256[] words)`。
+///
+/// 链上实证（XLayer 块 `70352700`）：该调用改写 slot0 `mapping(pairIdx => profileWord)`，
+/// 同样只 emit 空事件 `ELFOMO_UPDATE_EVENT`，信息全在 calldata。
+pub const ELFOMO_BAND_PROFILE_SELECTOR: [u8; 4] = [0xd4, 0xff, 0x31, 0xbd];
+
+/// 单笔 `0xd4ff31bd` 允许携带的 profile 改写条数上限（防御异常 calldata 造成巨量分配）。
+pub const ELFOMO_MAX_BAND_UPDATES: usize = 64;
+
+/// `getSupportedPairs()` 找不到本 pair 时，兜底扫描的 profile 存储键范围。
+/// 正常路径不会用到（key = pair 下标）；只在链上 pair 列表异常时保证仍能自愈。
+pub const ELFOMO_PROFILE_KEY_SCAN: u64 = 8;
 
 // ----------------------------------------------------------------------------
 // storage 读取专用 HTTP RPC（处理方式与 caliber_prop 一致）
@@ -238,6 +260,12 @@ pub struct ElfomoFiPropPool {
     /// 新种子回退成旧种子，产生旧价报价窗口）。见 principles §3 规则 1。
     #[serde(default)]
     pub price_seed_block: u64,
+    /// 逐档 profile word（宽度/偏离表）的**字段级水位**：上次被写入的块号。
+    ///
+    /// 与 `price_seed_block` 完全同形态——raw-tx（`0xd4ff31bd` calldata）来自
+    /// flashblock 乐观头，快照读规范头；两者各自按字段水位保鲜，互不覆盖。
+    #[serde(default)]
+    pub profile_block: u64,
     /// Factory 代理地址（getOrderbook 快照来源）
     pub factory_address: Address,
     /// Router 地址（swap 事件来源）
@@ -305,6 +333,7 @@ impl Default for ElfomoFiPropPool {
             last_synced_block: 0,
             price_seed: U256::ZERO,
             price_seed_block: 0,
+            profile_block: 0,
             tokens: Vec::new(),
             levels: OrderbookSnapshot::default(),
             ladder: ElfomoLadderConfig::default(),
@@ -347,6 +376,7 @@ impl ElfomoFiPropPool {
             last_synced_block: 0,
             price_seed: U256::ZERO,
             price_seed_block: 0,
+            profile_block: 0,
             tokens: Vec::new(),
             levels: OrderbookSnapshot::default(),
             ladder: ElfomoLadderConfig::default(),
@@ -387,6 +417,51 @@ impl ElfomoFiPropPool {
         Some(U256::from_be_slice(&input[4..36]) >> 32)
     }
 
+    /// 从 keeper `0xd4ff31bd(uint256[] keys, uint256[] words)` calldata
+    /// 解析逐档 profile 改写（`keys[i]` = pair 下标，`words[i]` = 新 profile word）。
+    ///
+    /// 该交易**只 emit 那条空事件**（`ELFOMO_UPDATE_EVENT`），信息全在 calldata 里，
+    /// 所以这是 profile 实时更新的唯一零 RPC 通道（与价格种子同构）。
+    ///
+    /// 解析失败（selector 不符 / 长度/偏移越界 / 两数组长度不等）→ `None`。
+    pub fn parse_band_profile_calldata(input: &[u8]) -> Option<Vec<(U256, U256)>> {
+        if input.len() < 4 + 64 || input[..4] != ELFOMO_BAND_PROFILE_SELECTOR {
+            return None;
+        }
+        let body = &input[4..];
+        let word_at = |off: usize| -> Option<U256> {
+            let end = off.checked_add(32)?;
+            if end > body.len() {
+                return None;
+            }
+            Some(U256::from_be_slice(&body[off..end]))
+        };
+        let as_usize = |v: U256| -> Option<usize> { usize::try_from(v).ok() };
+        // header: keys_off, words_off（相对 body 起点，ABI 标准）
+        let keys_off = as_usize(word_at(0)?)?;
+        let words_off = as_usize(word_at(32)?)?;
+        let keys_len = as_usize(word_at(keys_off)?)?;
+        let words_len = as_usize(word_at(words_off)?)?;
+        if keys_len != words_len || keys_len > ELFOMO_MAX_BAND_UPDATES {
+            return None;
+        }
+        let mut out = Vec::with_capacity(keys_len);
+        for i in 0..keys_len {
+            let key = word_at(keys_off + 32 * (i + 1))?;
+            let word = word_at(words_off + 32 * (i + 1))?;
+            out.push((key, word));
+        }
+        Some(out)
+    }
+
+    /// profile word 的存储槽：`keccak256(pad32(key)‖pad32(0))`
+    /// （`mapping(uint256=>uint256)` 在 slot 0）。
+    pub fn band_profile_slot(key: u64) -> B256 {
+        let mut buf = [0u8; 64];
+        buf[24..32].copy_from_slice(&key.to_be_bytes());
+        alloy::primitives::keccak256(buf)
+    }
+
     /// 按指定 pool ladder + 种子 + 金库余额生成 orderbook（纯函数，与链上逐位一致）。
     ///
     /// **这是 ladder 生成规则在本地唯一的实现**：`(U, T, F, spread_level, vault) → 档位表`
@@ -403,12 +478,14 @@ impl ElfomoFiPropPool {
         vault_usdt0: U256,
         vault_xeth: U256,
     ) -> OrderbookSnapshot {
+        let profile_word = ladder.profile.encode_word();
         let empty = || OrderbookSnapshot {
             from_to_levels: Vec::new(),
             to_from_levels: Vec::new(),
             vault_usdt0,
             vault_xeth,
             price_seed: seed,
+            profile_word,
         };
 
         // q 取位 22..27、low 取位 0..21，只需种子低 27 位
@@ -431,14 +508,19 @@ impl ElfomoFiPropPool {
             vault_usdt0,
             vault_xeth,
             price_seed: seed,
+            profile_word,
         }
     }
 
     /// 前缀宽度表逐档截断到容量 `cap`（不足一整档时给残余档）。
-    fn prefix_widths(cap: U256, unit: U256) -> Vec<U256> {
-        let mut out = Vec::with_capacity(ElfomoLadderConfig::PREFIX_WIDTHS.len());
+    ///
+    /// 宽度表 `widths` 来自链上 profile word（**动态存储**，见 [`ElfomoBandProfile`]），
+    /// 只取前 `count` 档；不再有写死的常量表。
+    fn prefix_widths(cap: U256, unit: U256, profile: &ElfomoBandProfile) -> Vec<U256> {
+        let n = (profile.count as usize).min(profile.widths.len());
+        let mut out = Vec::with_capacity(n);
         let mut cumulative = U256::ZERO;
-        for w in ElfomoLadderConfig::PREFIX_WIDTHS {
+        for w in profile.widths[..n].iter().copied() {
             let width = U256::from(w) * unit;
             if cumulative.saturating_add(width) <= cap {
                 out.push(width);
@@ -453,12 +535,18 @@ impl ElfomoFiPropPool {
         out
     }
 
-    /// 第 `i` 档偏离量：`D[i]`，整梯加宽时再加 `F`。
+    /// 第 `i` 档偏离量：`profile.deviations[i]`（链上动态表），整梯加宽时再加 `F`。
     ///
     /// 实测规则（2026-09-11 全网格实证）：加宽时 **`i >= 1` 的所有档位 +`F`**；
     /// 前缀只有 1 档时该档（`i == 0`）同样 +`F`（唯一档位等价于末档）。
-    fn prefix_deviation(i: usize, prefix_len: usize, penalty: u64, widened: bool) -> u64 {
-        let mut dev = ElfomoLadderConfig::DEVIATIONS.get(i).copied().unwrap_or(0);
+    fn prefix_deviation(
+        i: usize,
+        prefix_len: usize,
+        penalty: u64,
+        widened: bool,
+        profile: &ElfomoBandProfile,
+    ) -> u64 {
+        let mut dev = profile.deviations.get(i).copied().unwrap_or(0);
         if widened && (i >= 1 || prefix_len == 1) {
             dev += penalty;
         }
@@ -514,14 +602,14 @@ impl ElfomoFiPropPool {
         }
 
         let widened = Self::side_widened(ladder.spread_level, unit, cap);
-        let prefix = Self::prefix_widths(cap, unit);
+        let prefix = Self::prefix_widths(cap, unit, &ladder.profile);
         let mut widths = prefix.clone();
         widths.push(U256::from(5u64) * band_count * unit);
 
         for (i, width) in widths.iter().enumerate() {
             let slope = if i < prefix.len() {
                 ElfomoLadderConfig::SLOPE_BASE
-                    - Self::prefix_deviation(i, prefix.len(), penalty, widened)
+                    - Self::prefix_deviation(i, prefix.len(), penalty, widened, &ladder.profile)
             } else {
                 ElfomoLadderConfig::FT_TAIL_SLOPE
             };
@@ -561,14 +649,14 @@ impl ElfomoFiPropPool {
         }
 
         let widened = Self::side_widened(ladder.spread_level, unit, vault_xeth);
-        let prefix = Self::prefix_widths(vault_xeth.saturating_sub(unit), unit);
+        let prefix = Self::prefix_widths(vault_xeth.saturating_sub(unit), unit, &ladder.profile);
         let mut widths = prefix.clone();
         widths.push(unit);
 
         for (i, width) in widths.iter().enumerate() {
             let slope = if i < prefix.len() {
                 ElfomoLadderConfig::SLOPE_BASE
-                    + Self::prefix_deviation(i, prefix.len(), penalty, widened)
+                    + Self::prefix_deviation(i, prefix.len(), penalty, widened, &ladder.profile)
             } else {
                 ElfomoLadderConfig::TF_TAIL_SLOPE
             };
@@ -678,10 +766,17 @@ impl ElfomoFiPropPool {
         seed: U256,
         vault_usdt0: U256,
         vault_xeth: U256,
+        profile: &ElfomoBandProfile,
         source: &str,
         block: u64,
     ) -> bool {
-        let local = Self::build_orderbook_with(&self.ladder, seed, vault_usdt0, vault_xeth);
+        // **必须用快照自带的 profile** 重建（而不是本地的 `self.ladder.profile`）：
+        // 链上档位是"那一刻的 profile + seed + 余额"的纯函数；快照读规范头、
+        // raw-tx 读乐观头，本地 profile 可能已经更新。用本地 profile 对拍会在
+        // 快照落后时误判模型不可信（假阴性）并错误地停掉报价。
+        let mut snapshot_ladder = self.ladder;
+        snapshot_ladder.profile = *profile;
+        let local = Self::build_orderbook_with(&snapshot_ladder, seed, vault_usdt0, vault_xeth);
         let matched =
             local.from_to_levels == chain_from_to && local.to_from_levels == chain_to_from;
         if matched {
@@ -815,6 +910,43 @@ impl ElfomoFiPropPool {
         self.last_synced_block = self.last_synced_block.max(block_number);
     }
 
+    /// 应用 keeper `0xd4ff31bd` raw-tx 解析出的逐档 profile word（本地直算，零 RPC）。
+    ///
+    /// profile（宽度表 + 偏离表）与价格种子一样是**动态链上状态**：keeper 会改
+    /// （2026-09-11 块 `70352700` 实证偏离表 `[7,10,15,25,40,50]→[15,20,25,35,45,60]`）。
+    /// 这里与 [`Self::apply_price_seed`] 完全同形态：
+    /// - 解码 word → 更新 `ladder.profile`，按当前 (seed, 余额) 重算 orderbook；
+    /// - **字段级水位** `profile_block` 保鲜（旧块/重放不得回退，同块多笔由调用方按
+    ///   `tx_index` 排序，最后一笔赢）；
+    /// - word 解码非法（档数 0/超上限）→ 告警并忽略，保持原 profile。
+    pub fn apply_band_profile(&mut self, word: U256, block_number: u64) {
+        if block_number < self.profile_block {
+            tracing::debug!(
+                target: "amms::elfomo_prop",
+                pool = %self.pool_address,
+                block_number,
+                profile_block = self.profile_block,
+                "elfomofi: stale band profile ignored"
+            );
+            return;
+        }
+        match ElfomoBandProfile::decode_word(word) {
+            Some(profile) => {
+                self.ladder.profile = profile;
+                self.profile_block = block_number;
+                self.refresh_levels();
+                self.last_synced_block = self.last_synced_block.max(block_number);
+            }
+            None => warn!(
+                target: "amms::elfomo_prop",
+                pool = %self.pool_address,
+                block_number,
+                %word,
+                "elfomofi: invalid band profile word from raw-tx; keeping previous profile"
+            ),
+        }
+    }
+
     /// 正向 exact-in：from→to（size = 输入量），`out += floor(take×price/1e24)`，
     /// 封顶 `min(总输出, vault_usdt0)`。
     fn quote_fwd_exact(levels: &[OrderbookLevel], amount_in: U256, vault_usdt0: U256) -> U256 {
@@ -921,7 +1053,8 @@ impl ElfomoFiPropPool {
     // L2：整档回正（快照/init 通道；无"本地档位消耗"这一层状态）
     // ------------------------------------------------------------------------
 
-    /// 应用订单簿快照（init / 快照通道：整档回正 + 金库余额 + 价格种子）。
+    /// 应用订单簿快照（init / 快照通道：整档回正 + 金库余额 + 价格种子 + profile）。
+    #[allow(clippy::too_many_arguments)]
     pub fn apply_orderbook_snapshot(
         &mut self,
         from_to_levels: Vec<OrderbookLevel>,
@@ -929,6 +1062,7 @@ impl ElfomoFiPropPool {
         vault_usdt0: U256,
         vault_xeth: U256,
         price_seed: U256,
+        profile_word: U256,
         block_number: u64,
     ) {
         // 仅限 init / 空账本：更旧的块号会让账本锚点与水位回退，静默抹掉 P2 收益。
@@ -942,10 +1076,29 @@ impl ElfomoFiPropPool {
             );
             return;
         }
-        // 种子同样按字段级水位保鲜（与 `apply_price_seed` / `merge_snapshot` 同形态）：
-        // 本地已有更新种子时不得回退。链上档位数组是绑定快照种子的，此时必须按
-        // 本地 (seed, 余额) 重建，不能直接采用。
+        // 种子 / profile 同样按字段级水位保鲜（与 `apply_price_seed` /
+        // `apply_band_profile` / `merge_snapshot` 同形态）：本地已有的更新值不得回退。
+        // 链上档位数组是绑定快照 (profile, seed, 余额) 的，任一被本地更新取代，
+        // 都必须按本地值重建，不能直接采用。
         let seed_fresh = block_number >= self.price_seed_block;
+        // 快照自带的 profile：解码后既用于落地，也作为模型自证的 profile 基准
+        // （链上档位是那一刻 profile 的纯函数，不能用可能更新的本地 profile 对拍）。
+        let snapshot_profile_opt = if profile_word.is_zero() {
+            None
+        } else {
+            ElfomoBandProfile::decode_word(profile_word)
+        };
+        if !profile_word.is_zero() && snapshot_profile_opt.is_none() {
+            warn!(
+                target: "amms::elfomo_prop",
+                pool = %self.pool_address,
+                block_number,
+                %profile_word,
+                "elfomofi: invalid band profile word in orderbook snapshot; keeping local profile"
+            );
+        }
+        let snapshot_profile = snapshot_profile_opt.unwrap_or(self.ladder.profile);
+        let profile_fresh = snapshot_profile_opt.is_some() && block_number >= self.profile_block;
         // 模型自证：链上档位 vs 本地 `build_orderbook` 逐位对拍（不一致则拒绝报价）。
         // 放在赋值之前，借用的是入参而不是 `self.levels`（无需克隆）。
         self.verify_model_against_chain(
@@ -954,15 +1107,18 @@ impl ElfomoFiPropPool {
             price_seed,
             vault_usdt0,
             vault_xeth,
+            &snapshot_profile,
             "init/orderbook-snapshot",
             block_number,
         );
+        let covered_all = seed_fresh && profile_fresh;
         self.levels = OrderbookSnapshot {
             from_to_levels,
             to_from_levels,
             vault_usdt0,
             vault_xeth,
             price_seed,
+            profile_word: snapshot_profile.encode_word(),
         };
         if seed_fresh {
             self.price_seed = price_seed;
@@ -976,7 +1132,11 @@ impl ElfomoFiPropPool {
                 "elfomofi: orderbook snapshot kept newer realtime price seed"
             );
         }
-        if !seed_fresh {
+        if profile_fresh {
+            self.ladder.profile = snapshot_profile;
+            self.profile_block = block_number;
+        }
+        if !covered_all {
             self.refresh_levels();
         }
         self.last_synced_block = self.last_synced_block.max(block_number);
@@ -1029,16 +1189,23 @@ impl ElfomoFiPropPool {
             .call()
             .await?;
 
-        // 价格种子：Pool slot1 高 32 位。经 `eth_call` bulk-SLOAD 走调用方注入的
-        // provider（官方 WS 网关不开放 eth_getStorageAt，见 `amms::evm_storage`）。
-        let slot1 = crate::amms::evm_storage::storage_slots_at::<N, P>(
+        // 价格种子（Pool slot1 高 32 位）+ 逐档 profile word（slot0 mapping，
+        // key = 本 pair 在 `getSupportedPairs()` 中的下标，见 `fetch_ladder`）。
+        // 两条槽一次 bulk-SLOAD 读完，经 `eth_call` 走调用方注入的 provider
+        // （官方 WS 网关不开放 eth_getStorageAt，见 `amms::evm_storage`）。
+        let slots = [
+            B256::from(U256::from(1u64).to_be_bytes::<32>()),
+            Self::band_profile_slot(self.ladder.profile_key),
+        ];
+        let words = crate::amms::evm_storage::storage_slots_at::<N, P>(
             &provider,
             self.pool_address,
-            &[B256::from(U256::from(1u64).to_be_bytes::<32>())],
+            &slots,
             block,
         )
-        .await?[0];
-        let price_seed = slot1 >> 32;
+        .await?;
+        let price_seed = words[0] >> 32;
+        let profile_word = words[1];
 
         Ok(OrderbookSnapshot {
             from_to_levels: from_to
@@ -1052,14 +1219,20 @@ impl ElfomoFiPropPool {
             vault_usdt0,
             vault_xeth,
             price_seed,
+            profile_word,
         })
     }
 
-    /// 逐池从链上 `Pool.getMetadata(asset)` 读取该 pair 的 ladder 参数。
+    /// 逐池从链上读取该 pair 的 ladder：`Pool.getMetadata(asset)` 的静态参数
+    /// （U/T/spread）+ 逐档 profile word（宽度/偏离表，slot0 mapping）。
     ///
-    /// 这是"per-pool 自动获取"的实装：`init` 时按 `[token_x, token_y]` 顺序读 11 字段
-    /// 配置并解码成 [`ElfomoLadderConfig`]——**没有任何 pair 特判/地址常量**，接入新 pair
+    /// 这是"per-pool 自动获取"的实装：`init` 时读 11 字段配置并解码成
+    /// [`ElfomoLadderConfig`]——**没有任何 pair 特判/地址常量**，接入新 pair
     /// 自动获得自己的参数。
+    ///
+    /// profile 的存储键由链上 `Pool.getSupportedPairs()` 现算（key = 本 pair 在下标），
+    /// 与 keeper `0xd4ff31bd(uint256[] keys, …)` 用的是同一组下标；列表异常时才退回
+    /// 扫描 `0..ELFOMO_PROFILE_KEY_SCAN`（取第一条合法 profile）。**绝不写死 pair 0**。
     ///
     /// 两链实测的差异：XLayer 对非 base asset 返回**全零**，Base 的 pool 对非 base asset
     /// 直接 **revert**。因此这里对每个 asset 单独容错（失败/非法就试下一个），不能把
@@ -1077,7 +1250,32 @@ impl ElfomoFiPropPool {
     {
         use crate::amms::elfomo_prop::types::IElfomoFiPool;
 
-        let pool = IElfomoFiPool::new(self.pool_address, provider);
+        let pool = IElfomoFiPool::new(self.pool_address, provider.clone());
+
+        // 1) profile 存储键：本 pair 在 `getSupportedPairs()` 中的下标（pair 顺序无关）。
+        let pair_index = match pool.getSupportedPairs().block(block).call().await {
+            Ok(pairs) => pairs
+                .iter()
+                .position(|p| {
+                    let (a, b) = (p[0], p[1]);
+                    (a == self.token_x && b == self.token_y)
+                        || (a == self.token_y && b == self.token_x)
+                })
+                .map(|i| i as u64),
+            Err(e) => {
+                tracing::debug!(
+                    target: "amms::elfomo_prop",
+                    pool = %self.pool_address,
+                    error = %e,
+                    "elfomofi: getSupportedPairs() unavailable, falling back to profile-key scan"
+                );
+                None
+            }
+        };
+        let band = self
+            .fetch_band_profile::<N, _>(&provider, pair_index, block)
+            .await;
+
         for asset in [self.token_x, self.token_y] {
             let md = match pool.getMetadata(asset).block(block).call().await {
                 Ok(md) => md,
@@ -1106,12 +1304,58 @@ impl ElfomoFiPropPool {
                 U256::from_be_slice(md.field9.as_slice()),
                 md.field10,
             ];
-            let ladder = ElfomoLadderConfig::from_metadata(&fields);
+            let mut ladder = ElfomoLadderConfig::from_metadata(&fields);
+            if let Some((key, profile)) = band {
+                ladder.profile = profile;
+                ladder.profile_key = key;
+            }
             if ladder.is_valid() {
                 return Ok(Some(ladder));
             }
         }
         Ok(None)
+    }
+
+    /// 读本池的逐档 profile word：优先用 `pair_index`（= `getSupportedPairs()` 下标），
+    /// 取不到/非法时扫描 `0..ELFOMO_PROFILE_KEY_SCAN` 兜底。
+    ///
+    /// 一次 bulk `eth_call` 读完所有候选槽（零额外往返），返回 `(key, 解码后的 profile)`。
+    async fn fetch_band_profile<N, P>(
+        &self,
+        provider: &P,
+        pair_index: Option<u64>,
+        block: BlockId,
+    ) -> Option<(u64, ElfomoBandProfile)>
+    where
+        N: Network,
+        P: Provider<N>,
+    {
+        let mut keys: Vec<u64> = Vec::with_capacity(ELFOMO_PROFILE_KEY_SCAN as usize + 1);
+        if let Some(i) = pair_index {
+            keys.push(i);
+        }
+        for k in 0..ELFOMO_PROFILE_KEY_SCAN {
+            if !keys.contains(&k) {
+                keys.push(k);
+            }
+        }
+        let slots: Vec<B256> = keys.iter().map(|k| Self::band_profile_slot(*k)).collect();
+        let words = crate::amms::evm_storage::storage_slots_at::<N, P>(
+            provider,
+            self.pool_address,
+            &slots,
+            block,
+        )
+        .await
+        .ok()?;
+        for (key, word) in keys.iter().zip(words) {
+            if let Some(profile) = ElfomoBandProfile::decode_word(word) {
+                if profile.is_valid() {
+                    return Some((*key, profile));
+                }
+            }
+        }
+        None
     }
 }
 
@@ -1505,6 +1749,7 @@ impl AutomatedMarketMaker for ElfomoFiPropPool {
             snap.vault_usdt0,
             snap.vault_xeth,
             snap.price_seed,
+            snap.profile_word,
             snap_block,
         );
         Ok(self)
@@ -1648,12 +1893,45 @@ impl ElfomoFiPropPool {
             );
         }
 
+        // profile：同样的**字段级水位**保鲜（2026-09-11 起 profile 是动态存储：
+        // keeper 的 `0xd4ff31bd` 会改）。快照的 word 是"那一刻链上的值"，
+        // 既用于落地，也作为模型自证的 profile 基准（链上档位是那一刻 profile 的
+        // 纯函数，用本地更新过的 profile 对拍会假阴性）。
+        let snapshot_profile_opt = if snap.profile_word.is_zero() {
+            None
+        } else {
+            ElfomoBandProfile::decode_word(snap.profile_word)
+        };
+        if !snap.profile_word.is_zero() && snapshot_profile_opt.is_none() {
+            warn!(
+                target: "amms::elfomo_prop",
+                pool = %self.pool_address,
+                snap_block,
+                profile_word = %snap.profile_word,
+                "elfomofi: invalid band profile word in snapshot; keeping local profile"
+            );
+        }
+        let snapshot_profile = snapshot_profile_opt.unwrap_or(self.ladder.profile);
+        let profile_fresh = snapshot_profile_opt.is_some() && snap_block >= self.profile_block;
+        if profile_fresh {
+            self.ladder.profile = snapshot_profile;
+            self.profile_block = snap_block;
+        } else if !snap.profile_word.is_zero() {
+            tracing::debug!(
+                target: "amms::elfomo_prop",
+                pool = %self.pool_address,
+                snap_block,
+                profile_block = self.profile_block,
+                "elfomofi: snapshot kept newer realtime band profile"
+            );
+        }
+
         // 余额 = 账本派生（快照 + Σ_{>S}）。只有"快照覆盖全部已记录成交"
-        // （`Anchored`）**且**种子也采用快照值时才可直接采用链上档位——
-        // 链上档位是用快照的 (seed, 余额) 算出来的，两者任一被本地更新取代，
-        // 都必须按本地 (seed, 余额) 重建，否则档位与种子/余额互相矛盾。
+        // （`Anchored`）**且**种子/profile 也都采用快照值时才可直接采用链上档位——
+        // 链上档位是用快照的 (profile, seed, 余额) 算出来的，任一被本地更新取代，
+        // 都必须按本地值重建，否则档位与三者互相矛盾。
         let covered_all = apply == VaultLedgerApply::Anchored;
-        // 模型自证：链上档位是快照 (seed, 余额) 的纯函数，与本地重算逐位对拍。
+        // 模型自证：链上档位是快照 (profile, seed, 余额) 的纯函数，与本地重算逐位对拍。
         // 不一致 → `model_verified=false`，报价路径拒绝该池（不给错价）。
         self.verify_model_against_chain(
             &snap.from_to_levels,
@@ -1661,12 +1939,14 @@ impl ElfomoFiPropPool {
             snap.price_seed,
             snap.vault_usdt0,
             snap.vault_xeth,
+            &snapshot_profile,
             "snapshot-reconcile",
             snap_block,
         );
         self.sync_vault_balances_from_ledger();
         if covered_all
             && seed_fresh
+            && profile_fresh
             && !snap.from_to_levels.is_empty()
             && !snap.to_from_levels.is_empty()
         {
@@ -1676,6 +1956,7 @@ impl ElfomoFiPropPool {
                 vault_usdt0: snap.vault_usdt0,
                 vault_xeth: snap.vault_xeth,
                 price_seed: snap.price_seed,
+                profile_word: snapshot_profile.encode_word(),
             };
         } else {
             self.refresh_levels();
@@ -1736,20 +2017,34 @@ mod tests {
     /// XLayer xETH/USDT0 的链上 ladder 参数（`getMetadata(0xe7b0…025a)` 实测 fixture）。
     ///
     /// 仅测试用：生产代码在 `init` 阶段**逐池从链上读取**，不依赖此常量。
+    /// 旧的（块 `70352699` 及更早）链上 profile：宽度表 + 偏离表。
+    /// keeper 于块 `70352700` 起改为 `[15,20,25,35,45,60]`；本仓库的历史 fixture
+    /// （69M 块 / 全网格）都对应这张旧表，故测试用它。
+    fn legacy_profile() -> ElfomoBandProfile {
+        ElfomoBandProfile {
+            count: 6,
+            widths: [1, 5, 10, 10, 20, 100],
+            deviations: [7, 10, 15, 25, 40, 50],
+        }
+    }
+
     fn xlayer_ladder() -> ElfomoLadderConfig {
-        ElfomoLadderConfig::from_metadata(&[
-            U256::ZERO,
-            U256::from(18u64),
-            U256::from(2u64),
-            U256::ZERO,
-            U256::ZERO,
-            U256::from(600_000_000_000_000_000u128),
-            U256::from(30u64),
-            U256::from(5u64),
-            U256::from(60u64),
-            U256::ZERO,
-            U256::ZERO,
-        ])
+        ElfomoLadderConfig {
+            profile: legacy_profile(),
+            ..ElfomoLadderConfig::from_metadata(&[
+                U256::ZERO,
+                U256::from(18u64),
+                U256::from(2u64),
+                U256::ZERO,
+                U256::ZERO,
+                U256::from(600_000_000_000_000_000u128),
+                U256::from(30u64),
+                U256::from(5u64),
+                U256::from(60u64),
+                U256::ZERO,
+                U256::ZERO,
+            ])
+        }
     }
 
     /// fork 对拍 helper：用 xLayer ladder 走本地读时重算。
@@ -1779,6 +2074,7 @@ mod tests {
             vault_xeth: U256::from(2_940_462_501_000_862_186u128),
             // 本块价格种子（slot1 >> 32）
             price_seed: U256::from(0x143c60fu64),
+            profile_word: legacy_profile().encode_word(),
         }
     }
 
@@ -2316,6 +2612,7 @@ mod tests {
             vault_usdt0: snap_usdt0,
             vault_xeth: snap_xeth,
             price_seed: s.price_seed,
+            profile_word: legacy_profile().encode_word(),
         };
         assert!(
             pool.merge_snapshot(older, 1_003),
@@ -2337,6 +2634,7 @@ mod tests {
             vault_usdt0,
             vault_xeth,
             price_seed: s.price_seed,
+            profile_word: legacy_profile().encode_word(),
         };
         assert!(pool.merge_snapshot(fresh, 1_006));
         assert_eq!(pool.levels.vault_usdt0, vault_usdt0);
@@ -2413,6 +2711,7 @@ mod tests {
             vault_usdt0: s.vault_usdt0,
             vault_xeth: s.vault_xeth,
             price_seed: s.price_seed,
+            profile_word: legacy_profile().encode_word(),
         };
         assert!(pool.merge_snapshot(older, 1_003));
         assert_eq!(
@@ -2432,6 +2731,7 @@ mod tests {
             vault_usdt0: s.vault_usdt0,
             vault_xeth: s.vault_xeth,
             price_seed: s.price_seed,
+            profile_word: legacy_profile().encode_word(),
         };
         assert!(pool.merge_snapshot(fresh, 1_006));
         assert_eq!(pool.price_seed, s.price_seed);
@@ -2460,6 +2760,7 @@ mod tests {
             vault_usdt0,
             vault_xeth,
             price_seed: s.price_seed,
+            profile_word: legacy_profile().encode_word(),
         };
         assert!(!pool.merge_snapshot(stale, 1_999));
         assert_eq!(pool.levels.vault_xeth, s.vault_xeth);
@@ -2600,6 +2901,8 @@ mod tests {
                 band_count: r.t,
                 spread_level: r.sl,
                 spread_penalty: r.f,
+                profile: legacy_profile(),
+                profile_key: 0,
             };
             let ob = ElfomoFiPropPool::build_orderbook_with(
                 &ladder,
@@ -2651,6 +2954,7 @@ mod tests {
             s.price_seed,
             s.vault_usdt0,
             s.vault_xeth,
+            &legacy_profile(),
             "test",
             100,
         ));
@@ -2671,6 +2975,7 @@ mod tests {
             s.price_seed,
             s.vault_usdt0,
             s.vault_xeth,
+            &legacy_profile(),
             "test",
             100,
         ));
@@ -2693,6 +2998,7 @@ mod tests {
             s.price_seed,
             s.vault_usdt0,
             s.vault_xeth,
+            &legacy_profile(),
             "test",
             101,
         ));
@@ -2725,6 +3031,7 @@ mod tests {
             s.price_seed,
             s.vault_usdt0,
             s.vault_xeth,
+            &legacy_profile(),
             "test",
             100,
         ));
@@ -2831,5 +3138,185 @@ mod tests {
         // (2000, 2005) 内 2000..2004 共 5 块缺失
         assert_eq!(pool.blocks_since_seed, 5);
         assert!(pool.seed_coverage_alerted);
+    }
+
+    // ---- 逐档 profile（宽度/偏离表）= 动态链上状态 ----
+
+    /// 链上实测 profile word：块 70352699（旧表）与 70352700（keeper 改写后）。
+    fn word_from_hex(h: &str) -> U256 {
+        U256::from_be_slice(&alloy::hex::decode(h).expect("hex"))
+    }
+
+    fn legacy_word() -> U256 {
+        word_from_hex("0000000000000000320064002800140019000a000f000a000a00050007000106")
+    }
+
+    fn kairos_word() -> U256 {
+        word_from_hex("00000000000000003c0064002d00140023000a0019000a00140005000f000106")
+    }
+
+    #[test]
+    fn test_band_profile_decode_real_words_and_roundtrip() {
+        // 旧表：宽度 [1,5,10,10,20,100]、偏离 [7,10,15,25,40,50]
+        assert_eq!(
+            ElfomoBandProfile::decode_word(legacy_word()).unwrap(),
+            legacy_profile()
+        );
+        assert_eq!(legacy_profile().encode_word(), legacy_word());
+
+        // keeper 改写后：宽度不变、偏离 [15,20,25,35,45,60]
+        let kairos = ElfomoBandProfile::decode_word(kairos_word()).unwrap();
+        assert_eq!(kairos.count, 6);
+        assert_eq!(kairos.widths, [1, 5, 10, 10, 20, 100]);
+        assert_eq!(kairos.deviations, [15, 20, 25, 35, 45, 60]);
+        assert_eq!(kairos.encode_word(), kairos_word());
+
+        // 非法 word：n=0 / n>6 一律拒绝（fail-closed）
+        assert!(ElfomoBandProfile::decode_word(U256::ZERO).is_none());
+        assert!(ElfomoBandProfile::decode_word(U256::from(7u64)).is_none());
+    }
+
+    #[test]
+    fn test_parse_band_profile_calldata() {
+        // ABI: selector + keys_off + words_off + keys_len + key0 + words_len + word0
+        let word = kairos_word();
+        let mut input = Vec::new();
+        input.extend_from_slice(&ELFOMO_BAND_PROFILE_SELECTOR);
+        let u256_bytes = |v: U256| v.to_be_bytes::<32>().to_vec();
+        input.extend_from_slice(&u256_bytes(U256::from(64u64))); // keys_off
+        input.extend_from_slice(&u256_bytes(U256::from(128u64))); // words_off
+        input.extend_from_slice(&u256_bytes(U256::from(1u64))); // keys_len
+        input.extend_from_slice(&u256_bytes(U256::from(0u64))); // keys[0]
+        input.extend_from_slice(&u256_bytes(U256::from(1u64))); // words_len
+        input.extend_from_slice(&u256_bytes(word)); // words[0]
+
+        let parsed = ElfomoFiPropPool::parse_band_profile_calldata(&input).expect("解析");
+        assert_eq!(parsed, vec![(U256::ZERO, word)]);
+
+        // 不是该 selector → None（价格种子通道继续走 `parse_update_prices_calldata`）
+        let bad = [0u8; 100];
+        assert!(ElfomoFiPropPool::parse_band_profile_calldata(&bad).is_none());
+        // 数组长度不等 → None
+        let mut bad_len = input.clone();
+        bad_len[4 + 64..4 + 96].copy_from_slice(&U256::from(2u64).to_be_bytes::<32>());
+        assert!(ElfomoFiPropPool::parse_band_profile_calldata(&bad_len).is_none());
+        // 截断 → None（不 panic）
+        assert!(ElfomoFiPropPool::parse_band_profile_calldata(&input[..40]).is_none());
+    }
+
+    #[test]
+    fn test_apply_band_profile_recomputes_and_keeps_watermark() {
+        let s = snapshot();
+        let mut pool = ElfomoFiPropPool {
+            levels: s.clone(),
+            price_seed: s.price_seed,
+            ladder: xlayer_ladder(),
+            ..ElfomoFiPropPool::default()
+        };
+        let before = pool.local_orderbook(s.price_seed, s.vault_usdt0, s.vault_xeth);
+
+        // keeper 在块 1_010 改写 profile → 本地模型立即切换
+        pool.apply_band_profile(kairos_word(), 1_010);
+        assert_eq!(pool.ladder.profile.deviations, [15, 20, 25, 35, 45, 60]);
+        assert_eq!(pool.profile_block, 1_010);
+        assert_eq!(pool.last_synced_block, 1_010);
+        let after = pool.local_orderbook(s.price_seed, s.vault_usdt0, s.vault_xeth);
+        assert_ne!(
+            before.from_to_levels, after.from_to_levels,
+            "偏离表变了，档位价格必须跟着变"
+        );
+
+        // 旧块/重放不得回退 profile，也不得把水位 stamp 到更旧块号
+        pool.apply_band_profile(legacy_word(), 1_005);
+        assert_eq!(pool.ladder.profile.deviations, [15, 20, 25, 35, 45, 60]);
+        assert_eq!(pool.profile_block, 1_010);
+
+        // 同块重放可推进（调用方按 tx_index 排序，最后一笔赢）
+        pool.apply_band_profile(legacy_word(), 1_010);
+        assert_eq!(pool.ladder.profile.deviations, [7, 10, 15, 25, 40, 50]);
+        assert_eq!(pool.profile_block, 1_010);
+
+        // 非法 word（n=0）→ 忽略，保持原 profile
+        pool.apply_band_profile(U256::ZERO, 1_011);
+        assert_eq!(pool.ladder.profile.deviations, [7, 10, 15, 25, 40, 50]);
+        assert_eq!(pool.profile_block, 1_010);
+    }
+
+    #[test]
+    fn test_merge_snapshot_keeps_newer_realtime_profile() {
+        let s = snapshot();
+        let mut pool = ElfomoFiPropPool {
+            levels: s.clone(),
+            price_seed: s.price_seed,
+            ladder: xlayer_ladder(),
+            ..ElfomoFiPropPool::default()
+        };
+        // 块 1_010 raw-tx 应用了新 profile（乐观头）
+        pool.apply_band_profile(kairos_word(), 1_010);
+        assert_eq!(pool.profile_block, 1_010);
+
+        // 快照读块 1_005（规范头，落后）带的是旧 word → 不得回退
+        let mut snap = s.clone();
+        snap.profile_word = legacy_word();
+        assert!(pool.merge_snapshot(snap, 1_005));
+        assert_eq!(
+            pool.ladder.profile.deviations,
+            [15, 20, 25, 35, 45, 60],
+            "newer realtime profile must not be rolled back by a lagging snapshot"
+        );
+        assert_eq!(pool.profile_block, 1_010);
+
+        // 更新的快照（块 1_011）带新 word → 采用并推进水位
+        let mut snap2 = s.clone();
+        snap2.profile_word = kairos_word();
+        assert!(pool.merge_snapshot(snap2, 1_011));
+        assert_eq!(pool.profile_block, 1_011);
+    }
+
+    #[test]
+    fn test_verify_model_uses_snapshot_profile_not_local() {
+        // 快照(moment)的档位是"那一刻 profile"的函数；本地 profile 可能已更新。
+        // 对拍必须用快照自带的 profile，否则会在快照落后时假阴性、误停报价。
+        let s = snapshot();
+        let mut pool = pool_with_snapshot();
+        // 本地已切到新 profile（块 1_010）
+        pool.apply_band_profile(kairos_word(), 1_010);
+        assert_eq!(pool.ladder.profile.deviations, [15, 20, 25, 35, 45, 60]);
+
+        // 快照是旧 profile（块 1_005）算出来的档位：模型公式本身没问题，
+        // 用快照 profile 对拍必须通过（不能因为本地 profile 更新而判不可信）
+        assert!(pool.verify_model_against_chain(
+            &s.from_to_levels,
+            &s.to_from_levels,
+            s.price_seed,
+            s.vault_usdt0,
+            s.vault_xeth,
+            &legacy_profile(),
+            "test-snapshot-profile",
+            1_005,
+        ));
+        assert!(pool.model_verified);
+
+        // 用新 profile 去对旧档位必然不一致——这正说明"必须用快照 profile"
+        let local_profile = pool.ladder.profile;
+        assert!(!pool.verify_model_against_chain(
+            &s.from_to_levels,
+            &s.to_from_levels,
+            s.price_seed,
+            s.vault_usdt0,
+            s.vault_xeth,
+            &local_profile,
+            "test-local-profile",
+            1_005,
+        ));
+    }
+
+    #[test]
+    fn test_band_profile_slot_matches_chain_layout() {
+        // mapping(uint256=>uint256) @ slot0, key=0 → keccak256(0x00..00‖0x00..00)
+        assert_eq!(
+            format!("{:#x}", ElfomoFiPropPool::band_profile_slot(0)),
+            "0xad3228b676f7d3cd4284a5443f17f1962b36e491b30a40b2405849e597ba5fb5"
+        );
     }
 }

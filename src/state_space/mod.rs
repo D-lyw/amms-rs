@@ -3326,12 +3326,16 @@ impl StateSpace {
         affected_set.into_iter().collect()
     }
 
-    /// 应用 ElfomoFi `updatePrices` 原始交易（本地直算通道，零 RPC）。
+    /// 应用 ElfomoFi 池的 raw-tx 状态更新（本地直算通道，零 RPC）。
     ///
     /// 与 `apply_caliber_updates` 同锁调用；块内按 `tx_index` 排序，按
-    /// `pool_address` 路由，命中本地池子后 `apply_price_seed` 用本地金库余额
-    /// 重算整本 orderbook（读时纯函数，逐位一致）。池子不在本地 / 块号落后
-    /// 于池子已同步块 → 静默跳过（对账兜底）。
+    /// `pool_address` 路由。两条 calldata 通道都作用于同一份"读时纯函数"模型：
+    /// - `seed = Some(a)` → `apply_price_seed`（价格种子）；
+    /// - `profile = Some((key, word))` → 仅当 `key` 等于本池的 `ladder.profile_key`
+    ///   时 `apply_band_profile`（逐档宽度/偏离表）。
+    ///
+    /// 命中后用**本地金库余额**重算整本 orderbook（逐位一致）。池子不在本地 /
+    /// 块号落后于池子已同步块 → 静默跳过（对账兜底）。
     fn apply_elfomo_updates(&mut self, updates: &[ElfomoTxEvent], block_num: u64) -> Vec<Address> {
         if updates.is_empty() {
             return vec![];
@@ -3352,8 +3356,16 @@ impl StateSpace {
             if block_num < pool.last_synced_block() {
                 continue;
             }
-            pool.apply_price_seed(event.seed, block_num);
-            affected_set.insert(event.pool);
+            if let Some(seed) = event.seed {
+                pool.apply_price_seed(seed, block_num);
+                affected_set.insert(event.pool);
+            }
+            if let Some((key, word)) = event.profile {
+                if key == U256::from(pool.ladder.profile_key) {
+                    pool.apply_band_profile(word, block_num);
+                    affected_set.insert(event.pool);
+                }
+            }
         }
         affected_set.into_iter().collect()
     }

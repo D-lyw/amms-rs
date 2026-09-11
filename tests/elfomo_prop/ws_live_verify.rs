@@ -35,32 +35,16 @@ use amms::amms::elfomo_prop::{
 };
 use eyre::Result;
 
-/// XLayer xETH/USDT0 的链上 ladder 参数（`getMetadata(0xe7b0…025a)` 实测 fixture）。
-///
-/// 生产代码在 `init` 阶段逐池从链上读取；测试这里用固定 fixture 走**同一套**
-/// 读时重算逻辑（`build_orderbook_with`），确保公式本身被逐位验证。
-fn xlayer_ladder() -> ElfomoLadderConfig {
-    ElfomoLadderConfig::from_metadata(&[
-        U256::ZERO,
-        U256::from(18u64),
-        U256::from(2u64),
-        U256::ZERO,
-        U256::ZERO,
-        U256::from(600_000_000_000_000_000u128),
-        U256::from(30u64),
-        U256::from(5u64),
-        U256::from(60u64),
-        U256::ZERO,
-        U256::ZERO,
-    ])
-}
-
-fn build_orderbook(
-    seed: U256,
-    vault_usdt0: U256,
-    vault_xeth: U256,
-) -> amms::amms::elfomo_prop::types::OrderbookSnapshot {
-    ElfomoFiPropPool::build_orderbook_with(&xlayer_ladder(), seed, vault_usdt0, vault_xeth)
+/// 读取某块的完整 ladder（生产同路径：`getSupportedPairs()` + `getMetadata` + slot0
+/// profile word）。profile 是动态存储，keeper 会改，所以逐块从链上取。
+async fn chain_ladder<P>(provider: P, block_id: BlockId) -> Result<ElfomoLadderConfig>
+where
+    P: alloy::providers::Provider + Clone + Send + Sync + 'static,
+{
+    ElfomoFiPropPool::default()
+        .fetch_ladder(provider, block_id)
+        .await?
+        .ok_or_else(|| eyre::eyre!("elfomo: fetch_ladder returned None"))
 }
 use futures::StreamExt;
 use serde::Deserialize;
@@ -141,7 +125,8 @@ where
             x.balanceOf(ELFOMO_VAULT_ADDRESS).block(bid).call().await?,
         )
     };
-    let local_ob = build_orderbook(pc.seed, vu, vx);
+    let ladder = chain_ladder(provider.clone(), bid).await?;
+    let local_ob = ElfomoFiPropPool::build_orderbook_with(&ladder, pc.seed, vu, vx);
     let factory = IElfomoFiFactory::new(ELFOMO_FACTORY_ADDRESS, provider.clone());
     let cob = factory
         .getOrderbook(ELFOMO_XETH_ADDRESS, ELFOMO_USDT0_ADDRESS)

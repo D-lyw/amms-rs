@@ -335,15 +335,20 @@ pub(crate) struct CaliberTxEvent {
     pub update: CaliberBatchUpdate,
 }
 
-/// 从 flashblocks 原始交易中提取的 ElfomoFi `updatePrices` 报价更新事件。
+/// 从 flashblocks 原始交易中提取的 ElfomoFi 池报价更新事件。
 ///
 /// `tx_index` 为块内全局索引（跨 slice 由 `XlayerTxCountTracker` 的 `tx_base`
-/// 拼接，与懒排序修正使用同一约定）；`pool` 为被调用的 Pool 地址；
-/// `seed` 为 calldata 参数高 32 位价格种子（`a`），可直接本地重算 orderbook。
+/// 拼接，与懒排序修正使用同一约定）；`pool` 为被调用的 Pool 地址。
+///
+/// 两条 calldata 通道（都零 RPC，都是"某时刻池内定价状态"的直接来源）：
+/// - `updatePrices(uint256)`（`0xae7e8d81`）→ `seed = Some(a)`（价格种子）；
+/// - keeper 逐档 profile 改写（`0xd4ff31bd`）→ `profile = Some((key, word))`
+///   （`key` = pair 下标，`word` = 宽度/偏离表打包），一笔可携带多条，逐条展开。
 #[derive(Debug)]
 pub(crate) struct ElfomoTxEvent {
     pub pool: Address,
-    pub seed: U256,
+    pub seed: Option<U256>,
+    pub profile: Option<(U256, U256)>,
     pub tx_index: u64,
 }
 
@@ -622,14 +627,28 @@ fn extract_logs_from_xlayer_flashblock(
                 let Some(input) = extract_input_from_raw_tx(&raw) else {
                     continue;
                 };
-                let Some(seed) = ElfomoFiPropPool::parse_update_prices_calldata(&input) else {
+                let tx_index = tx_base + real_idx as u64;
+                if let Some(seed) = ElfomoFiPropPool::parse_update_prices_calldata(&input) {
+                    elfomo_updates.push(ElfomoTxEvent {
+                        pool: to,
+                        seed: Some(seed),
+                        profile: None,
+                        tx_index,
+                    });
                     continue;
-                };
-                elfomo_updates.push(ElfomoTxEvent {
-                    pool: to,
-                    seed,
-                    tx_index: tx_base + real_idx as u64,
-                });
+                }
+                // 逐档 profile 改写：一笔可能带多个 (key, word)，逐条展开，
+                // 由路由层按 pool 的 profile_key 过滤（提取侧无需知道下标）。
+                if let Some(entries) = ElfomoFiPropPool::parse_band_profile_calldata(&input) {
+                    for (key, word) in entries {
+                        elfomo_updates.push(ElfomoTxEvent {
+                            pool: to,
+                            seed: None,
+                            profile: Some((key, word)),
+                            tx_index,
+                        });
+                    }
+                }
             }
         }
     }
@@ -1837,7 +1856,7 @@ mod tests {
         );
         assert_eq!(elfomo_events.len(), 1);
         assert_eq!(elfomo_events[0].pool, pool);
-        assert_eq!(elfomo_events[0].seed, a);
+        assert_eq!(elfomo_events[0].seed, Some(a));
         assert_eq!(elfomo_events[0].tx_index, 0);
         assert!(logs.is_empty(), "update 空事件应被 raw-tx 通道过滤");
 
@@ -1865,21 +1884,29 @@ mod tests {
                 vault_usdt0: U256::from(19_192_415_254u64),
                 vault_xeth: U256::from(2_940_462_501_000_862_186u128),
                 price_seed: U256::ZERO,
+                profile_word: U256::ZERO,
             },
             vault_ledger: Default::default(),
-            ladder: crate::amms::elfomo_prop::types::ElfomoLadderConfig::from_metadata(&[
-                U256::ZERO,
-                U256::from(18u64),
-                U256::from(2u64),
-                U256::ZERO,
-                U256::ZERO,
-                U256::from(600_000_000_000_000_000u128),
-                U256::from(30u64),
-                U256::from(5u64),
-                U256::from(60u64),
-                U256::ZERO,
-                U256::ZERO,
-            ]),
+            ladder: crate::amms::elfomo_prop::types::ElfomoLadderConfig {
+                profile: crate::amms::elfomo_prop::types::ElfomoBandProfile {
+                    count: 6,
+                    widths: [1, 5, 10, 10, 20, 100],
+                    deviations: [7, 10, 15, 25, 40, 50],
+                },
+                ..crate::amms::elfomo_prop::types::ElfomoLadderConfig::from_metadata(&[
+                    U256::ZERO,
+                    U256::from(18u64),
+                    U256::from(2u64),
+                    U256::ZERO,
+                    U256::ZERO,
+                    U256::from(600_000_000_000_000_000u128),
+                    U256::from(30u64),
+                    U256::from(5u64),
+                    U256::from(60u64),
+                    U256::ZERO,
+                    U256::ZERO,
+                ])
+            },
             ..ElfomoFiPropPool::default()
         }));
 
@@ -1908,6 +1935,144 @@ mod tests {
             pool_obj.levels.to_from_levels[1].price,
             U256::from(2_474_964_919_058_850u128)
         );
+    }
+
+    /// ElfomoFi keeper 逐档 profile 改写（`0xd4ff31bd`）raw-tx 端到端：
+    /// 提取侧产出 `(key, word)`（同笔只 emit 空事件，信息在 calldata），
+    /// 路由侧按 pool 的 `profile_key` 过滤 → `apply_band_profile` 切换
+    /// 宽度/偏离表并本地重算（零 RPC）。这是 profile 动态化的主通道。
+    #[test]
+    fn xlayer_elfomo_band_profile_extraction_to_apply_end_to_end() {
+        use crate::amms::elfomo_prop::ElfomoFiPropPool;
+        use crate::amms::Token;
+
+        let pool = address!("02dcdf4171939ac0fe28e48e8758649311e9459a");
+        let block = 70_352_700u64;
+        // keeper 改写后的真实 word（偏离 [15,20,25,35,45,60]，宽度不变）
+        let word = U256::from_be_slice(
+            &alloy::hex::decode("00000000000000003c0064002d00140023000a0019000a00140005000f000106")
+                .unwrap(),
+        );
+        // calldata: selector + keys_off + words_off + keys_len + key0 + words_len + word0
+        let mut calldata = vec![0xd4, 0xff, 0x31, 0xbd];
+        for v in [64u64, 128, 1, 0, 1] {
+            calldata.extend_from_slice(&U256::from(v).to_be_bytes::<32>());
+        }
+        calldata.extend_from_slice(&word.to_be_bytes::<32>());
+
+        let fields = vec![
+            rlp_u64(0),
+            rlp_u64(1_000_000_000),
+            rlp_u64(300_000),
+            rlp_addr(pool),
+            rlp_u64(0),
+            rlp_item(&calldata),
+            vec![27],
+            vec![1],
+            vec![1],
+        ];
+        let raw_tx = rlp_list(&fields);
+
+        let mut receipts = Map::new();
+        receipts.insert(
+            hash_raw_tx(&raw_tx),
+            json!({
+                "status": "0x1",
+                "cumulativeGasUsed": "0x1",
+                "logs": [{
+                    "address": format!("{pool:#x}"),
+                    "topics": [format!("{:#x}", ELFOMO_UPDATE_EVENT)],
+                    "data": "0x"
+                }]
+            }),
+        );
+        let fb = flashblock("0xelfomo-profile", 0, block, vec![raw_tx], receipts);
+        let matcher = XlayerLogMatcher {
+            topic_addresses: HashSet::from([pool]),
+            topic_signatures: HashSet::from([ELFOMO_UPDATE_EVENT]),
+            address_only_addresses: HashSet::new(),
+        };
+        let mut dedup = XlayerDedupCache::new(XLAYER_DEDUP_PAYLOAD_WINDOW);
+        let mut parse_cache = XlayerParseCache::new();
+        let mut tx_tracker = XlayerTxCountTracker::new(XLAYER_TX_COUNT_WINDOW);
+        let mut latest_block_timestamp = None;
+
+        let (logs, _, _, _, _, _, elfomo_events) = extract_logs_from_xlayer_flashblock(
+            &fb,
+            &matcher,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::from([pool]),
+            &mut dedup,
+            &mut parse_cache,
+            &mut tx_tracker,
+            &mut latest_block_timestamp,
+        );
+        assert_eq!(elfomo_events.len(), 1);
+        assert_eq!(elfomo_events[0].pool, pool);
+        assert_eq!(elfomo_events[0].seed, None, "profile 交易没有价格种子");
+        assert_eq!(elfomo_events[0].profile, Some((U256::ZERO, word)));
+        assert!(logs.is_empty(), "空更新事件应被 raw-tx 通道过滤");
+
+        // 路由 + 应用：本地池 profile_key=0，旧 profile → 新 profile，档位重算
+        let mut state = StateSpace::default();
+        state.insert_amm(AMM::ElfomoFiPropPool(ElfomoFiPropPool {
+            pool_address: pool,
+            token_x: address!("e7b000003a45145decf8a28fc755ad5ec5ea025a"),
+            token_y: address!("779ded0c9e1022225f8e0630b35a9b54be713736"),
+            factory_address: address!("ffffffbb2d432b8acb4c57d556c0c721a431d038"),
+            router_address: address!("f0f0f0f0fb0d738452efd03a28e8be14c76d5f73"),
+            vault_address: address!("bb1b19f138db3925883a96ff7a304277460e0c99"),
+            chain_id: 196,
+            created_block: 0,
+            last_synced_block: 0,
+            tokens: vec![
+                Token::new_with_decimals(address!("e7b000003a45145decf8a28fc755ad5ec5ea025a"), 18),
+                Token::new_with_decimals(address!("779ded0c9e1022225f8e0630b35a9b54be713736"), 6),
+            ],
+            levels: crate::amms::elfomo_prop::types::OrderbookSnapshot {
+                from_to_levels: vec![],
+                to_from_levels: vec![],
+                vault_usdt0: U256::from(19_192_415_254u64),
+                vault_xeth: U256::from(2_940_462_501_000_862_186u128),
+                price_seed: U256::from(0x143c60fu64),
+                profile_word: U256::ZERO,
+            },
+            vault_ledger: Default::default(),
+            ladder: crate::amms::elfomo_prop::types::ElfomoLadderConfig {
+                profile: crate::amms::elfomo_prop::types::ElfomoBandProfile {
+                    count: 6,
+                    widths: [1, 5, 10, 10, 20, 100],
+                    deviations: [7, 10, 15, 25, 40, 50],
+                },
+                ..crate::amms::elfomo_prop::types::ElfomoLadderConfig::from_metadata(&[
+                    U256::ZERO,
+                    U256::from(18u64),
+                    U256::from(2u64),
+                    U256::ZERO,
+                    U256::ZERO,
+                    U256::from(600_000_000_000_000_000u128),
+                    U256::from(30u64),
+                    U256::from(5u64),
+                    U256::from(60u64),
+                    U256::ZERO,
+                    U256::ZERO,
+                ])
+            },
+            ..ElfomoFiPropPool::default()
+        }));
+
+        let affected = state.apply_elfomo_updates(&elfomo_events, block);
+        assert_eq!(affected, vec![pool]);
+        let pool_obj = match state.get(&pool).unwrap() {
+            AMM::ElfomoFiPropPool(p) => p,
+            _ => unreachable!(),
+        };
+        assert_eq!(pool_obj.ladder.profile.deviations, [15, 20, 25, 35, 45, 60]);
+        assert_eq!(pool_obj.ladder.profile.widths, [1, 5, 10, 10, 20, 100]);
+        assert_eq!(pool_obj.profile_block, block);
+        assert_eq!(pool_obj.levels.profile_word, word);
+        assert_eq!(pool_obj.last_synced_block, block);
     }
 
     /// caliber swap 事件提取：真实日志（块 67650064 tx#15 W→U）、

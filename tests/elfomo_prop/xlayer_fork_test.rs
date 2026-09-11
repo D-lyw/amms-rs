@@ -48,32 +48,19 @@ use amms::amms::{
 };
 use eyre::Result;
 
-/// XLayer xETH/USDT0 的链上 ladder 参数（`getMetadata(0xe7b0…025a)` 实测 fixture）。
+/// 读取某块的完整 ladder（生产同路径：`getSupportedPairs()` 定位 profile 存储键
+/// + `getMetadata(asset)` 静态参数 + slot0 profile word）。
 ///
-/// 生产代码在 `init` 阶段逐池从链上读取；测试这里用固定 fixture 走**同一套**
-/// 读时重算逻辑（`build_orderbook_with`），确保公式本身被逐位验证。
-fn xlayer_ladder() -> ElfomoLadderConfig {
-    ElfomoLadderConfig::from_metadata(&[
-        U256::ZERO,
-        U256::from(18u64),
-        U256::from(2u64),
-        U256::ZERO,
-        U256::ZERO,
-        U256::from(600_000_000_000_000_000u128),
-        U256::from(30u64),
-        U256::from(5u64),
-        U256::from(60u64),
-        U256::ZERO,
-        U256::ZERO,
-    ])
-}
-
-fn build_orderbook(
-    seed: U256,
-    vault_usdt0: U256,
-    vault_xeth: U256,
-) -> amms::amms::elfomo_prop::types::OrderbookSnapshot {
-    ElfomoFiPropPool::build_orderbook_with(&xlayer_ladder(), seed, vault_usdt0, vault_xeth)
+/// ladder（尤其是个逐档 profile 表）是**动态链上状态**：keeper 的 `0xd4ff31bd`
+/// 会改写它，所以测试必须与生产一样逐块从链上取，不能写死 fixture。
+async fn chain_ladder<P>(provider: P, block_id: BlockId) -> Result<ElfomoLadderConfig>
+where
+    P: alloy::providers::Provider + Clone + Send + Sync + 'static,
+{
+    ElfomoFiPropPool::default()
+        .fetch_ladder(provider, block_id)
+        .await?
+        .ok_or_else(|| eyre::eyre!("elfomo: fetch_ladder returned None"))
 }
 
 // ============================================================
@@ -291,6 +278,88 @@ async fn fetch_update_prices_seed<P: Provider + Clone>(
 // 主测试
 // ============================================================
 
+/// head 级端到端校验：**生产 init 全路径**（getSupportedPairs 定位 profile 键 →
+/// getMetadata → slot0 profile word → getOrderbook + slot1 + balanceOf）在节点
+/// 最新块上与链上逐位一致，并且本地 quote == 链上 getAmountOut。
+///
+/// 与 `test_elfomo_prop_fork_orderbook_quote_replication` 的区别：那个锚在历史块
+/// 并扫描多块（重），这个只看 head（轻，且能覆盖 keeper 刚改过的 profile）。
+/// 对 anvil fork（latest = fork block）与真实 RPC 都能跑。
+#[tokio::test]
+async fn test_elfomo_prop_fork_head_model_matches_chain() -> Result<()> {
+    let _guard = xlayer_test_guard();
+    let Some((provider, chain_id)) = connect_xlayer_provider().await? else {
+        return Ok(());
+    };
+    assert_eq!(chain_id, XLAYER_CHAIN_ID);
+
+    let head = provider.get_block_number().await?;
+    let bid = BlockId::Number(BlockNumberOrTag::Number(head));
+    let local = ElfomoFiPropPool::default()
+        .init(bid, provider.clone())
+        .await?;
+    println!("=== ElfomoFi head verification @ block {head} ===");
+    println!(
+        "profile_key={} profile_dev={:?} profile_widths={:?}",
+        local.ladder.profile_key, local.ladder.profile.deviations, local.ladder.profile.widths
+    );
+
+    // init 解析出的 profile 必须与链上 slot0 word 一致（动态读取，非写死）
+    let (chain_ladder_at_head, _) = (chain_ladder(provider.clone(), bid).await?, chain_id);
+    assert_eq!(
+        local.ladder.profile, chain_ladder_at_head.profile,
+        "本地 profile 必须与链上 slot0 解码一致"
+    );
+    assert_eq!(
+        local.ladder.profile_key, chain_ladder_at_head.profile_key,
+        "profile 存储键必须与 getSupportedPairs() 下标一致"
+    );
+
+    // init 档位 == 链上 getOrderbook
+    let (cft, ctf) = chain_orderbook(provider.clone(), bid).await?;
+    assert_eq!(
+        local
+            .levels
+            .from_to_levels
+            .iter()
+            .map(|lv| (lv.size, lv.price))
+            .collect::<Vec<_>>(),
+        cft,
+        "head init fromTo 与链上不一致"
+    );
+    assert_eq!(
+        local
+            .levels
+            .to_from_levels
+            .iter()
+            .map(|lv| (lv.size, lv.price))
+            .collect::<Vec<_>>(),
+        ctf,
+        "head init toFrom 与链上不一致"
+    );
+
+    // 本地 quote == 链上 getAmountOut（金库余额是在位状态，直接对拍）
+    for amt in [
+        121_513_229_231_558_820u128,
+        600_000_000_000_000_000,
+        3_600_000_000_000_000_000,
+    ] {
+        let a = U256::from(amt);
+        let chain = chain_quote(
+            provider.clone(),
+            ELFOMO_XETH_ADDRESS,
+            ELFOMO_USDT0_ADDRESS,
+            a,
+            bid,
+        )
+        .await?;
+        let sim = local.simulate_swap(ELFOMO_XETH_ADDRESS, ELFOMO_USDT0_ADDRESS, a)?;
+        assert_eq!(sim, chain, "xETH->USDT0 in={amt} 本地与链上不一致");
+    }
+    println!("head model OK");
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_elfomo_prop_fork_orderbook_quote_replication() -> Result<()> {
     let _guard = xlayer_test_guard();
@@ -349,7 +418,8 @@ async fn test_elfomo_prop_fork_orderbook_quote_replication() -> Result<()> {
         let bid = BlockId::Number(BlockNumberOrTag::Number(bn));
         let (vu, vx) = chain_vault_balances(provider.clone(), bid).await?;
         let seed = chain_price_seed(provider.clone(), bid).await?;
-        let local_ob = build_orderbook(seed, vu, vx);
+        let ladder = chain_ladder(provider.clone(), bid).await?;
+        let local_ob = ElfomoFiPropPool::build_orderbook_with(&ladder, seed, vu, vx);
         let (cft, ctf) = chain_orderbook(provider.clone(), bid).await?;
         total_ob += 1;
         let lft: Vec<(U256, U256)> = local_ob
@@ -527,12 +597,10 @@ async fn test_elfomo_prop_fork_orderbook_quote_replication() -> Result<()> {
         "updatePrices calldata 种子解析失败"
     );
     // 交易执行时刻状态 = 父块金库余额 + 本块种子
-    let (vu, vx) = chain_vault_balances(
-        provider.clone(),
-        BlockId::Number(BlockNumberOrTag::Number(ELFOMO_ARB_BLOCK - 1)),
-    )
-    .await?;
-    let ob = build_orderbook(parsed_seed, vu, vx);
+    let pre_block = BlockId::Number(BlockNumberOrTag::Number(ELFOMO_ARB_BLOCK - 1));
+    let (vu, vx) = chain_vault_balances(provider.clone(), pre_block).await?;
+    let pre_ladder = chain_ladder(provider.clone(), pre_block).await?;
+    let ob = ElfomoFiPropPool::build_orderbook_with(&pre_ladder, parsed_seed, vu, vx);
     let sim = ElfomoFiPropPool::simulate_swap_for_orderbook(
         &ob,
         ELFOMO_XETH_ADDRESS,
@@ -558,12 +626,11 @@ async fn test_elfomo_prop_fork_orderbook_quote_replication() -> Result<()> {
         BlockId::Number(BlockNumberOrTag::Number(ELFOMO_ARB_BLOCK)),
     )
     .await?;
-    let (vu_post, vx_post) = chain_vault_balances(
-        provider.clone(),
-        BlockId::Number(BlockNumberOrTag::Number(ELFOMO_ARB_BLOCK)),
-    )
-    .await?;
-    let ob_post = build_orderbook(parsed_seed, vu_post, vx_post);
+    let post_block = BlockId::Number(BlockNumberOrTag::Number(ELFOMO_ARB_BLOCK));
+    let (vu_post, vx_post) = chain_vault_balances(provider.clone(), post_block).await?;
+    let post_ladder = chain_ladder(provider.clone(), post_block).await?;
+    let ob_post =
+        ElfomoFiPropPool::build_orderbook_with(&post_ladder, parsed_seed, vu_post, vx_post);
     let sim_post = ElfomoFiPropPool::simulate_swap_for_orderbook(
         &ob_post,
         ELFOMO_XETH_ADDRESS,
