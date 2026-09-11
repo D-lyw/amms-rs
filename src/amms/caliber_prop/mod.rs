@@ -1708,7 +1708,7 @@ fn build_snapshot_from_slots(
 /// 存储布局见 `build_snapshot_from_slots`。10 个固定槽位（含全局 slot2/slot3）
 /// 与 ladder 槽位都走 [`crate::amms::evm_storage`] 的 `eth_call` bulk-SLOAD
 /// （一次调用读回任意多个槽；官方 WS 网关可用）。
-async fn fetch_exact_snapshot<N, P>(
+pub(crate) async fn fetch_exact_snapshot<N, P>(
     provider: &P,
     contract_address: Address,
     pair_id: B256,

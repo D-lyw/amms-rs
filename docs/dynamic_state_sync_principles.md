@@ -133,6 +133,14 @@ Caliber 2026-09-10 才补齐）。
    否则之后到达的旧实时事件还会把它打回去。
 4. 实时通道的缺口要能自证：`(payload_id, index)` 连续性、订单/事件序号、
    或与规范块 `transactionIndex` 对账。
+5. **零信息量事件不得当状态源。** 判据：事件 `data` 为空、无 indexed 参数，
+   且它携带不了任何别的通道拿不到的信息（典型：与真实数据出自**同一笔交易**）。
+   这种事件唯一的"作用"就是把全量 RPC 重拉常态化；把它从 `sync_events` /
+   query chunks 删掉，改用**零 RPC 自证**（如块边界收口的种子覆盖率告警）
+   来暴露主通道失效，纠错交给周期对账。
+6. **本地模型要能自证与链上同构。** 当协议内部逻辑靠逆向复刻时，每次拿到链上
+   权威值（初始化 / 对账快照）都应与本地重算**逐位对拍**；不一致即判定模型脱节，
+   **拒绝报价**（而不是输出可能错误的价），一致后自动恢复。
 
 ---
 
@@ -155,6 +163,8 @@ Caliber 2026-09-10 才补齐）。
 | `6abd894`/`8a96aa5` v1.18.x | Resync 目标块超前存储 RPC 头被降级读旧块 | 新增 `RetryLater`，按目标块重试 |
 | `4a99931` | caliber swap 日志断流 | 断流回补 + 对账周期 60s→30s |
 | 2026-09-10 | caliber 幻影报价：pair `0x5dda42ef…` 链上 USDT0 储备 `3,849.02`，本地按 `>= 5,255.86` 报价 → 4 笔上链还款不足回滚 | 三条独立缺陷叠加：①周期对账 Phase-1 克隆整池、锁外 RPC、整只覆盖（丢弃窗口内实时事件）；②`apply_snapshot` 对累积量无条件赋值（无 rebase）；③全槽位 `BlockId::latest()`，储备与 ladder 读到的块漂移。修复：`CaliberSwapLedger` + `apply_snapshot_merged`（A 类 rebase/B 类水位保鲜/C 类覆盖）+ 快照块号显式钉死 + 对账锁内合并写回 |
+| 2026-09-10 | Elfomo 生产日志每 5s 一条 `WARN Pending sync task skipped due to newer local state`，`first_seen_ms` 40→62s 持续增长 | 根因是**零信息量事件被当状态源**：Pool `updatePrices` 空事件（仅 topic0、`data` 0 字节）→ `AsyncUpdate` → 通用路径又被块级水位判为 `SkippedStale`（规则 2），任务积压无界、每次白拉 4 个 RPC。修复：该事件从 `sync_events`/query chunks 彻底移除（价格种子本就在**同一笔交易**的 calldata 里）；改块边界**种子覆盖率自证**（只告警不重拉）+ 45s 对账；pending 的 AsyncUpdate/Resync 对 Elfomo 走专用 `execute_elfomo_snapshot_reconcile`（锁外 fetch → 锁内对 current existing `merge_snapshot`），`SkippedStale` 降 `debug` |
+| 2026-09-11 | caliber 发单后 Resync 与 maintenance 覆盖对账被**无限推迟**：日志每 ~5s 一条 `WARN Pending sync task deferred: local state newer than target block ... deferred_to_block=…`，两个实例发现同一机会时，涉及 caliber 池（较新实例）执行失败、落后实例反而成功 | 根因：caliber `batchUpdateParameters` 是 raw-tx 更新，`apply_batch_update` / `apply_chain_swap` 把 `last_synced_block` 顶到 flashblock 乐观头；而 Resync 的 `required_block` 取自请求时的 canonical head（落后乐观头 ≥1 块）→ 通用块级水位闸门 `last_synced_block() > target_block` 健康期恒真，任务被 `postpone` 无限后移、纠错通道永久饿死（**规则 2 反模式**，与 Elfomo 同形，Elfomo 已有特判而 caliber 漏了）。修复：`resync_skips_block_watermark_gate` 把「raw-tx 每块推进水位」的池型（Caliber/Elfomo）判为必须绕过闸门；Resync/AsyncUpdate 统一走 `execute_caliber_snapshot_reconcile`（锁外按目标块 `fetch_exact_snapshot` → 写锁内对 current existing `apply_snapshot_merged`），既不整只覆盖丢增量、也不被水位挡死；`BlockNotAvailable` 保持 `RetryLater` 不降级读旧块 |
 | 2026-09-10 | caliber `pos`（`cfg+7`）跨块无限累加 | 链上 `cfg+7` 是**块门控**的（实测 70255494 的 low96 == 当块 3 笔 `amountOut` 之和，不含上一块），本地必须新块先清零；`pos_block` 字段复刻该语义 |
 
 ---
@@ -182,5 +192,7 @@ Caliber 2026-09-10 才补齐）。
 | Caliber 池子 | `src/amms/caliber_prop/{mod.rs,types.rs,factory.rs}` |
 | Caliber 累积量账本 | `src/amms/caliber_prop/ledger.rs`（`CaliberSwapLedger::record_swap/rebase`、`LedgerApply`、`anchor_block`） |
 | BinaryFi 池子 | `src/amms/binaryfi_prop/`（`ReservesDeltaLedger`、`apply_l2_update_full`、`apply_snapshot`） |
-| Elfomo 池子 | `src/amms/elfomo_prop/`（`sync` L1b、`merge_snapshot`、`price_seed_block` 字段水位） |
+| Elfomo 池子 | `src/amms/elfomo_prop/`（`sync` 只吃 `ElfomoTrade`、`build_orderbook` 读时纯函数、`apply_price_seed`、`merge_snapshot`、`price_seed_block` 字段水位、`verify_model_against_chain` 模型自证、`observe_block` 覆盖率自证） |
+| Caliber 纠错通道 | `src/state_space/maintenance.rs`（`resync_skips_block_watermark_gate`、`execute_caliber_snapshot_reconcile`）、`src/amms/caliber_prop/mod.rs`（`fetch_exact_snapshot`、`apply_snapshot_merged`） |
+| Elfomo 周期对账（45s） | `src/state_space/mod.rs`（`DEFAULT_ELFOMO_RECONCILE_INTERVAL`、`with_elfomo_sync_interval`、`observe_elfomo_seed_coverage`）、`src/state_space/maintenance.rs`（`execute_elfomo_snapshot_reconcile`） |
 | Elfomo 累积量账本 | `src/amms/elfomo_prop/ledger.rs`（`VaultDeltaLedger::record_trade/rebase`、`VaultLedgerApply`、`anchor_block`；余额由账本派生） |

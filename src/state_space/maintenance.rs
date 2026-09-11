@@ -183,6 +183,23 @@ fn should_skip_async_apply(
     existing_last_synced_block > snapshot_last_synced_block
 }
 
+/// Resync 的块级水位闸门是否必须跳过（改走「锁外 fetch → 锁内 merge」）。
+///
+/// 判据：该池型的 `last_synced_block` 是否被**每块必发的 raw-tx** 顶到
+/// flashblock 乐观头。这类池型的通用闸门 `last_synced_block() > target_block`
+/// 在健康期恒真——Resync 的 `required_block` 取自请求时的 canonical head，
+/// 落后乐观头 ≥1 块——于是任务被 `postpone` 无限后移、纠错与覆盖对账永远
+/// 排不上（原则文档 §3 规则 2 的典型反模式，2026-09-11 事故）。
+///
+/// - **Caliber**：`apply_batch_update`（`batchUpdateParameters`）/`apply_chain_swap`
+///   每块推进水位。
+/// - **Elfomo**：`updatePrices` 每块推进水位。
+/// - 其余池型闸门保留：BinaryFi 的水位只由快照 `apply_snapshot` 推进，
+///   不会高于它自己的快照目标块。
+fn resync_skips_block_watermark_gate(amm: &AMM) -> bool {
+    matches!(amm, AMM::CaliberPropPool(_) | AMM::ElfomoFiPropPool(_))
+}
+
 /// AsyncUpdate 快照写回前是否因"本地已更新"竞态丢弃。
 ///
 /// - `AMM::BinaryFiPropPool` 不放宽：其 AsyncUpdate 快照携带事件流无法提供的
@@ -770,6 +787,125 @@ impl<N, P> StateSpaceManager<N, P> {
         Ok(PendingExecutionOutcome::Applied)
     }
 
+    /// Elfomo 的 AsyncUpdate / Resync：三段式写回（锁外按目标块 fetch → 写锁内对
+    /// **current existing** `merge_snapshot`），与
+    /// `sync_services::start_elfomo_prop_sync_task` 同形状。
+    ///
+    /// 为什么必须特判、不能走通用路径：
+    /// - **通用路径**（锁外克隆整池 → RPC → 写锁内整只 `insert_amm`）在 RPC 窗口内
+    ///   会把实时流刚落到 live 池子上的 `ElfomoTrade` 金库增量丢掉；而用
+    ///   `last_synced_block` 做竞态闸门又会恒为 `SkippedStale`——Elfomo 的块级水位
+    ///   被每块一笔 raw-tx（`updatePrices`）顶到 flashblock 乐观头，快照读的是规范头/
+    ///   目标块，健康期就必然"本地更新"（原则文档 §3 规则 2 的反模式）。
+    /// - **本分支**：`merge_snapshot` 自带 `VaultDeltaLedger` rebase 语义
+    ///   （`current = 快照(S) + Σ_{块 > S} 增量`），快照永远能安全落地，RPC 窗口内
+    ///   落在 live 池子上的成交一个不丢；水位由池内取 `max` 只作幂等守卫。
+    async fn execute_elfomo_snapshot_reconcile(
+        provider: &P,
+        state: &Arc<RwLock<StateSpace>>,
+        address: Address,
+        target_block: u64,
+    ) -> Result<PendingExecutionOutcome, AMMError>
+    where
+        P: Provider<N> + Clone,
+        N: Network,
+    {
+        let probe = {
+            let guard = state.read().await;
+            match guard.get(&address) {
+                Some(AMM::ElfomoFiPropPool(p)) => p.clone(),
+                _ => return Ok(PendingExecutionOutcome::MissingPool),
+            }
+        };
+        let (snap, snap_block) = match probe
+            .fetch_snapshot_at::<N, _>(provider.clone(), BlockId::from(target_block))
+            .await
+        {
+            Ok(v) => v,
+            // 目标块超前于存储 RPC 头部（flashblocks 乐观头 vs HTTP 节点落后）：
+            // 留队重试，不降级读取旧块数据。
+            Err(AMMError::BlockNotAvailable { .. }) => {
+                return Ok(PendingExecutionOutcome::RetryLater(target_block));
+            }
+            Err(e) => return Err(e),
+        };
+
+        let mut guard = state.write().await;
+        let Some(existing) = guard.get_mut_cow(&address) else {
+            return Ok(PendingExecutionOutcome::MissingPool);
+        };
+        let AMM::ElfomoFiPropPool(existing) = existing else {
+            return Ok(PendingExecutionOutcome::MissingPool);
+        };
+        // 返回 false = 快照早于账本锚点块（无法重建 (S, anchor] 增量）→ 保持本地真值。
+        existing.merge_snapshot(snap, snap_block);
+        Ok(PendingExecutionOutcome::Applied)
+    }
+
+    /// Caliber 的 AsyncUpdate / Resync：三段式写回（锁外按目标块 fetch → 写锁内对
+    /// **current existing** `apply_snapshot_merged`），与
+    /// `sync_services::start_caliber_prop_sync_task` 的锁内合并同形状。
+    ///
+    /// 为什么必须特判、不能走通用路径（与 Elfomo 同一形态，见其注释）：
+    /// - **块级水位闸门恒真**：Caliber 的 `batchUpdateParameters` 是 raw-tx 更新，
+    ///   水位被 flashblock 乐观头顶高（`apply_batch_update` / `apply_swap` 取 max）；
+    ///   Resync 的 `required_block` 却取自请求时的 canonical head（落后乐观头 ≥1 块）
+    ///   → 通用闸门 `last_synced_block() > target_block` 每次都 `DeferredStale`，
+    ///   `postpone` 无限后移，**纠错通道被永久饿死**（原则文档 §3 规则 2 的反模式）。
+    ///   这也解释了日志里 `Pending sync task deferred: local state newer than
+    ///   target block ... deferred_to_block=…` 的死循环。
+    /// - **整只覆盖丢增量**：通用路径"锁外克隆整池 → RPC → `insert_amm`"会丢掉
+    ///   RPC 窗口内实时流落在 live 池子上的 swap/报价更新（连同事件账本一起）。
+    ///   `apply_snapshot_merged` 自带 rebase 合并（累积量 = 快照(S) + Σ(块 > S)
+    ///   增量）、B 类字段（field0/field1/deadline）字段级水位保鲜、C 类低频字段
+    ///   直接覆盖，快照永远能安全落地，水位由池内 `max` 只作幂等守卫。
+    async fn execute_caliber_snapshot_reconcile(
+        provider: &P,
+        state: &Arc<RwLock<StateSpace>>,
+        address: Address,
+        target_block: u64,
+    ) -> Result<PendingExecutionOutcome, AMMError>
+    where
+        P: Provider<N> + Clone,
+        N: Network,
+    {
+        let probe = {
+            let guard = state.read().await;
+            match guard.get(&address) {
+                Some(AMM::CaliberPropPool(p)) => p.clone(),
+                _ => return Ok(PendingExecutionOutcome::MissingPool),
+            }
+        };
+        let snap = match crate::amms::caliber_prop::fetch_exact_snapshot(
+            provider,
+            probe.contract_address,
+            probe.pair_id,
+            probe.token_x,
+            probe.token_y,
+            BlockId::from(target_block),
+        )
+        .await
+        {
+            Ok(v) => v,
+            // 目标块超前于存储 RPC 头部（flashblocks 乐观头 vs HTTP 节点落后）：
+            // 留队重试，不降级读取旧块数据。
+            Err(AMMError::BlockNotAvailable { .. }) => {
+                return Ok(PendingExecutionOutcome::RetryLater(target_block));
+            }
+            Err(e) => return Err(e),
+        };
+
+        let mut guard = state.write().await;
+        let Some(existing) = guard.get_mut_cow(&address) else {
+            return Ok(PendingExecutionOutcome::MissingPool);
+        };
+        let AMM::CaliberPropPool(existing) = existing else {
+            return Ok(PendingExecutionOutcome::MissingPool);
+        };
+        existing.apply_snapshot_merged(snap, target_block);
+        Ok(PendingExecutionOutcome::Applied)
+    }
+
     async fn execute_pending_task(
         provider: &P,
         state: &Arc<RwLock<StateSpace>>,
@@ -786,6 +922,17 @@ impl<N, P> StateSpaceManager<N, P> {
                 let Some(mut local_amm) = ({ state.read().await.get(&address).cloned() }) else {
                     return Ok(PendingExecutionOutcome::MissingPool);
                 };
+                // Elfomo 特判：块级水位不能当新鲜度闸门（规则 2），必须
+                // 「锁外 fetch → 写锁内对 current existing `merge_snapshot`」。
+                if matches!(local_amm, AMM::ElfomoFiPropPool(_)) {
+                    return Self::execute_elfomo_snapshot_reconcile(
+                        provider,
+                        state,
+                        address,
+                        target_block,
+                    )
+                    .await;
+                }
                 // BinaryFi 特判：必须「锁外 fetch → 写锁内对 current existing 合并」，
                 // 不能走下面的通用路径（锁外克隆整池 → RPC → 整只覆盖）——RPC 窗口内
                 // 实时流落在 live 池子上的 swap 增量不在这个克隆里，覆盖后会连同事件
@@ -795,6 +942,17 @@ impl<N, P> StateSpaceManager<N, P> {
                 if matches!(local_amm, AMM::BinaryFiPropPool(_)) {
                     return Self::execute_binaryfi_async_update(
                         provider, state, address, &local_amm,
+                    )
+                    .await;
+                }
+                // Caliber 特判：同 Elfomo——块级水位不能当新鲜度闸门（规则 2），
+                // 且必须对 current existing 做 rebase 合并而非整只覆盖。
+                if matches!(local_amm, AMM::CaliberPropPool(_)) {
+                    return Self::execute_caliber_snapshot_reconcile(
+                        provider,
+                        state,
+                        address,
+                        target_block,
                     )
                     .await;
                 }
@@ -835,6 +993,35 @@ impl<N, P> StateSpaceManager<N, P> {
                 let Some(local_amm) = ({ state.read().await.get(&address).cloned() }) else {
                     return Ok(PendingExecutionOutcome::MissingPool);
                 };
+                // Elfomo 特判：与 AsyncUpdate 同形（锁外 fetch → 锁内 merge）。
+                // **必须放在块级水位闸门之前**：Elfomo 水位被 raw-tx 顶到乐观头，
+                // 通用闸门会让它恒为 DeferredStale，纠错通道永远排不上（规则 2）。
+                // raw-tx 驱动水位的池型（Caliber / Elfomo）必须**放在块级水位闸门
+                // 之前**：它们的水位被 flashblock 乐观头顶高，通用闸门会让纠错任务
+                // 恒为 `DeferredStale`、永远排不上（原则文档 §3 规则 2）。
+                if resync_skips_block_watermark_gate(&local_amm) {
+                    return match &local_amm {
+                        AMM::ElfomoFiPropPool(_) => {
+                            Self::execute_elfomo_snapshot_reconcile(
+                                provider,
+                                state,
+                                address,
+                                target_block,
+                            )
+                            .await
+                        }
+                        AMM::CaliberPropPool(_) => {
+                            Self::execute_caliber_snapshot_reconcile(
+                                provider,
+                                state,
+                                address,
+                                target_block,
+                            )
+                            .await
+                        }
+                        _ => Ok(PendingExecutionOutcome::MissingPool),
+                    };
+                }
                 // 新鲜度保护（前置检查，避免无谓的链上点读）：本地实时状态已新于
                 // 目标 canonical 块时，禁止用旧块快照覆盖/回卷；把任务推迟到
                 // canonical 追上本地状态后，再以更新的块做纠错。
@@ -982,7 +1169,9 @@ impl<N, P> StateSpaceManager<N, P> {
                         .complete_success(address, canonical);
                 }
                 Ok(PendingExecutionOutcome::SkippedStale) => {
-                    warn!(
+                    // 实时流与异步快照的正常竞争（水位差），不是异常：
+                    // Elfomo/BinaryFi 这类"每块都有事件"的池子尤其会常态出现。
+                    debug!(
                         ?address,
                         action = ?task.action,
                         reason = ?task.reason,
@@ -2800,6 +2989,53 @@ mod tests {
         assert!(should_skip_async_apply(101, 100));
         assert!(!should_skip_async_apply(100, 100));
         assert!(!should_skip_async_apply(99, 100));
+    }
+
+    /// 回归（2026-09-11 事故）：Caliber 的 Resync 必须绕过块级水位闸门。
+    ///
+    /// Caliber 的 `batchUpdateParameters` 是 raw-tx 更新，`apply_batch_update`
+    /// 把 `last_synced_block` 顶到 flashblock 乐观头；而 Resync 的
+    /// `required_block` 取自请求时的 canonical head（落后乐观头 ≥1 块）→ 通用
+    /// 闸门 `last_synced_block() > target_block` 恒真，任务被 `postpone` 无限后移
+    /// （日志 `Pending sync task deferred: local state newer than target block`），
+    /// 发单后立即纠错与 maintenance 覆盖对账两条通道全部饿死。
+    #[test]
+    fn resync_skips_block_watermark_gate_for_rawtx_driven_props() {
+        use crate::amms::Token;
+
+        let contract = address!("0x154586b2479b9a11e3d4db90024dc0e26f097312");
+        let pair_id = B256::from([0x11u8; 32]);
+        let caliber = AMM::CaliberPropPool(crate::amms::caliber_prop::CaliberPropPool {
+            contract_address: contract,
+            pair_id,
+            virtual_address:
+                crate::amms::caliber_prop::CaliberPropPool::virtual_address_from_pair_id(
+                    pair_id, contract,
+                ),
+            token_x: Address::from([1u8; 20]),
+            token_y: Address::from([2u8; 20]),
+            token_a: Token::new_with_decimals(Address::from([1u8; 20]), 18),
+            token_b: Token::new_with_decimals(Address::from([2u8; 20]), 18),
+            created_block: 0,
+            last_synced_block: 0,
+            reserve_a: U256::from(1_000u64),
+            reserve_b: U256::from(1_000u64),
+            ladder: Default::default(),
+            price_a_in_b: 1.0,
+            price_b_in_a: 1.0,
+            swap_ledger: Default::default(),
+        });
+        let elfomo = AMM::ElfomoFiPropPool(crate::amms::elfomo_prop::ElfomoFiPropPool::default());
+        // BinaryFi 的水位只由快照 `apply_snapshot` 推进（raw L2 update 不动它），
+        // 因此仍走通用闸门。
+        let binaryfi =
+            AMM::BinaryFiPropPool(crate::amms::binaryfi_prop::BinaryFiPropPool::default());
+        let other = AMM::FermiPropPool(crate::amms::fermi_prop::FermiPropPool::default());
+
+        assert!(resync_skips_block_watermark_gate(&caliber));
+        assert!(resync_skips_block_watermark_gate(&elfomo));
+        assert!(!resync_skips_block_watermark_gate(&binaryfi));
+        assert!(!resync_skips_block_watermark_gate(&other));
     }
 
     /// 水位契约（`AutomatedMarketMaker::set_last_synced_block`）：只前进不回退。
