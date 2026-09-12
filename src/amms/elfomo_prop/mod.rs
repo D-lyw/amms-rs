@@ -1473,16 +1473,15 @@ impl AutomatedMarketMaker for ElfomoFiPropPool {
             self.ensure_vault_ledger_anchored(block);
             if !self
                 .vault_ledger
-                .record_trade(block, log.log_index, x_to_y, amount_in, amount_out)
+                .record_trade(block, x_to_y, amount_in, amount_out)
             {
                 // 两种被拒情形都留痕（不再静默）：快照锚点已含该块 / 同块同日志重放。
                 tracing::debug!(
                     target: "amms::elfomo_prop",
                     pool = %self.pool_address,
                     block,
-                    log_index = ?log.log_index,
                     anchor_block = self.vault_ledger.anchor_block(),
-                    "elfomofi: trade already covered by snapshot anchor or replayed; skipped"
+                    "elfomofi: trade already covered by block-end snapshot anchor; skipped"
                 );
                 return Ok(SyncAction::None);
             }

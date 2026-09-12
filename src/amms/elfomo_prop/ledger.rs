@@ -26,20 +26,13 @@
 
 use alloy::primitives::U256;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::ops::Bound::{Excluded, Unbounded};
 
 /// 账本块窗口（内存上限）。需覆盖 `(上一快照块, flashblock 乐观头]`：
 /// XLayer 约 1 块/秒，快照间隔 221s、失败退避上限 300s → 1024 块（≈17 分钟）
 /// 留足余量。超窗按"折叠进锚点"处理，不丢真值。
 pub const ELFOMO_LEDGER_BLOCK_WINDOW: usize = 1024;
-
-/// 已入账日志键 `(block, log_index)` 的保留条数（挡重连补拉/重复投递）。
-///
-/// 与块窗口对齐（每块通常 1 笔成交 → 约覆盖 `ELFOMO_LEDGER_BLOCK_WINDOW` 块），
-/// 不短于快照间隔；上游 `applied_log_dedup` 与 `block <= base_block` 锚点守卫
-/// 是第二道防线，这里只是把"同块同日志重放"挡在账本之外。
-const RECENT_LOG_KEYS: usize = ELFOMO_LEDGER_BLOCK_WINDOW;
 
 /// 单块 vault 净变化（**有符号**，块内多笔成交聚合为块末净值）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,8 +90,6 @@ pub struct VaultDeltaLedger {
     entries: BTreeMap<u64, VaultDelta>,
     /// 已记录事件的最高块（观测用）
     last_event_block: u64,
-    /// 最近已入账的日志键 `(block, log_index)`，用于去重
-    recent_logs: VecDeque<(u64, u64)>,
 }
 
 impl Default for VaultDeltaLedger {
@@ -110,7 +101,6 @@ impl Default for VaultDeltaLedger {
             base_usdt0: 0,
             entries: BTreeMap::new(),
             last_event_block: 0,
-            recent_logs: VecDeque::new(),
         }
     }
 }
@@ -163,31 +153,19 @@ impl VaultDeltaLedger {
 
     /// 记录一笔已**实际应用**到本地池子的 vault 净变化。
     ///
-    /// 返回 `false` 表示该笔被丢弃（重复回放 / 已含在快照锚点内），
+    /// 返回 `false` 表示该笔被丢弃（**块末快照锚点已覆盖该块**），
     /// 调用方**不得**再改本地余额。
-    pub fn record(
-        &mut self,
-        block: u64,
-        log_index: Option<u64>,
-        d_xeth: i128,
-        d_usdt0: i128,
-    ) -> bool {
+    ///
+    /// 账本自身**不做日志级去重**：重复投递由上游
+    /// `state_space::AppliedLogDedupCache` 负责（键含 `tx_hash`，两种口径下唯一）；
+    /// 这里只保留 `block <= base_block` 的锚点守卫（防快照覆盖区间重复入账）。
+    /// 历史回归：本账本曾用 `(block, log_index)` 做本地去重，而 flashblocks 通道
+    /// 传给它的 `log_index` 是 **receipt-local**（同块不同 tx 会重号），导致同块
+    /// 第二笔成交被静默丢弃 → 金库余额偏低 → 幻影报价。
+    pub fn record(&mut self, block: u64, d_xeth: i128, d_usdt0: i128) -> bool {
         // 锚点（块末状态）已覆盖该块（含）→ 重复回放，丢弃
         if self.anchored && self.base_block != 0 && block <= self.base_block {
             return false;
-        }
-        if let Some(idx) = log_index {
-            if self
-                .recent_logs
-                .iter()
-                .any(|(b, i)| *b == block && *i == idx)
-            {
-                return false;
-            }
-            self.recent_logs.push_back((block, idx));
-            while self.recent_logs.len() > RECENT_LOG_KEYS {
-                self.recent_logs.pop_front();
-            }
         }
         let entry = self.entries.entry(block).or_default();
         entry.d_xeth = entry.d_xeth.saturating_add(d_xeth);
@@ -202,11 +180,10 @@ impl VaultDeltaLedger {
     /// 记录一笔 `ElfomoTrade`（按 pair 方向给出正的 `amount_in` / `amount_out`）。
     ///
     /// 金库是成交的双向对手方：账户给出什么金库就收进什么，账户收到什么金库
-    /// 就付出什么。返回 `false` 同 [`Self::record`]（重复回放/已含在锚点内）。
+    /// 就付出什么。返回 `false` 同 [`Self::record`]（块末快照锚点已覆盖该块）。
     pub fn record_trade(
         &mut self,
         block: u64,
-        log_index: Option<u64>,
         x_to_y: bool,
         amount_in: U256,
         amount_out: U256,
@@ -216,7 +193,7 @@ impl VaultDeltaLedger {
         } else {
             (-to_i128(amount_out), to_i128(amount_in))
         };
-        self.record(block, log_index, d_xeth, d_usdt0)
+        self.record(block, d_xeth, d_usdt0)
     }
 
     /// 超窗时把最老条目**折叠进锚点**（保持 `anchor + Σ entries` 恒等于真值）。
@@ -294,9 +271,9 @@ mod tests {
     fn record_aggregates_per_block_and_sums_signed_deltas() {
         let mut l = VaultDeltaLedger::new();
         l.anchor(100, u(1_000), u(2_000));
-        assert!(l.record(105, Some(0), 50, -30));
-        assert!(l.record(105, Some(1), 25, -10));
-        assert!(l.record(106, Some(0), -5, 7));
+        assert!(l.record(105, 50, -30));
+        assert!(l.record(105, 25, -10));
+        assert!(l.record(106, -5, 7));
 
         // 同块聚合 + 全量有符号求和
         assert_eq!(l.len(), 2);
@@ -313,8 +290,8 @@ mod tests {
         // 核心修复：快照块落后于"本地已处理块"时不再跳过，而是 rebase 合并。
         let mut l = VaultDeltaLedger::new();
         l.anchor(100, u(1_000), u(2_000));
-        l.record(105, Some(0), 50, -30);
-        l.record(106, Some(1), 10, -5);
+        l.record(105, 50, -30);
+        l.record(106, 10, -5);
 
         // 快照读块 103 落后于本地事件块 106 → 仍然落地：
         // current = 快照(103) + Σ_{>103} = (snap + 60, snap − 35)
@@ -330,7 +307,7 @@ mod tests {
     fn rebase_anchors_when_snapshot_covers_every_entry() {
         let mut l = VaultDeltaLedger::new();
         l.anchor(100, u(1_000), u(2_000));
-        l.record(105, Some(0), 50, -30);
+        l.record(105, 50, -30);
 
         let apply = l.rebase(106, u(7_000), u(9_000));
         assert_eq!(apply, VaultLedgerApply::Anchored);
@@ -342,7 +319,7 @@ mod tests {
     fn rebase_skips_only_when_snapshot_precedes_anchor() {
         let mut l = VaultDeltaLedger::new();
         l.rebase(100, u(1_000), u(2_000));
-        l.record(105, Some(0), 50, -30);
+        l.record(105, 50, -30);
 
         // 早于锚点块：无法重建 (S, base] 增量 → 丢弃，账本不动
         assert_eq!(l.rebase(90, u(1), u(2)), VaultLedgerApply::SkippedStale);
@@ -355,18 +332,18 @@ mod tests {
     }
 
     #[test]
-    fn record_rejects_replay_and_post_anchor_blocks() {
+    fn record_rejects_post_anchor_blocks() {
         let mut l = VaultDeltaLedger::new();
         l.anchor(100, u(1_000), u(2_000));
 
-        // 重复投递同一条日志（block+log_index 相同）→ 只入账一次
-        assert!(l.record(105, Some(7), 50, -30));
-        assert!(!l.record(105, Some(7), 50, -30));
-        assert_eq!(l.current(), (u(1_050), u(1_970)));
+        // 同块多笔：账本不做日志级去重（去重由上游含 tx_hash 的键负责）→ 两笔都入账
+        assert!(l.record(105, 50, -30));
+        assert!(l.record(105, 25, -10));
+        assert_eq!(l.current(), (u(1_075), u(1_960)));
 
         // 快照锚点已覆盖的块（≤ base_block）→ 丢弃，防止重复入账
-        assert!(!l.record(100, Some(9), 999, -999));
-        assert_eq!(l.current(), (u(1_050), u(1_970)));
+        assert!(!l.record(100, 999, -999));
+        assert_eq!(l.current(), (u(1_075), u(1_960)));
     }
 
     #[test]
@@ -375,7 +352,7 @@ mod tests {
         l.anchor(1, u(1_000), u(100_000));
         let n = ELFOMO_LEDGER_BLOCK_WINDOW + 3;
         for i in 0..n {
-            assert!(l.record(2 + i as u64, None, 1, -1));
+            assert!(l.record(2 + i as u64, 1, -1));
         }
         // 挤出只影响分解粒度，不影响真值
         assert_eq!(l.current(), (u(1_000 + n as u64), u(100_000 - n as u64)));
@@ -388,7 +365,7 @@ mod tests {
         // 不静默掩盖负值：有符号视图暴露负余额，materialize 时截断为 0
         let mut l = VaultDeltaLedger::new();
         l.anchor(10, u(10), u(10));
-        assert!(l.record(11, None, -25, -25));
+        assert!(l.record(11, -25, -25));
         assert_eq!(l.current_signed(), (-15, -15));
         assert_eq!(l.current(), (U256::ZERO, U256::ZERO));
     }
