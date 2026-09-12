@@ -1,4 +1,6 @@
 mod common;
+#[path = "elfomo_prop/mainnet_sync_drift.rs"]
+mod mainnet_sync_drift;
 #[path = "elfomo_prop/ws_live_verify.rs"]
 mod ws_live_verify;
 #[path = "elfomo_prop/xlayer_fork_test.rs"]
