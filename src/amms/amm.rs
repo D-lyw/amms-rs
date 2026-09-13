@@ -165,6 +165,12 @@ macro_rules! amm {
                 }
             }
 
+            fn supported_chains(&self) -> Option<Vec<u64>> {
+                match self {
+                    $(AMM::$pool_type(pool) => pool.supported_chains(),)+
+                }
+            }
+
             fn last_synced_block(&self) -> u64 {
                 match self {
                     $(AMM::$pool_type(pool) => pool.last_synced_block(),)+

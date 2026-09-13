@@ -132,7 +132,10 @@ A convenience `sync!` macro is also available for simple setups.
 | **Ethereum Mainnet** | newHeads + logsBloom + getLogs | 50-block backfill windows |
 | **Base** | `pendingLogs` subscription (flashblocks-aware) | 100-block windows; requires WebSocket endpoint supporting `eth_subscribe` with `pendingLogs` |
 | **Arbitrum** | Nitro Sequencer Feed | 200-block windows; WebSocket endpoint auto-detected |
+| **BSC** | newHeads + logsBloom + getLogs | 300-block windows; block-boundary atomic apply (no same-block multi-batch phantom states) |
 | **XLayer** | Flashblocks raw WebSocket stream | 100-block windows; JSON transport (no Brotli) |
+| **Robinhood** | standard `eth_subscribe("logs")` push (provider pubsub) | 1000-block windows; per-block settle, then atomic apply |
+| **Arc** | newHeads + logsBloom + getLogs | 1000-block windows (~0.5s blocks ⇒ ~8 min); no pending/flashblock channel (node-level `-32001`), deterministic finality (no reorg) |
 | **Others** | newHeads + logsBloom + getLogs | 50-block windows |
 
 Automatic chain detection via `chain_id` selects the optimal realtime source; manual override is available via `RealtimeSyncSource`.

@@ -463,6 +463,9 @@ impl AutomatedMarketMaker for CurveNGPool {
             100,   // Gnosis
             42220, // Celo
             196,   // X Layer
+            5042,  // Arc mainnet（~0.5s 块，进块即终局；事件由池子自身 emit，
+            //             走 direct_hit 路由，无需 per-chain 地址表）
+            5042002, // Arc testnet
         ])
     }
 

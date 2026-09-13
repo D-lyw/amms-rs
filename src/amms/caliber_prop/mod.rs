@@ -132,6 +132,15 @@ pub const CALIBER_BATCH_UPDATE_SELECTOR: [u8; 4] = [0x00, 0x8d, 0xcc, 0x8e];
 pub const CALIBER_SWAP_EVENT: B256 =
     b256!("36d90ab6736dbd42ac28b968350d068640e9aea3f7b807679fe64d2a50dcbb03");
 
+/// Caliber 部署链：X Layer (196)。
+///
+/// 报价更新（`batchUpdateParameters`，零事件、只写 `data+0` 一个槽）**只能**通过
+/// XLayer flashblocks 原始交易流发现，所以本池的实时报价通道天然是 XLayer 独有的。
+/// 其他链上它不会报错，只会退化成"储备/pos 靠日志走、报价靠周期对账（30s）"的
+/// **半工作**状态——那种静默陈旧报价比直接不支持更危险。因此显式声明支持链，
+/// 让 `StateSpaceManager::sync()` 在别的链上把它拦下（warn + skip）。
+pub const CALIBER_CHAIN_ID: u64 = 196;
+
 /// 1e6：fee 的基数（200 = 2 bps）
 pub const MILLION: U256 = U256::from_limbs([1_000_000, 0, 0, 0]);
 /// 1e9：quote 公式中的固定系数
@@ -1140,6 +1149,10 @@ impl AutomatedMarketMaker for CaliberPropPool {
         self.virtual_address
     }
 
+    fn supported_chains(&self) -> Option<Vec<u64>> {
+        Some(vec![CALIBER_CHAIN_ID])
+    }
+
     fn sync_events(&self) -> Vec<B256> {
         // Caliber 合约确实 emit Swap 事件（2026-08-11 实测），但不走通用日志管道：
         // 由 flashblocks 提取通道按 `caliber_contracts` 地址预筛单独解析并
@@ -2078,6 +2091,18 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Caliber 的实时报价通道只有 XLayer flashblocks，因此必须显式钉在 XLayer：
+    /// 落到其他链（含 Arc）会退化成"储备实时、报价 30s 陈旧"的半工作状态，
+    /// 宁可被 `StateSpaceManager::sync()` 直接拦下。
+    #[test]
+    fn supported_chains_is_xlayer_only() {
+        let pool = test_pool_with_ladder();
+        assert_eq!(pool.supported_chains(), Some(vec![CALIBER_CHAIN_ID]));
+        assert_eq!(CALIBER_CHAIN_ID, 196, "X Layer mainnet");
+        let supported = pool.supported_chains().unwrap();
+        assert!(!supported.contains(&5042) && !supported.contains(&5042002));
+    }
 
     /// 水位契约（`amms::amm`）：只前进不回退。
     #[test]

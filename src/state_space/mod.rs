@@ -155,6 +155,59 @@ const ARBITRUM_CHAIN_ID: u64 = 42161;
 const ETHEREUM_MAINNET_CHAIN_ID: u64 = 1;
 const XLAYER_CHAIN_ID: u64 = 196;
 const ROBINHOOD_CHAIN_ID: u64 = 4663;
+/// Arc **testnet** chainId。
+///
+/// Arc（Circle 自研 L1：Reth 执行层 + Malachite BFT 共识，EVM Osaka 基线）
+/// 出块 ~0.5s、**进块即终局、无 reorg**、无 flashblock/preconfirmation 通道，
+/// 且节点层禁止 pending 可见性（`newPendingTransactionFilter` /
+/// `eth_subscribe("newPendingTransactions")` 均返回 `-32001`），`eth_subscribe`
+/// 仅支持 `newHeads` 与 `logs` ⇒ 落 `NewHeadsPull`（块边界 = apply 边界）。
+///
+/// 新链只需补进 [`is_arc_chain`]，realtime source 与 backfill window 两处分支都不需要改动。
+///
+/// 验证状态（2026-09-13，testnet 实测）：
+/// - 块时 0.515s（200 块跨度）；公共 WSS 可 `eth_subscribe("newHeads")` 持续推块；
+/// - 区块头 `logsBloom` 存在且非零 ⇒ 本库的 bloom 预筛有效（不会静默不拉日志）；
+/// - EIP-7708 系统 emitter 真的在发：6 块内 105 条 18 位 `Transfer`，占全网日志 ~30%；
+/// - ERC-20 USDC 视图（6 位）在 `0x3600000000000000000000000000000000000000`；
+/// - **主网未上线**：公共注册表条目 `rpc`/`explorers` 均为空；testnet 上也还没有
+///   目标协议的池子部署，所以"真实探针"验收（head 持续推进 / 断流 60s 补回）暂缓，
+///   待有池子数据再补 `examples/arc_new_heads_probe.rs`。当前只在单测层面固化语义。
+const ARC_TESTNET_CHAIN_ID: u64 = 5042002;
+
+/// Arc **mainnet** chainId。
+///
+/// 来源：`ethereum-lists/chains` 的 `_data/chains/eip155-5042.json`
+/// （`shortName: arc-mainnet`、native USDC 18 位、`infoURL: https://arc.network`）。
+/// 该条目 `rpc`/`explorers` 为空 ⇒ chainId 已分配、主网尚未上线；上线后需回归
+/// 确认实际 RPC 行为（限流档位、archive 计费边界）与合约地址。
+const ARC_MAINNET_CHAIN_ID: u64 = 5042;
+
+/// Arc 链判定（testnet + mainnet）。
+fn is_arc_chain(chain_id: u64) -> bool {
+    matches!(chain_id, ARC_TESTNET_CHAIN_ID | ARC_MAINNET_CHAIN_ID)
+}
+
+/// Arc EIP-7708 系统 emitter：每条**原生** USDC 移动由它额外发一条 **18 位**
+/// `Transfer` 日志，其 topic0 与 ERC-20 USDC 的 **6 位** `Transfer` 完全相同
+/// （即 `crate::amms::fot::ERC20_TRANSFER_SIG`）。
+///
+/// 本库今天的安全性建立在两个前提上：
+/// 1. 没有任何 chunk 含本地址（靠 `build_query_chunks` 的地址白名单 + 断言）；
+/// 2. chunk 地址集恒非空（靠 [`LogQueryChunk::new`] 断言 + `collect_logs_for_chunks`
+///    的跳过守卫）。
+///
+/// 因为全局 topic union 里已经有 `Transfer`（`fermi_prop::sync_events`），
+/// 前提 2 一旦失效就会退化成**全链 USDC 支付日志扫描**——Arc 上每 0.5s 一个块，
+/// 延迟与数据量都不可接受（且公共 RPC 批量 300 请求即 `-32005`）。
+///
+/// ⚠️ **反向盲区**：监控合约的**原生** USDC 收付只由本地址发日志、合约自身不发事件
+/// ⇒ 对日志管线完全不可见（不是被过滤，而是不存在以该合约为 `address` 的日志）。
+/// 若将来接入靠 `Transfer` 日志推储备/金库余额的协议（Fermi vault 式记账），必须
+/// ① 显式把本地址加进该 chunk，② 按 **18 位**口径单独处理，**绝不能混入 6 位池子
+/// 数学**（差 10^12），并同步放宽 `build_query_chunks` 里的排除断言。
+const ARC_SYSTEM_EMITTER: Address =
+    alloy::primitives::address!("fffffffffffffffffffffffffffffffffffffffe");
 /// Xlayer Flashblocks WebSocket 端点。
 ///
 /// 端点说明（由用户调研确认）:
@@ -520,7 +573,32 @@ struct LogQueryChunk {
 }
 
 impl LogQueryChunk {
+    /// 构造 chunk。`addresses` 必须非空（见 [`Self::is_address_scoped`]）。
+    fn new(addresses: Vec<Address>, mode: QueryMode) -> Self {
+        debug_assert!(
+            !addresses.is_empty(),
+            "LogQueryChunk requires a non-empty address set: alloy serializes an empty address \
+             list as `address: []`, which nodes treat as *no* address constraint -> full-chain \
+             getLogs (on Arc that is every EIP-7708 native-USDC Transfer log in the block)"
+        );
+        Self { addresses, mode }
+    }
+
+    /// 地址约束是否生效。
+    ///
+    /// alloy 的 `Filter::address(vec![])` 序列化成空数组，节点侧语义是**无约束**
+    /// （match-all），不是"匹配零个地址" ⇒ 空地址集 = 全链扫描，必须当硬错误。
+    /// Arc 上尤其致命：块内充满 EIP-7708 系统 emitter 的 USDC `Transfer` 日志，
+    /// 而全局 topic union 里本来就有 `Transfer`（`fermi_prop::sync_events`）。
+    fn is_address_scoped(&self) -> bool {
+        !self.addresses.is_empty()
+    }
+
     fn ranged_filter(&self, from_block: u64, to_block: u64) -> Filter {
+        debug_assert!(
+            self.is_address_scoped(),
+            "refusing to build an unconstrained (full-chain) log filter"
+        );
         let mut filter = Filter::new()
             .address(self.addresses.clone())
             .from_block(from_block)
@@ -1075,6 +1153,13 @@ impl<N, P> StateSpaceManager<N, P> {
                     // 同块多批推送产生的中间态幻影机会（P1 已砸/P2 未砸）。
                     SelectedRealtimeSource::NewHeadsPull
                 } else {
+                    // Arc（Circle L1）同样落这里：0.5s 块 + 进块即终局无 reorg +
+                    // 无 pending/flashblock 通道（节点层禁止），"块边界 = apply 边界"
+                    // 与 Arc 完全对齐，flashblock 类乐观视图没有收益。
+                    //
+                    // 注意 `ensure_background_tasks` 的 canonical tracker gate **不覆盖**
+                    // NewHeadsPull，这是正确行为：NewHeadsPull 自身即 canonical 源
+                    // （apply 时推进 canonical_head）并内联做 gap backfill，不要把它加进 gate。
                     SelectedRealtimeSource::NewHeadsPull
                 }
             }
@@ -1526,6 +1611,15 @@ impl<N, P> StateSpaceManager<N, P> {
         let mut all_logs = Vec::new();
 
         for chunk in chunks {
+            // 空地址集会退化成无约束查询（全链 getLogs）；宁可跳过也不发出去。
+            if !chunk.is_address_scoped() {
+                warn!(
+                    "Skipping log query chunk with empty address set: refusing to issue an \
+                     unconstrained (full-chain) getLogs"
+                );
+                continue;
+            }
+
             if let Some(block_bloom) = bloom {
                 if !Self::bloom_maybe_has_relevant_logs(block_bloom, chunk) {
                     continue;
@@ -1871,10 +1965,10 @@ impl<N, P> StateSpaceManager<N, P> {
             // avoids false negatives when different AMM types route through
             // shared manager/vault/plugin contracts.
             for addresses in topic_addresses.chunks(LOG_ADDRESS_CHUNK_SIZE) {
-                chunks.push(LogQueryChunk {
-                    addresses: addresses.to_vec(),
-                    mode: QueryMode::TopicFiltered(topic_signatures.clone()),
-                });
+                chunks.push(LogQueryChunk::new(
+                    addresses.to_vec(),
+                    QueryMode::TopicFiltered(topic_signatures.clone()),
+                ));
             }
         }
 
@@ -1884,10 +1978,10 @@ impl<N, P> StateSpaceManager<N, P> {
             address_only_addresses.sort();
 
             for addresses in address_only_addresses.chunks(LOG_ADDRESS_CHUNK_SIZE) {
-                chunks.push(LogQueryChunk {
-                    addresses: addresses.to_vec(),
-                    mode: QueryMode::AddressOnly,
-                });
+                chunks.push(LogQueryChunk::new(
+                    addresses.to_vec(),
+                    QueryMode::AddressOnly,
+                ));
             }
         }
 
@@ -1901,12 +1995,22 @@ impl<N, P> StateSpaceManager<N, P> {
             let mut swapback_tokens = swapback_tokens;
             swapback_tokens.sort();
             for addresses in swapback_tokens.chunks(LOG_ADDRESS_CHUNK_SIZE) {
-                chunks.push(LogQueryChunk {
-                    addresses: addresses.to_vec(),
-                    mode: QueryMode::AddressOnly,
-                });
+                chunks.push(LogQueryChunk::new(
+                    addresses.to_vec(),
+                    QueryMode::AddressOnly,
+                ));
             }
         }
+
+        // EIP-7708 前置条件固化：Arc 的系统 emitter 绝不能成为任何 chunk 的查询地址
+        // （它发的 18 位 Transfer 与 ERC-20 6 位视图共用 topic0，混入即 10^12 口径错误）。
+        // 若将来确有协议需要原生 USDC 记账，见 `ARC_SYSTEM_EMITTER` 的说明再放宽这里。
+        debug_assert!(
+            chunks
+                .iter()
+                .all(|chunk| !chunk.addresses.contains(&ARC_SYSTEM_EMITTER)),
+            "EIP-7708 system emitter must never be a log query address"
+        );
 
         Ok(chunks)
     }
@@ -1977,6 +2081,11 @@ impl<N, P> StateSpaceManager<N, P> {
             // 实测 Chainstack WS 区间 get_logs 一次 100~5000 块均 ~150ms：
             // 单次请求固定成本主导，窗口越大摊销越低，落后追赶越快。
             ROBINHOOD_CHAIN_ID => 1000,
+            // Arc ~0.5s 块：默认 50 块只有 25 秒历史，重连补拉窗口过小；
+            // 1000 块 ≈ 8 分钟。摊销理由同 Robinhood——单次请求固定成本主导，
+            // 窗口越大单块成本越低（注意 Chainstack 类"落后 tip 127 块按 archive
+            // 计费"在 Arc 上 ≈ 1 分钟，窗口调大只减少请求数、不改变单价）。
+            chain_id if is_arc_chain(chain_id) => 1000,
             ETHEREUM_MAINNET_CHAIN_ID => 50,
             _ => 50,
         }
@@ -3558,6 +3667,75 @@ mod tests {
             .any(|l| l.address() == addr_only && l.topics().first() == Some(&other_topic)));
     }
 
+    /// EIP-7708：Arc 系统 emitter 发的 **18 位** `Transfer` 与 ERC-20 USDC 的 6 位
+    /// `Transfer` 共用 topic0。全局 topic union 里已经有 `Transfer`（fermi），
+    /// 所以唯一把它挡在池子之外的是 chunk 的**地址**约束——本用例固化这一点。
+    #[test]
+    fn arc_system_emitter_transfer_never_reaches_pools() {
+        let usdc_pool = address!("1111111111111111111111111111111111111111");
+        let user = address!("2222222222222222222222222222222222222222");
+        let transfer_topic = crate::amms::fot::ERC20_TRANSFER_SIG;
+
+        let chunks = vec![LogQueryChunk::new(
+            vec![usdc_pool],
+            QueryMode::TopicFiltered(vec![transfer_topic]),
+        )];
+
+        let make_transfer = |token: Address, from: Address, to: Address, value: U256| Log {
+            inner: alloy::primitives::Log {
+                address: token,
+                data: LogData::new(
+                    vec![transfer_topic, from.into_word(), to.into_word()],
+                    Bytes::from(value.to_be_bytes::<32>().to_vec()),
+                )
+                .unwrap(),
+            },
+            block_hash: None,
+            block_number: Some(1),
+            block_timestamp: None,
+            transaction_hash: None,
+            transaction_index: Some(0),
+            log_index: Some(0),
+            removed: false,
+        };
+
+        // 同一笔"用户付 USDC 给池子"：系统 emitter 的 18 位日志 + USDC 合约的 6 位日志。
+        let emitter_log = make_transfer(
+            ARC_SYSTEM_EMITTER,
+            user,
+            usdc_pool,
+            U256::from(1_000_000_000_000_000_000u64),
+        );
+        let erc20_log = make_transfer(usdc_pool, user, usdc_pool, U256::from(1_000_000u64));
+
+        let filtered = StateSpaceManager::<(), ()>::filter_logs_for_chunks(
+            vec![emitter_log, erc20_log],
+            &chunks,
+        );
+
+        assert_eq!(
+            filtered.len(),
+            1,
+            "只有 USDC 合约自身那条 6 位日志可进入 apply"
+        );
+        assert_eq!(filtered[0].address(), usdc_pool);
+    }
+
+    /// 空地址集不允许构造：`Filter::address(vec![])` 会被节点当成**无地址约束**
+    /// （全链扫描），在 Arc 上等于把所有 EIP-7708 原生 USDC `Transfer` 拉回来。
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "non-empty address set")]
+    fn log_query_chunk_rejects_empty_address_set() {
+        let _ = LogQueryChunk::new(vec![], QueryMode::AddressOnly);
+    }
+
+    #[test]
+    fn log_query_chunk_address_scope_flag() {
+        let addr = address!("1111111111111111111111111111111111111111");
+        assert!(LogQueryChunk::new(vec![addr], QueryMode::AddressOnly).is_address_scoped());
+    }
+
     #[test]
     fn backfill_window_size_is_chain_specific() {
         assert_eq!(
@@ -3569,6 +3747,16 @@ mod tests {
         assert_eq!(StateSpaceManager::<(), ()>::backfill_window_size(56), 300);
         assert_eq!(StateSpaceManager::<(), ()>::backfill_window_size(1), 50);
         assert_eq!(StateSpaceManager::<(), ()>::backfill_window_size(10), 50);
+        // Arc ~0.5s 块：1000 块 ≈ 8 分钟历史（默认 50 块只有 25 秒，重连补拉窗口过小）。
+        // testnet 与 mainnet 必须同档，避免主网上线后漏配。
+        assert_eq!(
+            StateSpaceManager::<(), ()>::backfill_window_size(5042002),
+            1000
+        );
+        assert_eq!(
+            StateSpaceManager::<(), ()>::backfill_window_size(5042),
+            1000
+        );
     }
 
     #[test]
@@ -3589,6 +3777,71 @@ mod tests {
         assert!(matches!(
             StateSpaceManager::<(), ()>::resolve_realtime_source(42161, &RealtimeSyncSource::Auto),
             SelectedRealtimeSource::ArbitrumFeedPull
+        ));
+    }
+
+    /// Arc 支持面单点固化（放开哪些协议 = 显式决定，改动必须过这里）。
+    ///
+    /// - Uniswap V2/V3/V4：不覆写 `supported_chains()`（= 默认 `None`，不按链过滤）
+    ///   ⇒ 本来就对所有链开放，**不要**为了"加 Arc"把默认值改成显式列表，
+    ///   那会静默收窄其他链（Optimism/Polygon/未来新链）的支持面。
+    /// - CurveNG：显式列表，必须含 Arc testnet + mainnet。
+    #[test]
+    fn arc_support_surface_is_explicit() {
+        let addr = address!("1111111111111111111111111111111111111111");
+
+        let chain_agnostic: Vec<AMM> = vec![
+            AMM::UniswapV2Pool(crate::amms::uniswap_v2::UniswapV2Pool::new(addr)),
+            AMM::UniswapV3Pool(crate::amms::uniswap_v3::UniswapV3Pool::new(addr)),
+            AMM::UniswapV4Pool(crate::amms::uniswap_v4::UniswapV4Pool::default()),
+        ];
+        for amm in &chain_agnostic {
+            assert!(
+                amm.supported_chains().is_none(),
+                "{:?} 不应收窄支持链：默认 None 才对 Arc 开放",
+                amm.variant()
+            );
+        }
+
+        let curve_ng = AMM::CurveNGPool(crate::amms::curve_ng::CurveNGPool::new(
+            addr,
+            crate::amms::curve_ng::CurveNGPoolType::StableSwap,
+        ));
+        let supported = curve_ng
+            .supported_chains()
+            .expect("CurveNG 必须显式声明支持链");
+        assert!(
+            supported.contains(&5042),
+            "Arc mainnet 必须在 CurveNG 支持链内"
+        );
+        assert!(
+            supported.contains(&5042002),
+            "Arc testnet 必须在 CurveNG 支持链内"
+        );
+    }
+
+    #[test]
+    fn arc_realtime_source_resolves_to_new_heads_pull() {
+        // Arc：无 pending 通道（节点层 -32001）、无 flashblock，且进块即终局，
+        // 所以 Auto 落通用 NewHeadsPull（块边界 = apply 边界）。
+        assert!(matches!(
+            StateSpaceManager::<(), ()>::resolve_realtime_source(
+                5042002,
+                &RealtimeSyncSource::Auto
+            ),
+            SelectedRealtimeSource::NewHeadsPull
+        ));
+        assert!(matches!(
+            StateSpaceManager::<(), ()>::resolve_realtime_source(
+                5042002,
+                &RealtimeSyncSource::WsLogs
+            ),
+            SelectedRealtimeSource::NewHeadsPull
+        ));
+        // mainnet 5042 同路径（主网未上线，先固化语义）。
+        assert!(matches!(
+            StateSpaceManager::<(), ()>::resolve_realtime_source(5042, &RealtimeSyncSource::Auto),
+            SelectedRealtimeSource::NewHeadsPull
         ));
     }
 
