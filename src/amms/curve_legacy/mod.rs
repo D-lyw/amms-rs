@@ -520,6 +520,9 @@ impl AutomatedMarketMaker for CurveLegacyPool {
             43114, // Avalanche
             100,   // Gnosis
             42220, // Celo
+            // X Layer：OkieStableSwap 是 Curve v1 StableSwap 两币分叉，链上
+            // 部署于 196（此前该白名单遗漏，链过滤生效后会被静默丢弃）。
+            196, // X Layer
         ])
     }
 

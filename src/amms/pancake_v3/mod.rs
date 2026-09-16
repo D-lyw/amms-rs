@@ -392,6 +392,9 @@ impl AutomatedMarketMaker for PancakeV3Pool {
             43114, // Avalanche
             1101,  // Polygon zkEVM
             4663,  // Robinhood Chain
+            // X Layer：OkieSwapV3 是 PancakeV3 分叉，链上部署于 196（此前该
+            // 白名单遗漏，链过滤生效后会被静默丢弃）。
+            196, // X Layer
         ])
     }
 
