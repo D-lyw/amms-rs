@@ -73,6 +73,106 @@ async fn load_pool_from_factory<P: alloy::providers::Provider<alloy::network::Et
     Ok(Some(pool))
 }
 
+/// V3 FoT 建模回归：池子白名单命中时输入/输出侧均扣税。
+///
+/// 背景（2026-09-16，Arc 链 ARGUS，见 `fot` 模块文档「扣税档案 · ARGUS」）：
+/// 主池（UniswapV3）转出税币扣 buy_fee（接收方实收 99%）——此前 V3 变体
+/// 完全没有 FoT 通路（既无 `apply_to_token` 注入也无 math 侧扣税），
+/// 导致模拟按 gross 记账，产出 20 笔必然 revert 的「虚假机会」。
+#[test]
+fn test_simulate_swap_fot_tax_in_out() {
+    use crate::amms::fot::{self, FotTaxType};
+
+    let pool_addr = Address::repeat_byte(0x99);
+    let base = Address::repeat_byte(0xaa); // 非税币（6 dp）
+    let taxed = Address::repeat_byte(0xbb); // 税币（18 dp）
+
+    fot::register_fot_token(
+        taxed,
+        FotTaxType::BuySell {
+            buy_fee_bps: 100,
+            sell_fee_bps: 100,
+            pairs: vec![pool_addr],
+            swap_back_threshold: U256::MAX,
+        },
+    );
+
+    let mut pool = UniswapV3Pool::new(pool_addr);
+    pool.token_a = Token::new_with_decimals(base, 6);
+    pool.token_b = Token::new_with_decimals(taxed, 18);
+    // 与 sync_token_decimals 相同的注入点（token 级注册表 → Token.fot_tax）
+    fot::apply_to_token(&mut pool.token_a);
+    fot::apply_to_token(&mut pool.token_b);
+    assert!(pool.token_b.fot_tax.is_some(), "注册表应注入 fot_tax");
+    assert!(pool.token_a.fot_tax.is_none());
+
+    pool.fee = 3000;
+    pool.tick_spacing = 60;
+    pool.tick = 0;
+    pool.sqrt_price = U256::from(1u64) << 96;
+    pool.liquidity = 10u128.pow(21);
+
+    // 参照组：同一池子、同一状态，token 上无 fot_tax（= 旧行为）
+    let mut plain = pool.clone();
+    plain.token_b.fot_tax = None;
+
+    let amount_in = U256::from(1_000_000u64);
+
+    // 买入（池子转出税币）：接收方实收 = gross × 99%
+    let gross_buy = plain
+        .simulate_swap(pool.token_a.address, pool.token_b.address, amount_in)
+        .unwrap();
+    let net_buy = pool
+        .simulate_swap(pool.token_a.address, pool.token_b.address, amount_in)
+        .unwrap();
+    assert!(gross_buy > U256::ZERO);
+    // 模型公式：net = gross − floor(gross × fee_bps / 10000)
+    assert_eq!(
+        net_buy,
+        gross_buy - gross_buy * U256::from(100u64) / U256::from(10_000u64)
+    );
+    assert!(net_buy < gross_buy);
+
+    // 卖出（税币进池）：池子实收 net，等价于按 99% 净额入池做 math
+    let gross_sell = plain
+        .simulate_swap(pool.token_b.address, pool.token_a.address, amount_in)
+        .unwrap();
+    let net_sell = pool
+        .simulate_swap(pool.token_b.address, pool.token_a.address, amount_in)
+        .unwrap();
+    assert!(net_sell < gross_sell);
+    assert_eq!(
+        net_sell,
+        plain
+            .simulate_swap(
+                pool.token_b.address,
+                pool.token_a.address,
+                amount_in * U256::from(99u64) / U256::from(100u64)
+            )
+            .unwrap()
+    );
+
+    // exact-out：到手 net 不变 → 需多付输入（输出侧 gross-up）
+    let net_wanted = U256::from(1_000_000u64);
+    let in_plain = plain
+        .simulate_swap_exact_out(pool.token_a.address, pool.token_b.address, net_wanted)
+        .unwrap();
+    let in_taxed = pool
+        .simulate_swap_exact_out(pool.token_a.address, pool.token_b.address, net_wanted)
+        .unwrap();
+    assert!(in_taxed > in_plain, "含税路径需 gross-up 输入");
+    // 与 gross_up_for(net) = (net-1)×10000/9900 + 1 精确一致
+    let gross_wanted = (net_wanted - U256::from(1u64)) * U256::from(10_000u64)
+        / U256::from(9_900u64)
+        + U256::from(1u64);
+    assert_eq!(
+        in_taxed,
+        plain
+            .simulate_swap_exact_out(pool.token_a.address, pool.token_b.address, gross_wanted)
+            .unwrap()
+    );
+}
+
 #[tokio::test]
 async fn test_simulate_swap_usdc_weth() -> eyre::Result<()> {
     dotenv::dotenv().ok();

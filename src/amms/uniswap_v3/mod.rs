@@ -3,7 +3,7 @@ use super::{
     consts::{MIN_V3_LIQUIDITY, MPFR_T_PRECISION},
     error::{AMMError, BatchContractError},
     factory::{AutomatedMarketMakerFactory, DiscoverySync},
-    get_token_decimals, Token,
+    fot, get_token_decimals, Token,
 };
 use crate::amms::{
     consts::U256_1, uniswap_v3::GetUniswapV3PoolTickBitmapBatchRequest::TickBitmapInfo,
@@ -364,6 +364,19 @@ impl AutomatedMarketMaker for UniswapV3Pool {
             return Err(AMMError::Msg("sqrt_price is zero".into()));
         }
 
+        // 输入侧 FoT（user→pool）：仅税种对该池生效时扣税（BuySell 仅在
+        // `pairs` 白名单池扣 sell_fee），池子实收 net 参与 swap math。
+        // 语义与 UniswapV2 实现一致（见 `fot` 模块文档「扣税档案」）。
+        let input_token = if base_token == self.token_a.address {
+            &self.token_a
+        } else {
+            &self.token_b
+        };
+        let amount_in = input_token.fot_input_net_for(self.address, amount_in);
+        if amount_in.is_zero() {
+            return Ok(U256::ZERO);
+        }
+
         let zero_for_one = base_token == self.token_a.address;
 
         // Set sqrt_price_limit_x_96 to the max or min sqrt price in the pool depending on zero_for_one
@@ -503,7 +516,14 @@ impl AutomatedMarketMaker for UniswapV3Pool {
 
         tracing::trace!(?amount_out);
 
-        Ok(amount_out)
+        // 输出侧 FoT（pool→user）：池子 math 输出 gross，transfer 扣税后
+        // 接收方实收 net（BuySell 扣 buy_fee，仅 `pairs` 白名单池生效）
+        let output_token = if zero_for_one {
+            &self.token_b
+        } else {
+            &self.token_a
+        };
+        Ok(output_token.fot_net_for(self.address, amount_out))
     }
 
     fn simulate_swap_mut(
@@ -519,6 +539,17 @@ impl AutomatedMarketMaker for UniswapV3Pool {
         // Defensive check: prevent divide-by-zero panic in uniswap_v3_math
         if self.sqrt_price.is_zero() {
             return Err(AMMError::Msg("sqrt_price is zero".into()));
+        }
+
+        // 输入侧 FoT：池子实收 net（池子白名单过滤同 simulate_swap）
+        let input_token = if base_token == self.token_a.address {
+            &self.token_a
+        } else {
+            &self.token_b
+        };
+        let amount_in = input_token.fot_input_net_for(self.address, amount_in);
+        if amount_in.is_zero() {
+            return Ok(U256::ZERO);
         }
         if self.liquidity == 0 {
             return Err(AMMError::Msg("liquidity is zero".into()));
@@ -682,7 +713,13 @@ impl AutomatedMarketMaker for UniswapV3Pool {
 
         tracing::trace!(?amount_out);
 
-        Ok(amount_out)
+        // 输出侧 FoT：接收方实收 net
+        let output_token = if base_token == self.token_a.address {
+            &self.token_b
+        } else {
+            &self.token_a
+        };
+        Ok(output_token.fot_net_for(self.address, amount_out))
     }
 
     fn simulate_swap_exact_out(
@@ -699,6 +736,16 @@ impl AutomatedMarketMaker for UniswapV3Pool {
         if self.sqrt_price.is_zero() {
             return Err(AMMError::Msg("sqrt_price is zero".into()));
         }
+
+        // exact-out 的 `amount_out` 是接收方到手 net：池子 math 必须先输出
+        // gross（先 gross-up；仅税种对该池生效时），transfer 扣税后接收方
+        // 才能拿到 net。
+        let output_token = if base_token == self.token_a.address {
+            &self.token_b
+        } else {
+            &self.token_a
+        };
+        let amount_out = output_token.fot_gross_up_for(self.address, amount_out);
 
         let zero_for_one = base_token == self.token_a.address;
 
@@ -841,7 +888,14 @@ impl AutomatedMarketMaker for UniswapV3Pool {
         }
 
         let amount_in = current_state.amount_calculated.into_raw();
-        Ok(amount_in)
+        // 输入侧 FoT（user→pool）：math 返回的是池子需实收 net，用户需转
+        // gross-up 后的名义金额才能覆盖输入侧扣税（仅白名单池生效）
+        let input_token = if base_token == self.token_a.address {
+            &self.token_a
+        } else {
+            &self.token_b
+        };
+        Ok(input_token.fot_input_gross_up_for(self.address, amount_in))
     }
 
     fn tokens(&self) -> Vec<Address> {
@@ -1515,6 +1569,12 @@ impl UniswapV3Factory {
             if let Some(decimals) = token_decimals.get(&uniswap_v3_pool.token_b.address) {
                 uniswap_v3_pool.token_b.decimals = *decimals;
             }
+
+            // FoT 注入：从全局注册表按 token 地址注入 fot_tax（token 级事实，
+            // 与 V2 家族一致：注册一次即覆盖所有含该 token 的池子）。
+            // 必须在 Token 重建点注入，否则 V3 池永远按普通 ERC20 建模。
+            fot::apply_to_token(&mut uniswap_v3_pool.token_a);
+            fot::apply_to_token(&mut uniswap_v3_pool.token_b);
         }
 
         Ok(())

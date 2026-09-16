@@ -6,6 +6,62 @@
 //! **扣税档案**——每节对应一个 token，取证方式与判定规则完整记录，
 //! 是长期迭代维护的唯一事实来源；**修改扣税语义必须同步更新对应档案**。
 //!
+//! # 扣税档案 · ARGUS（0xece5ca8b...）= BuySell{buy:100, sell:100}，单主池（UniswapV3），无 swapBack 建模
+//!
+//! **取证**：2026-09-16，Arc 主网（chain_id 5042）。第一现场 = 连续 20 笔
+//! 「2hop|USDC|0x6a3bacaa…(V3)|0xb3f441e8…(V4)」套利交易全部 revert
+//! （block 21130345–21130372，14s 内 20 笔，7.85 USDC gas）；同池
+//! 2000 块窗口（21092697–21132696）93,041 条 Transfer 事件全量回归。
+//!
+//! ## 合约架构
+//!   - `ARGUS` 0xece5ca8b… = EIP-1167 minimal proxy → impl 0x122c82cf…
+//!     （11,166 B，solc 0.8.24，无源码），`name()="Argus"`、18 位
+//!   - xlaunch.fun `XLaunchTaxToken` 家族（同 STARMAN 家族）：`_update` 内
+//!     按「是否与主池交互」扣税；`mainPool()` = 0x6a3bacaa…（UniswapV3
+//!     USDC/ARGUS，fee 1%，TVL $1.19M）；其他池（V4 PoolManager）不扣税
+//!   - `isExempt()`：仅 address(0) 与 `portal()` 为 true；本合约/主池/
+//!     PoolManager/worker EOA 全部 false
+//!   - `currentTaxes()` = {100, 100}（1% / 1%）
+//!
+//! ## 扣税判定（链上实测矩阵，Transfer 事件逐笔归因）
+//!
+//! | 方向 | 判定 | 证据 |
+//! |:--|:--|:--|
+//! | 主池(V3) → 任意（买出） | **扣 1%，从转出额中扣** | 1,411/1,411 买入全部等于 100 bps；MAIN→税仓 1%、MAIN→用户 99%，两者之和 = Swap amount1 |
+//! | 税币 → 主池（卖进） | 池子实收**全额**（0 税，78% 样本）；22% 样本另在**名义额外**加收 1%（sender 余额多扣 1%）| 860 笔卖出中 672 笔零税、170 笔「池子实收全额 + sender→税仓 = 1%」、18 笔 1 wei |
+//! | 任意 ↔ V4 PoolManager | **0 税**（PoolManager 不是主池）| V4PM↔EOA 16,129 笔零税；V4PM→主池 31 笔按「卖进主池」计 1% |
+//! | EOA ↔ EOA / 其他池 | 0 税 | 27,567 笔零税 |
+//!
+//! **卖出侧 22% 加收的触发条件未完全定位**（候选：`swapping`/swapBack 状态、
+//! 合约自持余额、per-sender 冷却；已排除 `isExempt`、金额大小、池价偏离、
+//! 自持余额阈值相关性——同一 sender 同时出现在扣税与不扣税两组）。
+//! 建模取**保守**口径 `sell_fee_bps = 100`：主池卖出腿的 1% 税
+//! （≈$3/笔，ARGUS 腿 ~$318）远大于实盘净利（$0.32–1.39），
+//! 少算即产出虚假机会，多算仅漏掉理论上无税的 78% 路径。
+//!
+//! ## swapBack（不建模）
+//!   - `swapBackThreshold()` 动态（≈280e18 = 主池 ARGUS 余额的 ~0.5%），
+//!     `TOKEN → 主池` 砸盘在窗口内 63 笔、约每 600 块（~5min）一次，
+//!     由独立 keeper 交易触发，**不在用户 transfer 内**（卖出交易内无
+//!     税仓→主池转账）；因此注册 `swap_back_threshold = U256::MAX`，
+//!     amms 不做砸盘预交易（否则会在模拟里注入不存在的砸盘冲击）
+//!
+//! ## 失效现场（第一现场 trace 证据）
+//!   - tx 0xe1275904…（block 21130345，`executeV4Callback`）：V3 腿
+//!     USDC→ARGUS gross 输出 8,424.771259706602566646，V4 flash 需偿还
+//!     同额 ARGUS，但合约 `balanceOf` 只有 8,340.523547109536540980
+//!     = gross × 0.99，`ARGUS.transfer` 因 `ERC20InsufficientBalance`
+//!     revert；缺口恒为 1.0000% —— V3 变体此前没有 FoT 通路（无税注入、
+//!     math 不扣税），模拟按 gross 记账 ⇒ 结构性必然 revert 的「机会」
+//!
+//! ## 注册 JSON（fot_tokens 表 / ndjson token 条目）
+//!
+//! ```json
+//! {"type":"buy_sell","buy_fee_bps":100,"sell_fee_bps":100,
+//!  "pairs":["0x6a3bacaa6493734c1ac221ebf42cf530a96c1e02"],
+//!  "swap_back_threshold":"115792089237316195423570985008687907853269984665640564039457584007913129639935"}
+//! ```
+//!
 //! # 扣税档案 · XLS（0x64af27d3...）= BuySell{buy:0, sell:300}，XlayerSwapV2 池白名单，无 swapBack
 //!
 //! **取证**：2026-08-09 曾按 Transfer 事件逐笔金额 + balanceOf 差值误判为
@@ -118,6 +174,22 @@
 //!     维护；未读到按 0 = 不触发处理）
 //!   - 输出侧（token 出白名单池）：扣 `buy_fee_bps`
 //!   - pool ∉ pairs 时任何方向都不扣税
+//!
+//! # 池子变体覆盖范围（2026-09-16）
+//!
+//! FoT 通路必须由 **池子变体自己** 实现（math 内扣税 + Token 重建点注入
+//! `apply_to_token`）。当前已接入：
+//!   - V2 家族：UniswapV2 / SushiV2 / PancakeV2 / AerodromeV2（含 swapBack
+//!     预交易与事件驱动自持余额）
+//!   - UniswapV3（1.23.0 起）：输入侧 `fot_input_net_for` 进 math、
+//!     输出侧 `fot_net_for` 扣税、exact-out 双向 gross-up，
+//!     并在 `sync_token_decimals` 重建 Token 时注入注册表税种
+//!   - 其他专用变体（Ekubo / Caliber / BinaryFi / Elfomo 等）各自的实现
+//!
+//! **未接入**：UniswapV4 / PancakeV3 / 其他 CL 变体——注册税种后不会改变
+//! 模拟结果（V4 的 token 转账对手方是 PoolManager 而非池子本身，需按
+//! PoolManager 语义单独建模）。登记新链 FoT token 前必须先确认其池子变体
+//! 已接入，否则会产出「虚假机会」（Arc ARGUS 即此坑，见下方档案）。
 //!
 //! # 注册方式
 //!
