@@ -133,23 +133,85 @@ fn test_simulate_swap_fot_tax_in_out() {
     );
     assert!(net_buy < gross_buy);
 
-    // 卖出（税币进池）：池子实收 net，等价于按 99% 净额入池做 math
-    let gross_sell = plain
+    // 卖出（税币进池）：V3 池子有余额硬校验 → 池子按**名义额**实收并入 math，
+    // 因此输出与无税路径**完全一致**；输入侧税只增加付款方成本。
+    // 卖出（税币进池）：链上实测是**加收型**——池子按名义额 1:1 实收（余额硬
+    // 校验 `IIA`），付款方被扣 `名义 + floor(名义×1%)`。所以 `amount_in` 的
+    // 语义是"我方可用余额"，库内必须先换算名义额再进 math（否则高估 ≈1%）。
+    let taxed_sell = pool
         .simulate_swap(pool.token_b.address, pool.token_a.address, amount_in)
         .unwrap();
-    let net_sell = pool
-        .simulate_swap(pool.token_b.address, pool.token_a.address, amount_in)
-        .unwrap();
-    assert!(net_sell < gross_sell);
+    let nominal = pool
+        .token_b
+        .fot_input_nominal_for_balance(pool_addr, amount_in);
+    assert!(nominal < amount_in, "加收型：名义额必须小于可用余额");
     assert_eq!(
-        net_sell,
+        taxed_sell,
         plain
-            .simulate_swap(
-                pool.token_b.address,
-                pool.token_a.address,
-                amount_in * U256::from(99u64) / U256::from(100u64)
-            )
-            .unwrap()
+            .simulate_swap(pool.token_b.address, pool.token_a.address, nominal)
+            .unwrap(),
+        "税币进池腿输出必须等于按名义额（余额净额后）模拟的结果"
+    );
+    // 成本 = 名义 + floor(名义×1%) ≤ 余额，且名义额是满足该条件的最大解
+    let cost = pool.token_b.fot_input_cost_for(pool_addr, nominal);
+    assert!(cost <= amount_in, "付款方成本不得超过可用余额");
+    assert!(
+        pool.token_b
+            .fot_input_cost_for(pool_addr, nominal + U256::from(1u64))
+            > amount_in,
+        "名义额必须是满足 cost ≤ 余额 的最大解"
+    );
+    assert_eq!(
+        pool.token_b.fot_input_nominal_for_balance(pool_addr, cost),
+        nominal,
+        "余额 ↔ 名义额换算必须逐位可逆"
+    );
+    // 非税 token / 非白名单池：成本 = 名义额（不扣税）
+    assert_eq!(
+        pool.token_a.fot_input_cost_for(pool_addr, amount_in),
+        amount_in
+    );
+    assert_eq!(
+        pool.token_b
+            .fot_input_cost_for(Address::repeat_byte(0x77), amount_in),
+        amount_in,
+        "非白名单池任何方向都不扣税"
+    );
+
+    // mut 与非 mut 必须逐位一致（含输入侧税的卖出腿）
+    let mut pool_mut = pool.clone();
+    assert_eq!(
+        pool_mut
+            .simulate_swap_mut(pool.token_b.address, pool.token_a.address, amount_in)
+            .unwrap(),
+        taxed_sell
+    );
+    let mut pool_mut_buy = pool.clone();
+    assert_eq!(
+        pool_mut_buy
+            .simulate_swap_mut(pool.token_a.address, pool.token_b.address, amount_in)
+            .unwrap(),
+        net_buy
+    );
+
+    // 非白名单池（同状态、不同地址）两个方向都不扣税
+    let mut other_pool = pool.clone();
+    other_pool.address = Address::repeat_byte(0x77);
+    assert_eq!(
+        other_pool
+            .simulate_swap(pool.token_a.address, pool.token_b.address, amount_in)
+            .unwrap(),
+        gross_buy,
+        "非白名单池转出税币不应扣税"
+    );
+    assert_eq!(
+        other_pool
+            .simulate_swap(pool.token_b.address, pool.token_a.address, amount_in)
+            .unwrap(),
+        plain
+            .simulate_swap(pool.token_b.address, pool.token_a.address, amount_in)
+            .unwrap(),
+        "非白名单池：余额全额进 math（不净额、不扣税）"
     );
 
     // exact-out：到手 net 不变 → 需多付输入（输出侧 gross-up）

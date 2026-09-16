@@ -214,6 +214,38 @@ pub struct Tick {
     pub initialized: bool,
 }
 
+/// V3 变体**未实现** FoT swapBack 预交易，命中触发条件时显式告警。
+///
+/// V2 的 swapBack 可以只用 reserve 平移表达（`fot_swap_back_reserves`）；
+/// CL 的砸盘是"第二笔完整 swap"，必须推进 `(sqrt_price, tick, liquidity)`
+/// 状态后才能接用户主 swap，不能照搬。ARGUS 类 token（阈值 U256::MAX，
+/// 砸盘由独立 keeper 交易触发、不在用户 transfer 内）不受影响；但其它
+/// "CL 主池 + swapBack" 的 token 若被登记，模拟会**静默按不砸盘**计算，
+/// 方向是低估冲击 → 可能高估利润，故这里显式告警。
+fn warn_unmodeled_swap_back(pool: Address, input_token: &Token) {
+    let Some(fot::FotTaxType::BuySell {
+        pairs,
+        swap_back_threshold,
+        ..
+    }) = input_token.fot_tax.as_ref()
+    else {
+        return;
+    };
+    if *swap_back_threshold == U256::MAX || !pairs.contains(&pool) {
+        return;
+    }
+    let balance = fot::swap_back_balance(input_token.address);
+    if balance >= *swap_back_threshold {
+        tracing::warn!(
+            pool = ?pool,
+            token = ?input_token.address,
+            balance = %balance,
+            threshold = %swap_back_threshold,
+            "uniswap_v3: FoT swapBack 未建模（CL 需第二笔真实 swap），本次模拟未计入砸盘价格冲击"
+        );
+    }
+}
+
 impl AutomatedMarketMaker for UniswapV3Pool {
     fn address(&self) -> Address {
         self.address
@@ -364,16 +396,28 @@ impl AutomatedMarketMaker for UniswapV3Pool {
             return Err(AMMError::Msg("sqrt_price is zero".into()));
         }
 
-        // 输入侧 FoT（user→pool）：仅税种对该池生效时扣税（BuySell 仅在
-        // `pairs` 白名单池扣 sell_fee），池子实收 net 参与 swap math。
-        // 语义与 UniswapV2 实现一致（见 `fot` 模块文档「扣税档案」）。
+        // 输入侧 FoT（user→pool）：V3 是**加收型**，`amount_in` 语义 = 本腿
+        // **付款方可用余额**。
+        //
+        // 链上实测（Arc ARGUS/USDC 池，`debug_traceCall(from=付款人,
+        // transfer(池, X))` + prestate diff）：付款方 −1.01X、池子 +X、
+        // 税仓 +0.01X。池子 swap 回调结束后有余额硬校验（`IIA`）要求按
+        // **名义额**足额实收，所以余额必须先换算成名义额再进 math
+        // （`Token::fot_input_nominal_for_balance`）；被税拿走的 1% 不再回到
+        // 资金循环，利润无需额外扣减项。直接把余额当名义额进 math 会高估 ≈1%。
+        //
+        // V2 的输入侧语义不同（pair 按实收余额记账、由 V2 模块自行净额，见
+        // `uniswap_v2/mod.rs`）。付款方实际支出（余额/授权校验）见
+        // [`Token::fot_input_cost_for`]。
         let input_token = if base_token == self.token_a.address {
             &self.token_a
         } else {
             &self.token_b
         };
-        let amount_in = input_token.fot_input_net_for(self.address, amount_in);
-        if amount_in.is_zero() {
+        warn_unmodeled_swap_back(self.address, input_token);
+
+        let nominal_in = input_token.fot_input_nominal_for_balance(self.address, amount_in);
+        if nominal_in.is_zero() {
             return Ok(U256::ZERO);
         }
 
@@ -390,7 +434,7 @@ impl AutomatedMarketMaker for UniswapV3Pool {
         let mut current_state = CurrentState {
             sqrt_price_x_96: self.sqrt_price, // Active price on the pool
             amount_calculated: I256::ZERO,    // Amount of token_out that has been calculated
-            amount_specified_remaining: I256::from_raw(amount_in), // Amount of token_in that has not been swapped
+            amount_specified_remaining: I256::from_raw(nominal_in), // Amount of token_in that has not been swapped
             tick: self.tick,                                       // Current i24 tick of the pool
             liquidity: self.liquidity, // Current available liquidity in the tick range
         };
@@ -541,18 +585,22 @@ impl AutomatedMarketMaker for UniswapV3Pool {
             return Err(AMMError::Msg("sqrt_price is zero".into()));
         }
 
-        // 输入侧 FoT：池子实收 net（池子白名单过滤同 simulate_swap）
+        // 输入侧 FoT：语义同 `simulate_swap`——V3 是加收型，`amount_in` 是
+        // 付款方可用余额，库内按 `fot_input_nominal_for_balance` 换算名义额进
+        // math；实际支出（余额/授权）见 `fot_input_cost_for`。
         let input_token = if base_token == self.token_a.address {
             &self.token_a
         } else {
             &self.token_b
         };
-        let amount_in = input_token.fot_input_net_for(self.address, amount_in);
-        if amount_in.is_zero() {
-            return Ok(U256::ZERO);
-        }
+        warn_unmodeled_swap_back(self.address, input_token);
         if self.liquidity == 0 {
             return Err(AMMError::Msg("liquidity is zero".into()));
+        }
+
+        let nominal_in = input_token.fot_input_nominal_for_balance(self.address, amount_in);
+        if nominal_in.is_zero() {
+            return Ok(U256::ZERO);
         }
 
         let zero_for_one = base_token == self.token_a.address;
@@ -571,7 +619,7 @@ impl AutomatedMarketMaker for UniswapV3Pool {
             // Amount of token_out that has been calculated
             amount_calculated: I256::ZERO,
             // Amount of token_in that has not been swapped
-            amount_specified_remaining: I256::from_raw(amount_in),
+            amount_specified_remaining: I256::from_raw(nominal_in),
             // Current i24 tick of the pool
             tick: self.tick,
             // Current available liquidity in the tick range
@@ -888,14 +936,16 @@ impl AutomatedMarketMaker for UniswapV3Pool {
         }
 
         let amount_in = current_state.amount_calculated.into_raw();
-        // 输入侧 FoT（user→pool）：math 返回的是池子需实收 net，用户需转
-        // gross-up 后的名义金额才能覆盖输入侧扣税（仅白名单池生效）
+        // 输入侧 FoT（user→pool）：`amount_in` 是池子 math 要求收到的**名义额**
+        // （V3 余额硬校验口径），转到池子的也是该值。付款方实际支出 = 名义额 +
+        // 加收税（链上实测 `cost = N + floor(N×fee/10000)`）= 本返回值；执行层
+        // 按该值准备余额/授权额度。
         let input_token = if base_token == self.token_a.address {
             &self.token_a
         } else {
             &self.token_b
         };
-        Ok(input_token.fot_input_gross_up_for(self.address, amount_in))
+        Ok(input_token.fot_input_cost_for(self.address, amount_in))
     }
 
     fn tokens(&self) -> Vec<Address> {

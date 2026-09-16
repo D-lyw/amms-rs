@@ -212,6 +212,38 @@ impl Token {
         }
     }
 
+    /// 输入侧**付款方成本**（池子过滤版，V3 加收型口径）。
+    ///
+    /// V3 的输入侧税是**加收型**（链上实测）：付款方把 `nominal` 转给池子时被
+    /// 扣 `nominal + floor(nominal × fee_bps / 10000)`，池子按名义额 `nominal`
+    /// 实收（1:1，余额硬校验 `IIA` 通过）。本函数返回该"实际支出"，供执行层
+    /// 准备余额/授权额度（授权必须覆盖本值，而不是 `nominal`）。
+    ///
+    /// **优化器/利润侧不要用本函数做净额**，用
+    /// [`Token::fot_input_nominal_for_balance`]（余额 → 名义额），否则会重复扣减。
+    pub fn fot_input_cost_for(&self, pool: Address, nominal: U256) -> U256 {
+        match &self.fot_tax {
+            Some(tax) if tax.applies_to_pool(pool) => tax.input_cost_on_top(nominal),
+            _ => nominal,
+        }
+    }
+
+    /// 输入侧**余额 → 名义额**换算（池子过滤版，V3 加收型口径）。
+    ///
+    /// `balance` = 本腿付款方可用余额（hop 链里 = 上一跳输出 / 起点借款额），
+    /// 返回 = 应让池子 math 处理的名义额（也是应付给池子的转账额）。被税吃掉的
+    /// 那部分不再回到资金循环，所以利润无需再挂一个独立扣减项。
+    ///
+    /// 无税 / 非白名单池 / 输入侧不扣税的税种（`FlatRate`）返回 `balance` 原值。
+    /// V2 池的输入侧语义不同（pair 按实收余额记账，由 V2 模块自行净额，见
+    /// [`Token::fot_input_net_for`]），不要用本函数。
+    pub fn fot_input_nominal_for_balance(&self, pool: Address, balance: U256) -> U256 {
+        match &self.fot_tax {
+            Some(tax) if tax.applies_to_pool(pool) => tax.input_nominal_on_top(balance),
+            _ => balance,
+        }
+    }
+
     pub const fn decimals(&self) -> u8 {
         self.decimals
     }

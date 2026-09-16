@@ -38,6 +38,10 @@
 //! 建模取**保守**口径 `sell_fee_bps = 100`：主池卖出腿的 1% 税
 //! （≈$3/笔，ARGUS 腿 ~$318）远大于实盘净利（$0.32–1.39），
 //! 少算即产出虚假机会，多算仅漏掉理论上无税的 78% 路径。
+//! 注意 V3 上的落地方式（2026-09-16 修正）：池子按**名义额**实收并进 math
+//! （余额硬校验），该 1% 只体现为**付款方成本**（[`Token::fot_input_cost_for`]
+//! = gross_up(名义额) ≈ ×1.0101，比加收制的 ×1.01 高 0.01%，安全侧）；
+//! 卖出腿的池子输出与无税路径一致。
 //!
 //! ## swapBack（不建模）
 //!   - `swapBackThreshold()` 动态（≈280e18 = 主池 ARGUS 余额的 ~0.5%），
@@ -181,15 +185,38 @@
 //! `apply_to_token`）。当前已接入：
 //!   - V2 家族：UniswapV2 / SushiV2 / PancakeV2 / AerodromeV2（含 swapBack
 //!     预交易与事件驱动自持余额）
-//!   - UniswapV3（1.23.0 起）：输入侧 `fot_input_net_for` 进 math、
-//!     输出侧 `fot_net_for` 扣税、exact-out 双向 gross-up，
-//!     并在 `sync_token_decimals` 重建 Token 时注入注册表税种
+//!   - UniswapV3（1.23.0 起接入，2026-09-16 **修正输入侧语义**）：输出侧
+//!     `fot_net_for` 扣税（接收方实收 net，与 V2 一致）；**输入侧不做净额
+//!     变换**（见下节）；exact-out 输出侧 gross-up、输入侧返回"扣减型"
+//!     transfer 金额；并在 `sync_token_decimals` 重建 Token 时注入注册表税种
 //!   - 其他专用变体（Ekubo / Caliber / BinaryFi / Elfomo 等）各自的实现
 //!
 //! **未接入**：UniswapV4 / PancakeV3 / 其他 CL 变体——注册税种后不会改变
 //! 模拟结果（V4 的 token 转账对手方是 PoolManager 而非池子本身，需按
 //! PoolManager 语义单独建模）。登记新链 FoT token 前必须先确认其池子变体
 //! 已接入，否则会产出「虚假机会」（Arc ARGUS 即此坑，见下方档案）。
+//!
+//! ## V2 与 V3 的输入侧语义差异（唯一的结构性差异）
+//!
+//! | 变体 | 池子实收 | 进 swap math 的金额 | 付款方成本 |
+//! |:--|:--|:--|:--|
+//! | V2 | 名义 − 税（pair 按 `balanceOf` 差值记账）| **净额** | 名义额 |
+//! | V3 | **名义额**（余额硬校验强制）| **名义额** | 名义 + 税（gross-up）|
+//!
+//! 机制差异的根源：V2 pair 只相信"实际到账多少"（事实驱动），税改变了事实，
+//! 池子照实收记账；V3 池子**先按指定的名义额算完整条价格轨迹**，回调结束后
+//! 再硬校验余额（`balance_after >= balance_before + amountToPay`，Uniswap V3
+//! `IIA`），"少收"直接 revert。
+//!
+//! 所以：**V2 的输入侧税扣在池子里**（净额进 math），
+//! **V3 的输入侧税加在付款方身上**（池子看到的仍是名义额，多掏的钱付税）。
+//! 上层做循环输入 / 借款额 / 还款预算时，V3 腿必须按付款方成本
+//! （[`Token::fot_input_cost_for`]）而非名义额计算可用余额；否则链上会因
+//! 余额不足 revert（额外加收型）或池子余额校验 revert（从转账额内扣型）。
+//!
+//! CL 的 **swapBack 预交易未实现**（V2 可只平移 reserve；CL 的砸盘是"第二笔
+//! 完整 swap"，必须推进 `(sqrt_price, tick, liquidity)`）。命中触发条件时
+//! `uniswap_v3` 侧会打印显式告警，不做静默近似。
 //!
 //! # 注册方式
 //!
@@ -377,6 +404,50 @@ impl FotTaxType {
         let numerator = (net - U256::from(1u8)) * U256::from(Self::BASIS);
         let denominator = U256::from(Self::BASIS - fee_bps);
         numerator / denominator + U256::from(1u8)
+    }
+
+    /// 输入侧税率（bps）。[`FotTaxType::FlatRate`] 输入侧不扣税 → 0。
+    pub fn input_fee_bps(&self) -> u64 {
+        match self {
+            FotTaxType::FlatRate { .. } => 0,
+            FotTaxType::BothSides { fee_bps } => *fee_bps,
+            FotTaxType::BuySell { sell_fee_bps, .. } => *sell_fee_bps,
+        }
+    }
+
+    /// **加收型**输入侧成本：付款方要实际支出多少，池子才按名义额 `nominal`
+    /// 足额实收。
+    ///
+    /// 链上实测（Arc ARGUS/USDC V3 池，`debug_traceCall(from=付款人,
+    /// transfer(池, X))` + prestate diff）：付款方 **−1.01X**、池子 **+X**、
+    /// 税仓 **+0.01X**，即 `cost(X) = X + floor(X × fee_bps / 10000)`。
+    ///
+    /// 恒等：`X + floor(X×f/BASIS) == floor(X×(BASIS+f)/BASIS)`（X 为整数）。
+    pub fn input_cost_on_top(&self, nominal: U256) -> U256 {
+        let fee_bps = self.input_fee_bps();
+        if fee_bps == 0 {
+            return nominal;
+        }
+        nominal + nominal * U256::from(fee_bps) / U256::from(Self::BASIS)
+    }
+
+    /// **加收型**输入侧反解：付款方余额 `balance` 最多能让池子 math（按名义额）
+    /// 处理多少。
+    ///
+    /// `cost` 严格递增 ⇒ 解唯一：`max N s.t. floor(N×(BASIS+f)/BASIS) ≤ balance`
+    /// ⇒ `N = ((balance+1)×BASIS - 1) / (BASIS + f)`（纯整数闭式解）。
+    ///
+    /// V3 池子余额硬校验（`IIA`）要求池子按**名义额**实收，所以"余额 → 名义额"
+    /// 必须走本函数：直接把余额当名义额进 math 会高估 `≈ f/(BASIS+f)`
+    /// （ARGUS 实测 ≈1%）。
+    pub fn input_nominal_on_top(&self, balance: U256) -> U256 {
+        let fee_bps = self.input_fee_bps();
+        if fee_bps == 0 {
+            return balance;
+        }
+        let basis = U256::from(Self::BASIS);
+        let denom = U256::from(Self::BASIS + fee_bps);
+        ((balance + U256::from(1u8)) * basis - U256::from(1u8)) / denom
     }
 
     /// 该税种下，gross 金额实际到手 net
