@@ -708,10 +708,26 @@ impl PancakeInfinityFactory {
 
         let mut pools = liquid_pools;
         for pool in pools.iter_mut() {
-            pool.token_a_price =
-                pool.calculate_price(pool.token_a.address, pool.token_b.address)?;
-            pool.token_b_price =
-                pool.calculate_price(pool.token_b.address, pool.token_a.address)?;
+            // 定价失败不再中断整批初始化：强制保留的低流动性池状态可能退化
+            // （tick 结构为空 / sqrt_price 越界），单个坏池不应拖垮启动。
+            match pool.calculate_price(pool.token_a.address, pool.token_b.address) {
+                Ok(price) => {
+                    pool.token_a_price = price;
+                    pool.token_b_price = pool
+                        .calculate_price(pool.token_b.address, pool.token_a.address)
+                        .unwrap_or(0.0);
+                }
+                Err(err) => {
+                    pool.token_a_price = 0.0;
+                    pool.token_b_price = 0.0;
+                    tracing::warn!(
+                        target: "amms::pancake_infinity::init_batch",
+                        pool_id = ?pool.pool_id,
+                        error = %err,
+                        "Price initialization failed; pool kept with zero price"
+                    );
+                }
+            }
         }
 
         let result: Vec<AMM> = pools.into_iter().map(AMM::PancakeInfinityPool).collect();

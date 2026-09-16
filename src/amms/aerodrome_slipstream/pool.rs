@@ -1406,6 +1406,10 @@ impl AutomatedMarketMaker for AerodromeSlipstreamPool {
     }
 
     fn has_sufficient_liquidity(&self) -> bool {
+        // 使用方注册的强制保留池（低流动性 dust 池）：直接放行，不走阈值判定。
+        if crate::amms::liquidity_gate::is_force_retained(&self.address()) {
+            return true;
+        }
         let d_a = self.token_a.decimals;
         let d_b = self.token_b.decimals;
 

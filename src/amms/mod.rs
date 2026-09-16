@@ -36,6 +36,7 @@ pub mod fermi_prop;
 pub mod float;
 pub mod fluid_dex;
 pub mod fot;
+pub mod liquidity_gate;
 pub mod pancake_infinity;
 pub mod pancake_v2;
 pub mod pancake_v3;

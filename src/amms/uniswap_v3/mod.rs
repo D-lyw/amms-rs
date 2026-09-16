@@ -920,6 +920,10 @@ impl AutomatedMarketMaker for UniswapV3Pool {
     }
 
     fn has_sufficient_liquidity(&self) -> bool {
+        // 使用方注册的强制保留池（低流动性 dust 池）：直接放行，不走阈值判定。
+        if crate::amms::liquidity_gate::is_force_retained(&self.address()) {
+            return true;
+        }
         // Dynamic liquidity threshold based on token decimals
         // L ~ sqrt(x * y)
         // We estimate required L based on required token amounts (x_thresh, y_thresh)
