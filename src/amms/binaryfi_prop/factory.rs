@@ -122,6 +122,8 @@ impl BinaryFiPropFactory {
             ladder_reserves: Vec::new(),
             price0_calibrated: false,
             fee_ppm: BINARYFI_DEFAULT_FEE_PPM,
+            blacklisted: false,
+            blacklist_seen_block: 0,
         }
     }
 }

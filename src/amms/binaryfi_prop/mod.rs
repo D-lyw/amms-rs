@@ -18,6 +18,21 @@
 //! 事件实时同步；**所有价格/阶梯均存无费口径**，报价时输入侧扣费
 //! `rem = in − in×fee_ppm/1e6`（整数除法），fee 变更无需重校准价格：
 //!
+//! **费率无关性（v1.23.2 起，长期维护必读）**：`rates[]` 与价格/阶梯一样只存
+//! **无费口径**，费率一律由读取方 [`BinaryFiPropPool::rate_effective`] 按当前
+//! `fee_ppm` 现算 —— fee 变更（含黑名单 = 1e6）**不需要也不允许**任何缓存重导/
+//! 失效。历史实现把"含费可执行价"缓存在 `rates[]`，fee 变更路径一旦漏掉某个
+//! pair（推导缺料返回 `None`），旧费率的 rate 就永久残留，`simulate_swap` 的
+//! 兜底分支再把它当"未知价格的兜底价"报出去 → 链上 `AmountTooSmall` 连续回滚
+//! （2026-09-24 事故，见 `docs/binaryfi_prop_internal.md` §7.9.3）。同时"该方向
+//! 能否报价"只有单一判据 [`BinaryFiPropPool::quote_dead`]：spot /
+//! `simulate_swap`(`_mut`/`_exact_out`) 共用，死方向恒返回 0，缓存残留无法变成机会。
+//!
+//! 黑名单（`BlacklistSet`）另有**块水位**：事件即熔断（`blacklisted` +
+//! `blacklist_seen_block`），解除必须由"快照块 ≥ 水位且 `getFee` < 1e6"或
+//! 事件 `status=false` 给出 —— 快照块取自 canonical head、比 flashblock 事件流
+//! 滞后 1~2 块，无水位时旧块快照会把拉黑态回退成可报价（幻影窗口）。
+//!
 //! - 卖方向：`raw_i = price_i - sellOff_i`（`sellOff = bidOffsetRaw × scale/10000`；
 //!   `bid_i = price_i - sellOff_i`；历史 fee=1000 时等价
 //!   `bid = floor((price×999 - sellOff×1000)/1000)`）
@@ -409,6 +424,23 @@ pub struct BinaryFiPropPool {
     /// getFee 实时更新；序列化兜底 = 1000（与历史行为一致）。
     #[serde(default = "default_fee_ppm")]
     pub fee_ppm: u64,
+    /// 引擎黑名单位（`BlacklistSet(account, true)` 命中本实例费率生效账户时置位）。
+    /// 拉黑后链上 `getFee` = 1e6（100% 费）且全部 `quote` 归 0：任何方向都不可
+    /// 报价。事件即熔断（0 延迟，不等快照 RPC）；解除需链上权威口径
+    /// （`getFee` < 1e6 **且快照块 ≥ [`Self::blacklist_seen_block`]**，见下）。
+    /// 序列化兜底 = false。
+    #[serde(default)]
+    pub blacklisted: bool,
+    /// 首次观测到拉黑的块号（0 = 未拉黑），拉黑状态的**水位**。
+    ///
+    /// AsyncUpdate/周期快照的块取自 canonical head（`provider.get_block_number()`），
+    /// 比 flashblock 事件流**滞后 1~2 块**：拉黑事件在块 F 到达时，紧接着的快照可能
+    /// 读到 F−1 的 `getFee`（仍是 15000、quote 非 0）。若不加水位，这份"旧块快照"
+    /// 会把拉黑状态清掉 → 重新报价 1~2 块（幻影窗口）。故清除条件 = 快照块
+    /// `>= blacklist_seen_block` 且 `fee < 1e6`；`BlacklistSet(account, false)`
+    /// 事件是显式解除证据，可立即清零。
+    #[serde(default)]
+    pub blacklist_seen_block: u64,
     /// 链 ID
     pub chain_id: u64,
     /// 创建区块号（StateSpace 扫描起点）
@@ -492,7 +524,9 @@ pub struct BinaryFiPropPool {
     /// 首个快照走 replay 分支精确恢复，无需落盘/迁移。
     #[serde(default, skip_serializing)]
     pub ledger: ReservesDeltaLedger,
-    /// 有向费率 num/den，index = i * N + j（对角为空）
+    /// 有向费率 num/den（**无费口径**），index = i * N + j（对角为空）。
+    /// 读取必须经 [`Self::rate_effective`] 按当前 `fee_ppm` 现算可执行价；
+    /// 直接读缓存 = 绕过费率（fee 变更后即为旧费率幻影价）。
     pub rates: Vec<Rate>,
     /// 待批量刷新 pair（index 同上）
     pub stale_pairs: Vec<usize>,
@@ -1127,12 +1161,12 @@ impl BinaryFiPropPool {
     }
 
     /// 由 raw/q0j 推导 rate(i→j)，与引擎报价公式一致（精确有理数，约分后大整数分数）：
-    ///   - `i→0`：`rate = raw_i × 10^(d0-2) / 10^di`
-    ///     （raw = price - sell_off，无费；再按 fee_ppm 折算可执行价）
+    ///   - `i→0`：`rate = raw_i × 10^(d0-2) / 10^di`（raw = price - sell_off）
     ///   - `0→j`：`rate = q0j_j / 10^d0`（BUY 小额报价状态，无费）
     ///   - `i→j`：两段式 `rate = raw_i × q0j_j / 10^(di+2)`（无费）
-    /// 返回值均为**含当前 fee 的可执行中间价**（无费 rate × (1e6−fee)/1e6），
-    /// 供 spot/预过滤与下游可执行价对齐。
+    /// **返回值均为无费口径**（费率由读取方 [`Self::rate_effective`] 现算）：
+    /// fee 变更（快照 / 事件 / 黑名单）无需任何缓存重导或失效，从构造上消灭
+    /// "fee 变了、rates 没变" 这一类幻影价缺陷。
     fn derive_rate(&self, i: usize, j: usize) -> Option<Rate> {
         if i == j || i >= self.assets.len() || j >= self.assets.len() {
             return None;
@@ -1170,28 +1204,22 @@ impl BinaryFiPropPool {
                     den: U256::from(1),
                 }
             };
-            // 含当前 fee 的可执行中间价（输出侧 ×(1e6−fee)/1e6）
-            apply_fee_rate(rate, self.fee_ppm)
+            Some(rate)
         } else if i == 0 {
-            // rate = q0j / 10^d0（0→j 小额报价精确值，无费；再按 fee 折算可执行价）
+            // rate = q0j / 10^d0（0→j 小额报价精确值）
             let q = self
                 .q0j
                 .get(j)
                 .copied()
                 .flatten()
                 .filter(|q| !q.is_zero())?;
-            apply_fee_rate(
-                Rate {
-                    num: q,
-                    den: p10(d0),
-                },
-                self.fee_ppm,
-            )
+            Some(Rate {
+                num: q,
+                den: p10(d0),
+            })
         } else {
-            // 两段式相乘（无费）：raw_i×10^(d0-2)/10^di × q0j/10^d0
-            // = raw_i×q0j / 10^(di+2)
-            // （跨资产第二段不含费因子，链上实测；第一段扣费一次，
-            //  可执行价整体 ×(1e6−fee)/1e6）
+            // 两段式相乘：raw_i×10^(d0-2)/10^di × q0j/10^d0 = raw_i×q0j / 10^(di+2)
+            // （跨资产第二段不含费因子，链上实测；费在输入侧扣一次）
             let raw_i = raw(i)?;
             let q = self
                 .q0j
@@ -1199,29 +1227,96 @@ impl BinaryFiPropPool {
                 .copied()
                 .flatten()
                 .filter(|q| !q.is_zero())?;
-            apply_fee_rate(
-                Rate {
-                    num: raw_i.checked_mul(q)?,
-                    den: p10(di + 2),
-                },
-                self.fee_ppm,
-            )
+            Some(Rate {
+                num: raw_i.checked_mul(q)?,
+                den: p10(di + 2),
+            })
         }
     }
 
-    /// 仅设置费率（批量快照/update 用，不改变余额）
+    /// 可执行（含费）中间价：无费 `rates[]` 按当前 `fee_ppm` 现算。
+    ///
+    /// **所有读 `rates[]` 的报价/预过滤路径必须走这里**（费率后置，缓存不失效）；
+    /// fee ≥ 1e6（100% 费 = 黑名单口径）时任何输入都归 0 → `None`（不可报价）。
+    fn rate_effective(&self, i: usize, j: usize) -> Option<Rate> {
+        let rate = self
+            .rates
+            .get(self.pair_index(i, j))
+            .copied()
+            .unwrap_or_default();
+        if rate.is_zero() {
+            return None;
+        }
+        apply_fee_rate(rate, self.fee_ppm).filter(|r| !r.is_zero())
+    }
+
+    /// 黑名单口径：`BlacklistSet` 命中本账户，或 `fee_ppm` = 1e6（100% 费）。
+    /// 两者链上表现一致：任何方向 `quote` 恒 0、不可报价。
+    pub fn fee_blacklisted(&self) -> bool {
+        self.blacklisted || self.fee_ppm >= 1_000_000
+    }
+
+    /// 该方向在链上是否**恒不可报价**（链上 `quote` 必为 0）—— 纯状态判据，不含时效：
+    ///   - 黑名单 / 100% 费：引擎对所有输入返回 0
+    ///   - `buy_disabled[j]`：0→j 被引擎禁用
+    ///   - `max_inputs[i] == 0`：SELL 容量恒 0（阶梯权重或引擎储备归零）
+    ///   - `buy_ladder_remaining[j]` / `max_outputs[j] == 0`：BUY 容量恒 0
+    ///
+    /// spot / `simulate_swap`(`_mut`/`_exact_out`) 共用这一判据，杜绝
+    /// "spot 已归零、sim 仍报旧价" 的口径漂移（2026-09-24 事故直接出口）。
+    /// `None`（未知）**不判死**：与 `ladder_cap_known` 的 96% 兜底口径一致，
+    /// 只挡"已知不可报价"，不影响"尚未收到事件、只能靠缓存兜底"的方向。
+    ///
+    /// 时效单独判（[`Self::quote_stale`]）：`calculate_price` 检查两端（历史口径），
+    /// `engine_quote`/exact_out 用引擎口径（asset 0 为 numéraire，不判过期）。
+    fn quote_dead(&self, i: usize, j: usize) -> bool {
+        let n = self.assets.len();
+        if i >= n || j >= n || i == j {
+            return true;
+        }
+        if self.fee_blacklisted() {
+            return true;
+        }
+        let sell_dead = |k: usize| self.max_inputs.get(k).copied().flatten() == Some(U256::ZERO);
+        let buy_dead = |k: usize| {
+            self.buy_disabled.get(k).copied().unwrap_or(false)
+                || self.buy_ladder_remaining.get(k).copied().flatten() == Some(U256::ZERO)
+                || self.max_outputs.get(k).copied().flatten() == Some(U256::ZERO)
+        };
+        if j == 0 {
+            sell_dead(i)
+        } else if i == 0 {
+            buy_dead(j)
+        } else {
+            sell_dead(i) || buy_dead(j)
+        }
+    }
+
+    /// 时效过期（`engine_quote` 口径：asset 0 为 numéraire，不判过期）：
+    /// 引擎 update 后超窗口，链上 `quote` 归 0。
+    fn quote_stale(&self, i: usize, j: usize) -> bool {
+        !self.asset_price_fresh(j) || (i != 0 && !self.asset_price_fresh(i))
+    }
+
+    /// 仅设置费率（批量快照/update 用，不改变余额）。
+    ///
+    /// `amount_in`/`amount_out` 为**无费口径**（调用方用 `unfee_quote` 折算含费 quote）。
+    /// `amount_out == 0` = 该方向不可报价 → **显式清零**：历史实现直接 `return`，
+    /// 旧值残留成幻影价（2026-09-24 事故放大器之一）。
     pub fn set_rate(&mut self, i: usize, j: usize, amount_in: U256, amount_out: U256) {
         let n = self.assets.len();
         if i >= n || j >= n || i == j || amount_in.is_zero() {
             return;
         }
         let idx = self.pair_index(i, j);
-        if !amount_out.is_zero() {
-            self.rates[idx] = Rate {
+        self.rates[idx] = if amount_out.is_zero() {
+            Rate::zero()
+        } else {
+            Rate {
                 num: amount_out,
                 den: amount_in,
-            };
-        }
+            }
+        };
     }
 
     /// Swap 事件锚定（完整路径，测试/旧调用点保留）：共享金库账本 + price0 标定。
@@ -1263,7 +1358,11 @@ impl BinaryFiPropPool {
         let price_known = self.prices.get(i).map(|p| !p.is_zero()).unwrap_or(false)
             && self.prices.get(j).map(|p| !p.is_zero()).unwrap_or(false);
         if !price_known {
-            self.set_rate(i, j, amount_in, amount_out);
+            // Swap 成交比是含费可执行口径 → 无费化后缓存（fee ≥ 1e6 → 清零）
+            match unfee_quote(amount_out, self.fee_ppm) {
+                Some(out) => self.set_rate(i, j, amount_in, out),
+                None => self.set_rate(i, j, amount_in, U256::ZERO),
+            }
         }
         if !self.price0_calibrated {
             if let Some(p0) = self.implied_price0(i, j, amount_in, amount_out) {
@@ -1645,7 +1744,21 @@ impl BinaryFiPropPool {
                     snap_block = snap_block,
                     "binaryfi engine fee updated"
                 );
+                // rates 为无费口径：fee 变更无需重导/失效任何缓存
                 self.fee_ppm = new_fee;
+            }
+            // 链上 getFee 是黑名单态的权威口径，但**快照块可能滞后于事件 1~2 块**
+            // （canonical head vs flashblock），故用 `blacklist_seen_block` 水位：
+            //   - fee ≥ 1e6 → 置位并把水位推到本快照块（拉黑是单调事实）
+            //   - fee < 1e6 且快照块 ≥ 水位 → 解除（链上已恢复可报价）
+            //   - fee < 1e6 但快照块 < 水位 → **保留**拉黑态（旧块快照不得回退）
+            // `fee == 0`（旧状态/缺失）不参与校正。
+            if new_fee >= 1_000_000 {
+                self.blacklisted = true;
+                self.blacklist_seen_block = self.blacklist_seen_block.max(snap_block);
+            } else if self.blacklisted && snap_block >= self.blacklist_seen_block {
+                self.blacklisted = false;
+                self.blacklist_seen_block = 0;
             }
         }
 
@@ -2149,16 +2262,23 @@ impl BinaryFiPropPool {
             }
         }
 
-        // 2) 由 bid/ask 推导全部费率（精确 BigInt）
+        // 2) 由 bid/ask 推导全部费率（精确 BigInt；无费口径，与 fee 解耦）
         for i in 0..n {
             for j in 0..n {
                 if i == j {
                     continue;
                 }
-                if let Some(rate) = self.derive_rate(i, j) {
-                    let idx = self.pair_index(i, j);
-                    self.rates[idx] = rate;
-                    derived += 1;
+                let idx = self.pair_index(i, j);
+                match self.derive_rate(i, j) {
+                    Some(rate) => {
+                        self.rates[idx] = rate;
+                        derived += 1;
+                    }
+                    // 推导缺料 + 方向已知不可报价（容量恒 0 / 禁用 / 黑名单）：
+                    // 必须清零。历史实现保留旧值 → 拉黑后旧费率价被
+                    // simulate_swap 兜底读出，持续报幻影利润到进程重启。
+                    None if self.quote_dead(i, j) => self.rates[idx] = Rate::zero(),
+                    None => {}
                 }
             }
         }
@@ -2182,7 +2302,10 @@ impl BinaryFiPropPool {
                     } else {
                         U256::from(10u64).pow(U256::from(di.saturating_sub(4)))
                     };
-                    self.set_rate(i, j, amount_in, snap.quotes[k].amountOut);
+                    // 链上 quote 为含费可执行输出 → 无费化后缓存（fee ≥ 1e6 → 清零）
+                    let out = unfee_quote(snap.quotes[k].amountOut, self.fee_ppm)
+                        .unwrap_or(U256::ZERO);
+                    self.set_rate(i, j, amount_in, out);
                 }
             }
         }
@@ -2437,7 +2560,7 @@ fn apply_fee_rate(rate: Rate, fee_ppm: u64) -> Option<Rate> {
 /// panic（链上实证：黑名单账户 getFee=1e6、quote 返回 0 且 success=true，
 /// 快照会以 fee=1e6 + 全 0 quote 进入此路径）→ 返回 `None`，上层 quote 反推
 /// 全部归空 → rates 归 0 → 预过滤直接放弃该池，杜绝虚假机会。
-fn unfee_quote(out: U256, fee_ppm: u64) -> Option<U256> {
+pub fn unfee_quote(out: U256, fee_ppm: u64) -> Option<U256> {
     if fee_ppm == 0 {
         return Some(out);
     }
@@ -2501,11 +2624,31 @@ impl AutomatedMarketMaker for BinaryFiPropPool {
             && topics[0] == BINARYFI_FEE_ACCOUNT_EVENT
             && Address::from_word(topics[1]) == self.fee_recipient()
         {
+            // data = abi.encode(bool status)（链上实证 tx 0xcaaa5e61：word = 1）。
+            // 拉黑 = 该账户链上 getFee → 1e6、全部 quote → 0：事件即熔断
+            // （0 延迟，不等快照 RPC），权威口径仍以快照 getFee 校正
+            //（apply_snapshot：<1e6 自动解除）。
+            let data = log.data().data.as_ref();
+            let blacklisted = data.len() >= 32 && !U256::from_be_slice(&data[..32]).is_zero();
             tracing::debug!(
                 account = %Address::from_word(topics[1]),
                 block = log.block_number,
-                "binaryfi per-account fee event, async resync fee snapshot"
+                blacklisted = blacklisted,
+                "binaryfi per-account blacklist event, fail-closed + async resync"
             );
+            if blacklisted {
+                self.blacklisted = true;
+                // 事件块（flashblock，领先 canonical）作为水位：只有"不低于该块"的
+                // 快照才能解除，防止紧跟着的旧块快照反复开关（幻影窗口）。
+                self.blacklist_seen_block = log
+                    .block_number
+                    .unwrap_or_else(|| self.last_synced_block.saturating_add(1));
+            } else {
+                // 显式解除：立即清零标志（fee_ppm 仍由下一次快照校正；期间
+                // fee ≥ 1e6 依旧被 `fee_blacklisted` 门控，不会提前报价）
+                self.blacklisted = false;
+                self.blacklist_seen_block = 0;
+            }
             return Ok(SyncAction::AsyncUpdate);
         }
 
@@ -2534,8 +2677,9 @@ impl AutomatedMarketMaker for BinaryFiPropPool {
                         "binaryfi engine fee event"
                     );
                     self.fee_ppm = new_fee;
-                    // 同步重导全部 rates（spot/预过滤立即对齐新费率），
-                    // 不依赖 AsyncUpdate 快照的异步窗口；无费价格/阶梯不变。
+                    self.blacklisted = new_fee >= 1_000_000;
+                    // rates 为无费口径、与 fee 解耦：下面的重导对 fee 是幂等的
+                    // no-op，保留仅作"快照/事件乱序"时的额外刷新机会。
                     let n = self.assets.len();
                     for i in 0..n {
                         for j in 0..n {
@@ -2714,26 +2858,16 @@ impl AutomatedMarketMaker for BinaryFiPropPool {
         if !self.asset_price_fresh(i) || !self.asset_price_fresh(j) {
             return Ok(0.0);
         }
-        // 方向可交易性（spot 与 simulate_swap/链上 quote 对齐）：链上该方向容量
-        // 恒为 0 时 quote 恒 0，spot 也必须为 0，避免 multihop/2hop 预过滤把
-        // 已死方向排高（最终 sim 虽会剪掉，但白占候选位）。
-        //   - SELL（j==0）：maxIn = ladderWeight_sell×engineReserve == 0（MM
-        //     只买不卖/引擎储备归零）；快照路径 prices 已清零天然为 0，L2 路径
-        //     prices 来自 calldata 非零，此处补齐门控
-        //   - BUY（i==0）：buy_ladder_remaining（Σqty×R）或快照 maxOut == 0
-        //   - 跨资产：输入侧 SELL 或输出侧 BUY 任一为死方向 → 0
-        // 未知（None）不门控：与 ladder_cap_known/96% 兜底口径一致。
-        let sell_dead = |k: usize| self.max_inputs.get(k).copied().flatten() == Some(U256::ZERO);
-        let buy_dead = |k: usize| {
-            self.buy_ladder_remaining.get(k).copied().flatten() == Some(U256::ZERO)
-                || self.max_outputs.get(k).copied().flatten() == Some(U256::ZERO)
-        };
-        if (j == 0 && sell_dead(i))
-            || (i == 0 && buy_dead(j))
-            || (i != 0 && j != 0 && (sell_dead(i) || buy_dead(j)))
-        {
+        // 方向可交易性 + 黑名单：单一判据（与 simulate_swap/exact_out 共用）。
+        // 死方向（容量恒 0 / 禁用 / 拉黑）链上 quote 恒 0，spot 也必须为 0，
+        // 避免 multihop/2hop 预过滤把已死方向排高（最终 sim 虽会剪掉，但白占候选位）。
+        if self.quote_dead(i, j) {
             return Ok(0.0);
         }
+        // 无费缓存 × 当前费率 = 可执行中间价（fee ≥ 1e6 → 不可报价）
+        let Some(rate) = self.rate_effective(i, j) else {
+            return Ok(0.0);
+        };
         let di = self.assets[i].decimals as i32;
         let dj = self.assets[j].decimals as i32;
         Ok(u256_to_f64(&rate.num) / u256_to_f64(&rate.den) * 10f64.powi(di - dj))
@@ -2772,18 +2906,18 @@ impl AutomatedMarketMaker for BinaryFiPropPool {
                 return Ok(U256::ZERO);
             }
         }
+        // 已知不可报价（拉黑/100% 费/容量恒 0/时效过期）：链上恒 0，禁止任何兜底
+        if self.quote_dead(i, j) || self.quote_stale(i, j) {
+            return Ok(U256::ZERO);
+        }
         let (out, cap_known) = match self.engine_quote(i, j, amount_in) {
             Some(out) => (out, self.ladder_cap_known(i, j)),
             None => {
-                // 价格未知：退回费率锚定（保证可用）
-                let rate = self
-                    .rates
-                    .get(self.pair_index(i, j))
-                    .copied()
-                    .unwrap_or_default();
-                if rate.is_zero() {
+                // 价格未知（尚未收到 update/快照）：用无费缓存按**当前**费率现算兜底。
+                // 必须在门控之后：兜底只覆盖"未知"，不覆盖"已知不可报价"。
+                let Some(rate) = self.rate_effective(i, j) else {
                     return Ok(U256::ZERO);
-                }
+                };
                 (
                     amount_in
                         .checked_mul(rate.num)
@@ -2822,17 +2956,15 @@ impl AutomatedMarketMaker for BinaryFiPropPool {
                 return Ok(U256::ZERO);
             }
         }
+        if self.quote_dead(i, j) || self.quote_stale(i, j) {
+            return Ok(U256::ZERO);
+        }
         let (out, cap_known) = match self.engine_quote(i, j, amount_in) {
             Some(out) => (out, self.ladder_cap_known(i, j)),
             None => {
-                let rate = self
-                    .rates
-                    .get(self.pair_index(i, j))
-                    .copied()
-                    .unwrap_or_default();
-                if rate.is_zero() {
+                let Some(rate) = self.rate_effective(i, j) else {
                     return Ok(U256::ZERO);
-                }
+                };
                 (
                     amount_in
                         .checked_mul(rate.num)
@@ -2878,14 +3010,16 @@ impl AutomatedMarketMaker for BinaryFiPropPool {
                 return Err(AMMError::Msg("binaryfi: pair not exposed".to_string()));
             }
         }
-        let rate = self
-            .rates
-            .get(self.pair_index(i, j))
-            .copied()
-            .unwrap_or_default();
-        if rate.is_zero() {
-            return Err(AMMError::Msg("binaryfi: no rate for pair".to_string()));
+        // 已知不可报价（拉黑/100% 费/容量恒 0）+ 时效过期：exact-out 同样必须拒，
+        // 否则会给出幻影所需输入量。时效门控历史上缺失（引擎 update 后超窗口
+        // 链上 quote 归 0），此处按 engine_quote 口径补齐。
+        if self.quote_dead(i, j) || self.quote_stale(i, j) {
+            return Err(AMMError::Msg("binaryfi: direction not quotable".to_string()));
         }
+        // 无费缓存 × 当前费率 = 可执行中间价（fee ≥ 1e6 → 不可报价）
+        let Some(rate) = self.rate_effective(i, j) else {
+            return Err(AMMError::Msg("binaryfi: no rate for pair".to_string()));
+        };
         // 输出可达性：用精确 cap（maxOut/maxIn/金库）而非 96% 兜底，避免高估合法输出
         match self.max_achievable_out(i, j) {
             Some(max_out) if amount_out > max_out => {
@@ -3174,6 +3308,8 @@ impl Default for BinaryFiPropPool {
             router_address: BINARYFI_ROUTER_ADDRESS,
             fee_account: None,
             fee_ppm: BINARYFI_DEFAULT_FEE_PPM,
+            blacklisted: false,
+            blacklist_seen_block: 0,
             chain_id: BINARYFI_CHAIN_ID,
             created_block: 0,
             last_synced_block: 0,

@@ -24,6 +24,14 @@ fn update_asset_topic() -> B256 {
     asset_topic(1)
 }
 
+/// 成功的链上 quote（Snapshot.quotes 用）
+fn quote_of(v: u128) -> QuoteResult {
+    QuoteResult {
+        amountOut: U256::from(v),
+        success: true,
+    }
+}
+
 fn rlp_item(bytes: &[u8]) -> Vec<u8> {
     if bytes.len() == 1 && bytes[0] < 0x80 {
         return vec![bytes[0]];
@@ -517,8 +525,12 @@ fn test_swap_event_anchors_rate_and_reserves() {
     let out_amt = U256::from_str_radix("235576460790192551", 10).unwrap();
     pool.anchor_rate(0, 1, in_amt, out_amt);
 
+    // rates 为无费口径：Swap 的 out/in 含费 → 写入前 unfee_quote 折算
     let rate = pool.rates[pool.pair_index(0, 1)];
-    assert_eq!(rate.num, out_amt);
+    assert_eq!(
+        rate.num,
+        unfee_quote(out_amt, BINARYFI_DEFAULT_FEE_PPM).unwrap()
+    );
     assert_eq!(rate.den, in_amt);
     assert_eq!(pool.reserves[0], U256::from(350_000_000u64) + in_amt);
     assert_eq!(
@@ -543,18 +555,30 @@ fn test_swap_event_anchors_rate_and_reserves() {
 fn test_price_update_is_idempotent_set() {
     let mut pool = test_pool();
     pool.apply_l2_update(1, U256::from(13_984u64), 100, 3, 3);
-    // 0→SKHYx：rate = q0j/10^6 × (1e6−fee)/1e6 = q0j×999000 / 1e12
+    // rates 为**无费口径**（费率读取时现算，不烘进缓存）：
+    // 0→SKHYx：rate = q0j/10^6 = 7,149,495,960,534,782 / 1e12
     let rate = pool.rates[pool.pair_index(0, 1)];
     assert_eq!(
         rate.num,
-        U256::from_str_radix("7142346464574247218000", 10).unwrap()
+        U256::from_str_radix("7149495960534782", 10).unwrap()
     );
-    assert_eq!(rate.den, U256::from(1_000_000_000_000u64));
-    // SKHYx→0：raw = 13984−3 = 13,981（无费），
-    // rate = raw/10^14 × (1e6−fee)/1e6 = 13,981×999,000 / 1e20
+    assert_eq!(rate.den, U256::from(1_000_000u64));
+    // SKHYx→0：raw = 13984−3 = 13,981 → rate = 13,981 / 10^14
     let rate_ba = pool.rates[pool.pair_index(1, 0)];
-    assert_eq!(rate_ba.num, U256::from(13_967_019_000u64));
-    assert_eq!(rate_ba.den, U256::from(10u64).pow(U256::from(20)));
+    assert_eq!(rate_ba.num, U256::from(13_981u64));
+    assert_eq!(rate_ba.den, U256::from(10u64).pow(U256::from(14)));
+    // 读取时按当前费率现算：num×(1e6−fee)/1e6 / den 必须回到旧"含费缓存"口径
+    // （旧值 = q0j×999000/1e12，两者比值逐位一致）
+    let eff_num = rate.num * U256::from(1_000_000u64 - BINARYFI_DEFAULT_FEE_PPM);
+    let eff_den = rate.den * U256::from(1_000_000u64);
+    let expected_spot =
+        eff_num.to::<u128>() as f64 / eff_den.to::<u128>() as f64 * 10f64.powi(6 - 18);
+    let (t0, t1) = (pool.assets[0].address, pool.assets[1].address);
+    let spot = pool.spot_price(t0, t1).unwrap();
+    assert!(
+        (spot - expected_spot).abs() / expected_spot < 1e-12,
+        "spot {spot} != effective rate {expected_spot}"
+    );
 
     // 重复同 price 更新：费率不变（幂等）
     pool.apply_l2_update(1, U256::from(13_984u64), 101, 3, 3);
@@ -849,8 +873,12 @@ fn test_sync_swap_log_anchors() {
 
     let action = pool.sync(&log).expect("sync ok");
     assert!(matches!(action, SyncAction::None));
+    // rates 为无费口径：Swap 的 out 含费 → unfee_quote 折算后写入
     let rate = pool.rates[pool.pair_index(0, 1)];
-    assert_eq!(rate.num, amount_out);
+    assert_eq!(
+        rate.num,
+        unfee_quote(amount_out, BINARYFI_DEFAULT_FEE_PPM).unwrap()
+    );
     assert_eq!(rate.den, amount_in);
     assert_eq!(pool.reserves[0], U256::from(350_000_000u64) + amount_in);
     assert_eq!(
@@ -860,13 +888,15 @@ fn test_sync_swap_log_anchors() {
 }
 
 #[test]
-fn test_sync_fee_event_updates_fee_and_rederives_rates() {
+fn test_sync_fee_event_updates_fee_without_cache_rederive() {
     let mut pool = test_pool();
-    // 先建立无费价格（L2 语义）：默认 fee=1000 → rates 含 fee 折算
+    // 先建立无费价格（L2 语义）：rates 为无费口径，与 fee 解耦
     pool.apply_l2_update(1, U256::from(13_984u64), 100, 3, 3);
     assert_eq!(pool.fee_ppm, BINARYFI_DEFAULT_FEE_PPM);
     let rate_old = pool.rates[pool.pair_index(0, 1)];
     assert!(rate_old.num > U256::ZERO);
+    let (t0, t1) = (pool.assets[0].address, pool.assets[1].address);
+    let spot_old = pool.spot_price(t0, t1).unwrap();
 
     // 引擎 FeeUpdated：单 topic，data 前 32 字节 = 新 fee ppm（200）
     let data = U256::from(200u64).to_be_bytes::<32>().to_vec();
@@ -882,13 +912,15 @@ fn test_sync_fee_event_updates_fee_and_rederives_rates() {
     let action = pool.sync(&log).expect("sync ok");
     assert!(matches!(action, SyncAction::AsyncUpdate));
     assert_eq!(pool.fee_ppm, 200);
-    // rates 同步重导：fee 1000→200 → 可执行中间价上移（0→1 方向）
-    let rate_new = pool.rates[pool.pair_index(0, 1)];
-    assert!(
-        rate_new.num > rate_old.num,
-        "rate should rise after fee cut"
+    // 无费缓存**不变**（fee 与缓存解耦，无重导/无失效）；可执行价由读取方
+    // 按新费率现算 → spot 上移（0→1 方向）
+    assert_eq!(
+        pool.rates[pool.pair_index(0, 1)],
+        rate_old,
+        "费率为无费口径：fee 变更不得改写 rates 缓存"
     );
-    assert_eq!(rate_new.den, rate_old.den);
+    let spot_new = pool.spot_price(t0, t1).unwrap();
+    assert!(spot_new > spot_old, "spot must rise after fee cut");
 
     // 重复同 fee 事件 → 无动作
     let action2 = pool.sync(&log).expect("sync ok");
@@ -976,18 +1008,17 @@ fn test_sync_enriched_update_applies_price() {
     assert!(matches!(action, SyncAction::None));
     assert_eq!(pool.prices[1], U256::from(15005));
     assert_eq!(pool.price_updated_block[1], 0x400c944);
-    // 点差偏移 0/0 → raw = 15005（无费），
-    // rate(1→0) = raw/10^14 × (1e6−fee)/1e6 = 15,005×999,000/1e20
+    // 点差偏移 0/0 → raw = 15005（无费缓存口径）：rate(1→0) = 15,005 / 10^14
     let rate_ba = pool.rates[pool.pair_index(1, 0)];
-    assert_eq!(rate_ba.num, U256::from(14_989_995_000u64));
-    assert_eq!(rate_ba.den, U256::from(10u64).pow(U256::from(20)));
-    // BUY：q0j = floor(1e20/15005)（无费），rate(0→1) = q0j×999,000/1e12
+    assert_eq!(rate_ba.num, U256::from(15_005u64));
+    assert_eq!(rate_ba.den, U256::from(10u64).pow(U256::from(14)));
+    // BUY：q0j = floor(1e20/15005)，rate(0→1) = q0j / 10^6
     let rate = pool.rates[pool.pair_index(0, 1)];
     assert_eq!(
         rate.num,
-        U256::from_str_radix("6657780739753414647000", 10).unwrap()
+        U256::from_str_radix("6664445184938353", 10).unwrap()
     );
-    assert_eq!(rate.den, U256::from(1_000_000_000_000u64));
+    assert_eq!(rate.den, U256::from(1_000_000u64));
 }
 
 /// AsyncUpdate 快照写回的核心安全前提：L2 日志已把价格推进到块 N 后，旧块快照
@@ -1026,7 +1057,7 @@ fn test_apply_snapshot_does_not_regress_fresh_log_price() {
         ],
         vaultBalances: Vec::new(),
         quotePairs: vec![U256::from(1), U256::from(2)],
-        quotes: vec![ok("1000000000000000"), ok("14850")], // 0→1 small / 1→0 small
+        quotes: vec![quote_of(1_000_000_000_000_000), quote_of(14_850)], // 0→1 small / 1→0 small
         fee: U256::from(1000),
     };
     pool.apply_snapshot(&snap, 0x400c944 - 1);
@@ -1094,6 +1125,303 @@ fn test_apply_snapshot_blacklisted_fee_1e6_zeros_quotes() {
     );
     let (t0, t1) = (pool.assets[0].address, pool.assets[1].address);
     assert_eq!(pool.spot_price(t0, t1).unwrap_or(1.0), 0.0);
+}
+
+/// 2026-09-24 生产事故回归：拉黑（fee=1e6 + quote 全 0）后 `rates[]` 冻结，
+/// `simulate_swap` 的 None 兜底把拉黑前的旧费率价报出去 → 链上
+/// `AmountTooSmall` 连续回滚（实盘 0xbf08939d…，幻影价逐位相同持续一整夜）。
+///
+/// 生产形态（链上探针 probe_bf_blacklist_freeze @71412365 实测）：
+///   `sell_raw[asset]=None`（多档阶梯资产，快照 1.4 反推得 None）
+///   + 拉黑快照把 `max_inputs[asset]` 置 `Some(0)` → `bid_price` 返回 None
+///   → `derive_rate` 返回 **None** → 旧值不被覆盖；而 MM 每 1~3 块 update，
+///   `log_fresh` 恒真又挡住快照写价 → 冻结到进程重启。
+///
+/// 修复后必须满足：fee/spot/engine_quote/simulate_swap/exact_out 五者一致，
+/// 且死方向的 rates 被清除（缓存残留不能复活）。
+#[test]
+fn test_blacklist_freeze_regression_no_phantom_rate() {
+    let mut pool = test_pool();
+    let (t0, t1) = (pool.assets[0].address, pool.assets[1].address);
+    let in_sell = U256::from(10u64).pow(U256::from(18));
+    let in_buy = U256::from(1_000_000u64);
+
+    // ① 先建立"活着"的状态（fee=1000，quote 正常）
+    let s1 = Snapshot {
+        assets: pool.assets.iter().map(|t| t.address).collect(),
+        decimals: vec![6u8, 18u8],
+        scales: vec![U256::ZERO, U256::from(10_000u64)],
+        poolBalances: vec![U256::ZERO, U256::ZERO],
+        vaultReserves: vec![
+            U256::from(10u64).pow(U256::from(30)),
+            U256::from(10u64).pow(U256::from(30)),
+        ],
+        vaultBalances: vec![
+            U256::from(10u64).pow(U256::from(30)),
+            U256::from(10u64).pow(U256::from(30)),
+        ],
+        quotePairs: vec![U256::from(1), U256::from(2)],
+        quotes: vec![quote_of(1_000_000_000_000_000), quote_of(14_850)],
+        fee: U256::from(1_000),
+    };
+    pool.apply_snapshot(&s1, 100);
+    assert!(!pool.rates[pool.pair_index(1, 0)].is_zero(), "活态应有 SELL 费率");
+    assert!(pool.simulate_swap(t1, t0, in_sell).unwrap() > U256::ZERO);
+
+    // ② 生产形态：多档阶梯资产 sell_raw=None + MM 每块 update（日志比快照新）
+    pool.sell_raw[1] = None;
+    pool.price_updated_block[1] = 103;
+
+    // ③ 拉黑快照：fee=1e6、quote 全 0（snap_block=101 < 日志块 103 → log_fresh）
+    let zero = QuoteResult {
+        amountOut: U256::ZERO,
+        success: true,
+    };
+    let s2 = Snapshot {
+        assets: pool.assets.iter().map(|t| t.address).collect(),
+        decimals: vec![6u8, 18u8],
+        scales: vec![U256::ZERO, U256::from(10_000u64)],
+        poolBalances: vec![U256::ZERO, U256::ZERO],
+        vaultReserves: vec![
+            U256::from(10u64).pow(U256::from(30)),
+            U256::from(10u64).pow(U256::from(30)),
+        ],
+        vaultBalances: vec![
+            U256::from(10u64).pow(U256::from(30)),
+            U256::from(10u64).pow(U256::from(30)),
+        ],
+        quotePairs: vec![U256::from(1), U256::from(2)],
+        quotes: vec![zero.clone(), zero.clone()],
+        fee: U256::from(1_000_000),
+    };
+    pool.apply_snapshot(&s2, 101);
+
+    assert_eq!(pool.fee_ppm, 1_000_000);
+    assert!(pool.fee_blacklisted());
+    assert_eq!(pool.max_inputs[1], Some(U256::ZERO));
+    // 死方向缓存必须被清除（历史缺陷：旧值 14864/1e14 存活 → 幻影）
+    assert!(
+        pool.rates[pool.pair_index(1, 0)].is_zero(),
+        "拉黑后死方向 rates 必须清零"
+    );
+    // spot / engine_quote / simulate_swap / exact_out 四者一致
+    assert_eq!(pool.spot_price(t1, t0).unwrap(), 0.0);
+    assert_eq!(pool.spot_price(t0, t1).unwrap(), 0.0);
+    assert!(!matches!(
+        pool.engine_quote(1, 0, in_sell),
+        Some(v) if !v.is_zero()
+    ));
+    assert_eq!(pool.simulate_swap(t1, t0, in_sell).unwrap(), U256::ZERO);
+    assert_eq!(pool.simulate_swap(t0, t1, in_buy).unwrap(), U256::ZERO);
+    assert!(pool
+        .simulate_swap_exact_out(t1, t0, U256::from(1_000_000u64))
+        .is_err());
+
+    // ④ 拉黑后 MM 仍每块推送 update：L2 增强日志（raw 路径）必须静默丢弃
+    //    （历史缺陷：丢弃日志 + 快照被 log_fresh 挡住 → 冻结到进程重启）
+    let mut data = Vec::with_capacity(224);
+    for word in [
+        U256::from(16_360u64), // price
+        U256::from(200u64),    // blockNumber
+        U256::ZERO,            // data0（sell ladder）
+        U256::ZERO,            // data1（buy ladder）
+        U256::ZERO,            // 保留
+        U256::from(3u64),      // askOffsetRaw
+        U256::from(3u64),      // bidOffsetRaw
+    ] {
+        data.extend_from_slice(&word.to_be_bytes::<32>());
+    }
+    let enriched = Log {
+        inner: AlloyLog {
+            address: BINARYFI_ENGINE_ADDRESS,
+            data: LogData::new(vec![BINARYFI_UPDATE_EVENT, asset_topic(1)], Bytes::from(data))
+                .unwrap(),
+        },
+        block_number: Some(200),
+        ..Default::default()
+    };
+    let action = pool.sync(&enriched).expect("sync ok");
+    assert!(
+        matches!(action, SyncAction::None),
+        "拉黑后 L2 日志应静默丢弃（不触发 AsyncUpdate RPC）"
+    );
+    assert_eq!(pool.prices[1], U256::from(14_864u64), "拉黑后价格不再更新");
+    assert_eq!(pool.simulate_swap(t1, t0, in_sell).unwrap(), U256::ZERO);
+    assert_eq!(pool.spot_price(t1, t0).unwrap(), 0.0);
+
+    // ⑤ canonical 日志（无 raw bytes）走 AsyncUpdate 快照路径：同样不得复活幻影
+    let canonical = Log {
+        inner: AlloyLog {
+            address: BINARYFI_ENGINE_ADDRESS,
+            data: LogData::new(vec![BINARYFI_UPDATE_EVENT, asset_topic(1)], Bytes::new()).unwrap(),
+        },
+        block_number: Some(201),
+        ..Default::default()
+    };
+    let _ = pool.sync(&canonical).expect("sync ok");
+    assert_eq!(pool.simulate_swap(t1, t0, in_sell).unwrap(), U256::ZERO);
+    assert_eq!(pool.spot_price(t1, t0).unwrap(), 0.0);
+    assert!(pool
+        .simulate_swap_exact_out(t1, t0, U256::from(1_000_000u64))
+        .is_err());
+}
+
+/// `BlacklistSet(account, true)` 事件必须**即时**熔断（0 延迟，不等快照 RPC）；
+/// 解黑（事件 false / 快照 getFee < 1e6）自动恢复报价。
+#[test]
+fn test_blacklist_event_fail_closed_then_recovered_by_snapshot() {
+    let mut pool = test_pool();
+    let (t0, t1) = (pool.assets[0].address, pool.assets[1].address);
+    let in_sell = U256::from(10u64).pow(U256::from(18));
+    pool.apply_l2_update(1, U256::from(13_984u64), 100, 3, 3);
+    assert!(pool.simulate_swap(t1, t0, in_sell).unwrap() > U256::ZERO);
+
+    // BlacklistSet(address indexed account, bool) → topics=[sig, account]，data=bool
+    let account = pool.fee_recipient();
+    let data = U256::from(1u64).to_be_bytes::<32>().to_vec();
+    let log = Log {
+        inner: AlloyLog {
+            address: BINARYFI_ENGINE_ADDRESS,
+            data: LogData::new(
+                vec![BINARYFI_FEE_ACCOUNT_EVENT, account.into_word()],
+                Bytes::from(data),
+            )
+            .unwrap(),
+        },
+        ..Default::default()
+    };
+    let action = pool.sync(&log).expect("sync ok");
+    assert!(matches!(action, SyncAction::AsyncUpdate));
+    // fee_ppm 还是旧值（快照尚未回来）就已熔断：任何方向都不报价
+    assert_eq!(pool.fee_ppm, BINARYFI_DEFAULT_FEE_PPM);
+    assert!(pool.fee_blacklisted());
+    assert_eq!(pool.simulate_swap(t1, t0, in_sell).unwrap(), U256::ZERO);
+    assert_eq!(pool.simulate_swap(t0, t1, U256::from(1_000_000u64)).unwrap(), U256::ZERO);
+    assert_eq!(pool.spot_price(t1, t0).unwrap(), 0.0);
+
+    // 快照带回权威 getFee=15000（解黑）→ 标志按链上口径解除，报价恢复
+    let s = Snapshot {
+        assets: pool.assets.iter().map(|t| t.address).collect(),
+        decimals: vec![6u8, 18u8],
+        scales: vec![U256::ZERO, U256::from(10_000u64)],
+        poolBalances: vec![U256::ZERO, U256::ZERO],
+        vaultReserves: vec![
+            U256::from(10u64).pow(U256::from(30)),
+            U256::from(10u64).pow(U256::from(30)),
+        ],
+        vaultBalances: Vec::new(),
+        quotePairs: vec![U256::from(1), U256::from(2)],
+        quotes: vec![quote_of(1_000_000_000_000_000), quote_of(14_850)],
+        fee: U256::from(BINARYFI_DEFAULT_FEE_PPM),
+    };
+    pool.apply_snapshot(&s, 101);
+    assert!(!pool.blacklisted, "解黑后事件置位必须由链上 getFee 校正清除");
+    assert!(pool.simulate_swap(t1, t0, in_sell).unwrap() > U256::ZERO);
+}
+
+/// 拉黑态必须**块单调**：canonical head 滞后 flashblock 1~2 块，拉黑事件到达后
+/// 紧接着的 AsyncUpdate 快照可能读到旧块（`getFee` 仍是 15000、quote 非 0）。
+/// 若不加水位，这份旧块快照会把拉黑态清掉 → 重新报价 1~2 块（幻影窗口）。
+#[test]
+fn test_blacklist_survives_stale_snapshot_then_clears_authoritatively() {
+    let mut pool = test_pool();
+    let (t0, t1) = (pool.assets[0].address, pool.assets[1].address);
+    let in_sell = U256::from(10u64).pow(U256::from(18));
+    pool.apply_l2_update(1, U256::from(13_984u64), 100, 3, 3);
+    assert!(pool.simulate_swap(t1, t0, in_sell).unwrap() > U256::ZERO);
+
+    // 拉黑事件发生在 flashblock 200（canonical head 仍落后）
+    let account = pool.fee_recipient();
+    let log = Log {
+        inner: AlloyLog {
+            address: BINARYFI_ENGINE_ADDRESS,
+            data: LogData::new(
+                vec![BINARYFI_FEE_ACCOUNT_EVENT, account.into_word()],
+                Bytes::from(U256::from(1u64).to_be_bytes::<32>().to_vec()),
+            )
+            .unwrap(),
+        },
+        block_number: Some(200),
+        ..Default::default()
+    };
+    let _ = pool.sync(&log).expect("sync ok");
+    assert!(pool.fee_blacklisted());
+
+    fn live_snap(pool: &BinaryFiPropPool, fee: u64) -> Snapshot {
+        Snapshot {
+        assets: pool.assets.iter().map(|t| t.address).collect(),
+        decimals: vec![6u8, 18u8],
+        scales: vec![U256::ZERO, U256::from(10_000u64)],
+        poolBalances: vec![U256::ZERO, U256::ZERO],
+        vaultReserves: vec![
+            U256::from(10u64).pow(U256::from(30)),
+            U256::from(10u64).pow(U256::from(30)),
+        ],
+        vaultBalances: Vec::new(),
+        quotePairs: vec![U256::from(1), U256::from(2)],
+        quotes: vec![quote_of(1_000_000_000_000_000), quote_of(14_850)],
+        fee: U256::from(fee),
+        }
+    }
+
+    // ① 旧块快照（199 < 水位 200）：fee 与 quote 都是拉黑前的值 → 不得解除
+    let stale = live_snap(&pool, BINARYFI_DEFAULT_FEE_PPM);
+    pool.apply_snapshot(&stale, 199);
+    assert!(pool.blacklisted, "旧块快照不得回退拉黑态");
+    assert!(pool.fee_blacklisted());
+    assert_eq!(pool.simulate_swap(t1, t0, in_sell).unwrap(), U256::ZERO);
+    assert_eq!(pool.simulate_swap(t0, t1, U256::from(1_000_000u64)).unwrap(), U256::ZERO);
+    assert_eq!(pool.spot_price(t1, t0).unwrap(), 0.0);
+
+    // ② canonical 追平但账户仍被拉黑（fee=1e6）→ 维持熔断
+    let still_blacklisted = live_snap(&pool, 1_000_000);
+    pool.apply_snapshot(&still_blacklisted, 200);
+    assert!(pool.fee_blacklisted());
+    assert_eq!(pool.simulate_swap(t1, t0, in_sell).unwrap(), U256::ZERO);
+
+    // ③ 解黑：快照块 ≥ 水位且 fee < 1e6 → 解除并恢复报价
+    let cleared = live_snap(&pool, BINARYFI_DEFAULT_FEE_PPM);
+    pool.apply_snapshot(&cleared, 201);
+    assert!(!pool.blacklisted);
+    assert!(!pool.fee_blacklisted());
+    assert!(pool.simulate_swap(t1, t0, in_sell).unwrap() > U256::ZERO);
+}
+
+/// 费率读取时现算（不烘进缓存）：价格未知的兜底路径（engine_quote=None）
+/// 也必须随 fee 变化，且 fee=1e6 时归零。
+#[test]
+fn test_rate_fallback_applies_current_fee() {
+    let mut pool = test_pool();
+    let (t1, t0) = (pool.assets[1].address, pool.assets[0].address);
+    // 价格未知（prices=0、sell_raw=None）→ engine_quote 返回 None，走 rates 兜底
+    pool.prices[1] = U256::ZERO;
+    pool.sell_raw[1] = None;
+    let idx_sell = pool.pair_index(1, 0);
+    pool.rates[idx_sell] = Rate {
+        num: U256::from(15_000u64),
+        den: U256::from(10u64).pow(U256::from(14)),
+    };
+    let amount = U256::from(10u64).pow(U256::from(18));
+    assert_eq!(pool.engine_quote(1, 0, amount), None, "价格未知应为 None");
+
+    pool.fee_ppm = 1_000;
+    let out_1k = pool.simulate_swap(t1, t0, amount).unwrap();
+    pool.fee_ppm = 200;
+    let out_200 = pool.simulate_swap(t1, t0, amount).unwrap();
+    assert!(out_200 > out_1k, "费率下调 → 兜底输出必须增大");
+    assert_eq!(
+        out_200,
+        amount * U256::from(15_000u64) / U256::from(10u64).pow(U256::from(14))
+            * U256::from(1_000_000u64 - 200)
+            / U256::from(1_000_000u64)
+    );
+    // 100% 费（黑名单口径）：兜底同样必须归零，不得报旧费率价
+    pool.fee_ppm = 1_000_000;
+    assert_eq!(pool.simulate_swap(t1, t0, amount).unwrap(), U256::ZERO);
+    assert_eq!(pool.spot_price(t1, t0).unwrap(), 0.0);
+    assert!(pool
+        .simulate_swap_exact_out(t1, t0, U256::from(1_000_000u64))
+        .is_err());
 }
 
 #[test]

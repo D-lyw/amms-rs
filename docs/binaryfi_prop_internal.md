@@ -272,6 +272,63 @@ v1.19.9 的 fee_account 路径存在致命缺口：被拉黑账户的批量快�
 补充黑名单场景回归测试：快照 fee=1e6 + 全 0 quote 不 panic、fee_ppm=1e6、
 rates 全 0、engine_quote 输出 0。
 
+### 7.9.3 `rates[]` 费率解耦（v1.23.2 修复）—— 拉黑后幻影价冻结
+
+**现象**（2026-09-23 全天，执行合约 `0xB08e5F34…`）：账户被
+`setBlacklisted(…, true)` 拉黑后（块 71305606，`getFee` 15000→1000000、`quote`
+全 0），本地 `fee_ppm` / `spot_price` / `engine_quote` 都正确归零，**唯独
+`simulate_swap` 继续报出拉黑前逐位相同的价格**（`net_usd` 在 17 位有效数字上
+逐块完全一致，最长连续 33 次），链上每笔都以引擎 `AmountTooSmall`（`0xc2f5625a`）
+回滚，重启进程即恢复。
+
+**根因链**（链上状态探针 `probe_bf_blacklist_freeze` @71412365 逐字段复现）：
+1. `rates[]` 缓存的是**含费可执行价**（分子 = 无费 rate × (1e6−fee)）——
+   "fee 变更"隐含要求"缓存失效"，但该约束从未被写成不变量；
+2. 拉黑快照把 `max_inputs[asset]` 置 `Some(0)` → `bid_price` 返回 `None`；
+   多档阶梯资产的 `sell_raw` 本就是 `None`（快照 1.4 反推得 None）→
+   `derive_rate(i,0)` 返回 **`None`** → `apply_snapshot` 的全量重导
+   （`if let Some(rate)`）跳过该 pair，**旧费率（15000 口径）的 rate 存活**；
+3. `simulate_swap` 的 `engine_quote == None` 兜底分支直接读这个缓存，
+   **没有任何可报价门控** → 幻影价出口（同款还在 `_mut` / `_exact_out`）；
+4. `set_rate(…, 0)` 直接 `return` → quote 锚定路径也清不掉旧值；
+5. 自愈被掐掉：MM 每 1~3 块 update → `log_fresh` 恒真挡住快照写价；
+   `sync()` 对 `buy_disabled && maxIn==0` 的日志直接丢弃 → **冻结到进程重启**。
+
+**为什么前两次修复没覆盖**：7.9.1 只对齐了"读链上的口径"（fee_account），
+7.9.2 只修了 `unfee_quote` 除零 panic；两者都没有解决"**派生缓存如何随 fee 失效**"。
+7.9.2 的回归测试在**全新池子**上验证（rates 起点本来就全 0），未覆盖
+"已有非 0 rates + 拉黑快照 + `derive_rate` 返回 `None`"这一生产时序。
+
+**修复（两条不变量）**：
+- **不变量 1：`rates[]` 只存无费口径**（与 `prices/q0j/sell_raw` 一致），
+  费率一律由 `rate_effective(i,j)`（= 缓存 × 当前 fee，fee ≥ 1e6 → `None`）
+  在读取时现算 → fee 变更**不需要也不允许**任何缓存重导/失效。
+  写入侧同步无费化：快照 quote 锚定、Swap 锚定都先过 `unfee_quote`。
+- **不变量 2：单一可报价判据 `quote_dead(i,j)`**（黑名单 / 100% 费 /
+  `buy_disabled[j]` / `max_inputs[i]==0` / `buy_ladder_remaining|max_outputs[j]==0`）
+  被 spot / `simulate_swap`(`_mut`/`_exact_out`) 共用 → 死方向恒 `0`/`Err`，
+  缓存残留无法变成机会。时效另用 `quote_stale`（`calculate_price` 判两端、
+  引擎口径不判 asset 0；`_exact_out` 此前**完全没有**时效门控，本次补齐）。
+- `BlacklistSet(account, true)` 命中本账户 → `blacklisted` 置位**即时熔断**
+  （0 延迟，不等快照 RPC）；解除需"快照块 ≥ `blacklist_seen_block` 且
+  `getFee` < 1e6"或事件 `status=false`。**水位不可缺少**：AsyncUpdate/周期快照的
+  块取自 canonical head，滞后 flashblock 事件流 1~2 块 —— 拉黑事件在块 F 到达时，
+  紧接着的快照可能读到 F−1 的 `getFee`（仍是 15000、quote 非 0），无水位就会把
+  拉黑态清掉、重新报价 1~2 块（幻影窗口）。
+- `set_rate(…, 0)` 改为显式清零；`apply_snapshot` 重导对
+  "`None` 且 `quote_dead`" 的 pair 显式清零；`FeeUpdated` 的重导保留（幂等 no-op）。
+
+**维护约定（新增代码必须遵守）**：
+- 任何读 `rates[]` 的新路径必须走 `rate_effective`，不得直读缓存；
+- 任何新发现的"链上恒不可报价"条件必须加进 `quote_dead`，由 spot/sim 共用；
+- fee 相关改动只需改 `fee_ppm` / `blacklisted`，**不要**再往缓存里烘费率。
+
+**验证**：`cargo test --test binaryfi_prop`（含
+`test_blacklist_freeze_regression_no_phantom_rate`：
+活池 → 拉黑快照 → spot/engine_quote/sim/exact_out 五者一致为 0 →
+再喂 L2 增强日志与 canonical 日志均不复活；`test_blacklist_event_fail_closed_then_recovered_by_snapshot`；
+`test_rate_fallback_applies_current_fee`），以及链上探针复跑确认三步全 0。
+
 ## 8. 三层数据同步（事件驱动，无轮询）
 
 | 层 | 来源 | 处理 |
