@@ -298,6 +298,14 @@ impl AutomatedMarketMaker for PancakeInfinityPool {
         if amount_in.is_zero() {
             return Ok(U256::ZERO);
         }
+        let mut probe = crate::amms::sim_stats::SimProbe::exact_in(
+            "pancake_infinity",
+            self.token_a.chain_id,
+            amount_in,
+            self.liquidity,
+            self.tick,
+            || self.address(),
+        );
         let zero_for_one = base_token == self.token_a.address;
         let sqrt_price_limit_x_96 = if zero_for_one {
             MIN_SQRT_RATIO + U256_1
@@ -325,6 +333,7 @@ impl AutomatedMarketMaker for PancakeInfinityPool {
                 zero_for_one,
             )
             .map_err(UniswapV3Error::from)?;
+            probe.step(if initialized { 0 } else { 1 });
             step.tick_next = tick_next;
             step.initialized = initialized;
             step.tick_next = step.tick_next.clamp(MIN_TICK, MAX_TICK);
@@ -432,6 +441,15 @@ impl AutomatedMarketMaker for PancakeInfinityPool {
             return Err(AMMError::Msg("sqrt_price is zero".into()));
         }
 
+        let mut probe = crate::amms::sim_stats::SimProbe::exact_out(
+            "pancake_infinity",
+            self.token_a.chain_id,
+            amount_out,
+            self.liquidity,
+            self.tick,
+            || self.address(),
+        );
+
         let zero_for_one = base_token == self.token_a.address;
 
         // Set sqrt_price_limit_x_96 to the max or min sqrt price in the pool depending on zero_for_one
@@ -469,6 +487,7 @@ impl AutomatedMarketMaker for PancakeInfinityPool {
                 zero_for_one,
             )
             .map_err(UniswapV3Error::from)?;
+            probe.step(if initialized { 0 } else { 1 });
 
             step.tick_next = tick_next.clamp(MIN_TICK, MAX_TICK);
             step.initialized = initialized;

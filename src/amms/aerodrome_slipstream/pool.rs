@@ -915,6 +915,15 @@ impl AutomatedMarketMaker for AerodromeSlipstreamPool {
             return Err(AMMError::Msg("liquidity is zero".into()));
         }
 
+        let mut probe = crate::amms::sim_stats::SimProbe::exact_in(
+            "aerodrome_slipstream",
+            self.token_a.chain_id,
+            amount_in,
+            self.liquidity,
+            self.tick,
+            || self.address(),
+        );
+
         let zero_for_one = base_token == self.token_a.address;
         let sqrt_price_limit_x_96 = if zero_for_one {
             MIN_SQRT_RATIO + U256_1
@@ -946,6 +955,8 @@ impl AutomatedMarketMaker for AerodromeSlipstreamPool {
                     zero_for_one,
                 )
                 .map_err(AerodromeSlipstreamError::from)?;
+
+            probe.step(if step.initialized { 0 } else { 1 });
 
             step.tick_next = step.tick_next.clamp(MIN_TICK, MAX_TICK);
 
@@ -1052,6 +1063,15 @@ impl AutomatedMarketMaker for AerodromeSlipstreamPool {
             return Err(AMMError::Msg("sqrt_price is zero".into()));
         }
 
+        let mut probe = crate::amms::sim_stats::SimProbe::exact_in(
+            "aerodrome_slipstream",
+            self.token_a.chain_id,
+            amount_in,
+            self.liquidity,
+            self.tick,
+            || self.address(),
+        );
+
         let zero_for_one = base_token == self.token_a.address;
         let sqrt_price_limit_x_96 = if zero_for_one {
             MIN_SQRT_RATIO + U256_1
@@ -1083,6 +1103,8 @@ impl AutomatedMarketMaker for AerodromeSlipstreamPool {
                     zero_for_one,
                 )
                 .map_err(AerodromeSlipstreamError::from)?;
+
+            probe.step(if step.initialized { 0 } else { 1 });
 
             step.tick_next = step.tick_next.clamp(MIN_TICK, MAX_TICK);
 
@@ -1206,6 +1228,15 @@ impl AutomatedMarketMaker for AerodromeSlipstreamPool {
             return Err(AMMError::Msg("liquidity is zero".into()));
         }
 
+        let mut probe = crate::amms::sim_stats::SimProbe::exact_out(
+            "aerodrome_slipstream",
+            self.token_a.chain_id,
+            amount_out,
+            self.liquidity,
+            self.tick,
+            || self.address(),
+        );
+
         let zero_for_one = base_token == self.token_a.address;
         let sqrt_price_limit_x_96 = if zero_for_one {
             MIN_SQRT_RATIO + U256_1
@@ -1237,6 +1268,8 @@ impl AutomatedMarketMaker for AerodromeSlipstreamPool {
                     zero_for_one,
                 )
                 .map_err(AerodromeSlipstreamError::from)?;
+
+            probe.step(if step.initialized { 0 } else { 1 });
 
             step.tick_next = step.tick_next.clamp(MIN_TICK, MAX_TICK);
 

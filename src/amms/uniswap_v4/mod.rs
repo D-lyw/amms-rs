@@ -357,6 +357,15 @@ impl AutomatedMarketMaker for UniswapV4Pool {
             return Err(AMMError::Msg("sqrt_price is zero".into()));
         }
 
+        let mut probe = crate::amms::sim_stats::SimProbe::exact_out(
+            "uniswap_v4",
+            self.token_a.chain_id,
+            amount_out,
+            self.liquidity,
+            self.tick,
+            || self.address(),
+        );
+
         let zero_for_one = base_token == self.token_a.address;
 
         // Set sqrt_price_limit_x_96 to the max or min sqrt price in the pool depending on zero_for_one
@@ -398,6 +407,8 @@ impl AutomatedMarketMaker for UniswapV4Pool {
                 )
                 .map_err(UniswapV4Error::from)?;
 
+            probe.step(if step.initialized { 0 } else { 1 });
+
             // ensure that we do not overshoot the min/max tick, as the tick bitmap is not aware of these bounds
             step.tick_next = step.tick_next.clamp(MIN_TICK, MAX_TICK);
 
@@ -417,7 +428,7 @@ impl AutomatedMarketMaker for UniswapV4Pool {
 
             // Get the next sqrt price from the input amount
             step.sqrt_price_next_x96 =
-                uniswap_v3_math::tick_math::get_sqrt_ratio_at_tick(step.tick_next)
+                crate::amms::tick_math_cache::sqrt_ratio_at_tick_cached_or_compute(step.tick_next)
                     .map_err(UniswapV4Error::from)?;
 
             // Target spot price
@@ -777,6 +788,15 @@ impl UniswapV4Pool {
             return Err(AMMError::Msg("sqrt_price is zero".into()));
         }
 
+        let mut probe = crate::amms::sim_stats::SimProbe::exact_in(
+            "uniswap_v4",
+            self.token_a.chain_id,
+            amount_in,
+            self.liquidity,
+            self.tick,
+            || self.address(),
+        );
+
         let zero_for_one = base_token == self.token_a.address;
         let sqrt_price_limit_x_96 = if zero_for_one {
             MIN_SQRT_RATIO + U256_1
@@ -796,9 +816,23 @@ impl UniswapV4Pool {
         // 空洞兜底：低流动性连续跨空 word = 价格近乎免费移动 → 天文输出。
         let mut crossed_empty_words: i32 = 0;
 
+        // ---- tick 跨度表：逐 word 跳步（与原算术逐位等价，见 `tick_span_table` 模块文档）----
+        let span_enabled = crate::amms::tick_span_table::enabled();
+        let mut span_key = crate::amms::tick_span_table::RunKey::new(
+            &self.tick_bitmap,
+            zero_for_one,
+            self.tick_spacing,
+            current_state.liquidity,
+            fee_pips,
+        );
+        let mut span_recorder = crate::amms::tick_span_table::Recorder::new(span_enabled);
+        let mut span_jump_checked = false;
+
         while current_state.amount_specified_remaining != I256::ZERO
             && current_state.sqrt_price_x_96 != sqrt_price_limit_x_96
         {
+            let tick_before = current_state.tick;
+            let sqrt_before = current_state.sqrt_price_x_96;
             let mut step = StepComputations {
                 sqrt_price_start_x_96: current_state.sqrt_price_x_96,
                 ..Default::default()
@@ -812,7 +846,11 @@ impl UniswapV4Pool {
             )
             .map_err(UniswapV3Error::from)?;
 
+            probe.step(if initialized { 0 } else { 1 });
+
+            let span_tick_raw = tick_next;
             step.tick_next = tick_next.clamp(MIN_TICK, MAX_TICK);
+            let span_tick_clamped = step.tick_next != span_tick_raw;
             step.initialized = initialized;
 
             if step.initialized {
@@ -830,7 +868,7 @@ impl UniswapV4Pool {
             }
 
             step.sqrt_price_next_x96 =
-                uniswap_v3_math::tick_math::get_sqrt_ratio_at_tick(step.tick_next)
+                crate::amms::tick_math_cache::sqrt_ratio_at_tick_cached_or_compute(step.tick_next)
                     .map_err(UniswapV3Error::from)?;
 
             let swap_target_sqrt_ratio = if zero_for_one {
@@ -907,6 +945,73 @@ impl UniswapV4Pool {
                     current_state.sqrt_price_x_96,
                 )
                 .map_err(UniswapV3Error::from)?;
+            }
+            // ---- tick 跨度表：记录 / 跳步（与原逐 word 算术逐位等价）----
+            if span_enabled {
+                let span_landed = current_state.sqrt_price_x_96 == step.sqrt_price_next_x96;
+                let span_chainable = !step.initialized
+                    && span_landed
+                    && !span_tick_clamped
+                    && swap_target_sqrt_ratio == step.sqrt_price_next_x96;
+                span_recorder.observe(
+                    &self.tick_bitmap,
+                    span_key,
+                    tick_before,
+                    sqrt_before,
+                    crate::amms::tick_span_table::SpanStep {
+                        end_tick: current_state.tick,
+                        end_sqrt: current_state.sqrt_price_x_96,
+                        amount_in: step.amount_in,
+                        amount_out: step.amount_out,
+                        fee_amount: step.fee_amount,
+                    },
+                    span_chainable,
+                    span_landed,
+                );
+                if span_chainable {
+                    if !span_jump_checked
+                        && crossed_empty_words >= crate::amms::tick_span_table::GATE_EMPTY_WORDS
+                        && current_state.liquidity >= MIN_V3_LIQUIDITY
+                    {
+                        span_jump_checked = true;
+                        if let Some(span_jump) = crate::amms::tick_span_table::try_jump(
+                            &self.tick_bitmap,
+                            span_key,
+                            current_state.tick,
+                            current_state.sqrt_price_x_96,
+                            current_state.amount_specified_remaining.into_raw(),
+                            sqrt_price_limit_x_96,
+                        ) {
+                            if let Some(span_rest) = current_state
+                                .amount_specified_remaining
+                                .into_raw()
+                                .checked_sub(span_jump.consumed)
+                            {
+                                current_state.amount_specified_remaining =
+                                    I256::from_raw(span_rest);
+                                current_state.amount_calculated -=
+                                    I256::from_raw(span_jump.amount_out);
+                                current_state.sqrt_price_x_96 = span_jump.end_sqrt;
+                                current_state.tick = span_jump.end_tick;
+                                crossed_empty_words += span_jump.steps as i32;
+                                span_jump_checked = false;
+                                span_recorder.flush(&self.tick_bitmap, true);
+                                probe.skip(span_jump.steps, span_jump.steps);
+                            }
+                        }
+                    }
+                } else {
+                    span_jump_checked = false;
+                }
+                if current_state.liquidity != span_key.liquidity {
+                    span_key = crate::amms::tick_span_table::RunKey::new(
+                        &self.tick_bitmap,
+                        zero_for_one,
+                        self.tick_spacing,
+                        current_state.liquidity,
+                        fee_pips,
+                    );
+                }
             }
         }
 

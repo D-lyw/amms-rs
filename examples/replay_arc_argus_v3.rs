@@ -59,7 +59,11 @@ fn main() {
         i += 2;
     }
 
-    let (token_in, token_out) = if from_a { (token_a, token_b) } else { (token_b, token_a) };
+    let (token_in, token_out) = if from_a {
+        (token_a, token_b)
+    } else {
+        (token_b, token_a)
+    };
 
     let mut pool = UniswapV3Pool::new(pool_addr);
     pool.token_a = Token::new_with_decimals(token_a, dec_a);
@@ -115,7 +119,11 @@ fn main() {
     println!("direction      = {}", if from_a { "A→B" } else { "B→A" });
     println!(
         "口径           = {}",
-        if as_balance { "余额(引擎语义)" } else { "名义额(对账链上)" }
+        if as_balance {
+            "余额(引擎语义)"
+        } else {
+            "名义额(对账链上)"
+        }
     );
     println!("balance_in     = {balance_in}");
     println!("nominal_in     = {nominal_in}");

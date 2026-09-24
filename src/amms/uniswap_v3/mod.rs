@@ -396,6 +396,15 @@ impl AutomatedMarketMaker for UniswapV3Pool {
             return Err(AMMError::Msg("sqrt_price is zero".into()));
         }
 
+        let mut probe = crate::amms::sim_stats::SimProbe::exact_in(
+            "uniswap_v3",
+            self.token_a.chain_id,
+            amount_in,
+            self.liquidity,
+            self.tick,
+            || self.address(),
+        );
+
         // 输入侧 FoT（user→pool）：V3 是**加收型**，`amount_in` 语义 = 本腿
         // **付款方可用余额**。
         //
@@ -435,14 +444,29 @@ impl AutomatedMarketMaker for UniswapV3Pool {
             sqrt_price_x_96: self.sqrt_price, // Active price on the pool
             amount_calculated: I256::ZERO,    // Amount of token_out that has been calculated
             amount_specified_remaining: I256::from_raw(nominal_in), // Amount of token_in that has not been swapped
-            tick: self.tick,                                       // Current i24 tick of the pool
+            tick: self.tick,                                        // Current i24 tick of the pool
             liquidity: self.liquidity, // Current available liquidity in the tick range
         };
+
+        // ---- tick 跨度表：逐 word 跳步（与原算术逐位等价，见 `tick_span_table` 模块文档）----
+        let span_enabled = crate::amms::tick_span_table::enabled();
+        let mut span_key = crate::amms::tick_span_table::RunKey::new(
+            &self.tick_bitmap,
+            zero_for_one,
+            self.tick_spacing,
+            current_state.liquidity,
+            self.fee,
+        );
+        let mut span_recorder = crate::amms::tick_span_table::Recorder::new(span_enabled);
+        let mut span_empty_words: i32 = 0;
+        let mut span_jump_checked = false;
 
         while current_state.amount_specified_remaining != I256::ZERO
             && current_state.sqrt_price_x_96 != sqrt_price_limit_x_96
         {
             // Initialize a new step struct to hold the dynamic state of the pool at each step
+            let tick_before = current_state.tick;
+            let sqrt_before = current_state.sqrt_price_x_96;
             let mut step = StepComputations {
                 // Set the sqrt_price_start_x_96 to the current sqrt_price_x_96
                 sqrt_price_start_x_96: current_state.sqrt_price_x_96,
@@ -459,9 +483,13 @@ impl AutomatedMarketMaker for UniswapV3Pool {
                 )
                 .map_err(UniswapV3Error::from)?;
 
+            probe.step(if step.initialized { 0 } else { 1 });
+
             // ensure that we do not overshoot the min/max tick, as the tick bitmap is not aware of these bounds
             // Note: this could be removed as we are clamping in the batch contract
+            let span_tick_raw = step.tick_next;
             step.tick_next = step.tick_next.clamp(MIN_TICK, MAX_TICK);
+            let span_tick_clamped = step.tick_next != span_tick_raw;
 
             // Get the next sqrt price from the input amount
             step.sqrt_price_next_x96 =
@@ -554,6 +582,74 @@ impl AutomatedMarketMaker for UniswapV3Pool {
                 )
                 .map_err(UniswapV3Error::from)?;
             }
+            // ---- tick 跨度表：记录 / 跳步（与原逐 word 算术逐位等价）----
+            if span_enabled {
+                let span_landed = current_state.sqrt_price_x_96 == step.sqrt_price_next_x96;
+                let span_chainable = !step.initialized
+                    && span_landed
+                    && !span_tick_clamped
+                    && swap_target_sqrt_ratio == step.sqrt_price_next_x96;
+                span_recorder.observe(
+                    &self.tick_bitmap,
+                    span_key,
+                    tick_before,
+                    sqrt_before,
+                    crate::amms::tick_span_table::SpanStep {
+                        end_tick: current_state.tick,
+                        end_sqrt: current_state.sqrt_price_x_96,
+                        amount_in: step.amount_in,
+                        amount_out: step.amount_out,
+                        fee_amount: step.fee_amount,
+                    },
+                    span_chainable,
+                    span_landed,
+                );
+                if span_chainable {
+                    span_empty_words += 1;
+                    if !span_jump_checked
+                        && span_empty_words >= crate::amms::tick_span_table::GATE_EMPTY_WORDS
+                    {
+                        span_jump_checked = true;
+                        if let Some(span_jump) = crate::amms::tick_span_table::try_jump(
+                            &self.tick_bitmap,
+                            span_key,
+                            current_state.tick,
+                            current_state.sqrt_price_x_96,
+                            current_state.amount_specified_remaining.into_raw(),
+                            sqrt_price_limit_x_96,
+                        ) {
+                            if let Some(span_rest) = current_state
+                                .amount_specified_remaining
+                                .into_raw()
+                                .checked_sub(span_jump.consumed)
+                            {
+                                current_state.amount_specified_remaining =
+                                    I256::from_raw(span_rest);
+                                current_state.amount_calculated -=
+                                    I256::from_raw(span_jump.amount_out);
+                                current_state.sqrt_price_x_96 = span_jump.end_sqrt;
+                                current_state.tick = span_jump.end_tick;
+                                span_empty_words += span_jump.steps as i32;
+                                span_jump_checked = false;
+                                span_recorder.flush(&self.tick_bitmap, true);
+                                probe.skip(span_jump.steps, span_jump.steps);
+                            }
+                        }
+                    }
+                } else {
+                    span_empty_words = 0;
+                    span_jump_checked = false;
+                }
+                if current_state.liquidity != span_key.liquidity {
+                    span_key = crate::amms::tick_span_table::RunKey::new(
+                        &self.tick_bitmap,
+                        zero_for_one,
+                        self.tick_spacing,
+                        current_state.liquidity,
+                        self.fee,
+                    );
+                }
+            }
         }
 
         let amount_out = (-current_state.amount_calculated).into_raw();
@@ -584,6 +680,15 @@ impl AutomatedMarketMaker for UniswapV3Pool {
         if self.sqrt_price.is_zero() {
             return Err(AMMError::Msg("sqrt_price is zero".into()));
         }
+
+        let mut probe = crate::amms::sim_stats::SimProbe::exact_in(
+            "uniswap_v3",
+            self.token_a.chain_id,
+            amount_in,
+            self.liquidity,
+            self.tick,
+            || self.address(),
+        );
 
         // 输入侧 FoT：语义同 `simulate_swap`——V3 是加收型，`amount_in` 是
         // 付款方可用余额，库内按 `fot_input_nominal_for_balance` 换算名义额进
@@ -626,10 +731,25 @@ impl AutomatedMarketMaker for UniswapV3Pool {
             liquidity: self.liquidity,
         };
 
+        // ---- tick 跨度表：逐 word 跳步（与原算术逐位等价，见 `tick_span_table` 模块文档）----
+        let span_enabled = crate::amms::tick_span_table::enabled();
+        let mut span_key = crate::amms::tick_span_table::RunKey::new(
+            &self.tick_bitmap,
+            zero_for_one,
+            self.tick_spacing,
+            current_state.liquidity,
+            self.fee,
+        );
+        let mut span_recorder = crate::amms::tick_span_table::Recorder::new(span_enabled);
+        let mut span_empty_words: i32 = 0;
+        let mut span_jump_checked = false;
+
         while current_state.amount_specified_remaining != I256::ZERO
             && current_state.sqrt_price_x_96 != sqrt_price_limit_x_96
         {
             // Initialize a new step struct to hold the dynamic state of the pool at each step
+            let tick_before = current_state.tick;
+            let sqrt_before = current_state.sqrt_price_x_96;
             let mut step = StepComputations {
                 // Set the sqrt_price_start_x_96 to the current sqrt_price_x_96
                 sqrt_price_start_x_96: current_state.sqrt_price_x_96,
@@ -646,9 +766,13 @@ impl AutomatedMarketMaker for UniswapV3Pool {
                 )
                 .map_err(UniswapV3Error::from)?;
 
+            probe.step(if step.initialized { 0 } else { 1 });
+
             // ensure that we do not overshoot the min/max tick, as the tick bitmap is not aware of these bounds
             // Note: this could be removed as we are clamping in the batch contract
+            let span_tick_raw = step.tick_next;
             step.tick_next = step.tick_next.clamp(MIN_TICK, MAX_TICK);
+            let span_tick_clamped = step.tick_next != span_tick_raw;
 
             // Get the next sqrt price from the input amount
             step.sqrt_price_next_x96 =
@@ -740,6 +864,74 @@ impl AutomatedMarketMaker for UniswapV3Pool {
                 )
                 .map_err(UniswapV3Error::from)?;
             }
+            // ---- tick 跨度表：记录 / 跳步（与原逐 word 算术逐位等价）----
+            if span_enabled {
+                let span_landed = current_state.sqrt_price_x_96 == step.sqrt_price_next_x96;
+                let span_chainable = !step.initialized
+                    && span_landed
+                    && !span_tick_clamped
+                    && swap_target_sqrt_ratio == step.sqrt_price_next_x96;
+                span_recorder.observe(
+                    &self.tick_bitmap,
+                    span_key,
+                    tick_before,
+                    sqrt_before,
+                    crate::amms::tick_span_table::SpanStep {
+                        end_tick: current_state.tick,
+                        end_sqrt: current_state.sqrt_price_x_96,
+                        amount_in: step.amount_in,
+                        amount_out: step.amount_out,
+                        fee_amount: step.fee_amount,
+                    },
+                    span_chainable,
+                    span_landed,
+                );
+                if span_chainable {
+                    span_empty_words += 1;
+                    if !span_jump_checked
+                        && span_empty_words >= crate::amms::tick_span_table::GATE_EMPTY_WORDS
+                    {
+                        span_jump_checked = true;
+                        if let Some(span_jump) = crate::amms::tick_span_table::try_jump(
+                            &self.tick_bitmap,
+                            span_key,
+                            current_state.tick,
+                            current_state.sqrt_price_x_96,
+                            current_state.amount_specified_remaining.into_raw(),
+                            sqrt_price_limit_x_96,
+                        ) {
+                            if let Some(span_rest) = current_state
+                                .amount_specified_remaining
+                                .into_raw()
+                                .checked_sub(span_jump.consumed)
+                            {
+                                current_state.amount_specified_remaining =
+                                    I256::from_raw(span_rest);
+                                current_state.amount_calculated -=
+                                    I256::from_raw(span_jump.amount_out);
+                                current_state.sqrt_price_x_96 = span_jump.end_sqrt;
+                                current_state.tick = span_jump.end_tick;
+                                span_empty_words += span_jump.steps as i32;
+                                span_jump_checked = false;
+                                span_recorder.flush(&self.tick_bitmap, true);
+                                probe.skip(span_jump.steps, span_jump.steps);
+                            }
+                        }
+                    }
+                } else {
+                    span_empty_words = 0;
+                    span_jump_checked = false;
+                }
+                if current_state.liquidity != span_key.liquidity {
+                    span_key = crate::amms::tick_span_table::RunKey::new(
+                        &self.tick_bitmap,
+                        zero_for_one,
+                        self.tick_spacing,
+                        current_state.liquidity,
+                        self.fee,
+                    );
+                }
+            }
         }
 
         // Update the pool state
@@ -784,6 +976,15 @@ impl AutomatedMarketMaker for UniswapV3Pool {
         if self.sqrt_price.is_zero() {
             return Err(AMMError::Msg("sqrt_price is zero".into()));
         }
+
+        let mut probe = crate::amms::sim_stats::SimProbe::exact_out(
+            "uniswap_v3",
+            self.token_a.chain_id,
+            amount_out,
+            self.liquidity,
+            self.tick,
+            || self.address(),
+        );
 
         // exact-out 的 `amount_out` 是接收方到手 net：池子 math 必须先输出
         // gross（先 gross-up；仅税种对该池生效时），transfer 扣税后接收方
@@ -832,6 +1033,8 @@ impl AutomatedMarketMaker for UniswapV3Pool {
                     zero_for_one,
                 )
                 .map_err(UniswapV3Error::from)?;
+
+            probe.step(if step.initialized { 0 } else { 1 });
 
             // ensure that we do not overshoot the min/max tick, as the tick bitmap is not aware of these bounds
             // Note: this could be removed as we are clamping in the batch contract
