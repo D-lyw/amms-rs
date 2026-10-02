@@ -3,7 +3,7 @@
 //! ElfomoFi 不 emit 池子创建事件；pair→(pool, vault) 映射由部署配置
 //! （`ElfomoPairConfig`）在构建时传入，每 pair 独立 pool（参照 caliber_prop）。
 //! `discover()` 为每个配置 pair 返回独立池子骨架，初始化由链上读取
-//! （`getSupportedPairs()` + `getOrderbook()` + vault `balanceOf` + slot1）完成。
+//! （`getSupportedPairs()` + `getOrderbook()` + vault `balanceOf` + 种子槽）完成。
 
 use alloy::{
     eips::BlockId,
@@ -61,7 +61,7 @@ impl ElfomoPairConfig {
 ///
 /// ElfomoFi 不 emit 池子创建事件；pair→(pool, vault) 映射由部署配置
 /// （`pairs`）在构建时传入，`discover()` 为每个配置 pair 返回独立池子骨架，
-/// 初始化由链上读取（`getOrderbook` + `balanceOf` + slot1）完成。
+/// 初始化由链上读取（`getOrderbook` + `balanceOf` + 种子槽 slot2）完成。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ElfomoFiPropFactory {
     /// Factory 代理地址

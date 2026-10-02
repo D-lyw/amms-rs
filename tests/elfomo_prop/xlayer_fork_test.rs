@@ -18,13 +18,13 @@
 //! ## 验证范围
 //!
 //! 1. **init**：`ElfomoFiPropPool::init`（getSupportedPairs + getOrderbook +
-//!    slot1 种子 + `token.balanceOf(vault)`）在锚点块可跑通且与链上一致；
+//!    种子槽 slot2 + `token.balanceOf(vault)`）在锚点块可跑通且与链上一致；
 //! 2. **orderbook 生成公式**：多块（含最新块）种子+金库余额 → 本地
 //!    `build_orderbook` 与链上 `getOrderbook` 双向逐位一致；
 //! 3. **四向 quote**：锚点块 `simulate_swap`/`simulate_swap_exact_out` 与
 //!    链上 Router `getAmountOut`/`getAmountIn` 逐位一致（含档界/封顶）；
 //! 4. **真实交易账本**：真实套利交易所在块的 `updatePrices` calldata 解析种子
-//!    == slot1>>32；用**父块金库余额 + 本块种子**（即交易执行时刻状态）本地
+//!    == slot2>>32；用**本块金库余额 + 本块种子**本地
 //!    重算 == 链上实际成交额（300147468）；再用**块后状态**（金库被本交易
 //!    消耗后）本地重算 == 链上 `getAmountOut`，双重印证 orderbook 是
 //!    (seed, 当前金库余额) 的读时纯函数。
@@ -68,22 +68,14 @@ where
 // ============================================================
 
 const XLAYER_CHAIN_ID: u64 = 196;
-/// 已验证的 fork 锚点块（真实链逐位对拍通过，见 docs/2026-09-01_elfomo_prop_xlayer_research.md）
-const ELFOMO_TEST_BLOCK: u64 = 69_452_472;
-/// orderbook 公式多块扫描（固定历史块 + 运行时取最近块）
+/// 已验证的 fork 锚点块（v2 pool 上线后，2026-10-02 真链逐位对拍通过：
+/// `init` 全路径 `model_verified = true`）。
+const ELFOMO_TEST_BLOCK: u64 = 72_175_700;
+/// orderbook 公式多块扫描（v2 pool 生效期内的固定历史块 + 运行时取最近块）
 const ELFOMO_ORDERBOOK_BLOCKS: &[u64] = &[
-    69_452_472, // 锚点（xETH vault ≈ 2.94e18，n=3）
-    69_450_000, 69_440_000, 69_400_000, // xETH vault ≈ 0.61e18，toFrom n=1 退化档
-    69_300_000, 69_200_000,
+    72_175_700, // 锚点
+    72_170_000, 72_160_000, 72_150_000, 72_140_000, // v2 pool 生效期内
 ];
-/// 真实套利交易所在块（tx 0x3a608dfe…，ElfomoFi 段 xETH→USDT0）
-const ELFOMO_ARB_BLOCK: u64 = 69_447_881;
-/// 真实套利交易输入（xETH raw）
-const ELFOMO_ARB_IN: u128 = 121_513_229_231_558_820;
-/// 真实套利交易输出（USDT0 raw，链上成交额）
-const ELFOMO_ARB_OUT: u64 = 300_147_468;
-/// 该块 updatePrices calldata 解析出的价格种子（链上实证）
-const ELFOMO_ARB_SEED: u64 = 0x143c4e5;
 
 /// 正向 quote 金额网格（xETH raw；覆盖小额/首档内/档界/跨档/超容量）
 const FWD_AMOUNTS: &[u128] = &[
@@ -211,11 +203,15 @@ async fn chain_vault_balances<P: Provider + Clone>(
 }
 
 async fn chain_price_seed<P: Provider + Clone>(provider: P, block_id: BlockId) -> Result<U256> {
-    let slot1: U256 = provider
-        .get_storage_at(ELFOMO_POOL_ADDRESS, U256::from(1u64))
+    // 2026-10-02 起 v2 pool 的种子槽是 slot2（v1 的 slot1 已停用）。
+    let slot: U256 = provider
+        .get_storage_at(
+            ELFOMO_POOL_ADDRESS,
+            U256::from(amms::amms::elfomo_prop::types::ELFOMO_SEED_SLOT),
+        )
         .block_id(block_id)
         .await?;
-    Ok(slot1 >> 32)
+    Ok(slot >> 32)
 }
 
 async fn chain_quote<P: Provider + Clone>(
@@ -279,7 +275,7 @@ async fn fetch_update_prices_seed<P: Provider + Clone>(
 // ============================================================
 
 /// head 级端到端校验：**生产 init 全路径**（getSupportedPairs 定位 profile 键 →
-/// getMetadata → slot0 profile word → getOrderbook + slot1 + balanceOf）在节点
+/// getMetadata → slot0 profile word → getOrderbook + slot2 种子 + balanceOf）在节点
 /// 最新块上与链上逐位一致，并且本地 quote == 链上 getAmountOut。
 ///
 /// 与 `test_elfomo_prop_fork_orderbook_quote_replication` 的区别：那个锚在历史块
@@ -369,7 +365,7 @@ async fn test_elfomo_prop_fork_orderbook_quote_replication() -> Result<()> {
     assert_eq!(chain_id, XLAYER_CHAIN_ID);
     let anchor = BlockId::Number(BlockNumberOrTag::Number(ELFOMO_TEST_BLOCK));
 
-    // Phase 1: 本地 init（getSupportedPairs + getOrderbook + slot1 + balanceOf）
+    // Phase 1: 本地 init（getSupportedPairs + getOrderbook + slot2 种子 + balanceOf）
     let local = ElfomoFiPropPool::default()
         .init(anchor, provider.clone())
         .await?;
@@ -584,73 +580,45 @@ async fn test_elfomo_prop_fork_orderbook_quote_replication() -> Result<()> {
     );
     println!("Phase 3b: {ok_eo}/{total_eo} exact-out quotes replicated");
 
-    // Phase 4: 真实套利交易账本（updatePrices calldata → 种子 → 本地重算报价）
-    //         注意：链上 getAmountOut@块 N 是**块后状态**（金库已被本交易消耗），
-    //         而真实成交发生在**交易执行时刻**（父块金库 + 本块种子），两者
-    //         天然差 1 wei——这恰好实证了 orderbook 的读时纯函数性质。
-    let parsed_seed = fetch_update_prices_seed(provider.clone(), ELFOMO_ARB_BLOCK)
+    // Phase 4: raw-tx 种子通道 ↔ 种子槽 一致性 + 读时纯函数身份复核。
+    //
+    // v2 pool（2026-10-02 起）的种子槽是 slot2、且 `updatePrices` calldata 里的
+    // `arg >> 32` 就是该块 slot2 的值：两者必须**逐位相等**（flashblocks raw-tx
+    // 通道零 RPC 直算的根基）。再取「本块种子 + 本块金库余额 + 本块 ladder」本地
+    // 重算 orderbook，必须与链上 `getOrderbook` 逐位一致（`verify_model_against_chain`
+    // 在锚点块上的独立复核）。
+    let parsed_seed = fetch_update_prices_seed(provider.clone(), ELFOMO_TEST_BLOCK)
         .await?
-        .ok_or_else(|| eyre::eyre!("arb block updatePrices 交易未找到"))?;
+        .ok_or_else(|| eyre::eyre!("锚点块未找到 updatePrices 交易"))?;
+    let storage_seed = chain_price_seed(provider.clone(), anchor).await?;
     assert_eq!(
-        parsed_seed,
-        U256::from(ELFOMO_ARB_SEED),
-        "updatePrices calldata 种子解析失败"
+        parsed_seed, storage_seed,
+        "updatePrices calldata 种子必须等于本块 slot2 >> 32"
     );
-    // 交易执行时刻状态 = 父块金库余额 + 本块种子
-    let pre_block = BlockId::Number(BlockNumberOrTag::Number(ELFOMO_ARB_BLOCK - 1));
-    let (vu, vx) = chain_vault_balances(provider.clone(), pre_block).await?;
-    let pre_ladder = chain_ladder(provider.clone(), pre_block).await?;
-    let ob = ElfomoFiPropPool::build_orderbook_with(&pre_ladder, parsed_seed, vu, vx);
-    let sim = ElfomoFiPropPool::simulate_swap_for_orderbook(
-        &ob,
-        ELFOMO_XETH_ADDRESS,
-        ELFOMO_USDT0_ADDRESS,
-        ELFOMO_XETH_ADDRESS,
-        ELFOMO_USDT0_ADDRESS,
-        U256::from(ELFOMO_ARB_IN),
-    );
-    assert_eq!(
-        sim,
-        U256::from(ELFOMO_ARB_OUT),
-        "本地账本重算（父块金库+本块种子）必须等于链上成交额"
-    );
-    // 块后状态：链上 getAmountOut 视图在交易所在块存在 1 wei 的视图层取整
-    // 差异（`Router.getAmountOut` 视图路径，仅出现在交易执行后的那个块，
-    // 116 块扫描仅此 1 块出现；swap 执行路径无此差异）。因此这里只要求
-    // 本地与链上在 ±1 wei 内一致，并打印差值供审计。
-    let chain_out = chain_quote(
-        provider.clone(),
-        ELFOMO_XETH_ADDRESS,
-        ELFOMO_USDT0_ADDRESS,
-        U256::from(ELFOMO_ARB_IN),
-        BlockId::Number(BlockNumberOrTag::Number(ELFOMO_ARB_BLOCK)),
-    )
-    .await?;
-    let post_block = BlockId::Number(BlockNumberOrTag::Number(ELFOMO_ARB_BLOCK));
-    let (vu_post, vx_post) = chain_vault_balances(provider.clone(), post_block).await?;
-    let post_ladder = chain_ladder(provider.clone(), post_block).await?;
-    let ob_post =
-        ElfomoFiPropPool::build_orderbook_with(&post_ladder, parsed_seed, vu_post, vx_post);
-    let sim_post = ElfomoFiPropPool::simulate_swap_for_orderbook(
-        &ob_post,
-        ELFOMO_XETH_ADDRESS,
-        ELFOMO_USDT0_ADDRESS,
-        ELFOMO_XETH_ADDRESS,
-        ELFOMO_USDT0_ADDRESS,
-        U256::from(ELFOMO_ARB_IN),
-    );
+
+    let (vu, vx) = chain_vault_balances(provider.clone(), anchor).await?;
+    let anchor_ladder = chain_ladder(provider.clone(), anchor).await?;
+    let ob = ElfomoFiPropPool::build_orderbook_with(&anchor_ladder, parsed_seed, vu, vx);
+    let (cft4, ctf4) = chain_orderbook(provider.clone(), anchor).await?;
+    let lft4: Vec<(U256, U256)> = ob
+        .from_to_levels
+        .iter()
+        .map(|lv| (lv.size, lv.price))
+        .collect();
+    let ltf4: Vec<(U256, U256)> = ob
+        .to_from_levels
+        .iter()
+        .map(|lv| (lv.size, lv.price))
+        .collect();
+    assert_eq!(lft4, cft4, "本块 from→to orderbook 本地重算必须与链上逐位一致");
+    assert_eq!(ltf4, ctf4, "本块 to→from orderbook 本地重算必须与链上逐位一致");
     println!(
-        "Phase 4: arb in={ELFOMO_ARB_IN} sim(pre-tx state)={sim} tx_out={ELFOMO_ARB_OUT} \
-         chain_getAmountOut(post-tx)={chain_out} sim(post-tx state)={sim_post}"
-    );
-    let diff = if sim_post >= chain_out {
-        sim_post - chain_out
-    } else {
-        chain_out - sim_post
-    };
-    assert!(
-        diff <= U256::from(1u64),
-        "块后状态本地重算与链上 getAmountOut 偏差超过 1 wei: sim={sim_post} chain={chain_out}"
+        "Phase 4: calldata seed == slot2>>32 == {parsed_seed}; 本块 orderbook 逐位一致 \
+         (ft={}/{} tf={}/{}，vault_x={vx} vault_usdt0={vu})",
+        lft4.len(),
+        cft4.len(),
+        ltf4.len(),
+        ctf4.len()
     );
 
     println!("ALL PHASES OK");

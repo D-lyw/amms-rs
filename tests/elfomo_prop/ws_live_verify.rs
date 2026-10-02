@@ -3,7 +3,7 @@
 //! 照 `tests/fermi_prop/ws_live_verify.rs` 模式（`#[ignore]` 长跑，env 门控）：
 //! - 订阅 XLayer flashblocks WS，实时抓取发往 Elfomo Pool 的 `updatePrices`
 //!   原始交易，**本地**解析 calldata 种子（`parse_update_prices_calldata`）；
-//! - 对该块延迟校验（等区块确认后）：种子 == `slot1>>32`、本地
+//! - 对该块延迟校验（等区块确认后）：种子 == `slot2>>32`、本地
 //!   `build_orderbook(seed, 金库余额)` == 链上 `getOrderbook` 双向逐位、
 //!   本地 `simulate_swap` == 链上 Router `getAmountOut`（probe 金额）；
 //! - 这是"raw-tx → 本地直算 → 模拟"整条实时管道的最终验证。
@@ -110,12 +110,15 @@ where
     use amms::amms::elfomo_prop::types::IElfomoFiRouter;
 
     let bid = BlockId::Number(BlockNumberOrTag::Number(pc.block));
-    // 1) 种子 == slot1 >> 32
-    let slot1: U256 = provider
-        .get_storage_at(ELFOMO_POOL_ADDRESS, U256::from(1u64))
+    // 1) 种子 == slot2 >> 32（2026-10-02 起 v2 pool 的种子槽）
+    let slot: U256 = provider
+        .get_storage_at(
+            ELFOMO_POOL_ADDRESS,
+            U256::from(amms::amms::elfomo_prop::types::ELFOMO_SEED_SLOT),
+        )
         .block_id(bid)
         .await?;
-    let seed_ok = pc.seed == (slot1 >> 32);
+    let seed_ok = pc.seed == (slot >> 32);
     // 2) 金库余额 + 本地 orderbook vs 链上 getOrderbook
     let (vu, vx) = {
         let u = IERC20Balance::new(ELFOMO_USDT0_ADDRESS, provider.clone());

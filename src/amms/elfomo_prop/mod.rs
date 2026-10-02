@@ -17,7 +17,8 @@
 //! （`debug_traceCall` 实证：每次报价 Pool 都会实时 staticcall
 //! `token.balanceOf(vault)`）。因此本地模拟必须同样"读时重算"，不能缓存档位递减：
 //!
-//! - **价格**：`a = slot1 >> 32`；`q = (a >> 22) & 0x3f`，
+//! - **价格**：`a = slot2 >> 32`（2026-10-02 起 v2 pool 的种子槽；v1 为 slot1）；
+//!   `q = (a >> 22) & 0x3f`，
 //!   `qs = q>=32 ? q-64 : q`；`low = a & 0x3fffff`；
 //!   `base = (100000 + qs) × low`。每档 `price = slope × base`（定点 1e24）。
 //! - **档位生成**：宽度/偏离由**本 pool 的 ladder 参数**（[`ElfomoLadderConfig`]，
@@ -48,7 +49,7 @@
 //!
 //! 报价更新机制（2026-09-01 链上实证）：MM keeper 每块向 Pool 发一笔
 //! `updatePrices(uint256)`（selector `0xae7e8d81`），Pool 同步 emit 一条空
-//! data 事件（topic `0xc5d08cbe…`）并更新 slot1。**空事件零信息量、不是状态源**
+//! data 事件（topic `0xc5d08cbe…`）并更新种子槽 `slot2`。**空事件零信息量、不是状态源**
 //! （仅用于提取侧的 raw-tx 去重，见下）；**calldata 参数才是价格种子**：
 //! 实测 `arg ≈ (a<<32) | (ts-1)`，`a = arg >> 32` 可直接从原始交易解析，
 //! 无需任何 RPC 即可在本地重算整本 orderbook。
@@ -106,7 +107,7 @@ use crate::amms::{
 };
 
 use crate::amms::elfomo_prop::types::{
-    ElfomoBandProfile, ElfomoLadderConfig, OrderbookLevel, OrderbookSnapshot,
+    ElfomoBandProfile, ElfomoLadderConfig, OrderbookLevel, OrderbookSnapshot, ELFOMO_SEED_SLOT,
 };
 
 pub mod factory;
@@ -116,7 +117,7 @@ pub mod types;
 use self::ledger::{VaultDeltaLedger, VaultLedgerApply};
 
 // ============================================================================
-// 常量（XLayer 实测地址，2026-09-01）
+// 常量（XLayer 实测地址，2026-10-02）
 // ============================================================================
 
 /// XLayer chain id
@@ -126,8 +127,12 @@ pub const ELFOMO_CHAIN_ID: u64 = 196;
 pub const ELFOMO_ROUTER_ADDRESS: Address = address!("0xf0f0f0f0fb0d738452efd03a28e8be14c76d5f73");
 /// Factory 代理（getOrderbook / pair→pool 映射）
 pub const ELFOMO_FACTORY_ADDRESS: Address = address!("0xffffffbb2d432b8acb4c57d556c0c721a431d038");
-/// Pool（orderbook 存储与计算所在，非代理）
-pub const ELFOMO_POOL_ADDRESS: Address = address!("0x02dcdf4171939ac0fe28e48e8758649311e9459a");
+/// Pool（orderbook 存储与计算所在，非代理）。
+///
+/// 2026-09-29 20:32 CST 起协议把 XLayer pool 从 v1 `0x02dcdf41…` 换成 v2
+/// `0x19bbce39…`（同时价格种子槽 slot1 → slot2、`getMetadata` 11 词 → 13 词）；
+/// v1 已停更，本常量跟随当前部署。
+pub const ELFOMO_POOL_ADDRESS: Address = address!("0x19bbce3930e44349050db6b1b1e0529001d02d29");
 /// Vault（Gnosis Safe，仅持币背书）
 pub const ELFOMO_VAULT_ADDRESS: Address = address!("0xbb1b19f138db3925883a96ff7a304277460e0c99");
 /// 资产：xETH（18 dp）
@@ -171,7 +176,7 @@ pub const ELFOMO_PROFILE_KEY_SCAN: u64 = 8;
 
 /// 存储读取块高校验（与 `caliber_prop::ensure_storage_block_available` 同一逻辑）。
 ///
-/// elfomo 的 storage 读取（Pool slot1 价格种子）经 `eth_call` bulk-SLOAD 走
+/// elfomo 的 storage 读取（Pool 种子槽价格种子）经 `eth_call` bulk-SLOAD 走
 /// 调用方注入的 provider（见 [`crate::amms::evm_storage`]）；该节点头部可能落后于
 /// 调用方传入的块高（如 maintenance Resync / coverage 传入的 canonical 头），
 /// 直接查询会触发 `-32019 block is out of range`。超前块**不降级读取**，返回
@@ -249,7 +254,7 @@ pub struct ElfomoFiPropPool {
     pub token_x: Address,
     /// pair 的 token 1（from→to 输出侧，对应 vault_usdt0 余额）
     pub token_y: Address,
-    /// 价格种子 `a`（Pool slot1 >> 32，updatePrices calldata 直接携带）。
+    /// 价格种子 `a`（Pool `slot2` >> 32，updatePrices calldata 直接携带）。
     /// orderbook 是 `(a, vault_usdt0, vault_xeth)` 的读时纯函数，
     /// 本地报价实时重算（见 `build_orderbook`）。
     pub price_seed: U256,
@@ -408,7 +413,7 @@ impl ElfomoFiPropPool {
     /// 从 `updatePrices(uint256)` calldata 解析价格种子 `a`。
     ///
     /// 链上实证（2026-09-01）：MM keeper 每块发的 `0xae7e8d81` 交易，
-    /// calldata 参数 `arg ≈ (a<<32) | (ts-1)`，`arg >> 32` 即 Pool slot1
+    /// calldata 参数 `arg ≈ (a<<32) | (ts-1)`，`arg >> 32` 即 Pool 种子槽
     /// 高 32 位价格种子，无需任何 RPC 即可本地重算 orderbook。
     pub fn parse_update_prices_calldata(input: &[u8]) -> Option<U256> {
         if input.len() < 36 || input[..4] != ELFOMO_UPDATE_SELECTOR {
@@ -1148,9 +1153,10 @@ impl ElfomoFiPropPool {
     /// 拉取 orderbook + vault 余额 + 价格种子快照（L2/init 兜底通道）。
     ///
     /// 注意（链上实证）：vault 是 Gnosis Safe，**不能**在 vault 合约上调用
-    /// `balanceOf`；余额必须读 `token.balanceOf(vault)`。价格种子读
-    /// Pool slot1（`a = slot1 >> 32`，经 `eth_call` bulk-SLOAD 走调用方注入的
-    /// provider，官方 WS 网关可用），供本地 `build_orderbook` 使用。
+    /// `balanceOf`；余额必须读 `token.balanceOf(vault)`。价格种子读 Pool 的
+    /// [`ELFOMO_SEED_SLOT`]（2026-10-02 起 v2 pool = slot2，`a = slot >> 32`；
+    /// v1 的 slot1 已停用），经 `eth_call` 走调用方注入的 provider
+    /// （官方 WS 网关可用），供本地 `build_orderbook` 使用。
     pub async fn fetch_orderbook_snapshot<N, P>(
         &self,
         provider: P,
@@ -1189,12 +1195,13 @@ impl ElfomoFiPropPool {
             .call()
             .await?;
 
-        // 价格种子（Pool slot1 高 32 位）+ 逐档 profile word（slot0 mapping，
-        // key = 本 pair 在 `getSupportedPairs()` 中的下标，见 `fetch_ladder`）。
-        // 两条槽一次 bulk-SLOAD 读完，经 `eth_call` 走调用方注入的 provider
-        // （官方 WS 网关不开放 eth_getStorageAt，见 `amms::evm_storage`）。
+        // 价格种子（`ELFOMO_SEED_SLOT`，2026-10-02 起 v2 pool = slot2）+ 逐档
+        // profile word（slot0 mapping，key = 本 pair 在 `getSupportedPairs()` 中的
+        // 下标，见 `fetch_ladder`）。两条槽一次 bulk-SLOAD 读完，经 `eth_call` 走
+        // 调用方注入的 provider（官方 WS 网关不开放 eth_getStorageAt，见
+        // `amms::evm_storage`）。
         let slots = [
-            B256::from(U256::from(1u64).to_be_bytes::<32>()),
+            B256::from(U256::from(ELFOMO_SEED_SLOT).to_be_bytes::<32>()),
             Self::band_profile_slot(self.ladder.profile_key),
         ];
         let words = crate::amms::evm_storage::storage_slots_at::<N, P>(
@@ -1204,7 +1211,14 @@ impl ElfomoFiPropPool {
             block,
         )
         .await?;
-        let price_seed = words[0] >> 32;
+        let price_seed: U256 = words[0] >> 32;
+        if price_seed.is_zero() {
+            warn!(
+                target: "amms::elfomo_prop",
+                pool = %self.pool_address, block = ?block, slot = ELFOMO_SEED_SLOT,
+                "elfomofi: seed slot is zero (pool not priced yet?)"
+            );
+        }
         let profile_word = words[1];
 
         Ok(OrderbookSnapshot {
@@ -1277,33 +1291,19 @@ impl ElfomoFiPropPool {
             .await;
 
         for asset in [self.token_x, self.token_y] {
-            let md = match pool.getMetadata(asset).block(block).call().await {
-                Ok(md) => md,
-                Err(e) => {
-                    // 该 asset 无配置（部分部署对 quote asset 直接 revert）：换下一个
-                    tracing::debug!(
-                        target: "amms::elfomo_prop",
-                        pool = %self.pool_address,
-                        %asset,
-                        error = %e,
-                        "elfomofi: getMetadata(asset) unavailable, trying next asset"
-                    );
-                    continue;
-                }
+            // 变体自适应：13 词（v2）优先，11 词（v1）兜底；两者都拿不到就换下一个
+            // asset（部分部署对 quote asset 直接 revert）。
+            let fields = match Self::read_metadata_fields::<N, P>(
+                &provider,
+                self.pool_address,
+                asset,
+                block,
+            )
+            .await
+            {
+                Some(f) => f,
+                None => continue,
             };
-            let fields = [
-                U256::from(md.field0),
-                U256::from(md.decimals),
-                U256::from(md.field2),
-                U256::from(md.field3),
-                U256::from(md.field4),
-                U256::from(md.unit),
-                U256::from(md.band_count),
-                U256::from(md.spread_level),
-                U256::from(md.spread_penalty),
-                U256::from_be_slice(md.field9.as_slice()),
-                md.field10,
-            ];
             let mut ladder = ElfomoLadderConfig::from_metadata(&fields);
             if let Some((key, profile)) = band {
                 ladder.profile = profile;
@@ -1314,6 +1314,82 @@ impl ElfomoFiPropPool {
             }
         }
         Ok(None)
+    }
+
+    /// 读 `getMetadata(asset)` 并归一成 v1 的 11 字段视图（`unit` 恒在下标 5）。
+    ///
+    /// **按变体自适应，不写死**：
+    /// - 13 词 → v2 布局（[`types::IElfomoFiPoolV2`]，`unit` 在下标 7，`field11/12`
+    ///   对应 v1 的 `field9/field10`）；
+    /// - 11 词 → v1 布局（[`types::IElfomoFiPool`]，`unit` 在下标 5）。
+    ///
+    /// 先按 v2 解：v1 pool 的返回更短，静态字段解码必然失败 → 自动落到 v1。
+    /// 两者都失败返回 `None`（未配置该 asset / 链上 revert / 未来更新的布局），
+    /// 由调用方换下一个 asset，最终 `ladder` 为空 → `model_verified=false` fail-closed。
+    async fn read_metadata_fields<N, P>(
+        provider: &P,
+        pool_address: Address,
+        asset: Address,
+        block: BlockId,
+    ) -> Option<[U256; 11]>
+    where
+        N: Network,
+        P: Provider<N> + Clone,
+    {
+        use crate::amms::elfomo_prop::types::{IElfomoFiPool, IElfomoFiPoolV2};
+
+        if let Ok(md) = IElfomoFiPoolV2::new(pool_address, provider.clone())
+            .getMetadata(asset)
+            .block(block)
+            .call()
+            .await
+        {
+            return Some([
+                U256::from(md.field0),
+                U256::from(md.decimals),
+                U256::from(md.field2),
+                U256::from(md.field3),
+                U256::from(md.field4),
+                U256::from(md.unit),
+                U256::from(md.band_count),
+                U256::from(md.spread_level),
+                U256::from(md.spread_penalty),
+                U256::from_be_slice(md.field11.as_slice()),
+                md.field12,
+            ]);
+        }
+
+        let md = match IElfomoFiPool::new(pool_address, provider.clone())
+            .getMetadata(asset)
+            .block(block)
+            .call()
+            .await
+        {
+            Ok(md) => md,
+            Err(e) => {
+                tracing::debug!(
+                    target: "amms::elfomo_prop",
+                    %pool_address,
+                    %asset,
+                    error = %e,
+                    "elfomofi: getMetadata(asset) unavailable (v1/v2 both failed), trying next asset"
+                );
+                return None;
+            }
+        };
+        Some([
+            U256::from(md.field0),
+            U256::from(md.decimals),
+            U256::from(md.field2),
+            U256::from(md.field3),
+            U256::from(md.field4),
+            U256::from(md.unit),
+            U256::from(md.band_count),
+            U256::from(md.spread_level),
+            U256::from(md.spread_penalty),
+            U256::from_be_slice(md.field9.as_slice()),
+            md.field10,
+        ])
     }
 
     /// 读本池的逐档 profile word：优先用 `pair_index`（= `getSupportedPairs()` 下标），
@@ -2071,9 +2147,40 @@ mod tests {
             // 本块 vault 余额
             vault_usdt0: U256::from(19_192_415_254u64),
             vault_xeth: U256::from(2_940_462_501_000_862_186u128),
-            // 本块价格种子（slot1 >> 32）
+            // 本块价格种子（锚点块 v1 pool，slot1 >> 32）
             price_seed: U256::from(0x143c60fu64),
             profile_word: legacy_profile().encode_word(),
+        }
+    }
+
+    /// v2 pool 的 `getMetadata` 返回 **13 词**（在 v1 的 `field4` 后多插 2 个字段），
+    /// `unit` 下标由 5 移到 7。这里用真链原始返回（2026-10-02 新池 `0x19bbce39…`，
+    /// `getMetadata(0xe7b0…025a)`：unit=6e17 / band_count=19 / spread_level=5 /
+    /// spread_penalty=60）做 fixture，验证：
+    /// 1. v2 ABI 解出的四个报价关键字段全部落在正确下标；
+    /// 2. v1 ABI 对同一段 13 词**不会**读出 v2 的 `unit`（解码失败或 unit=0）
+    ///    → `read_metadata_fields` 的"先 v2 后 v1"自适应是安全且必要的。
+    #[test]
+    fn test_get_metadata_v2_thirteen_words() {
+        use crate::amms::elfomo_prop::types::{IElfomoFiPool, IElfomoFiPoolV2};
+        use alloy::sol_types::SolCall;
+
+        let words: [u64; 13] = [0, 18, 2, 0, 0, 0, 0, 600_000_000_000_000_000, 19, 5, 60, 0, 0];
+        let mut data = Vec::with_capacity(13 * 32);
+        for w in words {
+            data.extend_from_slice(&U256::from(w).to_be_bytes::<32>());
+        }
+
+        let md = <IElfomoFiPoolV2::getMetadataCall as SolCall>::abi_decode_returns(&data).unwrap();
+        assert_eq!(md.decimals, 18);
+        assert_eq!(md.unit, 600_000_000_000_000_000u128);
+        assert_eq!(md.band_count, 19);
+        assert_eq!(md.spread_level, 5);
+        assert_eq!(md.spread_penalty, 60);
+
+        match <IElfomoFiPool::getMetadataCall as SolCall>::abi_decode_returns(&data) {
+            Err(_) => {}
+            Ok(v1) => assert_eq!(v1.unit, 0u128, "v1 ABI must not pick up the v2 unit field"),
         }
     }
 

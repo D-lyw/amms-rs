@@ -37,7 +37,7 @@
 //!
 //! ## 对拍四项（逐块，任一不等即漂移）
 //!
-//! 1. `price_seed` ←→ 链上 `slot1 >> 32`
+//! 1. `price_seed` ←→ 链上 `slot2 >> 32`（2026-10-02 起 v2 pool 种子槽）
 //! 2. `levels.vault_xeth / vault_usdt0`（账本派生）←→ `token.balanceOf(vault)`
 //! 3. `levels.profile_word` ←→ 链上 profile 槽
 //! 4. `levels.{from_to,to_from}_levels` ←→ 链上 `getOrderbook` 逐位

@@ -104,6 +104,48 @@ sol! {
     }
 }
 
+sol! {
+    #[allow(missing_docs)]
+    #[sol(rpc)]
+    interface IElfomoFiPoolV2 {
+        /// 池内 per-asset 做市参数 **v2 布局**（2026-10-02 起 XLayer 新 pool 实测）。
+        ///
+        /// 相对 v1（[`IElfomoFiPool::getMetadata`]）在 `field4` 之后**多插了 2 个字段**，
+        /// 因此返回从 11 词变 13 词、`unit` 由下标 5 移到下标 7：
+        /// `[field0, decimals, field2, field3, field4, field5, field6, unit, band_count,
+        ///   spread_level, spread_penalty, field11, field12]`。
+        ///
+        /// 两个新增字段（`field5`/`field6`）当前恒为 0、真实宽度未知，这里声明成
+        /// `uint256` 以容纳任意取值（静态字段各占 1 词，位置解码不受影响）。
+        /// 调用方按**返回数据长度**自适应：13 词走本接口，11 词走 v1。
+        function getMetadata(address asset)
+            external
+            view
+            returns (
+                uint8 field0,
+                uint8 decimals,
+                uint8 field2,
+                uint8 field3,
+                uint16 field4,
+                uint256 field5,
+                uint256 field6,
+                uint128 unit,
+                uint16 band_count,
+                uint16 spread_level,
+                uint8 spread_penalty,
+                address field11,
+                uint256 field12
+            );
+    }
+}
+
+/// 价格种子的 storage 槽。
+///
+/// 2026-10-02 起 XLayer 换成 v2 pool（`0x19bbce39…`），种子槽**从 slot1 挪到
+/// slot2**（逐块实证：`updatePrices` calldata `arg` 与该块 `slot2` 完全相等，
+/// `slot1` 恒为 0）。报价读取一律用本常量，不再读 slot1。
+pub const ELFOMO_SEED_SLOT: u64 = 2;
+
 // ============================================================================
 // 数据结构
 // ============================================================================
@@ -129,7 +171,7 @@ impl OrderbookLevel {
 
 /// 订单簿快照：两侧档位 + 金库余额背书 + 价格种子 + 逐档 profile word。
 ///
-/// `price_seed` 是 Pool slot1 高 32 位（`a`）、`profile_word` 是逐档
+/// `price_seed` 是 Pool 种子槽（[`ELFOMO_SEED_SLOT`]）高 32 位（`a`）、`profile_word` 是逐档
 /// 宽度/偏离表 word（见 [`ElfomoBandProfile`]），orderbook 是
 /// `(profile, price_seed, vault_usdt0, vault_xeth)` 的**读时纯函数**（见
 /// `ElfomoFiPropPool::build_orderbook_with`）。档位字段仅为缓存/对拍，
@@ -144,7 +186,7 @@ pub struct OrderbookSnapshot {
     pub vault_usdt0: U256,
     /// 金库 xETH 余额（反向输出封顶；s1+s2+s3 == 此值）
     pub vault_xeth: U256,
-    /// 价格种子 `a`（Pool slot1 >> 32；updatePrices calldata 直接携带）
+    /// 价格种子 `a`（Pool `slot2` >> 32；updatePrices calldata 直接携带）
     #[serde(default)]
     pub price_seed: U256,
     /// 逐档宽度/偏离表 word（池存储 `keccak256(pad32(key)‖pad32(0))`；
@@ -319,19 +361,19 @@ pub struct ElfomoLadderConfig {
 //
 // | 项 | XLayer（已支持） | Base（已核查、未支持） |
 // |---|---|---|
-// | `getMetadata(address)` | 有（selector `0x2a50c146`） | 有，ABI/存储布局相同 |
+// | `getMetadata(address)` | 有（selector `0x2a50c146`）；**v2 pool 返回 13 词**（`unit` 在下标 7，v1 为 11 词 / 下标 5），`fetch_ladder` 按长度自适应 | 有，ABI/存储布局相同 |
 // | `getMetadata(quote)` | 返回**全零** | 直接 **revert**（`0x672215de`）→ `fetch_ladder` 已逐 asset 容错 |
 // | metadata word byte28（ABI `f3`） | `0` | `1`（XLayer 上把该字节改非 0 → `getOrderbook` revert / `not implemented`，说明 `f3` 是**实现变体开关**） |
 // | `DEVIATIONS`（偏离表） | `[7,10,15,25,40,50]` | `[2,3,15,25,40,50]`（仅前两档不同） |
 // | `PREFIX_WIDTHS` | `[1,5,10,10,20,100]` | 实测相同 |
-// | 价格种子 | `slot1 >> 32` | **不是** `slot1>>32`（槽位打包不同，需另行逆向） |
+// | 价格种子 | v1 `slot1 >> 32`；**v2（2026-10-02 起）`slot2 >> 32`**，见 [`ELFOMO_SEED_SLOT`] | **不是** `slot1>>32`（槽位打包不同，需另行逆向） |
 // | vault 余额 | `token.balanceOf(vault)` | 未核查 |
 //
 // **结论/维护指引**：本模块只对 XLayer（`f3 = 0` 变体）做过全网格逐位对拍，因此
 // 当前只在 XLayer 启用。接入 Base 等变体时的最小步骤：
 //   ① 从 `getMetadata` 的原始 word 里读出 `f3`（本模块目前不解析该字段）；
 //   ② 按变体给出对应的 `DEVIATIONS`（必要时连 `PREFIX_WIDTHS`/容量规则一起）；
-//   ③ 逆向该链的种子读取方式（Base 不是 `slot1>>32`）与 vault 读法；
+//   ③ 逆向该链的种子槽（XLayer v2 已实测为 `slot2`；Base 不是 `slot1>>32`）与 vault 读法；
 //   ④ 用与 XLayer 相同的方法（anvil fork + `eth_call` stateOverride 全网格）逐位对拍，
 //      结果固化进 fixture 单测。**在对拍通过之前不要开启**——`verify_model_against_chain`
 //      会把不匹配的池判为 `model_verified = false`（fail-closed，不报价，不会出错价）。
