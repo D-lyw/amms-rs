@@ -1466,8 +1466,9 @@ pub async fn start_binaryfi_prop_sync_task<N, P>(
 /// orderbook（零 RPC）；Pool `updatePrices` 空事件已不再订阅（零信息量），
 /// 提取通道失效由覆盖率自证暴露。本任务作为**唯一兜底**，在事件流断供
 /// （flashblocks 断流/重连/漏块、matcher 未覆盖）时低频重拉整档回正 + 种子 +
-/// vault 余额，防止本地报价长期过期。单池部署：每轮一次 `getOrderbook` + slot1 + 2 次 `balanceOf` 静态
-/// 调用，开销可忽略；失败退避上限 300s。
+/// vault 余额，防止本地报价长期过期。单池部署：每轮每池一次 `fetch_snapshot_at`
+/// （档位 + 价格种子槽 `ELFOMO_SEED_SLOT` = slot2，v1 池的 slot1 已停用）+
+/// 2 次 `balanceOf` 静态调用，开销可忽略；失败退避上限 300s。
 pub async fn start_elfomo_prop_sync_task<N, P>(
     state: Arc<RwLock<StateSpace>>,
     provider: P,
