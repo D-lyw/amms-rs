@@ -224,6 +224,17 @@ pub const ELFOMO_SEED_COVERAGE_ALERT_BLOCKS: u64 = 5;
 const SEED_Q_MASK: u64 = 0x3f;
 const SEED_LOW_MASK: u64 = 0x3f_ffff;
 
+/// 种子低位总掩码：`q` 占 bit22..27（6 位，**含符号位 bit27**）、`low` 占 bit0..21
+/// （22 位）→ 一共 **28 位**。
+///
+/// **绝不能收窄成 27 位**（`0x7ff_ffff`，历史 bug）：那会抹掉 `q` 的符号位，MM 用负偏
+/// 报价（`q >= 32`，v2 池常态 `q = 49/59` 即 `qs = -15/-5`）时本地把 `q` 读成 `q-32`，
+/// 基价 `(100000 + qs) × low` 整体偏 `32 / (100000+qs)`（实测 +0.032%）→
+/// `verify_model_against_chain` 判模型不可信、`fail-closed` 停掉该池报价
+/// （2026-10-15 生产事故）。v1 池期间 MM 恒为 `q < 32`（锚点块实测 `q = 5`），
+/// 27 位掩码恰好无害 —— 这正是它能在锚点对拍 + 全网格回归下长期潜伏的原因。
+const SEED_BITS_MASK: u64 = 0xfff_ffff;
+
 sol! {
     #[allow(missing_docs)]
     #[sol(rpc)]
@@ -493,8 +504,9 @@ impl ElfomoFiPropPool {
             profile_word,
         };
 
-        // q 取位 22..27、low 取位 0..21，只需种子低 27 位
-        let low_bits = (seed & U256::from(0x7ff_ffffu64)).to::<u64>();
+        // q 取位 22..27、low 取位 0..21 → 取满种子低 28 位（见 [`SEED_BITS_MASK`]）。
+        // 只取 27 位会抹掉 `q` 的符号位，负偏种子（v2 池常态）基价必错。
+        let low_bits = (seed & U256::from(SEED_BITS_MASK)).to::<u64>();
         let q = (low_bits >> 22) & SEED_Q_MASK;
         let qs = if q >= 32 { q as i64 - 64 } else { q as i64 };
         let low = low_bits & SEED_LOW_MASK;
@@ -2973,6 +2985,94 @@ mod tests {
         let rebuilt = build_orderbook(s.price_seed, s.vault_usdt0, s.vault_xeth);
         assert_eq!(rebuilt.from_to_levels, s.from_to_levels);
         assert_eq!(rebuilt.to_from_levels, s.to_from_levels);
+    }
+
+    /// v2 池真实链回归：**负偏种子（`q >= 32`，bit27=1）** 的基价解析。
+    ///
+    /// 背景（2026-10-15 生产事故）：`build_orderbook_with` 曾以 27 位掩码取种子，抹掉
+    /// `q` 的符号位 → MM 负偏报价被本地读小 32（`qs` 偏 +32），价格整体低 ~0.032% →
+    /// 模型自证 `fail-closed`、该池报价静默停摆。
+    ///
+    /// 下方每组数据都是 v2 池（`0x19bbce39…`）在**真实链块**上的 `getOrderbook` 原始
+    /// 档位、同块 `slot2 >> 32` 种子与 vault `balanceOf(vault)`（size/price 全精度）。
+    /// v1 池的 fixture（锚点块、全网格）seed 全部 `q < 32`，覆盖不到这条路径。
+    #[test]
+    fn test_v2_pool_negative_q_seed_matches_chain() {
+        // v2 池 ladder：`getMetadata` 13 词实测（U=6e17 / T=19 / SL=5 / F=60）
+        // + keeper 改写后的 profile（宽度 [1,5,10,10,20,100]、偏离 [15,20,25,35,45,60]）。
+        let ladder = ElfomoLadderConfig {
+            profile: ElfomoBandProfile {
+                count: 6,
+                widths: [1, 5, 10, 10, 20, 100],
+                deviations: [15, 20, 25, 35, 45, 60],
+            },
+            ..ElfomoLadderConfig::from_metadata(&[
+                U256::ZERO,
+                U256::from(18u64),
+                U256::from(2u64),
+                U256::ZERO,
+                U256::ZERO,
+                U256::from(600_000_000_000_000_000u128),
+                U256::from(19u64),
+                U256::from(5u64),
+                U256::from(60u64),
+                U256::ZERO,
+                U256::ZERO,
+            ])
+        };
+        // 两个块的金库状态相同：USDT0 `4_105_375_270`（6dp）、xETH 0x8dfb714bab9e4f24。
+        let vu = U256::from(4_105_375_270u64);
+        let vx = U256::from(10_230_895_548_317_978_404u128);
+
+        // (种子 `a` = `slot2 >> 32`, 链上 from→to 档位, 链上 to→from 档位)
+        let cases: [(u64, Vec<OrderbookLevel>, Vec<OrderbookLevel>); 2] = [
+            (
+                0xc439_cb4, // 块 73283136：q=49 → qs=-15（bit27=1）
+                vec![
+                    lev(569_104_451_682_021_596, 2_365_109_750_314_500),
+                    lev(2_331_656_064_626_047_128, 1_183_442_457_000_000),
+                ],
+                vec![
+                    lev(600_000_000_000_000_000, 2_367_239_946_737_100),
+                    lev(3_000_000_000_000_000_000, 2_367_358_290_982_800),
+                    lev(6_000_000_000_000_000_000, 2_367_476_635_228_500),
+                    lev(30_895_548_317_978_404, 2_367_713_323_719_900),
+                    lev(600_000_000_000_000_000, 3_550_327_371_000_000),
+                ],
+            ),
+            (
+                0xec3_9c78, // 块 73283323：q=59 → qs=-5（bit27=1）
+                vec![
+                    lev(569_104_451_682_021_596, 2_364_746_776_749_000),
+                    lev(2_332_188_535_871_035_177, 1_183_260_834_000_000),
+                ],
+                vec![
+                    lev(600_000_000_000_000_000, 2_366_876_646_250_200),
+                    lev(3_000_000_000_000_000_000, 2_366_994_972_333_600),
+                    lev(6_000_000_000_000_000_000, 2_367_113_298_417_000),
+                    lev(30_895_548_317_978_404, 2_367_349_950_583_800),
+                    lev(600_000_000_000_000_000, 3_549_782_502_000_000),
+                ],
+            ),
+        ];
+
+        for (seed, ft, tf) in &cases {
+            let ob = ElfomoFiPropPool::build_orderbook_with(&ladder, U256::from(*seed), vu, vx);
+            assert_eq!(&ob.from_to_levels, ft, "seed {seed:#x} from→to 与链上不一致");
+            assert_eq!(&ob.to_from_levels, tf, "seed {seed:#x} to→from 与链上不一致");
+        }
+
+        // 防回退：按旧 27 位掩码截断种子后，档位/容量不变但价格必然偏离（旧 bug 症状）。
+        let truncated = U256::from(0xc439_cb4u64 & 0x7ff_ffff);
+        let trunc_ob = ElfomoFiPropPool::build_orderbook_with(&ladder, truncated, vu, vx);
+        assert_eq!(
+            trunc_ob.from_to_levels[0].size, cases[0].1[0].size,
+            "27 位掩码只影响基价，档位容量不应变化"
+        );
+        assert_ne!(
+            trunc_ob.from_to_levels[0].price, cases[0].1[0].price,
+            "27 位掩码抹掉 q 的符号位 → 价格必然偏离链上"
+        );
     }
 
     /// 全网格 bit-exact 回归：链上 `getOrderbook` vs 本地模型（不依赖 RPC）。
